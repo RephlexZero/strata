@@ -3,69 +3,20 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
-use rist_bonding_core::net::link::Link;
-use rist_bonding_core::scheduler::bonding::BondingScheduler;
+use rist_bonding_core::config::{BondingConfig, LinkConfig};
+use rist_bonding_core::runtime::{BondingRuntime, PacketSendError};
 use rist_bonding_core::scheduler::PacketProfile;
-use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Mutex};
 use std::time::{Duration, Instant};
-
-#[derive(Default, Deserialize)]
-#[serde(default)]
-struct SinkConfigV1 {
-    version: u32,
-    links: Vec<LinkConfig>,
-}
-
-#[derive(Deserialize)]
-struct LinkConfig {
-    id: Option<usize>,
-    uri: String,
-    interface: Option<String>,
-}
-
-fn parse_config_links(config: &str) -> Result<Vec<(usize, String, Option<String>)>, String> {
-    let config = config.trim();
-    if config.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let parsed: SinkConfigV1 =
-        serde_json::from_str(config).map_err(|e| format!("Invalid config JSON: {}", e))?;
-
-    if parsed.version != 0 && parsed.version != 1 {
-        return Err(format!("Unsupported config version {}", parsed.version));
-    }
-
-    let mut used = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for (idx, link) in parsed.links.into_iter().enumerate() {
-        let id = link.id.unwrap_or(idx);
-        if !used.insert(id) {
-            continue;
-        }
-        if link.uri.trim().is_empty() {
-            continue;
-        }
-        let iface = link.interface.and_then(|iface| {
-            if iface.trim().is_empty() {
-                None
-            } else {
-                Some(iface)
-            }
-        });
-        out.push((id, link.uri, iface));
-    }
-
-    Ok(out)
+fn parse_config(config: &str) -> Result<BondingConfig, String> {
+    BondingConfig::from_toml_str(config)
 }
 
 mod imp {
     use super::*;
 
     pub(crate) enum SinkMessage {
-        Packet(bytes::Bytes, PacketProfile),
         AddLink {
             id: usize,
             uri: String,
@@ -77,23 +28,24 @@ mod imp {
     }
 
     pub struct RsRistBondSink {
-        // We only hold the Sender. The Scheduler lives in the worker thread.
-        pub(crate) sender: Mutex<Option<flume::Sender<SinkMessage>>>,
-        pub(crate) worker_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+        pub(crate) runtime: Mutex<Option<BondingRuntime>>,
+        pub(crate) stats_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+        pub(crate) stats_running: Arc<AtomicBool>,
 
         // Configuration state management
         pub(crate) links_config: Mutex<String>,
-        pub(crate) config_json: Mutex<String>,
+        pub(crate) config_toml: Mutex<String>,
         pub(crate) pad_map: Mutex<HashMap<String, usize>>,
     }
 
     impl Default for RsRistBondSink {
         fn default() -> Self {
             Self {
-                sender: Mutex::new(None),
-                worker_thread: Mutex::new(None),
+                runtime: Mutex::new(None),
+                stats_thread: Mutex::new(None),
+                stats_running: Arc::new(AtomicBool::new(false)),
                 links_config: Mutex::new(String::new()),
-                config_json: Mutex::new(String::new()),
+                config_toml: Mutex::new(String::new()),
                 pad_map: Mutex::new(HashMap::new()),
             }
         }
@@ -101,9 +53,20 @@ mod imp {
 
     impl RsRistBondSink {
         pub(crate) fn send_msg(&self, msg: SinkMessage) {
-            let sender = self.sender.lock().unwrap();
-            if let Some(tx) = &*sender {
-                let _ = tx.send(msg);
+            let runtime = self.runtime.lock().unwrap();
+            if let Some(rt) = &*runtime {
+                match msg {
+                    SinkMessage::AddLink { id, uri, iface } => {
+                        let _ = rt.add_link(LinkConfig {
+                            id,
+                            uri,
+                            interface: iface,
+                        });
+                    }
+                    SinkMessage::RemoveLink { id } => {
+                        let _ = rt.remove_link(id);
+                    }
+                }
             }
         }
 
@@ -150,10 +113,10 @@ mod imp {
         }
 
         fn apply_config(&self, config: &str) {
-            match parse_config_links(config) {
-                Ok(links) => {
-                    for (id, uri, iface) in links {
-                        self.send_msg(SinkMessage::AddLink { id, uri, iface });
+            match parse_config(config) {
+                Ok(parsed) => {
+                    if let Some(rt) = self.runtime.lock().unwrap().as_ref() {
+                        let _ = rt.apply_config(parsed);
                     }
                 }
                 Err(err) => {
@@ -199,8 +162,8 @@ mod imp {
                         .mutable_ready()
                         .build(),
                     glib::ParamSpecString::builder("config")
-                        .nick("Config (JSON)")
-                        .blurb("JSON config with versioned schema")
+                        .nick("Config (TOML)")
+                        .blurb("TOML config with versioned schema")
                         .mutable_ready()
                         .build(),
                 ]
@@ -216,7 +179,7 @@ mod imp {
                 }
                 "config" => {
                     let cfg: String = value.get().expect("type checked upstream");
-                    *self.config_json.lock().unwrap() = cfg.clone();
+                    *self.config_toml.lock().unwrap() = cfg.clone();
                     self.apply_config(&cfg);
                 }
                 _ => unimplemented!(),
@@ -226,7 +189,7 @@ mod imp {
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
             match pspec.name() {
                 "links" => self.links_config.lock().unwrap().to_value(),
-                "config" => self.config_json.lock().unwrap().to_value(),
+                "config" => self.config_toml.lock().unwrap().to_value(),
                 _ => unimplemented!(),
             }
         }
@@ -325,71 +288,25 @@ mod imp {
 
     impl BaseSinkImpl for RsRistBondSink {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
-            let (tx, rx) = flume::bounded(1000);
-            *self.sender.lock().unwrap() = Some(tx);
+            let runtime = BondingRuntime::new();
+            let metrics_handle = runtime.metrics_handle();
+            *self.runtime.lock().unwrap() = Some(runtime);
 
             self.reconfigure_legacy();
-            self.apply_config(&self.config_json.lock().unwrap());
+            self.apply_config(&self.config_toml.lock().unwrap());
 
             let element_weak = self.obj().downgrade();
+            let running = self.stats_running.clone();
+            running.store(true, Ordering::Relaxed);
 
-            // Spawn Worker
             let handle = std::thread::spawn(move || {
-                let mut scheduler = BondingScheduler::new();
-                let mut last_stats = Instant::now();
                 let stats_interval = Duration::from_secs(1);
-                let mut last_fast_stats = Instant::now();
-                let fast_stats_interval = Duration::from_millis(100);
+                let mut last_stats = Instant::now();
 
-                loop {
-                    // Timeout allows us to run stats periodically even if no data
-                    match rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(msg) => match msg {
-                            SinkMessage::Packet(data, profile) => {
-                                let _ = scheduler.send(data, profile);
-                            }
-                            SinkMessage::AddLink { id, uri, iface } => {
-                                match Link::new_with_iface(id, &uri, iface) {
-                                    Ok(l) => {
-                                        scheduler.add_link(Arc::new(l));
-                                        gst::info!(
-                                            gst::CAT_DEFAULT,
-                                            "Added link {} -> {}",
-                                            id,
-                                            uri
-                                        );
-                                    }
-                                    Err(e) => {
-                                        gst::error!(
-                                            gst::CAT_DEFAULT,
-                                            "Failed to create link {}: {}",
-                                            uri,
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                            SinkMessage::RemoveLink { id } => {
-                                scheduler.remove_link(id);
-                                gst::info!(gst::CAT_DEFAULT, "Removed link {}", id);
-                            }
-                        },
-                        Err(flume::RecvTimeoutError::Timeout) => {
-                            // idle check
-                        }
-                        Err(flume::RecvTimeoutError::Disconnected) => break,
-                    }
-
-                    // Fast-path scheduler metrics refresh (internal only)
-                    if last_fast_stats.elapsed() >= fast_stats_interval {
-                        scheduler.refresh_metrics();
-                        last_fast_stats = Instant::now();
-                    }
-
-                    // Stats Tick
+                while running.load(Ordering::Relaxed) {
                     if last_stats.elapsed() >= stats_interval {
                         if let Some(element) = element_weak.upgrade() {
-                            let metrics = scheduler.get_all_metrics();
+                            let metrics = metrics_handle.lock().unwrap().clone();
                             let mut msg_struct = gst::Structure::builder("rist-bonding-stats");
                             for (id, m) in metrics {
                                 let os_up =
@@ -413,19 +330,22 @@ mod imp {
                         }
                         last_stats = Instant::now();
                     }
+                    std::thread::sleep(Duration::from_millis(50));
                 }
             });
 
-            *self.worker_thread.lock().unwrap() = Some(handle);
+            *self.stats_thread.lock().unwrap() = Some(handle);
             Ok(())
         }
 
         fn stop(&self) -> Result<(), gst::ErrorMessage> {
-            // Drop sender to signal worker to stop
-            *self.sender.lock().unwrap() = None;
-
-            if let Some(handle) = self.worker_thread.lock().unwrap().take() {
+            self.stats_running.store(false, Ordering::Relaxed);
+            if let Some(handle) = self.stats_thread.lock().unwrap().take() {
                 let _ = handle.join();
+            }
+
+            if let Some(mut runtime) = self.runtime.lock().unwrap().take() {
+                runtime.shutdown();
             }
             Ok(())
         }
@@ -447,12 +367,10 @@ mod imp {
                 can_drop,
             };
 
-            let sender_guard = self.sender.lock().unwrap();
-            if let Some(tx) = &*sender_guard {
-                // Never block render thread. Try-send everything; drop on congestion.
-                match tx.try_send(SinkMessage::Packet(data, profile)) {
+            if let Some(rt) = self.runtime.lock().unwrap().as_ref() {
+                match rt.try_send_packet(data, profile) {
                     Ok(_) => (),
-                    Err(flume::TrySendError::Full(_)) => {
+                    Err(PacketSendError::Full) => {
                         if can_drop {
                             gst::warning!(gst::CAT_DEFAULT, "Congestion dropping expendable frame");
                         } else {
@@ -460,7 +378,7 @@ mod imp {
                         }
                         return Ok(gst::FlowSuccess::Ok);
                     }
-                    Err(flume::TrySendError::Disconnected(_)) => {
+                    Err(PacketSendError::Disconnected) => {
                         return Err(gst::FlowError::Error);
                     }
                 }
@@ -473,54 +391,70 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_config_links;
+    use super::parse_config;
 
     #[test]
     fn parse_config_links_basic() {
-        let json = r#"{
-            "version": 1,
-            "links": [
-                {"id": 10, "uri": "rist://1.2.3.4:5000"},
-                {"uri": "rist://5.6.7.8:5000"}
-            ]
-        }"#;
+        let toml = r#"
+            version = 1
 
-        let links = parse_config_links(json).unwrap();
-        assert_eq!(links.len(), 2);
-        assert_eq!(links[0].0, 10);
-        assert_eq!(links[0].1, "rist://1.2.3.4:5000");
-        assert!(links[0].2.is_none());
-        assert_eq!(links[1].0, 1); // idx fallback
-        assert_eq!(links[1].1, "rist://5.6.7.8:5000");
-        assert!(links[1].2.is_none());
+            [[links]]
+            id = 10
+            uri = "rist://1.2.3.4:5000"
+
+            [[links]]
+            uri = "rist://5.6.7.8:5000"
+        "#;
+
+        let cfg = parse_config(toml).unwrap();
+        assert_eq!(cfg.links.len(), 2);
+        assert_eq!(cfg.links[0].id, 10);
+        assert_eq!(cfg.links[0].uri, "rist://1.2.3.4:5000");
+        assert!(cfg.links[0].interface.is_none());
+        assert_eq!(cfg.links[1].id, 1); // idx fallback
+        assert_eq!(cfg.links[1].uri, "rist://5.6.7.8:5000");
+        assert!(cfg.links[1].interface.is_none());
     }
 
     #[test]
     fn parse_config_links_dedup() {
-        let json = r#"{"version": 1, "links": [
-            {"id": 1, "uri": "a"},
-            {"id": 1, "uri": "b"}
-        ]}"#;
-        let links = parse_config_links(json).unwrap();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].1, "a");
+        let toml = r#"
+            version = 1
+            [[links]]
+            id = 1
+            uri = "a"
+            [[links]]
+            id = 1
+            uri = "b"
+        "#;
+        let cfg = parse_config(toml).unwrap();
+        assert_eq!(cfg.links.len(), 1);
+        assert_eq!(cfg.links[0].uri, "a");
     }
 
     #[test]
     fn parse_config_links_with_interface() {
-        let json = r#"{"version": 1, "links": [
-            {"id": 2, "uri": "rist://9.9.9.9:5000", "interface": "eth0"},
-            {"id": 3, "uri": "rist://9.9.9.10:5000", "interface": ""}
-        ]}"#;
+        let toml = r#"
+            version = 1
+            [[links]]
+            id = 2
+            uri = "rist://9.9.9.9:5000"
+            interface = "eth0"
 
-        let links = parse_config_links(json).unwrap();
-        assert_eq!(links.len(), 2);
-        assert_eq!(links[0].0, 2);
-        assert_eq!(links[0].1, "rist://9.9.9.9:5000");
-        assert_eq!(links[0].2.as_deref(), Some("eth0"));
-        assert_eq!(links[1].0, 3);
-        assert_eq!(links[1].1, "rist://9.9.9.10:5000");
-        assert!(links[1].2.is_none());
+            [[links]]
+            id = 3
+            uri = "rist://9.9.9.10:5000"
+            interface = ""
+        "#;
+
+        let cfg = parse_config(toml).unwrap();
+        assert_eq!(cfg.links.len(), 2);
+        assert_eq!(cfg.links[0].id, 2);
+        assert_eq!(cfg.links[0].uri, "rist://9.9.9.9:5000");
+        assert_eq!(cfg.links[0].interface.as_deref(), Some("eth0"));
+        assert_eq!(cfg.links[1].id, 3);
+        assert_eq!(cfg.links[1].uri, "rist://9.9.9.10:5000");
+        assert!(cfg.links[1].interface.is_none());
     }
 }
 

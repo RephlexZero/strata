@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 pub struct Packet {
@@ -9,10 +9,13 @@ pub struct Packet {
 }
 
 pub struct ReassemblyBuffer {
-    buffer: BTreeMap<u64, Packet>,
+    buffer: Vec<Option<Packet>>,
+    capacity: usize,
+    buffered: usize,
     next_seq: u64,
     latency: Duration,
     start_latency: Duration,
+    skip_after: Option<Duration>,
     pub lost_packets: u64,
     pub late_packets: u64,
 
@@ -21,6 +24,23 @@ pub struct ReassemblyBuffer {
     avg_iat: f64,
     jitter_smoothed: f64,
     jitter_samples: VecDeque<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReassemblyConfig {
+    pub start_latency: Duration,
+    pub buffer_capacity: usize,
+    pub skip_after: Option<Duration>,
+}
+
+impl Default for ReassemblyConfig {
+    fn default() -> Self {
+        Self {
+            start_latency: Duration::from_millis(50),
+            buffer_capacity: 2048,
+            skip_after: None,
+        }
+    }
 }
 
 #[derive(Default, Clone, Debug)]
@@ -44,11 +64,25 @@ fn percentile(samples: &VecDeque<f64>, pct: f64) -> f64 {
 
 impl ReassemblyBuffer {
     pub fn new(start_seq: u64, latency: Duration) -> Self {
+        Self::with_config(
+            start_seq,
+            ReassemblyConfig {
+                start_latency: latency,
+                ..ReassemblyConfig::default()
+            },
+        )
+    }
+
+    pub fn with_config(start_seq: u64, config: ReassemblyConfig) -> Self {
+        let capacity = config.buffer_capacity.max(16);
         Self {
-            buffer: BTreeMap::new(),
+            buffer: (0..capacity).map(|_| None).collect(),
+            capacity,
+            buffered: 0,
             next_seq: start_seq,
-            latency,
-            start_latency: latency,
+            latency: config.start_latency,
+            start_latency: config.start_latency,
+            skip_after: config.skip_after,
             lost_packets: 0,
             late_packets: 0,
             last_arrival: None,
@@ -60,7 +94,7 @@ impl ReassemblyBuffer {
 
     pub fn get_stats(&self) -> ReassemblyStats {
         ReassemblyStats {
-            queue_depth: self.buffer.len(),
+            queue_depth: self.buffered,
             next_seq: self.next_seq,
             lost_packets: self.lost_packets,
             late_packets: self.late_packets,
@@ -107,55 +141,112 @@ impl ReassemblyBuffer {
             self.late_packets += 1;
             return;
         }
-        self.buffer.insert(
+
+        let capacity = self.capacity as u64;
+        if seq_id >= self.next_seq + capacity {
+            let new_next = seq_id.saturating_sub(capacity.saturating_sub(1));
+            if new_next > self.next_seq {
+                let skipped = new_next - self.next_seq;
+                self.lost_packets += skipped;
+                self.advance_window(new_next);
+            }
+        }
+
+        let idx = self.buffer_index(seq_id);
+        if let Some(existing) = &self.buffer[idx] {
+            if existing.seq_id != seq_id && existing.seq_id >= self.next_seq {
+                self.lost_packets += 1;
+            }
+        } else {
+            self.buffered += 1;
+        }
+
+        self.buffer[idx] = Some(Packet {
             seq_id,
-            Packet {
-                seq_id,
-                payload,
-                arrival_time: now,
-            },
-        );
+            payload,
+            arrival_time: now,
+        });
     }
 
     pub fn tick(&mut self, now: Instant) -> Vec<Bytes> {
         let mut released = Vec::new();
+        let skip_after = self.skip_after.unwrap_or(self.latency);
+        let release_after = self
+            .skip_after
+            .map(|v| v.min(self.latency))
+            .unwrap_or(self.latency);
 
         // While loop to process available packets or skip gaps
         loop {
             // Case 1: We have the next packet
-            if let Some(packet) = self.buffer.get(&self.next_seq) {
-                // Check if it has satisfied the latency requirement
-                if now.duration_since(packet.arrival_time) >= self.latency {
-                    if let Some(p) = self.buffer.remove(&self.next_seq) {
+            let idx = self.buffer_index(self.next_seq);
+            if let Some(packet) = &self.buffer[idx] {
+                if packet.seq_id == self.next_seq {
+                    // Check if it has satisfied the latency requirement
+                    if now.duration_since(packet.arrival_time) >= release_after {
+                        let p = self.buffer[idx].take().unwrap();
+                        self.buffered = self.buffered.saturating_sub(1);
                         released.push(p.payload);
                         self.next_seq += 1;
+                        continue;
                     }
-                } else {
                     // Not ready yet
                     break;
                 }
             }
-            // Case 2: We have a gap (missing next_seq)
-            else {
-                // Check if any future packet has timed out (waiting too long)
-                // If the earliest future packet has exceeded latency, we skip to it.
-                if let Some((&first_seq, first_packet)) = self.buffer.iter().next() {
-                    if now.duration_since(first_packet.arrival_time) >= self.latency {
-                        // The gap is declared lost. Skip to first_seq.
-                        let skipped = first_seq.saturating_sub(self.next_seq);
-                        self.lost_packets += skipped;
-                        self.next_seq = first_seq;
-                        // Continue loop to process this packet (it will match Case 1)
-                        continue;
-                    }
-                }
 
-                // No packets or waiting for gap to fill
-                break;
+            // Case 2: We have a gap (missing next_seq)
+            if let Some((first_seq, first_arrival)) = self.find_next_available() {
+                if now.duration_since(first_arrival) >= skip_after {
+                    let skipped = first_seq.saturating_sub(self.next_seq);
+                    self.lost_packets += skipped;
+                    self.advance_window(first_seq);
+                    continue;
+                }
             }
+
+            // No packets or waiting for gap to fill
+            break;
         }
 
         released
+    }
+
+    fn buffer_index(&self, seq_id: u64) -> usize {
+        (seq_id % self.capacity as u64) as usize
+    }
+
+    fn advance_window(&mut self, new_next: u64) {
+        let old_next = self.next_seq;
+        if new_next <= old_next {
+            return;
+        }
+        for seq in old_next..new_next {
+            let idx = self.buffer_index(seq);
+            if let Some(packet) = &self.buffer[idx] {
+                if packet.seq_id == seq {
+                    self.buffer[idx] = None;
+                    self.buffered = self.buffered.saturating_sub(1);
+                }
+            }
+        }
+        self.next_seq = new_next;
+    }
+
+    fn find_next_available(&self) -> Option<(u64, Instant)> {
+        let mut best: Option<(u64, Instant)> = None;
+        for slot in self.buffer.iter().flatten() {
+            if slot.seq_id <= self.next_seq {
+                continue;
+            }
+            match best {
+                Some((best_seq, _)) if slot.seq_id >= best_seq => {}
+                _ => {
+                    best = Some((slot.seq_id, slot.arrival_time));
+                }
+            }
+        }
+        best
     }
 }
 
@@ -278,5 +369,42 @@ mod tests {
 
         assert_eq!(p50, 3.0);
         assert_eq!(p95, 100.0);
+    }
+
+    #[test]
+    fn test_aggressive_skip_policy() {
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(100),
+            buffer_capacity: 64,
+            skip_after: Some(Duration::from_millis(30)),
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        // Missing seq 0, seq 1 arrives
+        buf.push(1, Bytes::from_static(b"P1"), start);
+
+        // At 30ms, aggressive skip should release P1
+        let out = buf.tick(start + Duration::from_millis(30));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], Bytes::from_static(b"P1"));
+    }
+
+    #[test]
+    fn test_far_ahead_packet_advances_window() {
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(10),
+            buffer_capacity: 8,
+            skip_after: None,
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        // Push far ahead packet to force window advance
+        buf.push(20, Bytes::from_static(b"P20"), start);
+        let out = buf.tick(start + Duration::from_millis(10));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], Bytes::from_static(b"P20"));
+        assert!(buf.lost_packets > 0);
     }
 }

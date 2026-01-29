@@ -1,6 +1,6 @@
 use crate::net::wrapper::{RistReceiverContext, RIST_PROFILE_SIMPLE};
 use crate::protocol::header::BondingHeader;
-use crate::receiver::aggregator::{Packet, ReassemblyBuffer, ReassemblyStats};
+use crate::receiver::aggregator::{Packet, ReassemblyBuffer, ReassemblyConfig, ReassemblyStats};
 use anyhow::Result;
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -28,6 +28,13 @@ pub struct BondingReceiver {
 
 impl BondingReceiver {
     pub fn new(latency: Duration) -> Self {
+        Self::new_with_config(ReassemblyConfig {
+            start_latency: latency,
+            ..ReassemblyConfig::default()
+        })
+    }
+
+    pub fn new_with_config(config: ReassemblyConfig) -> Self {
         let (output_tx, output_rx) = bounded(100);
         let (input_tx, input_rx) = bounded::<Packet>(1000);
         let running = Arc::new(AtomicBool::new(true));
@@ -39,7 +46,7 @@ impl BondingReceiver {
 
         // Dedicated jitter buffer/tick thread
         thread::spawn(move || {
-            let mut buffer = ReassemblyBuffer::new(0, latency);
+            let mut buffer = ReassemblyBuffer::with_config(0, config);
             let tick_interval = Duration::from_millis(10);
 
             while running_clone.load(Ordering::Relaxed) {

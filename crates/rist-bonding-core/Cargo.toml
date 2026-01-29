@@ -10,6 +10,8 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 crossbeam-channel = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
 librist-sys = { path = "../librist-sys" }
 libc = "0.2.180"
 
