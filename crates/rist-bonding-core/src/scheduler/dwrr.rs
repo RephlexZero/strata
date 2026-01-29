@@ -26,11 +26,14 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
 
     pub fn add_link(&mut self, link: Arc<L>) {
         let id = link.id();
-        self.links.insert(id, LinkState {
-            link,
-            credits: 0.0,
-            last_update: Instant::now(),
-        });
+        self.links.insert(
+            id,
+            LinkState {
+                link,
+                credits: 0.0,
+                last_update: Instant::now(),
+            },
+        );
         self.sorted_ids.push(id);
         self.sorted_ids.sort();
     }
@@ -53,34 +56,49 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             .collect()
     }
 
+    /// Returns all alive links and deducts the cost from their credits.
+    /// This is used for broadcasting critical packets.
+    pub fn broadcast_links(&mut self, packet_len: usize) -> Vec<Arc<L>> {
+        let packet_cost = packet_len as f64;
+        let mut alive_links = Vec::new();
+
+        for state in self.links.values_mut() {
+            if state.link.get_metrics().alive {
+                state.credits -= packet_cost;
+                alive_links.push(state.link.clone());
+            }
+        }
+        alive_links
+    }
+
     pub fn select_link(&mut self, packet_len: usize) -> Option<Arc<L>> {
         if self.sorted_ids.is_empty() {
-             return None;
+            return None;
         }
 
         let packet_cost = packet_len as f64;
         let now = Instant::now();
-        
+
         // 1. Update Credits
         for state in self.links.values_mut() {
             let metrics = state.link.get_metrics();
             if metrics.alive {
                 let elapsed = now.duration_since(state.last_update).as_secs_f64();
-                
+
                 // Calculate Effective Capacity (Quality Aware)
                 // Penalty for loss: (1.0 - loss_rate)^4 to aggressively penalize bad links.
                 let loss = metrics.loss_rate.clamp(0.0, 1.0);
                 let quality_factor = (1.0 - loss).powi(4);
-                
+
                 let effective_bps = metrics.capacity_bps * quality_factor;
                 // Capacity is in bps (bits per sec). Convert to bytes per sec.
                 let bytes_per_sec = effective_bps / 8.0;
-                
+
                 // Add credits
                 state.credits += bytes_per_sec * elapsed;
-                
+
                 // Cap credits (100ms max burst based on effective rate)
-                let max_credits = bytes_per_sec * 0.1; 
+                let max_credits = bytes_per_sec * 0.1;
                 if state.credits > max_credits {
                     state.credits = max_credits;
                 }
@@ -91,17 +109,17 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         // 2. Select Link (DWRR)
         let start_idx = self.current_rr_idx;
         let count = self.sorted_ids.len();
-        
+
         for i in 0..count {
             let idx = (start_idx + i) % count;
             let id = self.sorted_ids[idx];
-            
+
             if let Some(state) = self.links.get_mut(&id) {
                 let metrics = state.link.get_metrics();
                 if !metrics.alive {
                     continue;
                 }
-                
+
                 if state.credits >= packet_cost {
                     state.credits -= packet_cost;
                     self.current_rr_idx = (idx + 1) % count;
@@ -109,11 +127,11 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 }
             }
         }
-        
+
         // Fallback: Pick link with max credits (best effort)
         let mut best_id = None;
         let mut max_creds = f64::MIN;
-        
+
         for &id in &self.sorted_ids {
             if let Some(state) = self.links.get(&id) {
                 if state.link.get_metrics().alive {
@@ -124,12 +142,12 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 }
             }
         }
-        
+
         if let Some(id) = best_id {
-             if let Some(state) = self.links.get_mut(&id) {
+            if let Some(state) = self.links.get_mut(&id) {
                 state.credits -= packet_cost; // Goes negative
                 return Some(state.link.clone());
-             }
+            }
         }
 
         None

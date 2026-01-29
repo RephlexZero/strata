@@ -111,7 +111,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(sock) = &stats_socket {
                             // Convert GST Structure to JSON
                             // Naive manual conversion for specific fields we know
-                            if let Ok(s_str) = s.to_string().parse::<String>() {
+                            if let Ok(_s_str) = s.to_string().parse::<String>() {
                                 // Debug string
                                 // Better: extract fields
                                 // The structure is flat: link_0_rtt, link_0_capacity...

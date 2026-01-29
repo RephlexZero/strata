@@ -5,6 +5,7 @@ use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
 use rist_bonding_core::net::link::Link;
 use rist_bonding_core::scheduler::bonding::BondingScheduler;
+use rist_bonding_core::scheduler::PacketProfile;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,19 +14,19 @@ mod imp {
     use super::*;
 
     pub(crate) enum SinkMessage {
-        Packet(bytes::Bytes),
+        Packet(bytes::Bytes, PacketProfile),
         AddLink { id: usize, uri: String },
         RemoveLink { id: usize },
     }
 
     pub struct RsRistBondSink {
         // We only hold the Sender. The Scheduler lives in the worker thread.
-        pub sender: Mutex<Option<flume::Sender<SinkMessage>>>,
-        pub worker_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+        pub(crate) sender: Mutex<Option<flume::Sender<SinkMessage>>>,
+        pub(crate) worker_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 
         // Configuration state management
-        pub links_config: Mutex<String>,
-        pub pad_map: Mutex<HashMap<String, usize>>,
+        pub(crate) links_config: Mutex<String>,
+        pub(crate) pad_map: Mutex<HashMap<String, usize>>,
     }
 
     impl Default for RsRistBondSink {
@@ -251,8 +252,8 @@ mod imp {
                     // Timeout allows us to run stats periodically even if no data
                     match rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(msg) => match msg {
-                            SinkMessage::Packet(data) => {
-                                let _ = scheduler.send(data);
+                            SinkMessage::Packet(data, profile) => {
+                                let _ = scheduler.send(data, profile);
                             }
                             SinkMessage::AddLink { id, uri } => match Link::new(id, &uri) {
                                 Ok(l) => {
@@ -317,11 +318,40 @@ mod imp {
             let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
             let data = bytes::Bytes::copy_from_slice(&map);
 
+            let flags = buffer.flags();
+            // Content-Aware Bonding:
+            // 1. Critical: Broadcast Keyframes (IDR), Headers, and non-Delta (Audio) for reliability.
+            // 2. Droppable: Allow dropping non-ref B-frames during congestion to preserve latency.
+            let is_critical = !flags.contains(gst::BufferFlags::DELTA_UNIT)
+                || flags.contains(gst::BufferFlags::HEADER);
+            let can_drop = flags.contains(gst::BufferFlags::DROPPABLE);
+
+            let profile = PacketProfile {
+                is_critical,
+                can_drop,
+            };
+
             let sender_guard = self.sender.lock().unwrap();
             if let Some(tx) = &*sender_guard {
-                if let Err(_) = tx.send(SinkMessage::Packet(data)) {
-                    // Worker died?
-                    return Err(gst::FlowError::Error);
+                if can_drop {
+                    // Trick: If the buffer is full (congestion), drop B-frames immediately
+                    // instead of blocking. This preserves low-latency for P/I frames.
+                    match tx.try_send(SinkMessage::Packet(data, profile)) {
+                        Ok(_) => (),
+                        Err(flume::TrySendError::Full(_)) => {
+                            gst::warning!(gst::CAT_DEFAULT, "Congestion dropping expendable frame");
+                            return Ok(gst::FlowSuccess::Ok);
+                        }
+                        Err(flume::TrySendError::Disconnected(_)) => {
+                            return Err(gst::FlowError::Error);
+                        }
+                    }
+                } else {
+                    // For important frames, blocking backpressure is better than dropping
+                    if let Err(_) = tx.send(SinkMessage::Packet(data, profile)) {
+                        // Worker died?
+                        return Err(gst::FlowError::Error);
+                    }
                 }
             }
 
