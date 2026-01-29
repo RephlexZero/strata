@@ -33,3 +33,7 @@ build/
 
 # Temporary directories
 tmp/
+
+# Archives
+archive/
+docs/archive/
