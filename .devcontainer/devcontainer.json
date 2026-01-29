@@ -1,0 +1,32 @@
+{
+    "name": "Rust RIST Bonding",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml",
+                "vadimcn.vscode-lldb",
+                "fill-labs.dependi"
+            ]
+        }
+    },
+    // "privileged": true is required for ip netns creation (mount operations)
+    "privileged": true,
+    "capAdd": [
+        "SYS_PTRACE",
+        "NET_ADMIN"
+    ],
+    "securityOpt": [
+        "seccomp=unconfined"
+    ],
+    "mounts": [
+        "source=/lib/modules,target=/lib/modules,type=bind,readonly"
+    ],
+    "features": {
+        "ghcr.io/devcontainers/features/rust:1": {}
+    }
+}

@@ -1,0 +1,35 @@
+# Rust build artifacts
+/target/
+
+# Temporary files and backups
+*~
+*.swp
+*.rs.bk
+*.bak
+*.log
+.DS_Store
+Thumbs.db
+
+# IDE settings (optional, but good to ignore user-specifics)
+.idea/
+.vscode/*.log
+.vscode/chrome-debug_*
+
+# Project specific test artifacts (media files, captures)
+*.mp4
+*.ts
+*.pcap
+*.pcapng
+*.h264
+*.ivf
+
+# Credentials
+.env
+.env.*
+
+# Meson build artifacts (if built in-tree anywhere)
+build/
+.meson_cache/
+
+# Temporary directories
+tmp/

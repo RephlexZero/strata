@@ -1,0 +1,3 @@
+[submodule "vendor/librist"]
+	path = vendor/librist
+	url = https://code.videolan.org/rist/librist.git
