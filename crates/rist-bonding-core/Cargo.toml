@@ -1,0 +1,17 @@
+[package]
+name = "rist-bonding-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+librist-sys = { path = "../librist-sys" }
+libc = "0.2.180"
+
+[dev-dependencies]
+mockall = { workspace = true }
