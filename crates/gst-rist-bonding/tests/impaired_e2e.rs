@@ -1,12 +1,12 @@
 use plotters::prelude::*;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use rist_network_sim::topology::Namespace;
-use rist_network_sim::impairment::{apply_impairment, ImpairmentConfig};
+use rist_network_sim::impairment::apply_impairment;
+use rist_network_sim::scenario::{Scenario, ScenarioConfig, LinkScenarioConfig};
 
 // Helper to spawn async process in namespace
 fn spawn_in_ns(ns_name: &str, cmd: &str, args: &[&str]) -> std::process::Child {
@@ -111,29 +111,64 @@ fn test_impaired_bonding_visualization() {
     );
 
     // 5. Run Scenario (30s)
-    let start = Instant::now();
     let chaos_ns = ns_snd.clone();
-    
-    println!("Running Chaos Scenario...");
-    while start.elapsed().as_secs() < 30 {
-        let t = start.elapsed().as_secs();
+    let scenario_start = Instant::now();
+    let scenario_start_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
 
-        // 0-10s: Good
-        // 10-20s: Link 2 Loss 5%
-        // 20-30s: Link 2 Limited to 1Mbps
-        
-        let mut config = ImpairmentConfig::default();
-        if t >= 10 && t < 20 {
-            config.loss_percent = Some(5.0);
-        } else if t >= 20 {
-            config.rate_kbit = Some(1000);
-            config.delay_ms = Some(50); // Add delay to force queue buildup
+    let truth_points: Arc<Mutex<Vec<TruthPoint>>> = Arc::new(Mutex::new(Vec::new()));
+    let truth_clone = truth_points.clone();
+
+    let mut scenario = Scenario::new(ScenarioConfig {
+        seed: 7,
+        duration: Duration::from_secs(30),
+        step: Duration::from_secs(1),
+        links: vec![
+            LinkScenarioConfig {
+                min_rate_kbit: 3500,
+                max_rate_kbit: 5500,
+                rate_step_kbit: 200,
+                base_delay_ms: 20,
+                delay_jitter_ms: 10,
+                delay_step_ms: 3,
+                max_loss_percent: 2.0,
+                loss_step_percent: 0.4,
+            },
+            LinkScenarioConfig {
+                min_rate_kbit: 500,
+                max_rate_kbit: 2000,
+                rate_step_kbit: 250,
+                base_delay_ms: 40,
+                delay_jitter_ms: 30,
+                delay_step_ms: 8,
+                max_loss_percent: 8.0,
+                loss_step_percent: 1.2,
+            },
+        ],
+    });
+
+    println!("Running Chaos Scenario...");
+    for frame in scenario.frames() {
+        let elapsed = scenario_start.elapsed();
+        if elapsed < frame.t {
+            thread::sleep(frame.t - elapsed);
         }
-        
-        // Apply to Link 2 interface (veth2_a inside sender ns)
-        let _ = apply_impairment(&chaos_ns, "veth2_a", config);
-        
-        thread::sleep(Duration::from_secs(1));
+
+        // Apply to both links (veth1_a, veth2_a)
+        let _ = apply_impairment(&chaos_ns, "veth1_a", frame.configs[0].clone());
+        let _ = apply_impairment(&chaos_ns, "veth2_a", frame.configs[1].clone());
+
+        // Log truth for link 2 (index 1)
+        let t_abs = scenario_start_epoch + frame.t.as_secs_f64();
+        let cfg = &frame.configs[1];
+        truth_clone.lock().unwrap().push(TruthPoint {
+            timestamp: t_abs,
+            link_id: 1,
+            rate_kbit: cfg.rate_kbit.unwrap_or(0) as f64,
+            loss_percent: cfg.loss_percent.unwrap_or(0.0) as f64,
+        });
     }
 
     println!("Scenario complete. Shutting down.");
@@ -152,37 +187,57 @@ fn test_impaired_bonding_visualization() {
         eprintln!("No stats collected! Check connectivity.");
     } else {
         println!("Collected {} stats points. Generating plot...", data.len());
-        plot_results(&data);
+        let truth = truth_points.lock().unwrap();
+        plot_results(&data, &truth);
     }
 }
 
-fn plot_results(data: &[Value]) {
+#[derive(Clone, Debug)]
+struct TruthPoint {
+    timestamp: f64,
+    link_id: usize,
+    rate_kbit: f64,
+    loss_percent: f64,
+}
+
+fn plot_results(data: &[Value], truth: &[TruthPoint]) {
     let filename = "bandwidth_tracking.svg";
     let root = SVGBackend::new(filename, (1024, 768)).into_drawing_area();
     root.fill(&WHITE).unwrap();
 
     let t0 = data.first().and_then(|v| v["timestamp"].as_f64()).unwrap_or(0.0);
+    let t0_truth = truth.first().map(|p| p.timestamp).unwrap_or(t0);
+    let t0 = t0.min(t0_truth);
     
     let mut ts = Vec::new();
     let mut caps = Vec::new();
     let mut losses = Vec::new();
+    let mut truth_caps = Vec::new();
+    let mut truth_losses = Vec::new();
 
     for v in data {
         if let Some(t_abs) = v["timestamp"].as_f64() {
             let t = t_abs - t0;
             if t < 0.0 { continue; }
             
-            // Convert capacity to Mbps
-            let cap = v["total_capacity"].as_f64().unwrap_or(0.0) / 1_000_000.0;
-            
             // Extract Link 2 metrics (assuming link 1 is present at "1" or similar)
             let l2_stats = &v["links"]["1"];
+            let cap = l2_stats["capacity"].as_f64().unwrap_or(0.0) / 1_000_000.0;
             let loss = l2_stats["loss"].as_f64().unwrap_or(0.0) * 100.0;
 
             ts.push(t);
             caps.push(cap);
             losses.push(loss);
         }
+    }
+
+    for point in truth.iter().filter(|p| p.link_id == 1) {
+        let t = point.timestamp - t0;
+        if t < 0.0 {
+            continue;
+        }
+        truth_caps.push((t, point.rate_kbit / 1000.0));
+        truth_losses.push((t, point.loss_percent));
     }
 
     let mut chart = ChartBuilder::on(&root)
@@ -209,8 +264,15 @@ fn plot_results(data: &[Value]) {
         ts.iter().zip(caps.iter()).map(|(&t, &c)| (t, c)),
         &BLUE,
     )).unwrap()
-    .label("Total Capacity (Mbps)")
+    .label("Link 2 Capacity (Mbps)")
     .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
+
+    chart.draw_series(LineSeries::new(
+        truth_caps.iter().map(|(t, c)| (*t, *c)),
+        &BLUE.mix(0.4),
+    )).unwrap()
+    .label("Truth Capacity (Mbps)")
+    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE.mix(0.4)));
 
     // Draw Loss line (Red) - Secondary Axis
     chart.draw_secondary_series(LineSeries::new(
@@ -219,6 +281,13 @@ fn plot_results(data: &[Value]) {
     )).unwrap()
     .label("Link 2 Loss (%)")
     .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+
+    chart.draw_secondary_series(LineSeries::new(
+        truth_losses.iter().map(|(t, l)| (*t, *l)),
+        &RED.mix(0.4),
+    )).unwrap()
+    .label("Truth Loss (%)")
+    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED.mix(0.4)));
 
     chart.configure_series_labels()
         .background_style(&WHITE.mix(0.8))

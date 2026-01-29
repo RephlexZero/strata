@@ -1,9 +1,10 @@
 use rist_network_sim::topology::Namespace;
 use rist_network_sim::impairment::{ImpairmentConfig, apply_impairment};
+use rist_network_sim::scenario::{Scenario, ScenarioConfig, LinkScenarioConfig};
 use std::process::Command;
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::sync::Arc;
 
 fn check_privileges() -> bool {
@@ -44,7 +45,7 @@ fn test_race_car_scenarios() {
         delay_ms: Some(50),
         ..Default::default()
     };
-    
+
     apply_impairment(&sender_ns, "race_veth1_a", clean_config_1.clone()).unwrap();
     apply_impairment(&sender_ns, "race_veth2_a", clean_config_2.clone()).unwrap();
 
@@ -85,37 +86,54 @@ fn test_race_car_scenarios() {
     });
     
     // 4. Simulation Logic (Main Thread)
-    println!(">>> SIMULATION: Started. All Links Clean.");
-    thread::sleep(Duration::from_secs(10));
-    
-    // T=10: The Tunnel (Heavy Loss on Link 1)
-    println!(">>> SIMULATION: Entering Tunnel (100% Loss on Link 1)");
-    let tunnel_config = ImpairmentConfig {
-        loss_percent: Some(100.0), 
-        ..Default::default()
-    };
-    apply_impairment(&sender_ns, "race_veth1_a", tunnel_config).unwrap();
-    
-    thread::sleep(Duration::from_secs(5));
-    
-    // T=15: Recovery
-    println!(">>> SIMULATION: Exiting Tunnel (Recovery)");
-    apply_impairment(&sender_ns, "race_veth1_a", clean_config_1.clone()).unwrap();
-    
-    thread::sleep(Duration::from_secs(10));
-    
-    // T=25: The Chicane (High Jitter on Link 1 + 5% Loss)
-    println!(">>> SIMULATION: The Chicane (High Jitter + 5% Loss)");
-    let chicane_config = ImpairmentConfig {
-        rate_kbit: Some(5000),
-        delay_ms: Some(50),
-        jitter_ms: Some(30), 
-        loss_percent: Some(5.0),
-        ..Default::default()
-    };
-    apply_impairment(&sender_ns, "race_veth1_a", chicane_config).unwrap();
-    
-    thread::sleep(Duration::from_secs(10));
+    println!(">>> SIMULATION: Started. Seeded dynamic scenario.");
+    let scenario_start = Instant::now();
+    let mut scenario = Scenario::new(ScenarioConfig {
+        seed: 99,
+        duration: Duration::from_secs(35),
+        step: Duration::from_secs(2),
+        links: vec![
+            LinkScenarioConfig {
+                min_rate_kbit: 2500,
+                max_rate_kbit: 6000,
+                rate_step_kbit: 400,
+                base_delay_ms: 20,
+                delay_jitter_ms: 40,
+                delay_step_ms: 6,
+                max_loss_percent: 15.0,
+                loss_step_percent: 2.0,
+            },
+            LinkScenarioConfig {
+                min_rate_kbit: 500,
+                max_rate_kbit: 2000,
+                rate_step_kbit: 200,
+                base_delay_ms: 40,
+                delay_jitter_ms: 40,
+                delay_step_ms: 8,
+                max_loss_percent: 10.0,
+                loss_step_percent: 1.5,
+            },
+        ],
+    });
+
+    for frame in scenario.frames() {
+        let elapsed = scenario_start.elapsed();
+        if elapsed < frame.t {
+            thread::sleep(frame.t - elapsed);
+        }
+
+        let _ = apply_impairment(&sender_ns, "race_veth1_a", frame.configs[0].clone());
+        let _ = apply_impairment(&sender_ns, "race_veth2_a", frame.configs[1].clone());
+
+        println!(
+            ">>> IMPAIRMENT t={:.1}s link1 rate={}kbps loss={:.1}% link2 rate={}kbps loss={:.1}%",
+            frame.t.as_secs_f64(),
+            frame.configs[0].rate_kbit.unwrap_or(0),
+            frame.configs[0].loss_percent.unwrap_or(0.0),
+            frame.configs[1].rate_kbit.unwrap_or(0),
+            frame.configs[1].loss_percent.unwrap_or(0.0)
+        );
+    }
 
     // Wait for Sender to finish (Assuming 3000 buffers runs longer than 35s... wait, 3000 buffers @ 30fps is 100s)
     // We should probably kill the sender early to check logs, or just wait?

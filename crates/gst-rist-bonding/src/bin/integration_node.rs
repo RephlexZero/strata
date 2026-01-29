@@ -111,67 +111,66 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(sock) = &stats_socket {
                             // Convert GST Structure to JSON
                             // Naive manual conversion for specific fields we know
-                            if let Ok(_s_str) = s.to_string().parse::<String>() {
-                                // Debug string
-                                // Better: extract fields
-                                // The structure is flat: link_0_rtt, link_0_capacity...
-                                // We need to parse this into the hierarchy the test expects
-                                // Test expects: { "timestamp": f64, "total_capacity": f64, "links": { "0": { "loss": ... } } }
+                            // Debug string
+                            let _s_str = s.to_string();
+                            // Better: extract fields
+                            // The structure is flat: link_0_rtt, link_0_capacity...
+                            // We need to parse this into the hierarchy the test expects
+                            // Test expects: { "timestamp": f64, "total_capacity": f64, "links": { "0": { "loss": ... } } }
 
-                                // Reconstruct hierarchy
-                                // We don't have total_capacity in the msg (Wait, worker doesn't sum it).
-                                // Worker code:
-                                // msg_struct.field("link_X_rtt", ...).field("link_X_capacity", ...)
+                            // Reconstruct hierarchy
+                            // We don't have total_capacity in the msg (Wait, worker doesn't sum it).
+                            // Worker code:
+                            // msg_struct.field("link_X_rtt", ...).field("link_X_capacity", ...)
 
-                                // We need to sum capacity here.
-                                let mut total_cap = 0.0;
-                                let mut links_map = serde_json::Map::new();
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs_f64();
+                            // We need to sum capacity here.
+                            let mut total_cap = 0.0;
+                            let mut links_map = serde_json::Map::new();
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs_f64();
 
-                                // Iterate fields? GstStructure doesn't expose iter easily in bindings sometimes.
-                                // But we know keys "link_0_rtt".
-                                // Let's assume max 16 links and query them.
-                                for i in 0..16 {
-                                    let prefix = format!("link_{}_", i);
-                                    if s.has_field(&format!("{}alive", prefix)) {
-                                        let alive = s
-                                            .get::<bool>(&format!("{}alive", prefix))
-                                            .unwrap_or(false);
-                                        let cap = s
-                                            .get::<f64>(&format!("{}capacity", prefix))
-                                            .unwrap_or(0.0);
-                                        let rtt =
-                                            s.get::<f64>(&format!("{}rtt", prefix)).unwrap_or(0.0);
-                                        let loss =
-                                            s.get::<f64>(&format!("{}loss", prefix)).unwrap_or(0.0);
+                            // Iterate fields? GstStructure doesn't expose iter easily in bindings sometimes.
+                            // But we know keys "link_0_rtt".
+                            // Let's assume max 16 links and query them.
+                            for i in 0..16 {
+                                let prefix = format!("link_{}_", i);
+                                if s.has_field(&format!("{}alive", prefix)) {
+                                    let alive = s
+                                        .get::<bool>(&format!("{}alive", prefix))
+                                        .unwrap_or(false);
+                                    let cap = s
+                                        .get::<f64>(&format!("{}capacity", prefix))
+                                        .unwrap_or(0.0);
+                                    let rtt =
+                                        s.get::<f64>(&format!("{}rtt", prefix)).unwrap_or(0.0);
+                                    let loss =
+                                        s.get::<f64>(&format!("{}loss", prefix)).unwrap_or(0.0);
 
-                                        if alive {
-                                            total_cap += cap;
-                                        }
-
-                                        let link_json = serde_json::json!({
-                                            "rtt": rtt,
-                                            "capacity": cap,
-                                            "loss": loss,
-                                            "alive": alive,
-                                            "queue": 0 // unavailable
-                                        });
-                                        links_map.insert(i.to_string(), link_json);
+                                    if alive {
+                                        total_cap += cap;
                                     }
-                                }
 
-                                let json_stats = serde_json::json!({
-                                    "timestamp": now,
-                                    "total_capacity": total_cap,
-                                    "links": links_map
-                                });
-
-                                if let Ok(data) = serde_json::to_vec(&json_stats) {
-                                    let _ = sock.send_to(&data, stats_dest);
+                                    let link_json = serde_json::json!({
+                                        "rtt": rtt,
+                                        "capacity": cap,
+                                        "loss": loss,
+                                        "alive": alive,
+                                        "queue": 0 // unavailable
+                                    });
+                                    links_map.insert(i.to_string(), link_json);
                                 }
+                            }
+
+                            let json_stats = serde_json::json!({
+                                "timestamp": now,
+                                "total_capacity": total_cap,
+                                "links": links_map
+                            });
+
+                            if let Ok(data) = serde_json::to_vec(&json_stats) {
+                                let _ = sock.send_to(&data, stats_dest);
                             }
                         }
                     }
