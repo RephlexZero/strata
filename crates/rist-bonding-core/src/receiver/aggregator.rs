@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 pub struct Packet {
@@ -20,6 +20,7 @@ pub struct ReassemblyBuffer {
     last_arrival: Option<Instant>,
     avg_iat: f64,
     jitter_smoothed: f64,
+    jitter_samples: VecDeque<f64>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -29,6 +30,16 @@ pub struct ReassemblyStats {
     pub lost_packets: u64,
     pub late_packets: u64,
     pub current_latency_ms: u64,
+}
+
+fn percentile(samples: &VecDeque<f64>, pct: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut v: Vec<f64> = samples.iter().copied().collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((v.len() - 1) as f64 * pct).round() as usize;
+    v[idx.min(v.len() - 1)]
 }
 
 impl ReassemblyBuffer {
@@ -43,6 +54,7 @@ impl ReassemblyBuffer {
             last_arrival: None,
             avg_iat: 0.0,
             jitter_smoothed: 0.0,
+            jitter_samples: VecDeque::with_capacity(128),
         }
     }
 
@@ -72,9 +84,18 @@ impl ReassemblyBuffer {
 
             // Smooth jitter
             self.jitter_smoothed = (1.0 - alpha) * self.jitter_smoothed + alpha * jitter;
+            self.jitter_samples.push_back(jitter);
+            if self.jitter_samples.len() > 128 {
+                self.jitter_samples.pop_front();
+            }
 
-            // Update target latency: Start Latency + 4 * Jitter
-            let jitter_ms = self.jitter_smoothed * 1000.0;
+            // Update target latency: Start Latency + 4 * p95(Jitter)
+            let jitter_est = if self.jitter_samples.len() >= 5 {
+                percentile(&self.jitter_samples, 0.95)
+            } else {
+                self.jitter_smoothed
+            };
+            let jitter_ms = jitter_est * 1000.0;
             let additional_latency = Duration::from_millis((4.0 * jitter_ms) as u64);
 
             self.latency = self.start_latency + additional_latency;
@@ -242,5 +263,20 @@ mod tests {
         // Check stats
         let stats = buf.get_stats();
         assert_eq!(stats.current_latency_ms, current_latency as u64);
+    }
+
+    #[test]
+    fn test_percentile_basic() {
+        let mut samples = VecDeque::new();
+        samples.push_back(1.0);
+        samples.push_back(2.0);
+        samples.push_back(3.0);
+        samples.push_back(100.0);
+
+        let p50 = percentile(&samples, 0.5);
+        let p95 = percentile(&samples, 0.95);
+
+        assert_eq!(p50, 3.0);
+        assert_eq!(p95, 100.0);
     }
 }

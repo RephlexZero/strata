@@ -3,6 +3,7 @@ use librist_sys::*;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::ptr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::net::state::LinkStats;
 use std::sync::atomic::Ordering;
@@ -58,6 +59,11 @@ unsafe extern "C" fn stats_cb(
     if stats_ref.stats_type == rist_stats_type_RIST_STATS_SENDER_PEER {
         let sender_stats = &stats_ref.stats.sender_peer;
         let link_stats = &*(arg as *const LinkStats);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        link_stats.last_stats_ms.store(now_ms, Ordering::Relaxed);
 
         // Raw updates
         link_stats

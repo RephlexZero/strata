@@ -26,6 +26,10 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         self.scheduler.remove_link(id);
     }
 
+    pub fn refresh_metrics(&mut self) {
+        self.scheduler.refresh_metrics();
+    }
+
     pub fn get_all_metrics(&self) -> HashMap<usize, crate::net::interface::LinkMetrics> {
         self.scheduler.get_active_links().into_iter().collect()
     }
@@ -73,7 +77,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::interface::LinkMetrics;
+    use crate::net::interface::{LinkMetrics, LinkPhase};
     use std::sync::Mutex;
 
     struct MockLink {
@@ -93,6 +97,11 @@ mod tests {
                     queue_depth: 0,
                     max_queue: 100,
                     alive: true,
+                    phase: LinkPhase::Live,
+                    os_up: None,
+                    mtu: None,
+                    iface: None,
+                    link_kind: None,
                 },
                 sent_packets: Mutex::new(Vec::new()),
             }
