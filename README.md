@@ -80,11 +80,27 @@ The sink element emits `rist-bonding-stats` messages on the GStreamer bus at 1Hz
 
 ```javascript
 {
-  "link_0_rtt": 45.0,        // ms
+  "schema_version": 1,
+  "stats_seq": 42,
+  "heartbeat": true,
+  "mono_time_ns": 1234567890,
+  "wall_time_ms": 1710000000000,
+  "total_capacity": 5000000,
+  "alive_links": 2,
+  "link_0_rtt": 45.0,         // ms
   "link_0_capacity": 5000000, // bps
-  "link_0_loss": 0.01,       // 1%
+  "link_0_loss": 0.01,        // 1%
   "link_0_alive": true
 }
+
+## 📘 Production Docs
+
+- [docs/production_plan.md](docs/production_plan.md)
+- [docs/privileges.md](docs/privileges.md)
+- [docs/ops_playbook.md](docs/ops_playbook.md)
+- [docs/regression_thresholds.md](docs/regression_thresholds.md)
+- [docs/config_migration.md](docs/config_migration.md)
+- [docs/perf_budgets.md](docs/perf_budgets.md)
 ```
 
 ## 🔮 Roadmap
@@ -94,4 +110,4 @@ The sink element emits `rist-bonding-stats` messages on the GStreamer bus at 1Hz
 3.  **Phase 3**: Advanced Scheduler (Weighted Round Robin based on RTT/Capacity).
 4.  **Phase 4**: Production Hardening (Encryption, SRT interop).
 
-See [EXECUTION_PLAN.md](EXECUTION_PLAN.md) for details.
+See [docs/production_plan.md](docs/production_plan.md) for details.

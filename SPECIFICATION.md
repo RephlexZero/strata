@@ -18,7 +18,7 @@ The system is a userspace bonded video transport solution designed to aggregate 
 ### End-to-End Dataflow
 
 1.  **Media Source (GStreamer):**
-    `Video Source` -> `Encoder (H.264/H.265)` -> `MPEG-TS Muxer` -> **`rsristbondsink`**
+    `Video Source` -> `Encoder (H.264)` -> `MPEG-TS Muxer` -> **`rsristbondsink`**
 2.  **Bonding Sender (Rust):**
     - `rsristbondsink` receives GStreamer Buffers.
     - **Header Extension:** Adds a custom RTP header extension or payload wrapper containing a global sequence number for reassembly.
@@ -131,7 +131,7 @@ The scheduler relies on **Deficit Weighted Round Robin (DWRR)** with **Active Ra
 The system implements a back-pressure loop to prevent buffer bloat.
 - **Capacity Aggregation:** Sum of all *alive* link capacities.
 - **Thresholding:** If $\text{TotalCapacity} < \text{TargetBitrate} \times 1.2$ (Headroom), the sink emits a `congestion-control` message.
-- **Action:** The application layer catches this message and dynamically reconfigures the video encoder's bitrate (e.g., `x265enc` property `bitrate`).
+- **Action:** The application layer catches this message and dynamically reconfigures the video encoder's bitrate (e.g., `x264enc` property `bitrate`).
 ### Dynamic Link Management
 The scheduler must handle the runtime addition and removal of network interfaces (e.g., plugging in a USB Modem).
 

@@ -57,13 +57,13 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     register_plugins()?;
 
-    // Pipeline: videotestsrc ! x265enc ! mpegtsmux ! rsristbondsink
+    // Pipeline: videotestsrc ! x264enc ! mpegtsmux ! rsristbondsink
     // We send 3000 buffers (approx 100s at 30fps).
-    // Note: H265 Encoding might buffer frames, so we might not get exactly 450 out if we stop abruptly.
+    // Note: H264 Encoding might buffer frames, so we might not get exactly 450 out if we stop abruptly.
     // We use tune=zerolatency to minimize this.
     // Ensure PAT/PMT are sent effectively for quick lock.
     let pipeline_str = format!(
-        "videotestsrc num-buffers=3000 is-live=true pattern=ball ! video/x-raw,width=320,height=240 ! x265enc name=enc tune=zerolatency bitrate={} ! mpegtsmux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink links=\"{}\"",
+        "videotestsrc num-buffers=3000 is-live=true pattern=ball ! video/x-raw,width=320,height=240 ! x264enc name=enc tune=zerolatency bitrate={} ! mpegtsmux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink links=\"{}\"",
         bitrate_kbps, dest_str
     );
     eprintln!("Sender Pipeline: {}", pipeline_str);
@@ -100,7 +100,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             );
                             // Update encoder
                             if let Some(enc) = pipeline.by_name("enc") {
-                                // x265enc bitrate is in kbit/sec
+                                // x264enc bitrate is in kbit/sec
                                 let bitrate_kbps = (recommended / 1000) as u32;
                                 let target = std::cmp::max(bitrate_kbps, 500);
                                 enc.set_property("bitrate", target);
@@ -118,13 +118,21 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             // We need to parse this into the hierarchy the test expects
                             // Test expects: { "timestamp": f64, "total_capacity": f64, "links": { "0": { "loss": ... } } }
 
-                            // Reconstruct hierarchy
-                            // We don't have total_capacity in the msg (Wait, worker doesn't sum it).
-                            // Worker code:
-                            // msg_struct.field("link_X_rtt", ...).field("link_X_capacity", ...)
+                            // Reconstruct hierarchy from the flat stats structure.
+                            // The schema provides aggregate fields plus per-link metrics.
+                            let schema_version = s.get::<i32>("schema_version").unwrap_or(0);
+                            let stats_seq = s.get::<u64>("stats_seq").unwrap_or(0);
+                            let heartbeat = s.get::<bool>("heartbeat").unwrap_or(false);
+                            let mono_time_ns = s.get::<u64>("mono_time_ns").unwrap_or(0);
+                            let wall_time_ms = s.get::<u64>("wall_time_ms").unwrap_or(0);
+                            let total_capacity_field = s.get::<f64>("total_capacity").unwrap_or(0.0);
+                            let alive_links = s.get::<u64>("alive_links").unwrap_or(0);
 
-                            // We need to sum capacity here.
-                            let mut total_cap = 0.0;
+                            let mut total_cap = if total_capacity_field > 0.0 {
+                                total_capacity_field
+                            } else {
+                                0.0
+                            };
                             let mut links_map = serde_json::Map::new();
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -137,18 +145,16 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             for i in 0..16 {
                                 let prefix = format!("link_{}_", i);
                                 if s.has_field(&format!("{}alive", prefix)) {
-                                    let alive = s
-                                        .get::<bool>(&format!("{}alive", prefix))
-                                        .unwrap_or(false);
-                                    let cap = s
-                                        .get::<f64>(&format!("{}capacity", prefix))
-                                        .unwrap_or(0.0);
+                                    let alive =
+                                        s.get::<bool>(&format!("{}alive", prefix)).unwrap_or(false);
+                                    let cap =
+                                        s.get::<f64>(&format!("{}capacity", prefix)).unwrap_or(0.0);
                                     let rtt =
                                         s.get::<f64>(&format!("{}rtt", prefix)).unwrap_or(0.0);
                                     let loss =
                                         s.get::<f64>(&format!("{}loss", prefix)).unwrap_or(0.0);
 
-                                    if alive {
+                                    if alive && total_capacity_field == 0.0 {
                                         total_cap += cap;
                                     }
 
@@ -163,9 +169,21 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
 
+                            let timestamp = if wall_time_ms > 0 {
+                                wall_time_ms as f64 / 1000.0
+                            } else {
+                                now
+                            };
+
                             let json_stats = serde_json::json!({
-                                "timestamp": now,
+                                "schema_version": schema_version,
+                                "stats_seq": stats_seq,
+                                "heartbeat": heartbeat,
+                                "mono_time_ns": mono_time_ns,
+                                "wall_time_ms": wall_time_ms,
+                                "timestamp": timestamp,
                                 "total_capacity": total_cap,
+                                "alive_links": alive_links,
                                 "links": links_map
                             });
 
@@ -220,11 +238,11 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 bind_str, output_file
             )
         } else {
-            // Remux to encoded container: Encoded H265 TS -> Demux -> Parse -> MP4 Mux -> File
+            // Remux to encoded container: Encoded H264 TS -> Demux -> Parse -> MP4 Mux -> File
             // Use faststart=true to move MOOV atom to front (requires rewriting file at end).
             // Use queues to prevent blocking.
             format!(
-                "rsristbondsrc links=\"{}\" name=src ! tee name=t ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! appsink name=sink emit-signals=true sync=false t. ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! tsdemux ! h265parse ! mp4mux faststart=true ! filesink location=\"{}\" sync=false",
+                "rsristbondsrc links=\"{}\" name=src ! tee name=t ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! appsink name=sink emit-signals=true sync=false t. ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! tsdemux ! h264parse ! mp4mux faststart=true ! filesink location=\"{}\" sync=false",
                 bind_str, output_file
             )
         }

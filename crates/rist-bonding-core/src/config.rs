@@ -11,6 +11,7 @@ pub struct BondingConfigInput {
     pub version: u32,
     pub links: Vec<LinkConfigInput>,
     pub receiver: ReceiverConfigInput,
+    pub lifecycle: LinkLifecycleConfigInput,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -29,6 +30,23 @@ pub struct ReceiverConfigInput {
     pub skip_after_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LinkLifecycleConfigInput {
+    pub good_loss_rate_max: Option<f64>,
+    pub good_rtt_ms_min: Option<f64>,
+    pub good_capacity_bps_min: Option<f64>,
+    pub stats_fresh_ms: Option<u64>,
+    pub stats_stale_ms: Option<u64>,
+    pub probe_to_warm_good: Option<u32>,
+    pub warm_to_live_good: Option<u32>,
+    pub warm_to_degrade_bad: Option<u32>,
+    pub live_to_degrade_bad: Option<u32>,
+    pub degrade_to_warm_good: Option<u32>,
+    pub degrade_to_cooldown_bad: Option<u32>,
+    pub cooldown_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkConfig {
     pub id: usize,
@@ -36,11 +54,27 @@ pub struct LinkConfig {
     pub interface: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiverConfig {
     pub start_latency: Duration,
     pub buffer_capacity: usize,
     pub skip_after: Option<Duration>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinkLifecycleConfig {
+    pub good_loss_rate_max: f64,
+    pub good_rtt_ms_min: f64,
+    pub good_capacity_bps_min: f64,
+    pub stats_fresh_ms: u64,
+    pub stats_stale_ms: u64,
+    pub probe_to_warm_good: u32,
+    pub warm_to_live_good: u32,
+    pub warm_to_degrade_bad: u32,
+    pub live_to_degrade_bad: u32,
+    pub degrade_to_warm_good: u32,
+    pub degrade_to_cooldown_bad: u32,
+    pub cooldown_ms: u64,
 }
 
 impl Default for ReceiverConfig {
@@ -53,11 +87,31 @@ impl Default for ReceiverConfig {
     }
 }
 
+impl Default for LinkLifecycleConfig {
+    fn default() -> Self {
+        Self {
+            good_loss_rate_max: 0.2,
+            good_rtt_ms_min: 1.0,
+            good_capacity_bps_min: 1.0,
+            stats_fresh_ms: 1500,
+            stats_stale_ms: 3000,
+            probe_to_warm_good: 3,
+            warm_to_live_good: 10,
+            warm_to_degrade_bad: 3,
+            live_to_degrade_bad: 3,
+            degrade_to_warm_good: 5,
+            degrade_to_cooldown_bad: 10,
+            cooldown_ms: 2000,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BondingConfig {
     pub version: u32,
     pub links: Vec<LinkConfig>,
     pub receiver: ReceiverConfig,
+    pub lifecycle: LinkLifecycleConfig,
 }
 
 impl Default for BondingConfig {
@@ -66,6 +120,41 @@ impl Default for BondingConfig {
             version: CONFIG_VERSION,
             links: Vec::new(),
             receiver: ReceiverConfig::default(),
+            lifecycle: LinkLifecycleConfig::default(),
+        }
+    }
+}
+
+impl LinkLifecycleConfigInput {
+    pub fn resolve(self) -> LinkLifecycleConfig {
+        let defaults = LinkLifecycleConfig::default();
+        LinkLifecycleConfig {
+            good_loss_rate_max: self
+                .good_loss_rate_max
+                .unwrap_or(defaults.good_loss_rate_max),
+            good_rtt_ms_min: self.good_rtt_ms_min.unwrap_or(defaults.good_rtt_ms_min),
+            good_capacity_bps_min: self
+                .good_capacity_bps_min
+                .unwrap_or(defaults.good_capacity_bps_min),
+            stats_fresh_ms: self.stats_fresh_ms.unwrap_or(defaults.stats_fresh_ms),
+            stats_stale_ms: self.stats_stale_ms.unwrap_or(defaults.stats_stale_ms),
+            probe_to_warm_good: self
+                .probe_to_warm_good
+                .unwrap_or(defaults.probe_to_warm_good),
+            warm_to_live_good: self.warm_to_live_good.unwrap_or(defaults.warm_to_live_good),
+            warm_to_degrade_bad: self
+                .warm_to_degrade_bad
+                .unwrap_or(defaults.warm_to_degrade_bad),
+            live_to_degrade_bad: self
+                .live_to_degrade_bad
+                .unwrap_or(defaults.live_to_degrade_bad),
+            degrade_to_warm_good: self
+                .degrade_to_warm_good
+                .unwrap_or(defaults.degrade_to_warm_good),
+            degrade_to_cooldown_bad: self
+                .degrade_to_cooldown_bad
+                .unwrap_or(defaults.degrade_to_cooldown_bad),
+            cooldown_ms: self.cooldown_ms.unwrap_or(defaults.cooldown_ms),
         }
     }
 }
@@ -94,6 +183,8 @@ impl BondingConfigInput {
                 .max(16),
             skip_after: self.receiver.skip_after_ms.map(Duration::from_millis),
         };
+
+        let lifecycle = self.lifecycle.resolve();
 
         let mut used = HashSet::new();
         let mut out = Vec::new();
@@ -125,6 +216,7 @@ impl BondingConfigInput {
             version,
             links: out,
             receiver,
+            lifecycle,
         })
     }
 }
@@ -161,6 +253,11 @@ mod tests {
             start_latency_ms = 80
             buffer_capacity = 1024
             skip_after_ms = 40
+
+            [lifecycle]
+            good_loss_rate_max = 0.15
+            stats_fresh_ms = 1200
+            cooldown_ms = 1500
         "#;
 
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
@@ -174,6 +271,9 @@ mod tests {
         assert_eq!(cfg.receiver.start_latency, Duration::from_millis(80));
         assert_eq!(cfg.receiver.buffer_capacity, 1024);
         assert_eq!(cfg.receiver.skip_after, Some(Duration::from_millis(40)));
+        assert_eq!(cfg.lifecycle.good_loss_rate_max, 0.15);
+        assert_eq!(cfg.lifecycle.stats_fresh_ms, 1200);
+        assert_eq!(cfg.lifecycle.cooldown_ms, 1500);
     }
 
     #[test]
@@ -190,5 +290,31 @@ mod tests {
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.links.len(), 1);
         assert_eq!(cfg.links[0].uri, "a");
+    }
+
+    #[test]
+    fn parse_toml_config_version_zero_defaults() {
+        let toml = r#"
+            version = 0
+            [[links]]
+            uri = "rist://1.2.3.4:5000"
+        "#;
+
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.version, CONFIG_VERSION);
+        assert_eq!(cfg.links.len(), 1);
+        assert_eq!(cfg.links[0].uri, "rist://1.2.3.4:5000");
+    }
+
+    #[test]
+    fn parse_toml_config_empty_defaults() {
+        let cfg = BondingConfig::from_toml_str("").unwrap();
+        assert_eq!(cfg.version, CONFIG_VERSION);
+        assert!(cfg.links.is_empty());
+        assert_eq!(cfg.receiver, ReceiverConfig::default());
+        assert_eq!(
+            cfg.lifecycle.good_loss_rate_max,
+            LinkLifecycleConfig::default().good_loss_rate_max
+        );
     }
 }

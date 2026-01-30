@@ -1,6 +1,6 @@
 use crate::impairment::ImpairmentConfig;
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -67,7 +67,8 @@ impl Scenario {
 
     pub fn frames(&mut self) -> Vec<ScenarioFrame> {
         let mut frames = Vec::new();
-        let total_steps = (self.cfg.duration.as_secs_f64() / self.cfg.step.as_secs_f64()).ceil() as u64;
+        let total_steps =
+            (self.cfg.duration.as_secs_f64() / self.cfg.step.as_secs_f64()).ceil() as u64;
 
         for step_idx in 0..=total_steps {
             let t = self.cfg.step.mul_f64(step_idx as f64);
@@ -83,10 +84,12 @@ impl Scenario {
 
                 state.rate_kbit = (state.rate_kbit + rate_delta)
                     .clamp(link_cfg.min_rate_kbit as f64, link_cfg.max_rate_kbit as f64);
-                state.delay_ms = (state.delay_ms + delay_delta)
-                    .clamp(1.0, (link_cfg.base_delay_ms + link_cfg.delay_jitter_ms) as f64);
-                state.loss_percent = (state.loss_percent + loss_delta)
-                    .clamp(0.0, link_cfg.max_loss_percent as f64);
+                state.delay_ms = (state.delay_ms + delay_delta).clamp(
+                    1.0,
+                    (link_cfg.base_delay_ms + link_cfg.delay_jitter_ms) as f64,
+                );
+                state.loss_percent =
+                    (state.loss_percent + loss_delta).clamp(0.0, link_cfg.max_loss_percent as f64);
 
                 let jitter_ms = if link_cfg.delay_jitter_ms == 0 {
                     None
@@ -108,7 +111,6 @@ impl Scenario {
 
         frames
     }
-
 }
 
 fn rand_signed(rng: &mut StdRng, max_step: f64) -> f64 {

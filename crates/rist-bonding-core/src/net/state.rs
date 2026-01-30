@@ -1,3 +1,4 @@
+use crate::config::LinkLifecycleConfig;
 use crate::net::interface::LinkPhase;
 use crate::scheduler::ewma::Ewma;
 use std::sync::atomic::{AtomicI32, AtomicU64};
@@ -43,8 +44,8 @@ pub struct LinkStats {
     pub lifecycle: Mutex<LinkLifecycle>,
 }
 
-impl Default for LinkStats {
-    fn default() -> Self {
+impl LinkStats {
+    pub fn new(lifecycle_config: LinkLifecycleConfig) -> Self {
         Self {
             rtt: AtomicU64::new(0),
             bandwidth: AtomicU64::new(0),
@@ -59,8 +60,14 @@ impl Default for LinkStats {
             mtu_i32: AtomicI32::new(-1),
             os_last_poll_ms: AtomicU64::new(0),
             ewma_state: Mutex::new(EwmaStats::default()),
-            lifecycle: Mutex::new(LinkLifecycle::new()),
+            lifecycle: Mutex::new(LinkLifecycle::new(lifecycle_config)),
         }
+    }
+}
+
+impl Default for LinkStats {
+    fn default() -> Self {
+        Self::new(LinkLifecycleConfig::default())
     }
 }
 
@@ -71,10 +78,11 @@ pub struct LinkLifecycle {
     pub last_bad: Instant,
     pub consecutive_good: u32,
     pub consecutive_bad: u32,
+    pub config: LinkLifecycleConfig,
 }
 
 impl LinkLifecycle {
-    pub fn new() -> Self {
+    pub fn new(config: LinkLifecycleConfig) -> Self {
         let now = Instant::now();
         Self {
             phase: LinkPhase::Init,
@@ -83,6 +91,7 @@ impl LinkLifecycle {
             last_bad: now,
             consecutive_good: 0,
             consecutive_bad: 0,
+            config,
         }
     }
 
@@ -94,8 +103,11 @@ impl LinkLifecycle {
         capacity_bps: f64,
         stats_age: std::time::Duration,
     ) -> LinkPhase {
-        let fresh = stats_age < std::time::Duration::from_millis(1500);
-        let good = fresh && rtt_ms > 0.0 && loss_rate < 0.2 && capacity_bps > 0.0;
+        let fresh = stats_age < std::time::Duration::from_millis(self.config.stats_fresh_ms);
+        let good = fresh
+            && rtt_ms >= self.config.good_rtt_ms_min
+            && loss_rate <= self.config.good_loss_rate_max
+            && capacity_bps >= self.config.good_capacity_bps_min;
 
         if good {
             self.consecutive_good += 1;
@@ -107,7 +119,7 @@ impl LinkLifecycle {
             self.last_bad = now;
         }
 
-        let stats_stale = stats_age > std::time::Duration::from_secs(3);
+        let stats_stale = stats_age > std::time::Duration::from_millis(self.config.stats_stale_ms);
 
         self.phase = match self.phase {
             LinkPhase::Init => {
@@ -120,16 +132,16 @@ impl LinkLifecycle {
             LinkPhase::Probe => {
                 if stats_stale {
                     LinkPhase::Reset
-                } else if self.consecutive_good >= 3 {
+                } else if self.consecutive_good >= self.config.probe_to_warm_good {
                     LinkPhase::Warm
                 } else {
                     LinkPhase::Probe
                 }
             }
             LinkPhase::Warm => {
-                if self.consecutive_good >= 10 {
+                if self.consecutive_good >= self.config.warm_to_live_good {
                     LinkPhase::Live
-                } else if self.consecutive_bad >= 3 {
+                } else if self.consecutive_bad >= self.config.warm_to_degrade_bad {
                     LinkPhase::Degrade
                 } else {
                     LinkPhase::Warm
@@ -138,23 +150,25 @@ impl LinkLifecycle {
             LinkPhase::Live => {
                 if stats_stale {
                     LinkPhase::Reset
-                } else if self.consecutive_bad >= 3 {
+                } else if self.consecutive_bad >= self.config.live_to_degrade_bad {
                     LinkPhase::Degrade
                 } else {
                     LinkPhase::Live
                 }
             }
             LinkPhase::Degrade => {
-                if self.consecutive_good >= 5 {
+                if self.consecutive_good >= self.config.degrade_to_warm_good {
                     LinkPhase::Warm
-                } else if self.consecutive_bad >= 10 {
+                } else if self.consecutive_bad >= self.config.degrade_to_cooldown_bad {
                     LinkPhase::Cooldown
                 } else {
                     LinkPhase::Degrade
                 }
             }
             LinkPhase::Cooldown => {
-                if now.duration_since(self.last_transition) > std::time::Duration::from_secs(2) {
+                if now.duration_since(self.last_transition)
+                    > std::time::Duration::from_millis(self.config.cooldown_ms)
+                {
                     LinkPhase::Probe
                 } else {
                     LinkPhase::Cooldown
@@ -186,7 +200,7 @@ mod tests {
 
     #[test]
     fn lifecycle_reaches_live_on_good_stats() {
-        let mut lc = LinkLifecycle::new();
+        let mut lc = LinkLifecycle::new(LinkLifecycleConfig::default());
         let start = Instant::now();
 
         for i in 0..12 {
@@ -200,7 +214,7 @@ mod tests {
 
     #[test]
     fn lifecycle_degrades_on_bad_stats() {
-        let mut lc = LinkLifecycle::new();
+        let mut lc = LinkLifecycle::new(LinkLifecycleConfig::default());
         let start = Instant::now();
 
         for i in 0..12 {
@@ -218,7 +232,7 @@ mod tests {
 
     #[test]
     fn lifecycle_resets_on_stale_stats() {
-        let mut lc = LinkLifecycle::new();
+        let mut lc = LinkLifecycle::new(LinkLifecycleConfig::default());
         let start = Instant::now();
 
         for i in 0..12 {

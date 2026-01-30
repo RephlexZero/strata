@@ -8,7 +8,7 @@ use rist_bonding_core::runtime::{BondingRuntime, PacketSendError};
 use rist_bonding_core::scheduler::PacketProfile;
 use std::collections::HashMap;
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 fn parse_config(config: &str) -> Result<BondingConfig, String> {
     BondingConfig::from_toml_str(config)
 }
@@ -302,12 +302,36 @@ mod imp {
             let handle = std::thread::spawn(move || {
                 let stats_interval = Duration::from_secs(1);
                 let mut last_stats = Instant::now();
+                let start = Instant::now();
+                let mut stats_seq: u64 = 0;
 
                 while running.load(Ordering::Relaxed) {
                     if last_stats.elapsed() >= stats_interval {
                         if let Some(element) = element_weak.upgrade() {
                             let metrics = metrics_handle.lock().unwrap().clone();
-                            let mut msg_struct = gst::Structure::builder("rist-bonding-stats");
+                            let mono_time_ns = start.elapsed().as_nanos() as u64;
+                            let wall_time_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+
+                            let mut total_capacity = 0.0;
+                            let mut alive_links = 0u64;
+                            for m in metrics.values() {
+                                if m.alive {
+                                    total_capacity += m.capacity_bps;
+                                    alive_links += 1;
+                                }
+                            }
+
+                            let mut msg_struct = gst::Structure::builder("rist-bonding-stats")
+                                .field("schema_version", 1i32)
+                                .field("stats_seq", stats_seq)
+                                .field("heartbeat", true)
+                                .field("mono_time_ns", mono_time_ns)
+                                .field("wall_time_ms", wall_time_ms)
+                                .field("total_capacity", total_capacity)
+                                .field("alive_links", alive_links);
                             for (id, m) in metrics {
                                 let os_up =
                                     m.os_up.map(|v| if v { 1i32 } else { 0i32 }).unwrap_or(-1);
@@ -328,6 +352,7 @@ mod imp {
                             let _ = element
                                 .post_message(gst::message::Element::new(msg_struct.build()));
                         }
+                        stats_seq = stats_seq.wrapping_add(1);
                         last_stats = Instant::now();
                     }
                     std::thread::sleep(Duration::from_millis(50));

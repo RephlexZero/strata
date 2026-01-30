@@ -88,6 +88,7 @@ fn test_race_car_scenarios() {
     // 4. Simulation Logic (Main Thread)
     println!(">>> SIMULATION: Started. Seeded dynamic scenario.");
     let scenario_start = Instant::now();
+    let mut flapped = false;
     let mut scenario = Scenario::new(ScenarioConfig {
         seed: 99,
         duration: Duration::from_secs(35),
@@ -124,6 +125,14 @@ fn test_race_car_scenarios() {
 
         let _ = apply_impairment(&sender_ns, "race_veth1_a", frame.configs[0].clone());
         let _ = apply_impairment(&sender_ns, "race_veth2_a", frame.configs[1].clone());
+
+        if !flapped && frame.t.as_secs_f64() >= 15.0 {
+            flapped = true;
+            println!(">>> CHAOS: Flapping race_veth2_a down/up");
+            let _ = sender_ns.exec("ip", &["link", "set", "race_veth2_a", "down"]);
+            thread::sleep(Duration::from_secs(2));
+            let _ = sender_ns.exec("ip", &["link", "set", "race_veth2_a", "up"]);
+        }
 
         println!(
             ">>> IMPAIRMENT t={:.1}s link1 rate={}kbps loss={:.1}% link2 rate={}kbps loss={:.1}%",

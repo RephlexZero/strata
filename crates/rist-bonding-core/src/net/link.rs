@@ -19,14 +19,19 @@ pub struct Link {
 
 impl Link {
     pub fn new(id: usize, url: &str) -> Result<Self> {
-        Self::new_with_iface(id, url, None)
+        Self::new_with_iface(id, url, None, crate::config::LinkLifecycleConfig::default())
     }
 
-    pub fn new_with_iface(id: usize, url: &str, iface: Option<String>) -> Result<Self> {
+    pub fn new_with_iface(
+        id: usize,
+        url: &str,
+        iface: Option<String>,
+        lifecycle_config: crate::config::LinkLifecycleConfig,
+    ) -> Result<Self> {
         let mut ctx = RistContext::new(crate::net::wrapper::RIST_PROFILE_SIMPLE)?;
         ctx.peer_add(url)?;
 
-        let stats = Arc::new(LinkStats::default());
+        let stats = Arc::new(LinkStats::new(lifecycle_config));
         // Register stats callback (e.g. every 100ms)
         ctx.register_stats(stats.clone(), 100)?;
 

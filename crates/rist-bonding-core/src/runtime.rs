@@ -1,4 +1,4 @@
-use crate::config::{BondingConfig, LinkConfig};
+use crate::config::{BondingConfig, LinkConfig, LinkLifecycleConfig};
 use crate::net::interface::LinkMetrics;
 use crate::net::link::Link;
 use crate::scheduler::bonding::BondingScheduler;
@@ -100,6 +100,7 @@ impl Drop for BondingRuntime {
 fn runtime_worker(rx: Receiver<RuntimeMessage>, metrics: Arc<Mutex<HashMap<usize, LinkMetrics>>>) {
     let mut scheduler = BondingScheduler::new();
     let mut current_links: HashMap<usize, LinkConfig> = HashMap::new();
+    let mut lifecycle_config = LinkLifecycleConfig::default();
 
     let mut last_fast_stats = Instant::now();
     let fast_stats_interval = Duration::from_millis(100);
@@ -111,14 +112,15 @@ fn runtime_worker(rx: Receiver<RuntimeMessage>, metrics: Arc<Mutex<HashMap<usize
                     let _ = scheduler.send(data, profile);
                 }
                 RuntimeMessage::AddLink(link) => {
-                    apply_link(&mut scheduler, &mut current_links, link);
+                    apply_link(&mut scheduler, &mut current_links, &lifecycle_config, link);
                 }
                 RuntimeMessage::RemoveLink(id) => {
                     scheduler.remove_link(id);
                     current_links.remove(&id);
                 }
                 RuntimeMessage::ApplyConfig(config) => {
-                    apply_config(&mut scheduler, &mut current_links, config);
+                    lifecycle_config = config.lifecycle.clone();
+                    apply_config(&mut scheduler, &mut current_links, &lifecycle_config, config);
                 }
                 RuntimeMessage::Shutdown => break,
             },
@@ -139,6 +141,7 @@ fn runtime_worker(rx: Receiver<RuntimeMessage>, metrics: Arc<Mutex<HashMap<usize
 fn apply_config(
     scheduler: &mut BondingScheduler<Link>,
     current_links: &mut HashMap<usize, LinkConfig>,
+    lifecycle_config: &LinkLifecycleConfig,
     config: BondingConfig,
 ) {
     let desired_ids: std::collections::HashSet<usize> = config.links.iter().map(|l| l.id).collect();
@@ -159,7 +162,12 @@ fn apply_config(
 
         if needs_update {
             scheduler.remove_link(link.id);
-            if let Ok(new_link) = Link::new_with_iface(link.id, &link.uri, link.interface.clone()) {
+            if let Ok(new_link) = Link::new_with_iface(
+                link.id,
+                &link.uri,
+                link.interface.clone(),
+                lifecycle_config.clone(),
+            ) {
                 scheduler.add_link(Arc::new(new_link));
                 current_links.insert(link.id, link);
             }
@@ -170,10 +178,16 @@ fn apply_config(
 fn apply_link(
     scheduler: &mut BondingScheduler<Link>,
     current_links: &mut HashMap<usize, LinkConfig>,
+    lifecycle_config: &LinkLifecycleConfig,
     link: LinkConfig,
 ) {
     scheduler.remove_link(link.id);
-    if let Ok(new_link) = Link::new_with_iface(link.id, &link.uri, link.interface.clone()) {
+    if let Ok(new_link) = Link::new_with_iface(
+        link.id,
+        &link.uri,
+        link.interface.clone(),
+        lifecycle_config.clone(),
+    ) {
         scheduler.add_link(Arc::new(new_link));
         current_links.insert(link.id, link);
     }
