@@ -63,6 +63,9 @@ mod imp {
                             id,
                             uri,
                             interface: iface,
+                            recovery_maxbitrate: None,
+                            recovery_rtt_max: None,
+                            recovery_reorder_buffer: None,
                         });
                     }
                     SinkMessage::RemoveLink { id } => {
@@ -78,6 +81,9 @@ mod imp {
                                 id,
                                 uri,
                                 interface: iface,
+                                recovery_maxbitrate: None,
+                                recovery_rtt_max: None,
+                                recovery_reorder_buffer: None,
                             },
                         );
                     }
@@ -432,6 +438,7 @@ mod imp {
             let profile = PacketProfile {
                 is_critical,
                 can_drop,
+                size_bytes: data.len(),
             };
 
             if let Some(rt) = self.runtime.lock().unwrap().as_ref() {

@@ -11,6 +11,8 @@ pub struct PacketProfile {
     /// If true, this packet can be seemingly dropped if congestion occurs
     /// (e.g. non-reference B-frames), to preserve latency for other packets.
     pub can_drop: bool,
+    /// Size of the packet in bytes (used for size-aware redundancy decisions).
+    pub size_bytes: usize,
 }
 
 pub fn init() {}

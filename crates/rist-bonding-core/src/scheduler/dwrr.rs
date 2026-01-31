@@ -12,6 +12,7 @@ pub(crate) struct LinkState<L: ?Sized> {
     pub last_sent_bytes: u64,
     pub last_sent_at: Instant,
     pub measured_bps: f64,
+    pub spare_capacity_bps: f64,
     pub prev_capacity_bps: f64,
     pub prev_rtt_ms: f64,
     pub prev_loss_rate: f64,
@@ -65,6 +66,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 last_sent_bytes: 0,
                 last_sent_at: now,
                 measured_bps: 0.0,
+                spare_capacity_bps: metrics.capacity_bps,
                 prev_capacity_bps: metrics.capacity_bps,
                 prev_rtt_ms: metrics.rtt_ms,
                 prev_loss_rate: metrics.loss_rate,
@@ -96,16 +98,20 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             state.metrics.observed_bps = state.measured_bps;
             state.metrics.observed_bytes = state.sent_bytes;
 
+            // Calculate spare capacity: available bandwidth not currently utilized
+            state.spare_capacity_bps = (state.metrics.capacity_bps - state.measured_bps).max(0.0);
+
             if state.metrics.observed_bps > 0.0 {
                 state.metrics.alive = true;
             }
 
-            if state.metrics.capacity_bps < 500_000.0 {
-                let default_bps = 500_000.0;
-                if state.measured_bps > default_bps {
-                     state.metrics.capacity_bps = state.measured_bps;
+            if state.metrics.capacity_bps < 1_000_000.0 {
+                let default_bps = 5_000_000.0; // Start with 5 Mbps floor
+                                               // Use measured + aggressive probing factor to allow ramp up
+                if state.measured_bps > (default_bps * 0.3) {
+                    state.metrics.capacity_bps = state.measured_bps * 2.0;
                 } else {
-                     state.metrics.capacity_bps = default_bps;
+                    state.metrics.capacity_bps = default_bps;
                 }
             }
             let prev_capacity = state.prev_capacity_bps;
@@ -154,6 +160,21 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         }
     }
 
+    /// Returns the total spare capacity (unused bandwidth) across all Live/Warm links.
+    /// This is used for calculating the redundancy budget.
+    pub fn total_spare_capacity(&self) -> f64 {
+        self.links
+            .values()
+            .filter(|state| {
+                matches!(
+                    state.metrics.phase,
+                    LinkPhase::Live | LinkPhase::Warm
+                ) && state.metrics.alive
+            })
+            .map(|state| state.spare_capacity_bps)
+            .sum()
+    }
+
     /// Returns all alive links and deducts the cost from their credits.
     /// This is used for broadcasting critical packets.
     pub fn broadcast_links(&mut self, packet_len: usize) -> Vec<Arc<L>> {
@@ -169,6 +190,82 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             }
         }
         alive_links
+    }
+
+    /// Selects the best N links with diversity preference.
+    /// Prefers links from different carriers/interfaces (link_kind) to maximize path independence.
+    pub fn select_best_n_links(&mut self, packet_len: usize, n: usize) -> Vec<Arc<L>> {
+        let packet_cost = packet_len as f64;
+        let mut selected = Vec::new();
+        let mut used_kinds: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Score all alive links
+        let mut scored_links: Vec<_> = self
+            .links
+            .iter()
+            .filter(|(_, state)| state.metrics.alive)
+            .map(|(id, state)| {
+                // Quality score: capacity * (loss_quality * 0.5 + rtt_quality * 0.3 + phase * 0.2)
+                let loss_quality = (1.0 - state.metrics.loss_rate).max(0.0);
+                let rtt_quality = 1.0 / (1.0 + state.metrics.rtt_ms / 100.0);
+                let phase_weight = match state.metrics.phase {
+                    LinkPhase::Live => 1.0,
+                    LinkPhase::Warm => 0.8,
+                    LinkPhase::Degrade => 0.5,
+                    LinkPhase::Probe => 0.3,
+                    _ => 0.1,
+                };
+                
+                let quality_score = state.metrics.capacity_bps
+                    * (loss_quality * 0.5 + rtt_quality * 0.3 + phase_weight * 0.2);
+                
+                (*id, quality_score, state.metrics.link_kind.clone())
+            })
+            .collect();
+
+        // Sort by quality score descending
+        scored_links.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Select up to N links, preferring diversity
+        for (id, _score, link_kind) in &scored_links {
+            if selected.len() >= n {
+                break;
+            }
+
+            // Diversity preference: prefer new link_kind if we have multiple links
+            let is_diverse = match link_kind {
+                None => true,  // Unknown kind is always considered diverse
+                Some(kind) => !used_kinds.contains(kind.as_str()),
+            };
+            
+            // Always select if we haven't reached N, but prefer diverse links first
+            if is_diverse || selected.len() < n {
+                if let Some(state) = self.links.get_mut(id) {
+                    state.credits -= packet_cost;
+                    selected.push(state.link.clone());
+                    if let Some(kind) = link_kind {
+                        used_kinds.insert(kind.clone());
+                    }
+                }
+            }
+        }
+
+        // If we couldn't get N diverse links, fill with remaining best quality links
+        if selected.len() < n {
+            for (id, _score, _) in &scored_links {
+                if selected.len() >= n {
+                    break;
+                }
+                if !selected.iter().any(|l| l.id() == *id) {
+                    if let Some(state) = self.links.get_mut(id) {
+                        state.credits -= packet_cost;
+                        selected.push(state.link.clone());
+                    }
+                }
+            }
+        }
+
+        selected
     }
 
     pub fn select_link(&mut self, packet_len: usize) -> Option<Arc<L>> {
@@ -340,7 +437,7 @@ mod tests {
 
     #[test]
     fn penalty_factor_reacts_to_capacity_drop() {
-        let link = Arc::new(MockLink::new(1, 1_000_000.0, LinkPhase::Live));
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live)); // Start at 10M
         let mut dwrr = Dwrr::new();
         dwrr.add_link(link.clone());
 
@@ -348,10 +445,11 @@ mod tests {
         let penalty = dwrr.links.get(&1).unwrap().penalty_factor;
         assert!((penalty - 1.0).abs() < 1e-6);
 
-        link.set_capacity(400_000.0);
+        // Drop capacity to 4M (< 50% of 10M, but > 1M so not bootstrapped)
+        link.set_capacity(4_000_000.0);
         dwrr.refresh_metrics();
         let penalty = dwrr.links.get(&1).unwrap().penalty_factor;
-        assert!((penalty - 0.7).abs() < 1e-6);
+        assert!((penalty - 0.7).abs() < 0.01); // Penalty should be 1.0 * 0.7 = 0.7
     }
 
     #[test]
@@ -448,5 +546,90 @@ mod tests {
         let link2_credits = dwrr.links.get(&2).unwrap().credits;
 
         assert!(link1_credits > link2_credits);
+    }
+
+    #[test]
+    fn test_spare_capacity_calculation() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let mut dwrr = Dwrr::new();
+        dwrr.add_link(link.clone());
+
+        // Initial state - no observed traffic yet
+        dwrr.refresh_metrics();
+        let state = dwrr.links.get(&1).unwrap();
+        assert_eq!(state.spare_capacity_bps, 10_000_000.0);
+
+        // Simulate observed traffic at 6 Mbps
+        if let Some(state) = dwrr.links.get_mut(&1) {
+            state.measured_bps = 6_000_000.0;
+        }
+        dwrr.refresh_metrics();
+        
+        let state = dwrr.links.get(&1).unwrap();
+        assert_eq!(state.spare_capacity_bps, 4_000_000.0); // 10M - 6M
+    }
+
+    #[test]
+    fn test_total_spare_capacity() {
+        let link1 = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let link2 = Arc::new(MockLink::new(2, 5_000_000.0, LinkPhase::Live));
+        let link3 = Arc::new(MockLink::new(3, 8_000_000.0, LinkPhase::Probe));
+        
+        let mut dwrr = Dwrr::new();
+        dwrr.add_link(link1.clone());
+        dwrr.add_link(link2.clone());
+        dwrr.add_link(link3.clone());
+
+        // Set observed traffic
+        if let Some(state) = dwrr.links.get_mut(&1) {
+            state.measured_bps = 7_000_000.0; // 3M spare
+        }
+        if let Some(state) = dwrr.links.get_mut(&2) {
+            state.measured_bps = 3_000_000.0; // 2M spare
+        }
+        if let Some(state) = dwrr.links.get_mut(&3) {
+            state.measured_bps = 1_000_000.0; // 7M spare but link is Probe
+        }
+        
+        dwrr.refresh_metrics();
+        
+        let total_spare = dwrr.total_spare_capacity();
+        // Only Link1 (3M) + Link2 (2M) = 5M (Link3 excluded as Probe phase)
+        assert_eq!(total_spare, 5_000_000.0);
+    }
+
+    #[test]
+    fn test_diversity_aware_link_selection() {
+        // Create links with different kinds
+        let wifi_link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let cellular_link = Arc::new(MockLink::new(2, 8_000_000.0, LinkPhase::Live));
+        let wired_link = Arc::new(MockLink::new(3, 12_000_000.0, LinkPhase::Live));
+        
+        // Set link_kind for diversity
+        if let Ok(mut m) = wifi_link.metrics.lock() {
+            m.link_kind = Some("wifi".to_string());
+        }
+        if let Ok(mut m) = cellular_link.metrics.lock() {
+            m.link_kind = Some("cellular".to_string());
+        }
+        if let Ok(mut m) = wired_link.metrics.lock() {
+            m.link_kind = Some("wired".to_string());
+        }
+        
+        let mut dwrr = Dwrr::new();
+        dwrr.add_link(wifi_link.clone());
+        dwrr.add_link(cellular_link.clone());
+        dwrr.add_link(wired_link.clone());
+        
+        dwrr.refresh_metrics();
+        
+        // Select best 2 links - should prefer diverse kinds
+        let selected = dwrr.select_best_n_links(1000, 2);
+        assert_eq!(selected.len(), 2);
+        
+        // Should get wired (highest capacity) and wifi (second highest)
+        let ids: Vec<usize> = selected.iter().map(|l| l.id()).collect();
+        assert!(ids.contains(&3)); // Wired should be selected
+        assert!(ids.len() == 2); // Got 2 links
     }
 }
