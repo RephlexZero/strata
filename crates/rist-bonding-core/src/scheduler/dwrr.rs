@@ -8,6 +8,10 @@ pub(crate) struct LinkState<L: ?Sized> {
     pub credits: f64,
     pub last_update: Instant,
     pub metrics: LinkMetrics,
+    pub sent_bytes: u64,
+    pub last_sent_bytes: u64,
+    pub last_sent_at: Instant,
+    pub measured_bps: f64,
     pub prev_capacity_bps: f64,
     pub prev_rtt_ms: f64,
     pub prev_loss_rate: f64,
@@ -49,13 +53,18 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
     pub fn add_link(&mut self, link: Arc<L>) {
         let id = link.id();
         let metrics = link.get_metrics();
+        let now = Instant::now();
         self.links.insert(
             id,
             LinkState {
                 metrics: metrics.clone(),
                 link,
                 credits: 0.0,
-                last_update: Instant::now(),
+                last_update: now,
+                sent_bytes: 0,
+                last_sent_bytes: 0,
+                last_sent_at: now,
+                measured_bps: 0.0,
                 prev_capacity_bps: metrics.capacity_bps,
                 prev_rtt_ms: metrics.rtt_ms,
                 prev_loss_rate: metrics.loss_rate,
@@ -74,6 +83,26 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         for state in self.links.values_mut() {
             let now = Instant::now();
             state.metrics = state.link.get_metrics();
+            let dt_sent = now.duration_since(state.last_sent_at).as_secs_f64();
+            if dt_sent > 0.0 {
+                let delta_bytes = state.sent_bytes.saturating_sub(state.last_sent_bytes);
+                if delta_bytes > 0 {
+                    state.measured_bps = (delta_bytes as f64 * 8.0) / dt_sent;
+                }
+                state.last_sent_bytes = state.sent_bytes;
+                state.last_sent_at = now;
+            }
+
+            state.metrics.observed_bps = state.measured_bps;
+            state.metrics.observed_bytes = state.sent_bytes;
+
+            if state.metrics.observed_bps > 0.0 {
+                state.metrics.alive = true;
+            }
+
+            if state.metrics.capacity_bps <= 0.0 && state.measured_bps > 0.0 {
+                state.metrics.capacity_bps = state.measured_bps;
+            }
             let prev_capacity = state.prev_capacity_bps;
             let curr_capacity = state.metrics.capacity_bps;
             if prev_capacity > 0.0 && curr_capacity < prev_capacity * 0.5 {
@@ -114,14 +143,22 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             .collect()
     }
 
+    pub fn record_send(&mut self, id: usize, bytes: u64) {
+        if let Some(state) = self.links.get_mut(&id) {
+            state.sent_bytes = state.sent_bytes.saturating_add(bytes);
+        }
+    }
+
     /// Returns all alive links and deducts the cost from their credits.
     /// This is used for broadcasting critical packets.
     pub fn broadcast_links(&mut self, packet_len: usize) -> Vec<Arc<L>> {
         let packet_cost = packet_len as f64;
         let mut alive_links = Vec::new();
 
+        let any_alive = self.links.values().any(|state| state.metrics.alive);
+
         for state in self.links.values_mut() {
-            if state.metrics.alive {
+            if state.metrics.alive || !any_alive {
                 state.credits -= packet_cost;
                 alive_links.push(state.link.clone());
             }
@@ -138,9 +175,10 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         let now = Instant::now();
 
         // 1. Update Credits
+        let any_alive = self.links.values().any(|state| state.metrics.alive);
         for state in self.links.values_mut() {
             let metrics = state.metrics.clone();
-            if metrics.alive {
+            if metrics.alive || !any_alive {
                 let elapsed = now.duration_since(state.last_update).as_secs_f64();
 
                 // Calculate Effective Capacity (Quality Aware)
@@ -260,6 +298,8 @@ mod tests {
                     rtt_ms: 10.0,
                     capacity_bps,
                     loss_rate: 0.0,
+                    observed_bps: 0.0,
+                    observed_bytes: 0,
                     queue_depth: 0,
                     max_queue: 100,
                     alive: true,

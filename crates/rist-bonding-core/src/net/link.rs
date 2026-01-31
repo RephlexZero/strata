@@ -95,16 +95,20 @@ impl LinkSender for Link {
 
     fn get_metrics(&self) -> LinkMetrics {
         let now = std::time::Instant::now();
-        // Use smoothed values if available, else fallback to raw or 0
+        // Use smoothed values if available, else fallback to raw
         let rtt_us = self.stats.smoothed_rtt_us.load(Ordering::Relaxed);
+        let raw_rtt_ms = self.stats.rtt.load(Ordering::Relaxed) as f64;
+        let raw_bw = self.stats.bandwidth.load(Ordering::Relaxed) as f64;
         let bw = self.stats.smoothed_bw_bps.load(Ordering::Relaxed) as f64;
         let loss_pm = self.stats.smoothed_loss_permille.load(Ordering::Relaxed);
 
         let rtt_ms = if rtt_us > 0 {
             rtt_us as f64 / 1000.0
         } else {
-            0.0
+            raw_rtt_ms
         };
+
+        let bw = if bw > 0.0 { bw } else { raw_bw };
 
         let loss_rate = loss_pm as f64 / 1000.0;
 
@@ -174,6 +178,8 @@ impl LinkSender for Link {
             rtt_ms,
             capacity_bps: bw,
             loss_rate,
+            observed_bps: 0.0,
+            observed_bytes: 0,
             queue_depth: 0, // Need to implement if possible via stats or wrapper tracking
             max_queue: 1000,
             alive,

@@ -57,20 +57,36 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     register_plugins()?;
 
-    // Pipeline: videotestsrc ! x264enc ! mpegtsmux ! rsristbondsink
+    // Pipeline: videotestsrc ! x264enc ! mpegtsmux ! rsristbondsink (request pads)
     // We send 3000 buffers (approx 100s at 30fps).
     // Note: H264 Encoding might buffer frames, so we might not get exactly 450 out if we stop abruptly.
     // We use tune=zerolatency to minimize this.
     // Ensure PAT/PMT are sent effectively for quick lock.
     let pipeline_str = format!(
-        "videotestsrc num-buffers=3000 is-live=true pattern=ball ! video/x-raw,width=320,height=240 ! x264enc name=enc tune=zerolatency bitrate={} ! mpegtsmux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink links=\"{}\"",
-        bitrate_kbps, dest_str
+        "videotestsrc num-buffers=3000 is-live=true pattern=ball ! video/x-raw,width=320,height=240 ! x264enc name=enc tune=zerolatency bitrate={} ! mpegtsmux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink name=rsink",
+        bitrate_kbps
     );
     eprintln!("Sender Pipeline: {}", pipeline_str);
 
     let pipeline = gst::parse::launch(&pipeline_str)?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "Failed to cast to pipeline")?;
+
+    if let Some(sink) = pipeline.by_name("rsink") {
+        for (idx, uri) in dest_str.split(',').enumerate() {
+            let uri = uri.trim();
+            if uri.is_empty() {
+                continue;
+            }
+            let pad = sink
+                .request_pad_simple("link_%u")
+                .ok_or("Failed to request link pad")?;
+            pad.set_property("uri", &uri);
+            eprintln!("Configured link {} -> {}", idx, uri);
+        }
+    } else {
+        return Err("Failed to find rsristbondsink element".into());
+    }
 
     // Setup Stats Relay if requested
     let mut stats_socket = None;
@@ -147,8 +163,16 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 if s.has_field(&format!("{}alive", prefix)) {
                                     let alive =
                                         s.get::<bool>(&format!("{}alive", prefix)).unwrap_or(false);
-                                    let cap =
-                                        s.get::<f64>(&format!("{}capacity", prefix)).unwrap_or(0.0);
+                                    let cap = s
+                                        .get::<f64>(&format!("{}capacity", prefix))
+                                        .unwrap_or(0.0);
+                                    let observed_bps = s
+                                        .get::<f64>(&format!("{}observed_bps", prefix))
+                                        .unwrap_or(0.0);
+                                    let observed_bytes = s
+                                        .get::<u64>(&format!("{}observed_bytes", prefix))
+                                        .unwrap_or(0);
+                                    let cap = if cap > 0.0 { cap } else { observed_bps };
                                     let rtt =
                                         s.get::<f64>(&format!("{}rtt", prefix)).unwrap_or(0.0);
                                     let loss =
@@ -163,7 +187,9 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                         "capacity": cap,
                                         "loss": loss,
                                         "alive": alive,
-                                        "queue": 0 // unavailable
+                                        "queue": 0,
+                                        "observed_bps": observed_bps,
+                                        "observed_bytes": observed_bytes
                                     });
                                     links_map.insert(i.to_string(), link_json);
                                 }

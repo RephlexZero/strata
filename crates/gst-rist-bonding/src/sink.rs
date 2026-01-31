@@ -36,6 +36,7 @@ mod imp {
         pub(crate) links_config: Mutex<String>,
         pub(crate) config_toml: Mutex<String>,
         pub(crate) pad_map: Mutex<HashMap<String, usize>>,
+        pub(crate) pending_links: Mutex<HashMap<usize, LinkConfig>>,
     }
 
     impl Default for RsRistBondSink {
@@ -47,6 +48,7 @@ mod imp {
                 links_config: Mutex::new(String::new()),
                 config_toml: Mutex::new(String::new()),
                 pad_map: Mutex::new(HashMap::new()),
+                pending_links: Mutex::new(HashMap::new()),
             }
         }
     }
@@ -65,6 +67,22 @@ mod imp {
                     }
                     SinkMessage::RemoveLink { id } => {
                         let _ = rt.remove_link(id);
+                    }
+                }
+            } else {
+                match msg {
+                    SinkMessage::AddLink { id, uri, iface } => {
+                        self.pending_links.lock().unwrap().insert(
+                            id,
+                            LinkConfig {
+                                id,
+                                uri,
+                                interface: iface,
+                            },
+                        );
+                    }
+                    SinkMessage::RemoveLink { id } => {
+                        self.pending_links.lock().unwrap().remove(&id);
                     }
                 }
             }
@@ -113,6 +131,9 @@ mod imp {
         }
 
         fn apply_config(&self, config: &str) {
+            if config.trim().is_empty() {
+                return;
+            }
             match parse_config(config) {
                 Ok(parsed) => {
                     if let Some(rt) = self.runtime.lock().unwrap().as_ref() {
@@ -292,6 +313,20 @@ mod imp {
             let metrics_handle = runtime.metrics_handle();
             *self.runtime.lock().unwrap() = Some(runtime);
 
+            for pad in self.obj().pads() {
+                if let Some(bond_pad) = pad.downcast_ref::<RsRistBondSinkPad>() {
+                    self.add_link_from_pad(bond_pad);
+                }
+            }
+
+            if let Some(rt) = self.runtime.lock().unwrap().as_ref() {
+                let pending: Vec<LinkConfig> =
+                    self.pending_links.lock().unwrap().drain().map(|(_, v)| v).collect();
+                for link in pending {
+                    let _ = rt.add_link(link);
+                }
+            }
+
             self.reconfigure_legacy();
             self.apply_config(&self.config_toml.lock().unwrap());
 
@@ -342,6 +377,8 @@ mod imp {
                                     .field(&format!("link_{}_rtt", id), m.rtt_ms)
                                     .field(&format!("link_{}_capacity", id), m.capacity_bps)
                                     .field(&format!("link_{}_loss", id), m.loss_rate)
+                                    .field(&format!("link_{}_observed_bps", id), m.observed_bps)
+                                    .field(&format!("link_{}_observed_bytes", id), m.observed_bytes)
                                     .field(&format!("link_{}_alive", id), m.alive)
                                     .field(&format!("link_{}_phase", id), m.phase.as_str())
                                     .field(&format!("link_{}_os_up", id), os_up)

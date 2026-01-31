@@ -53,7 +53,9 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             for link in links {
                 // Ignore individual errors during broadcast, as long as one succeeds?
                 // Or bail? For bonding, best effort broadcast.
-                let _ = link.send(&wrapped);
+                if link.send(&wrapped).is_ok() {
+                    self.scheduler.record_send(link.id(), packet_len as u64);
+                }
             }
             return Ok(());
         }
@@ -67,6 +69,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             let wrapped = header.wrap(payload);
 
             link.send(&wrapped)?;
+            self.scheduler.record_send(link.id(), packet_len as u64);
             return Ok(());
         }
 
@@ -94,6 +97,8 @@ mod tests {
                     capacity_bps: capacity,
                     rtt_ms: rtt,
                     loss_rate: 0.0,
+                    observed_bps: 0.0,
+                    observed_bytes: 0,
                     queue_depth: 0,
                     max_queue: 100,
                     alive: true,

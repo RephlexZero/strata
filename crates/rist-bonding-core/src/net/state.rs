@@ -12,6 +12,7 @@ pub struct EwmaStats {
     pub last_sent: u64,
     pub last_lost: u64,
     pub last_rex: u64,
+    pub last_stats_ms: u64,
 }
 
 impl Default for EwmaStats {
@@ -23,6 +24,7 @@ impl Default for EwmaStats {
             last_sent: 0,
             last_lost: 0,
             last_rex: 0,
+            last_stats_ms: 0,
         }
     }
 }

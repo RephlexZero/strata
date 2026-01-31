@@ -36,6 +36,8 @@ pub struct LinkMetrics {
     pub rtt_ms: f64,
     pub capacity_bps: f64,
     pub loss_rate: f64, // 0.0 - 1.0 (Percentage of bad packets)
+    pub observed_bps: f64,
+    pub observed_bytes: u64,
     pub queue_depth: usize,
     pub max_queue: usize,
     pub alive: bool,

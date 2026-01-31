@@ -69,9 +69,6 @@ unsafe extern "C" fn stats_cb(
         link_stats
             .rtt
             .store(sender_stats.rtt as u64, Ordering::Relaxed);
-        link_stats
-            .bandwidth
-            .store(sender_stats.bandwidth as u64, Ordering::Relaxed);
         link_stats.sent.store(sender_stats.sent, Ordering::Relaxed);
         link_stats
             .retransmitted
@@ -81,7 +78,6 @@ unsafe extern "C" fn stats_cb(
         // We take the lock. Since this runs infrequently (100ms), lock contention is negligible.
         if let Ok(mut ewma) = link_stats.ewma_state.lock() {
             ewma.rtt.update(sender_stats.rtt as f64);
-            ewma.bandwidth.update(sender_stats.bandwidth as f64);
 
             let sent = sender_stats.sent;
             let rex = sender_stats.retransmitted;
@@ -89,8 +85,15 @@ unsafe extern "C" fn stats_cb(
             let delta_sent = sent.saturating_sub(ewma.last_sent);
             let delta_rex = rex.saturating_sub(ewma.last_rex);
 
+            let dt_ms = if ewma.last_stats_ms > 0 {
+                now_ms.saturating_sub(ewma.last_stats_ms)
+            } else {
+                0
+            };
+
             ewma.last_sent = sent;
             ewma.last_rex = rex;
+            ewma.last_stats_ms = now_ms;
 
             // Calculate "Badness" ratio: (Retransmitted) / Sent
             // If sent is 0 (idle), we keep previous estimate or decay?
@@ -103,6 +106,16 @@ unsafe extern "C" fn stats_cb(
 
             // Update EWMA with current loss ratio (0.0 - 1.0+)
             ewma.loss.update(loss_ratio);
+
+            // Bandwidth update (fallback if librist reports 0)
+            let mut bw_bps = sender_stats.bandwidth as f64;
+            if bw_bps <= 0.0 && dt_ms > 0 && delta_sent > 0 {
+                bw_bps = (delta_sent as f64 * 8.0 * 1000.0) / dt_ms as f64;
+            }
+            ewma.bandwidth.update(bw_bps);
+            link_stats
+                .bandwidth
+                .store(bw_bps.max(0.0) as u64, Ordering::Relaxed);
 
             // Update Cached Smooth Values
             // RTT in micros

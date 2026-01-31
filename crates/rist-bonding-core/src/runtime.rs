@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 #[derive(Debug)]
 pub enum PacketSendError {
@@ -162,14 +163,24 @@ fn apply_config(
 
         if needs_update {
             scheduler.remove_link(link.id);
-            if let Ok(new_link) = Link::new_with_iface(
+            match Link::new_with_iface(
                 link.id,
                 &link.uri,
                 link.interface.clone(),
                 lifecycle_config.clone(),
             ) {
-                scheduler.add_link(Arc::new(new_link));
-                current_links.insert(link.id, link);
+                Ok(new_link) => {
+                    scheduler.add_link(Arc::new(new_link));
+                    current_links.insert(link.id, link);
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to create link id={} uri={}: {}",
+                        link.id,
+                        link.uri,
+                        err
+                    );
+                }
             }
         }
     }
@@ -182,13 +193,23 @@ fn apply_link(
     link: LinkConfig,
 ) {
     scheduler.remove_link(link.id);
-    if let Ok(new_link) = Link::new_with_iface(
+    match Link::new_with_iface(
         link.id,
         &link.uri,
         link.interface.clone(),
         lifecycle_config.clone(),
     ) {
-        scheduler.add_link(Arc::new(new_link));
-        current_links.insert(link.id, link);
+        Ok(new_link) => {
+            scheduler.add_link(Arc::new(new_link));
+            current_links.insert(link.id, link);
+        }
+        Err(err) => {
+            warn!(
+                "Failed to create link id={} uri={}: {}",
+                link.id,
+                link.uri,
+                err
+            );
+        }
     }
 }

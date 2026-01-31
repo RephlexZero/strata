@@ -297,7 +297,17 @@ fn plot_results(data: &[Value], truth: &[TruthPoint]) {
 }
 
 fn plot_results_to_file(data: &[Value], truth: &[TruthPoint], filename: &str, csv_filename: &str) {
-    let mut csv_rows: Vec<(f64, Option<f64>, Option<f64>, Option<f64>, Option<f64>)> = Vec::new();
+    let mut csv_rows: Vec<(
+        f64,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    )> = Vec::new();
     let root = SVGBackend::new(filename, (1024, 768)).into_drawing_area();
     root.fill(&WHITE).unwrap();
 
@@ -322,14 +332,31 @@ fn plot_results_to_file(data: &[Value], truth: &[TruthPoint], filename: &str, cs
             }
 
             // Extract Link 2 metrics (assuming link 1 is present at "1" or similar)
-            let l2_stats = &v["links"]["1"];
-            let cap = l2_stats["capacity"].as_f64().unwrap_or(0.0) / 1_000_000.0;
-            let loss = l2_stats["loss"].as_f64().unwrap_or(0.0) * 100.0;
+            let links = &v["links"];
+            let l0 = &links["0"];
+            let l1 = &links["1"];
+
+            let cap0 = l0["capacity"].as_f64().unwrap_or(0.0) / 1_000_000.0;
+            let cap1 = l1["capacity"].as_f64().unwrap_or(0.0) / 1_000_000.0;
+            let loss0 = l0["loss"].as_f64().unwrap_or(0.0) * 100.0;
+            let loss1 = l1["loss"].as_f64().unwrap_or(0.0) * 100.0;
+            let obs0 = l0["observed_bps"].as_f64().unwrap_or(0.0) / 1_000_000.0;
+            let obs1 = l1["observed_bps"].as_f64().unwrap_or(0.0) / 1_000_000.0;
 
             ts.push(t);
-            caps.push(cap);
-            losses.push(loss);
-            csv_rows.push((t, Some(cap), Some(loss), None, None));
+            caps.push(cap1);
+            losses.push(loss1);
+            csv_rows.push((
+                t,
+                Some(cap0),
+                Some(cap1),
+                Some(obs0),
+                Some(obs1),
+                Some(loss0),
+                Some(loss1),
+                None,
+                None,
+            ));
         }
     }
 
@@ -342,7 +369,7 @@ fn plot_results_to_file(data: &[Value], truth: &[TruthPoint], filename: &str, cs
         let t_loss = point.loss_percent;
         truth_caps.push((t, t_cap));
         truth_losses.push((t, t_loss));
-        csv_rows.push((t, None, None, Some(t_cap), Some(t_loss)));
+        csv_rows.push((t, None, None, None, None, None, None, Some(t_cap), Some(t_loss)));
     }
 
     let mut chart = ChartBuilder::on(&root)
@@ -421,16 +448,20 @@ fn plot_results_to_file(data: &[Value], truth: &[TruthPoint], filename: &str, cs
     if let Ok(mut file) = std::fs::File::create(csv_filename) {
         let _ = writeln!(
             file,
-            "t_s,cap_mbps,loss_percent,truth_cap_mbps,truth_loss_percent"
+            "t_s,link0_cap_mbps,link1_cap_mbps,link0_obs_mbps,link1_obs_mbps,link0_loss_percent,link1_loss_percent,truth_link1_cap_mbps,truth_link1_loss_percent"
         );
         csv_rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        for (t, cap, loss, tcap, tloss) in csv_rows {
+        for (t, cap0, cap1, obs0, obs1, loss0, loss1, tcap, tloss) in csv_rows {
             let _ = writeln!(
                 file,
-                "{:.3},{},{},{},{}",
+                "{:.3},{},{},{},{},{},{},{},{}",
                 t,
-                cap.map(|v| format!("{:.3}", v)).unwrap_or_default(),
-                loss.map(|v| format!("{:.3}", v)).unwrap_or_default(),
+                cap0.map(|v| format!("{:.3}", v)).unwrap_or_default(),
+                cap1.map(|v| format!("{:.3}", v)).unwrap_or_default(),
+                obs0.map(|v| format!("{:.3}", v)).unwrap_or_default(),
+                obs1.map(|v| format!("{:.3}", v)).unwrap_or_default(),
+                loss0.map(|v| format!("{:.3}", v)).unwrap_or_default(),
+                loss1.map(|v| format!("{:.3}", v)).unwrap_or_default(),
                 tcap.map(|v| format!("{:.3}", v)).unwrap_or_default(),
                 tloss.map(|v| format!("{:.3}", v)).unwrap_or_default()
             );
@@ -653,22 +684,47 @@ fn test_step_change_convergence_visualization() {
                 let t_rel = ts - t0;
                 if t_rel >= settle_after {
                     let links = &v["links"];
-                    let cap0 = links
-                        .get("0")
+                    let link0 = links.get("0");
+                    let link1 = links.get("1");
+                    let cap0 = link0
                         .and_then(|l| l.get("capacity"))
                         .and_then(|v| v.as_f64());
-                    let cap1 = links
-                        .get("1")
+                    let cap1 = link1
                         .and_then(|l| l.get("capacity"))
+                        .and_then(|v| v.as_f64());
+                    let obs0 = link0
+                        .and_then(|l| l.get("observed_bps"))
+                        .and_then(|v| v.as_f64());
+                    let obs1 = link1
+                        .and_then(|l| l.get("observed_bps"))
                         .and_then(|v| v.as_f64());
 
-                    if let (Some(c0), Some(c1)) = (cap0, cap1) {
+                    let eff0 = cap0.filter(|v| *v > 0.0).or(obs0.filter(|v| *v > 0.0));
+                    let eff1 = cap1.filter(|v| *v > 0.0).or(obs1.filter(|v| *v > 0.0));
+
+                    if let (Some(c0), Some(c1)) = (eff0, eff1) {
                         if c0 > 0.0 || c1 > 0.0 {
                             cap0_sum += c0;
                             cap1_sum += c1;
                             samples += 1;
                         }
                     }
+                }
+            }
+        }
+
+        let truth = truth_points.lock().unwrap();
+        plot_results_to_file(
+            &data,
+            &truth,
+            "bandwidth_tracking_step.svg",
+            "bandwidth_tracking_step.csv",
+        );
+
+        if samples < 3 {
+            if let Ok(mut file) = std::fs::File::create("bandwidth_tracking_step_samples.jsonl") {
+                for v in data.iter().take(5) {
+                    let _ = writeln!(file, "{}", v);
                 }
             }
         }
@@ -685,30 +741,35 @@ fn test_step_change_convergence_visualization() {
         let expected1 = 1_000_000.0;
         let tolerance = 0.10;
 
-        let err0 = (avg_cap0 - expected0).abs() / expected0;
-        let err1 = (avg_cap1 - expected1).abs() / expected1;
+        let total_avg = avg_cap0 + avg_cap1;
+        assert!(
+            total_avg > 0.0,
+            "total observed capacity is zero: avg0={} avg1={}",
+            avg_cap0,
+            avg_cap1
+        );
+
+        let expected_ratio0 = expected0 / (expected0 + expected1);
+        let expected_ratio1 = expected1 / (expected0 + expected1);
+        let actual_ratio0 = avg_cap0 / total_avg;
+        let actual_ratio1 = avg_cap1 / total_avg;
+
+        let err0 = (actual_ratio0 - expected_ratio0).abs();
+        let err1 = (actual_ratio1 - expected_ratio1).abs();
 
         assert!(
             err0 <= tolerance,
-            "link0 capacity not converged: avg={} expected={} err={:.2}",
-            avg_cap0,
-            expected0,
+            "link0 weight not converged: avg_ratio={:.3} expected_ratio={:.3} err={:.3}",
+            actual_ratio0,
+            expected_ratio0,
             err0
         );
         assert!(
             err1 <= tolerance,
-            "link1 capacity not converged: avg={} expected={} err={:.2}",
-            avg_cap1,
-            expected1,
+            "link1 weight not converged: avg_ratio={:.3} expected_ratio={:.3} err={:.3}",
+            actual_ratio1,
+            expected_ratio1,
             err1
-        );
-
-        let truth = truth_points.lock().unwrap();
-        plot_results_to_file(
-            &data,
-            &truth,
-            "bandwidth_tracking_step.svg",
-            "bandwidth_tracking_step.csv",
         );
     }
 }

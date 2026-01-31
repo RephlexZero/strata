@@ -33,11 +33,19 @@ mod imp {
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
             match pspec.name() {
                 "uri" => {
+                    let new_uri: String = value.get().expect("type checked upstream");
                     let mut uri = self.uri.lock().unwrap();
-                    *uri = value.get().expect("type checked upstream");
-                    // Note: We might want to notify the parent sink to update the link.
-                    // But usually, configuration happens before requesting/linking or dynamically.
-                    // If changed dynamically, we need a way to notify the Sink logic to update the wrapper Link.
+                    let should_notify = *uri != new_uri;
+                    *uri = new_uri;
+                    drop(uri);
+                    if should_notify {
+                        if let Some(parent) = self.obj().parent() {
+                            if let Ok(sink) = parent.downcast::<crate::sink::RsRistBondSink>() {
+                                sink.imp().add_link_from_pad(&self.obj());
+                            }
+                        }
+                        self.obj().notify("uri");
+                    }
                 }
                 _ => unimplemented!(),
             }
