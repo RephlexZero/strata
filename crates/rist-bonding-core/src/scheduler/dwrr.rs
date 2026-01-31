@@ -100,8 +100,13 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 state.metrics.alive = true;
             }
 
-            if state.metrics.capacity_bps <= 0.0 && state.measured_bps > 0.0 {
-                state.metrics.capacity_bps = state.measured_bps;
+            if state.metrics.capacity_bps < 500_000.0 {
+                let default_bps = 500_000.0;
+                if state.measured_bps > default_bps {
+                     state.metrics.capacity_bps = state.measured_bps;
+                } else {
+                     state.metrics.capacity_bps = default_bps;
+                }
             }
             let prev_capacity = state.prev_capacity_bps;
             let curr_capacity = state.metrics.capacity_bps;
