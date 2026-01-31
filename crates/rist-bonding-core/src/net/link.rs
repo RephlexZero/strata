@@ -1,6 +1,6 @@
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
 use crate::net::state::LinkStats;
-use crate::net::wrapper::RistContext;
+use crate::net::wrapper::{RecoveryConfig, RistContext};
 use anyhow::Result;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -28,8 +28,18 @@ impl Link {
         iface: Option<String>,
         lifecycle_config: crate::config::LinkLifecycleConfig,
     ) -> Result<Self> {
+        Self::new_with_full_config(id, url, iface, lifecycle_config, None)
+    }
+
+    pub fn new_with_full_config(
+        id: usize,
+        url: &str,
+        iface: Option<String>,
+        lifecycle_config: crate::config::LinkLifecycleConfig,
+        recovery: Option<RecoveryConfig>,
+    ) -> Result<Self> {
         let mut ctx = RistContext::new(crate::net::wrapper::RIST_PROFILE_SIMPLE)?;
-        ctx.peer_add(url)?;
+        ctx.peer_add(url, recovery.as_ref())?;
 
         let stats = Arc::new(LinkStats::new(lifecycle_config));
         // Register stats callback (e.g. every 100ms)

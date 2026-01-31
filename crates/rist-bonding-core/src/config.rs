@@ -20,6 +20,12 @@ pub struct LinkConfigInput {
     pub id: Option<usize>,
     pub uri: String,
     pub interface: Option<String>,
+    /// Optional: RIST recovery maxbitrate in kbps (defaults to 100000)
+    pub recovery_maxbitrate: Option<u32>,
+    /// Optional: RIST recovery RTT max in ms (defaults to 500)
+    pub recovery_rtt_max: Option<u32>,
+    /// Optional: RIST recovery reorder buffer in ms (defaults to 15)
+    pub recovery_reorder_buffer: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -52,6 +58,9 @@ pub struct LinkConfig {
     pub id: usize,
     pub uri: String,
     pub interface: Option<String>,
+    pub recovery_maxbitrate: Option<u32>,
+    pub recovery_rtt_max: Option<u32>,
+    pub recovery_reorder_buffer: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +218,9 @@ impl BondingConfigInput {
                 id,
                 uri,
                 interface: iface,
+                recovery_maxbitrate: link.recovery_maxbitrate,
+                recovery_rtt_max: link.recovery_rtt_max,
+                recovery_reorder_buffer: link.recovery_reorder_buffer,
             });
         }
 
@@ -316,5 +328,60 @@ mod tests {
             cfg.lifecycle.good_loss_rate_max,
             LinkLifecycleConfig::default().good_loss_rate_max
         );
+    }
+
+    #[test]
+    fn parse_toml_config_with_recovery_params() {
+        let toml = r#"
+            version = 1
+
+            [[links]]
+            id = 1
+            uri = "rist://10.0.0.1:5000"
+            interface = "wwan0"
+            recovery_maxbitrate = 20000
+            recovery_rtt_max = 800
+            recovery_reorder_buffer = 50
+
+            [[links]]
+            id = 2
+            uri = "rist://10.0.0.2:5000"
+            interface = "wlan0"
+            recovery_rtt_max = 200
+        "#;
+
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.links.len(), 2);
+        
+        // Link 1 with all recovery params
+        assert_eq!(cfg.links[0].id, 1);
+        assert_eq!(cfg.links[0].recovery_maxbitrate, Some(20000));
+        assert_eq!(cfg.links[0].recovery_rtt_max, Some(800));
+        assert_eq!(cfg.links[0].recovery_reorder_buffer, Some(50));
+        
+        // Link 2 with partial recovery params
+        assert_eq!(cfg.links[1].id, 2);
+        assert_eq!(cfg.links[1].recovery_maxbitrate, None);
+        assert_eq!(cfg.links[1].recovery_rtt_max, Some(200));
+        assert_eq!(cfg.links[1].recovery_reorder_buffer, None);
+    }
+
+    #[test]
+    fn parse_toml_config_without_recovery_params() {
+        let toml = r#"
+            version = 1
+
+            [[links]]
+            id = 1
+            uri = "rist://10.0.0.1:5000"
+        "#;
+
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.links.len(), 1);
+        
+        // Recovery params should be None when not specified
+        assert_eq!(cfg.links[0].recovery_maxbitrate, None);
+        assert_eq!(cfg.links[0].recovery_rtt_max, None);
+        assert_eq!(cfg.links[0].recovery_reorder_buffer, None);
     }
 }

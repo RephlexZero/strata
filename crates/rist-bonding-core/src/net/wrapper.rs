@@ -9,6 +9,14 @@ use crate::net::state::LinkStats;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+/// Optional RIST recovery tuning parameters per link
+#[derive(Debug, Clone)]
+pub struct RecoveryConfig {
+    pub recovery_maxbitrate: Option<u32>,       // kbps
+    pub recovery_rtt_max: Option<u32>,          // ms
+    pub recovery_reorder_buffer: Option<u32>,   // ms
+}
+
 unsafe extern "C" fn log_cb(
     _arg: *mut libc::c_void,
     _level: rist_log_level,
@@ -202,12 +210,25 @@ impl RistContext {
         Ok(())
     }
 
-    pub fn peer_add(&self, url: &str) -> Result<()> {
+    pub fn peer_add(&self, url: &str, recovery: Option<&RecoveryConfig>) -> Result<()> {
         let c_url = CString::new(url)?;
         unsafe {
             let mut peer_config: *mut rist_peer_config = ptr::null_mut();
             if rist_parse_address2(c_url.as_ptr(), &mut peer_config) != 0 {
                 return Err(anyhow::anyhow!("Failed to parse address: {}", url));
+            }
+
+            // Apply custom recovery parameters if provided
+            if let Some(recovery_cfg) = recovery {
+                if let Some(maxbitrate) = recovery_cfg.recovery_maxbitrate {
+                    (*peer_config).recovery_maxbitrate = maxbitrate;
+                }
+                if let Some(rtt_max) = recovery_cfg.recovery_rtt_max {
+                    (*peer_config).recovery_rtt_max = rtt_max;
+                }
+                if let Some(reorder_buffer) = recovery_cfg.recovery_reorder_buffer {
+                    (*peer_config).recovery_reorder_buffer = reorder_buffer;
+                }
             }
 
             let mut peer: *mut rist_peer = ptr::null_mut();
@@ -395,17 +416,14 @@ mod tests {
     fn test_add_peer() {
         let ctx = RistContext::new(RIST_PROFILE_SIMPLE).unwrap();
         // Assume I wrap peer creation too
-        let res = ctx.peer_add("rist://127.0.0.1:1234");
+        let res = ctx.peer_add("rist://127.0.0.1:1234", None);
         assert!(res.is_ok());
     }
 
     #[test]
     fn test_send_data() {
         let ctx = RistContext::new(RIST_PROFILE_SIMPLE).unwrap();
-        ctx.peer_add("rist://127.0.0.1:1235").unwrap();
-        ctx.start().unwrap();
-
-        // This relies on UDP not blocking/failing if no listener?
+        ctx.peer_add("rist://127.0.0.1:1235", None).unwrap();
         // UDP is connectionless, so send usually succeeds locally.
         let data = b"Hello RIST";
         let sent = ctx.send_data(data);
@@ -428,7 +446,7 @@ mod tests {
                 // Sender
                 let sender = RistContext::new(RIST_PROFILE_SIMPLE).unwrap();
                 sender
-                    .peer_add(&format!("rist://127.0.0.1:{}", port))
+                    .peer_add(&format!("rist://127.0.0.1:{}", port), None)
                     .unwrap();
                 sender.start().unwrap();
 
