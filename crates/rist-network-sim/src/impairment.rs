@@ -101,7 +101,6 @@ pub fn apply_impairment(
         args_storage.push(format!("{}kbit", rate));
     }
 
-
     let args: Vec<&str> = args_storage.iter().map(|s| s.as_str()).collect();
 
     let output = ns.exec("tc", &args)?;
@@ -165,7 +164,7 @@ mod tests {
         // Apply 100ms delay on ns1 side
         let config = ImpairmentConfig {
             delay_ms: Some(100),
-            jitter_ms: Some(10), // slight jitter
+            jitter_ms: Some(10),   // slight jitter
             rate_kbit: Some(5000), // 5Mbps
             loss_percent: None,
             ..Default::default()

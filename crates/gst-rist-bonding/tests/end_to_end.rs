@@ -28,15 +28,18 @@ fn build_integration_binary() -> PathBuf {
     path.push("integration_node");
 
     if !path.exists() {
-         // Fallback just in case directory structure is weird (e.g. running from IDE vs CLI)
-         // Try to use fallback logic if available, or just panic nicely
-         eprintln!("Warning: Did not find integration_node at {:?}, checking relative to CWD", path);
-         let cwd = std::env::current_dir().unwrap();
-         let try_path = cwd.join("target/debug/integration_node");
-         if try_path.exists() {
+        // Fallback just in case directory structure is weird (e.g. running from IDE vs CLI)
+        // Try to use fallback logic if available, or just panic nicely
+        eprintln!(
+            "Warning: Did not find integration_node at {:?}, checking relative to CWD",
+            path
+        );
+        let cwd = std::env::current_dir().unwrap();
+        let try_path = cwd.join("target/debug/integration_node");
+        if try_path.exists() {
             return try_path;
-         }
-         panic!("Binary not found at expected path: {:?}", path);
+        }
+        panic!("Binary not found at expected path: {:?}", path);
     }
 
     path
@@ -52,11 +55,13 @@ fn test_bonded_transmission() {
     // binary_path is .../target/debug/integration_node
     // we want .../target/bonding_rcv.ts
     let output_path = binary_path
-        .parent().expect("debug dir")
-        .parent().expect("target dir")
+        .parent()
+        .expect("debug dir")
+        .parent()
+        .expect("target dir")
         .join("bonding_rcv.ts");
     let output_path_str = output_path.to_str().expect("Valid output path");
-    
+
     // Remove existing file to avoid false positives
     if output_path.exists() {
         let _ = std::fs::remove_file(&output_path);
@@ -99,19 +104,32 @@ fn test_bonded_transmission() {
 
     // DEBUG: Inspect interfaces
     let ip_out = rcv_ns.exec("ip", &["addr"]).unwrap();
-    println!("RCV Netns Interfaces:\n{}", String::from_utf8_lossy(&ip_out.stdout));
+    println!(
+        "RCV Netns Interfaces:\n{}",
+        String::from_utf8_lossy(&ip_out.stdout)
+    );
 
     // DEBUG: Verify connectivity via Ping
     println!("Verifying Link A connectivity...");
-    let ping_a = snd_ns.exec("ping", &["-c", "1", "10.10.1.2"]).expect("Failed to exec ping A");
+    let ping_a = snd_ns
+        .exec("ping", &["-c", "1", "10.10.1.2"])
+        .expect("Failed to exec ping A");
     if !ping_a.status.success() {
-         panic!("Ping Link A failed: {}", String::from_utf8_lossy(&ping_a.stderr));
+        panic!(
+            "Ping Link A failed: {}",
+            String::from_utf8_lossy(&ping_a.stderr)
+        );
     }
 
     println!("Verifying Link B connectivity...");
-    let ping_b = snd_ns.exec("ping", &["-c", "1", "10.10.2.2"]).expect("Failed to exec ping B");
+    let ping_b = snd_ns
+        .exec("ping", &["-c", "1", "10.10.2.2"])
+        .expect("Failed to exec ping B");
     if !ping_b.status.success() {
-         panic!("Ping Link B failed: {}", String::from_utf8_lossy(&ping_b.stderr));
+        panic!(
+            "Ping Link B failed: {}",
+            String::from_utf8_lossy(&ping_b.stderr)
+        );
     }
 
     // 4. Spawn Receiver (Background)
@@ -125,7 +143,7 @@ fn test_bonded_transmission() {
         "--bind",
         "rist://@10.10.1.2:5000,rist://@10.10.2.2:5002",
         "--output",
-        output_path_str // Output TS file (absolute path)
+        output_path_str, // Output TS file (absolute path)
     ];
 
     let mut receiver_child = Command::new("sudo")
@@ -157,8 +175,8 @@ fn test_bonded_transmission() {
         .args(&sender_cmd_args)
         .status()
         .expect("Failed to execute sender process");
-    
-    // Sender now runs for approx 15s (450 buffers), so this call will block for that duration.
+
+    // Sender now runs for approx 20s (1200 buffers @ 60fps with 1080p video), so this call will block for that duration.
 
     // Allow receiver time to finish processing buffers
     thread::sleep(Duration::from_secs(2));
@@ -166,17 +184,27 @@ fn test_bonded_transmission() {
     // Send SIGINT to receiver to trigger graceful shutdown (and MP4 finalization)
     println!("Sender finished. Sending SIGINT to receiver...");
     let status = Command::new("sudo")
-        .args(&["ip", "netns", "exec", "bonding_rcv", "pkill", "-SIGINT", "-f", "integration_node"])
+        .args(&[
+            "ip",
+            "netns",
+            "exec",
+            "bonding_rcv",
+            "pkill",
+            "-SIGINT",
+            "-f",
+            "integration_node",
+        ])
         .status()
         .expect("Failed to send pkill");
-    
+
     if !status.success() {
         println!("Warning: Failed to pkill receiver (maybe it already exited?)");
     }
 
     // Wait for receiver to exit. It should exit quickly after SIGINT with EOS handling.
     let mut finished = false;
-    for _ in 0..10 { // Wait up to 10s
+    for _ in 0..10 {
+        // Wait up to 10s
         if let Ok(Some(_)) = receiver_child.try_wait() {
             finished = true;
             break;
@@ -185,8 +213,8 @@ fn test_bonded_transmission() {
     }
 
     if !finished {
-         println!("Receiver did not exit in time after SIGINT. Killing...");
-         let _ = receiver_child.kill();
+        println!("Receiver did not exit in time after SIGINT. Killing...");
+        let _ = receiver_child.kill();
     }
 
     let receiver_output = receiver_child
@@ -204,21 +232,30 @@ fn test_bonded_transmission() {
 
     // println!("Receiver Stdout:\n{}", stdout);
     // println!("Receiver Stderr:\n{}", stderr);
-    
+
     // Sometimes stderr is empty if the process crashes hard or buffers weirdly with sudo.
     // If output file exists and is > 0 bytes, we consider it a partial success for data flow.
-    let file_check = output_path.exists() && std::fs::metadata(&output_path).map(|m| m.len() > 0).unwrap_or(false);
+    let file_check = output_path.exists()
+        && std::fs::metadata(&output_path)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
 
     if file_check {
-        println!("Success: Output file created at {:?} and has data.", output_path);
+        println!(
+            "Success: Output file created at {:?} and has data.",
+            output_path
+        );
     } else if !stderr.contains("rist-bonding-stats") {
-         println!("Receiver Stderr Dump:\n{}", stderr);
-         panic!("Data flow verification failed (No stats in stderr and no output file at {:?})", output_path);
+        println!("Receiver Stderr Dump:\n{}", stderr);
+        panic!(
+            "Data flow verification failed (No stats in stderr and no output file at {:?})",
+            output_path
+        );
     }
-    
+
     // Verify final stats
     // Receiver Final Stats: Count=..., Bytes=...
     if !stderr.contains("Receiver Final Stats: Count=") {
-         println!("WARNING: Receiver did not exit cleanly or print final stats.");
+        println!("WARNING: Receiver did not exit cleanly or print final stats.");
     }
 }

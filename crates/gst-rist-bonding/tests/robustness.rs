@@ -1,11 +1,11 @@
+use rist_network_sim::impairment::{apply_impairment, ImpairmentConfig};
+use rist_network_sim::scenario::{LinkScenarioConfig, Scenario, ScenarioConfig};
 use rist_network_sim::topology::Namespace;
-use rist_network_sim::impairment::{ImpairmentConfig, apply_impairment};
-use rist_network_sim::scenario::{Scenario, ScenarioConfig, LinkScenarioConfig};
-use std::process::Command;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use std::sync::Arc;
 
 fn check_privileges() -> bool {
     // Check if we can run sudo without password
@@ -24,14 +24,29 @@ fn test_race_car_scenarios() {
 
     // 1. Setup Namespaces
     let sender_ns = Arc::new(Namespace::new("rst_race_snd").expect("Failed to create sender ns"));
-    let receiver_ns = Arc::new(Namespace::new("rst_race_rcv").expect("Failed to create receiver ns"));
+    let receiver_ns =
+        Arc::new(Namespace::new("rst_race_rcv").expect("Failed to create receiver ns"));
 
     // Link 1: 10.0.30.x (Main High Speed Link)
-    sender_ns.add_veth_link(&receiver_ns, "race_veth1_a", "race_veth1_b", "10.0.30.1/24", "10.0.30.2/24")
+    sender_ns
+        .add_veth_link(
+            &receiver_ns,
+            "race_veth1_a",
+            "race_veth1_b",
+            "10.0.30.1/24",
+            "10.0.30.2/24",
+        )
         .expect("Failed to create link 1");
-    
+
     // Link 2: 10.0.40.x (Backup / Control Link)
-    sender_ns.add_veth_link(&receiver_ns, "race_veth2_a", "race_veth2_b", "10.0.40.1/24", "10.0.40.2/24")
+    sender_ns
+        .add_veth_link(
+            &receiver_ns,
+            "race_veth2_a",
+            "race_veth2_b",
+            "10.0.40.1/24",
+            "10.0.40.2/24",
+        )
         .expect("Failed to create link 2");
 
     // Initial State: Clean
@@ -51,40 +66,53 @@ fn test_race_car_scenarios() {
 
     // 2. Start Receiver
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_integration_node"));
-    
+
     let receiver_ns_clone = receiver_ns.clone();
     let exec_recv = executable.clone();
 
     let _receiver_handle = thread::spawn(move || {
-        let output = receiver_ns_clone.exec(
-            exec_recv.to_str().unwrap(),
-            &[
-                "receiver",
-                "--bind", "rist://10.0.30.2:1234,rist://10.0.40.2:1235",
-            ]
-        ).expect("Failed to run receiver");
-        println!("Receiver Output: {}", String::from_utf8_lossy(&output.stderr));
+        let output = receiver_ns_clone
+            .exec(
+                exec_recv.to_str().unwrap(),
+                &[
+                    "receiver",
+                    "--bind",
+                    "rist://10.0.30.2:1234,rist://10.0.40.2:1235",
+                ],
+            )
+            .expect("Failed to run receiver");
+        println!(
+            "Receiver Output: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     });
 
     // 3. Start Sender
     let sender_ns_clone = sender_ns.clone();
     let exec_send = executable.clone();
-    
+
     let _sender_handle = thread::spawn(move || {
         thread::sleep(Duration::from_secs(1));
-        let output = sender_ns_clone.exec(
-            exec_send.to_str().unwrap(),
-            &[
-                "sender",
-                "--dest", "rist://10.0.30.2:1234,rist://10.0.40.2:1235",
-                "--bitrate", "4000" // 4Mbps target.
-            ]
-        ).expect("Failed to run sender");
+        let output = sender_ns_clone
+            .exec(
+                exec_send.to_str().unwrap(),
+                &[
+                    "sender",
+                    "--dest",
+                    "rist://10.0.30.2:1234,rist://10.0.40.2:1235",
+                    "--bitrate",
+                    "4000", // 4Mbps target.
+                ],
+            )
+            .expect("Failed to run sender");
         // We print stdout/stderr to inspect later
-        println!("Sender Output Log:\n{}", String::from_utf8_lossy(&output.stderr));
+        println!(
+            "Sender Output Log:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         output
     });
-    
+
     // 4. Simulation Logic (Main Thread)
     println!(">>> SIMULATION: Started. Seeded dynamic scenario.");
     let scenario_start = Instant::now();
@@ -144,12 +172,8 @@ fn test_race_car_scenarios() {
         );
     }
 
-    // Wait for Sender to finish (Assuming 3000 buffers runs longer than 35s... wait, 3000 buffers @ 30fps is 100s)
-    // We should probably kill the sender early to check logs, or just wait?
-    // Waiting 65s more is boring.
-    // I will rely on manual inspection or assume if it didn't crash it's fine.
-    // But verify the "Sender Output Log" appears in test output.
-    
+    // Wait for Sender to finish (Now using 1200 buffers @ 60fps = 20s of video)
+    // The test runs for 35s, so sender will finish before the test ends
     // Just drop the sender_ns handles to kill processes?
     println!(">>> SIMULATION: End. Cleaning up.");
     // Dropping namespaces will kill processes.

@@ -58,12 +58,9 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     register_plugins()?;
 
     // Pipeline: videotestsrc ! x264enc ! mpegtsmux ! rsristbondsink (request pads)
-    // We send 3000 buffers (approx 100s at 30fps).
-    // Note: H264 Encoding might buffer frames, so we might not get exactly 450 out if we stop abruptly.
-    // We use tune=zerolatency to minimize this.
-    // Ensure PAT/PMT are sent effectively for quick lock.
+    // We send 1200 buffers (20s at 60fps) to ensure continuous flow beyond test duration.
     let pipeline_str = format!(
-        "videotestsrc num-buffers=3000 is-live=true pattern=ball ! video/x-raw,width=320,height=240 ! x264enc name=enc tune=zerolatency bitrate={} ! mpegtsmux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink name=rsink",
+        "videotestsrc num-buffers=1200 is-live=true pattern=smpte ! video/x-raw,width=1920,height=1080,framerate=60/1 ! x264enc name=enc tune=zerolatency bitrate={} ! mpegtsmux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink name=rsink",
         bitrate_kbps
     );
     eprintln!("Sender Pipeline: {}", pipeline_str);
@@ -141,7 +138,8 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             let heartbeat = s.get::<bool>("heartbeat").unwrap_or(false);
                             let mono_time_ns = s.get::<u64>("mono_time_ns").unwrap_or(0);
                             let wall_time_ms = s.get::<u64>("wall_time_ms").unwrap_or(0);
-                            let total_capacity_field = s.get::<f64>("total_capacity").unwrap_or(0.0);
+                            let total_capacity_field =
+                                s.get::<f64>("total_capacity").unwrap_or(0.0);
                             let alive_links = s.get::<u64>("alive_links").unwrap_or(0);
 
                             let mut total_cap = if total_capacity_field > 0.0 {
@@ -163,9 +161,8 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 if s.has_field(&format!("{}alive", prefix)) {
                                     let alive =
                                         s.get::<bool>(&format!("{}alive", prefix)).unwrap_or(false);
-                                    let cap = s
-                                        .get::<f64>(&format!("{}capacity", prefix))
-                                        .unwrap_or(0.0);
+                                    let cap =
+                                        s.get::<f64>(&format!("{}capacity", prefix)).unwrap_or(0.0);
                                     let observed_bps = s
                                         .get::<f64>(&format!("{}observed_bps", prefix))
                                         .unwrap_or(0.0);
