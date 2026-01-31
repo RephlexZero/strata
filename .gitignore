@@ -37,3 +37,7 @@ tmp/
 # Archives
 archive/
 docs/archive/
+
+# Test result artifacts
+*.csv
+*.svg

@@ -320,8 +320,13 @@ mod imp {
             }
 
             if let Some(rt) = self.runtime.lock().unwrap().as_ref() {
-                let pending: Vec<LinkConfig> =
-                    self.pending_links.lock().unwrap().drain().map(|(_, v)| v).collect();
+                let pending: Vec<LinkConfig> = self
+                    .pending_links
+                    .lock()
+                    .unwrap()
+                    .drain()
+                    .map(|(_, v)| v)
+                    .collect();
                 for link in pending {
                     let _ = rt.add_link(link);
                 }

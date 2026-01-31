@@ -121,7 +121,12 @@ fn runtime_worker(rx: Receiver<RuntimeMessage>, metrics: Arc<Mutex<HashMap<usize
                 }
                 RuntimeMessage::ApplyConfig(config) => {
                     lifecycle_config = config.lifecycle.clone();
-                    apply_config(&mut scheduler, &mut current_links, &lifecycle_config, config);
+                    apply_config(
+                        &mut scheduler,
+                        &mut current_links,
+                        &lifecycle_config,
+                        config,
+                    );
                 }
                 RuntimeMessage::Shutdown => break,
             },
@@ -176,9 +181,7 @@ fn apply_config(
                 Err(err) => {
                     warn!(
                         "Failed to create link id={} uri={}: {}",
-                        link.id,
-                        link.uri,
-                        err
+                        link.id, link.uri, err
                     );
                 }
             }
@@ -206,9 +209,7 @@ fn apply_link(
         Err(err) => {
             warn!(
                 "Failed to create link id={} uri={}: {}",
-                link.id,
-                link.uri,
-                err
+                link.id, link.uri, err
             );
         }
     }
