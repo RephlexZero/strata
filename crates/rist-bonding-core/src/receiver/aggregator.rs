@@ -18,6 +18,7 @@ pub struct ReassemblyBuffer {
     skip_after: Option<Duration>,
     pub lost_packets: u64,
     pub late_packets: u64,
+    pub duplicate_packets: u64,
 
     // Adaptive Latency Calculation
     last_arrival: Option<Instant>,
@@ -49,6 +50,7 @@ pub struct ReassemblyStats {
     pub next_seq: u64,
     pub lost_packets: u64,
     pub late_packets: u64,
+    pub duplicate_packets: u64,
     pub current_latency_ms: u64,
 }
 
@@ -85,6 +87,7 @@ impl ReassemblyBuffer {
             skip_after: config.skip_after,
             lost_packets: 0,
             late_packets: 0,
+            duplicate_packets: 0,
             last_arrival: None,
             avg_iat: 0.0,
             jitter_smoothed: 0.0,
@@ -98,6 +101,7 @@ impl ReassemblyBuffer {
             next_seq: self.next_seq,
             lost_packets: self.lost_packets,
             late_packets: self.late_packets,
+            duplicate_packets: self.duplicate_packets,
             current_latency_ms: self.latency.as_millis() as u64,
         }
     }
@@ -154,7 +158,12 @@ impl ReassemblyBuffer {
 
         let idx = self.buffer_index(seq_id);
         if let Some(existing) = &self.buffer[idx] {
-            if existing.seq_id != seq_id && existing.seq_id >= self.next_seq {
+            if existing.seq_id == seq_id {
+                // Duplicate packet (same seq_id arrived again)
+                self.duplicate_packets += 1;
+                return;  // Don't overwrite
+            } else if existing.seq_id >= self.next_seq {
+                // Different packet in this slot, was lost
                 self.lost_packets += 1;
             }
         } else {
@@ -406,5 +415,52 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], Bytes::from_static(b"P20"));
         assert!(buf.lost_packets > 0);
+    }
+
+    #[test]
+    fn test_duplicate_packet_counting() {
+        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(100));
+        let start = Instant::now();
+
+        // Push packet with seq_id 0
+        buf.push(0, Bytes::from_static(b"P0-original"), start);
+        assert_eq!(buf.duplicate_packets, 0);
+
+        // Push same seq_id again (duplicate)
+        buf.push(0, Bytes::from_static(b"P0-duplicate"), start);
+        assert_eq!(buf.duplicate_packets, 1);
+
+        // Push another different packet
+        buf.push(1, Bytes::from_static(b"P1"), start);
+        assert_eq!(buf.duplicate_packets, 1); // Still 1
+
+        // Push duplicate of seq_id 1
+        buf.push(1, Bytes::from_static(b"P1-duplicate"), start);
+        assert_eq!(buf.duplicate_packets, 2);
+
+        // Verify stats expose duplicate count
+        let stats = buf.get_stats();
+        assert_eq!(stats.duplicate_packets, 2);
+    }
+
+    #[test]
+    fn test_duplicate_vs_late_packets() {
+        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(100));
+        let start = Instant::now();
+
+        // Push packet 0 and 1
+        buf.push(0, Bytes::from_static(b"P0"), start);
+        buf.push(1, Bytes::from_static(b"P1"), start);
+
+        // Release them
+        let out = buf.tick(start + Duration::from_millis(100));
+        assert_eq!(out.len(), 2);
+
+        // Now push seq_id 0 again - this is LATE, not duplicate
+        // (because next_seq has advanced past it)
+        buf.push(0, Bytes::from_static(b"P0-late"), start + Duration::from_millis(120));
+        
+        assert_eq!(buf.late_packets, 1);
+        assert_eq!(buf.duplicate_packets, 0); // Not counted as duplicate
     }
 }
