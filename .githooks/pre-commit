@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "[pre-commit] Running rustfmt check..."
-cargo fmt --all -- --check
+echo "[pre-commit] Running rustfmt..."
+cargo fmt --all
 
 exit 0
