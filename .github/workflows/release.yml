@@ -63,13 +63,13 @@ jobs:
       - name: Package
         run: |
           mkdir -p staging
-          cp target/release/libgstristbonding.so staging/
-          cd staging && tar czf ../strata-${{ github.ref_name }}-x86_64-linux-gnu.tar.gz *
+          cp target/release/libgstristbonding.so \
+            staging/strata-${{ github.ref_name }}-x86_64-linux-gnu.so
 
       - uses: actions/upload-artifact@v4
         with:
           name: release-x86_64
-          path: strata-*.tar.gz
+          path: staging/*.so
 
   build-aarch64:
     name: Build aarch64
@@ -118,13 +118,13 @@ jobs:
       - name: Package
         run: |
           mkdir -p staging
-          cp cross-output/libgstristbonding.so staging/ 2>/dev/null || true
-          cd staging && tar czf ../strata-${{ github.ref_name }}-aarch64-linux-gnu.tar.gz *
+          cp cross-output/libgstristbonding.so \
+            staging/strata-${{ github.ref_name }}-aarch64-linux-gnu.so
 
       - uses: actions/upload-artifact@v4
         with:
           name: release-aarch64
-          path: strata-*.tar.gz
+          path: staging/*.so
 
   release:
     name: Create GitHub Release
@@ -152,7 +152,7 @@ jobs:
           generate_release_notes: ${{ steps.tag_body.outputs.body == '' }}
           body: ${{ steps.tag_body.outputs.body }}
           files: |
-            artifacts/release-x86_64/*.tar.gz
-            artifacts/release-aarch64/*.tar.gz
+            artifacts/release-x86_64/*.so
+            artifacts/release-aarch64/*.so
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
