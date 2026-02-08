@@ -129,6 +129,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          pattern: release-*
           path: artifacts
 
       - name: Create release
