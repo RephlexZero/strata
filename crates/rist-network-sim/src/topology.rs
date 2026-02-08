@@ -7,17 +7,19 @@ pub struct Namespace {
 impl Namespace {
     pub fn new(name: &str) -> Result<Self, std::io::Error> {
         // cleanup any existing namespace with the same name
-        let _ = Command::new("sudo").args(["ip", "netns", "del", name]).output();
+        let _ = Command::new("sudo")
+            .args(["ip", "netns", "del", name])
+            .output();
 
-        let output = Command::new("sudo").args(["ip", "netns", "add", name]).output()?;
+        let output = Command::new("sudo")
+            .args(["ip", "netns", "add", name])
+            .output()?;
 
         if !output.status.success() {
-            return Err(std::io::Error::other(
-                format!(
-                    "Failed to create netns: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Failed to create netns: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
 
         // Initialize loopback
@@ -66,12 +68,10 @@ impl Namespace {
             .output()?;
 
         if !output.status.success() {
-            return Err(std::io::Error::other(
-                format!(
-                    "Failed to create veth pair: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Failed to create veth pair: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
 
         // 2. Move veth_local to self
@@ -79,12 +79,10 @@ impl Namespace {
             .args(["ip", "link", "set", veth_name_local, "netns", &self.name])
             .output()?;
         if !output.status.success() {
-            return Err(std::io::Error::other(
-                format!(
-                    "Failed to move local veth: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Failed to move local veth: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
 
         // 3. Move veth_peer to other
@@ -92,52 +90,42 @@ impl Namespace {
             .args(["ip", "link", "set", veth_name_peer, "netns", &other.name])
             .output()?;
         if !output.status.success() {
-            return Err(std::io::Error::other(
-                format!(
-                    "Failed to move peer veth: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Failed to move peer veth: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
 
         // 4. Configure self (local side)
         let output = self.exec("ip", &["addr", "add", ip_local, "dev", veth_name_local])?;
         if !output.status.success() {
-            return Err(std::io::Error::other(
-                format!(
-                    "Failed to set local IP: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Failed to set local IP: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
         let output = self.exec("ip", &["link", "set", veth_name_local, "up"])?;
         if !output.status.success() {
-            return Err(std::io::Error::other(
-                format!(
-                    "Failed to set local link up: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Failed to set local link up: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
 
         // 5. Configure other (peer side)
         let output = other.exec("ip", &["addr", "add", ip_peer, "dev", veth_name_peer])?;
         if !output.status.success() {
-            return Err(std::io::Error::other(
-                format!(
-                    "Failed to set peer IP: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Failed to set peer IP: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
         let output = other.exec("ip", &["link", "set", veth_name_peer, "up"])?;
         if !output.status.success() {
-            return Err(std::io::Error::other(
-                format!(
-                    "Failed to set peer link up: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Failed to set peer link up: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
 
         Ok(())
@@ -193,7 +181,10 @@ mod tests {
         // Use random suffix/distinct names to avoid parallel conflicts
         // Interface name limit is 15 chars. "veth_a_" is 7 chars. We have 8 chars left.
         use std::time::{SystemTime, UNIX_EPOCH};
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
         let suffix = now % 100000; // 5 digits
         let v_a = format!("veth_a_{}", suffix);
         let v_b = format!("veth_b_{}", suffix);

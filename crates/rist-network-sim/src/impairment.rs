@@ -167,7 +167,14 @@ mod tests {
             ..Default::default()
         };
 
-        apply_impairment(&ns1, "veth_a", config).expect("Failed to apply impairment");
+        if let Err(err) = apply_impairment(&ns1, "veth_a", config) {
+            let msg = err.to_string();
+            if msg.contains("qdisc kind is unknown") {
+                eprintln!("Skipping test_impairment, netem qdisc not available");
+                return;
+            }
+            panic!("Failed to apply impairment: {}", err);
+        }
 
         // Ping
         let out = ns1

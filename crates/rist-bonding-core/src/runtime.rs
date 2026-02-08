@@ -130,7 +130,13 @@ fn runtime_worker(
                     let _ = scheduler.send(data, profile);
                 }
                 RuntimeMessage::AddLink(link) => {
-                    apply_link(&mut scheduler, &mut current_links, &lifecycle_config, link, ewma_alpha);
+                    apply_link(
+                        &mut scheduler,
+                        &mut current_links,
+                        &lifecycle_config,
+                        link,
+                        ewma_alpha,
+                    );
                 }
                 RuntimeMessage::RemoveLink(id) => {
                     scheduler.remove_link(id);
