@@ -1,6 +1,7 @@
-use crate::config::{BondingConfig, LinkConfig, LinkLifecycleConfig};
+use crate::config::{BondingConfig, LinkConfig, LinkLifecycleConfig, SchedulerConfig};
 use crate::net::interface::LinkMetrics;
 use crate::net::link::Link;
+use crate::net::wrapper::RecoveryConfig;
 use crate::scheduler::bonding::BondingScheduler;
 use crate::scheduler::PacketProfile;
 use bytes::Bytes;
@@ -33,11 +34,16 @@ pub struct BondingRuntime {
 
 impl BondingRuntime {
     pub fn new() -> Self {
-        let (tx, rx) = bounded(1000);
+        Self::with_config(SchedulerConfig::default())
+    }
+
+    pub fn with_config(scheduler_config: SchedulerConfig) -> Self {
+        let channel_capacity = scheduler_config.channel_capacity;
+        let (tx, rx) = bounded(channel_capacity);
         let metrics = Arc::new(Mutex::new(HashMap::new()));
         let metrics_clone = metrics.clone();
 
-        let handle = thread::spawn(move || runtime_worker(rx, metrics_clone));
+        let handle = thread::spawn(move || runtime_worker(rx, metrics_clone, scheduler_config));
 
         Self {
             sender: tx,
@@ -98,10 +104,15 @@ impl Drop for BondingRuntime {
     }
 }
 
-fn runtime_worker(rx: Receiver<RuntimeMessage>, metrics: Arc<Mutex<HashMap<usize, LinkMetrics>>>) {
-    let mut scheduler = BondingScheduler::new();
+fn runtime_worker(
+    rx: Receiver<RuntimeMessage>,
+    metrics: Arc<Mutex<HashMap<usize, LinkMetrics>>>,
+    scheduler_config: SchedulerConfig,
+) {
+    let mut scheduler = BondingScheduler::with_config(scheduler_config.clone());
     let mut current_links: HashMap<usize, LinkConfig> = HashMap::new();
     let mut lifecycle_config = LinkLifecycleConfig::default();
+    let mut ewma_alpha = scheduler_config.ewma_alpha;
 
     let mut last_fast_stats = Instant::now();
     let fast_stats_interval = Duration::from_millis(100);
@@ -113,7 +124,7 @@ fn runtime_worker(rx: Receiver<RuntimeMessage>, metrics: Arc<Mutex<HashMap<usize
                     let _ = scheduler.send(data, profile);
                 }
                 RuntimeMessage::AddLink(link) => {
-                    apply_link(&mut scheduler, &mut current_links, &lifecycle_config, link);
+                    apply_link(&mut scheduler, &mut current_links, &lifecycle_config, link, ewma_alpha);
                 }
                 RuntimeMessage::RemoveLink(id) => {
                     scheduler.remove_link(id);
@@ -121,11 +132,14 @@ fn runtime_worker(rx: Receiver<RuntimeMessage>, metrics: Arc<Mutex<HashMap<usize
                 }
                 RuntimeMessage::ApplyConfig(config) => {
                     lifecycle_config = config.lifecycle.clone();
+                    ewma_alpha = config.scheduler.ewma_alpha;
+                    scheduler.update_config(config.scheduler.clone());
                     apply_config(
                         &mut scheduler,
                         &mut current_links,
                         &lifecycle_config,
                         config,
+                        ewma_alpha,
                     );
                 }
                 RuntimeMessage::Shutdown => break,
@@ -149,6 +163,7 @@ fn apply_config(
     current_links: &mut HashMap<usize, LinkConfig>,
     lifecycle_config: &LinkLifecycleConfig,
     config: BondingConfig,
+    ewma_alpha: f64,
 ) {
     let desired_ids: std::collections::HashSet<usize> = config.links.iter().map(|l| l.id).collect();
 
@@ -168,11 +183,14 @@ fn apply_config(
 
         if needs_update {
             scheduler.remove_link(link.id);
-            match Link::new_with_iface(
+            let recovery = recovery_config_from_link(&link);
+            match Link::new_with_full_config(
                 link.id,
                 &link.uri,
                 link.interface.clone(),
                 lifecycle_config.clone(),
+                recovery,
+                Some(ewma_alpha),
             ) {
                 Ok(new_link) => {
                     scheduler.add_link(Arc::new(new_link));
@@ -194,13 +212,17 @@ fn apply_link(
     current_links: &mut HashMap<usize, LinkConfig>,
     lifecycle_config: &LinkLifecycleConfig,
     link: LinkConfig,
+    ewma_alpha: f64,
 ) {
     scheduler.remove_link(link.id);
-    match Link::new_with_iface(
+    let recovery = recovery_config_from_link(&link);
+    match Link::new_with_full_config(
         link.id,
         &link.uri,
         link.interface.clone(),
         lifecycle_config.clone(),
+        recovery,
+        Some(ewma_alpha),
     ) {
         Ok(new_link) => {
             scheduler.add_link(Arc::new(new_link));
@@ -212,5 +234,21 @@ fn apply_link(
                 link.id, link.uri, err
             );
         }
+    }
+}
+
+/// Build a RecoveryConfig from the link's optional recovery parameters.
+fn recovery_config_from_link(link: &LinkConfig) -> Option<RecoveryConfig> {
+    if link.recovery_maxbitrate.is_some()
+        || link.recovery_rtt_max.is_some()
+        || link.recovery_reorder_buffer.is_some()
+    {
+        Some(RecoveryConfig {
+            recovery_maxbitrate: link.recovery_maxbitrate,
+            recovery_rtt_max: link.recovery_rtt_max,
+            recovery_reorder_buffer: link.recovery_reorder_buffer,
+        })
+    } else {
+        None
     }
 }

@@ -15,17 +15,23 @@ pub struct EwmaStats {
     pub last_stats_ms: u64,
 }
 
-impl Default for EwmaStats {
-    fn default() -> Self {
+impl EwmaStats {
+    pub fn with_alpha(alpha: f64) -> Self {
         Self {
-            rtt: Ewma::new(0.125),
-            bandwidth: Ewma::new(0.125),
-            loss: Ewma::new(0.125),
+            rtt: Ewma::new(alpha),
+            bandwidth: Ewma::new(alpha),
+            loss: Ewma::new(alpha),
             last_sent: 0,
             last_lost: 0,
             last_rex: 0,
             last_stats_ms: 0,
         }
+    }
+}
+
+impl Default for EwmaStats {
+    fn default() -> Self {
+        Self::with_alpha(0.125)
     }
 }
 
@@ -48,6 +54,10 @@ pub struct LinkStats {
 
 impl LinkStats {
     pub fn new(lifecycle_config: LinkLifecycleConfig) -> Self {
+        Self::with_ewma_alpha(lifecycle_config, 0.125)
+    }
+
+    pub fn with_ewma_alpha(lifecycle_config: LinkLifecycleConfig, ewma_alpha: f64) -> Self {
         Self {
             rtt: AtomicU64::new(0),
             bandwidth: AtomicU64::new(0),
@@ -61,7 +71,7 @@ impl LinkStats {
             os_up_i32: AtomicI32::new(-1),
             mtu_i32: AtomicI32::new(-1),
             os_last_poll_ms: AtomicU64::new(0),
-            ewma_state: Mutex::new(EwmaStats::default()),
+            ewma_state: Mutex::new(EwmaStats::with_alpha(ewma_alpha)),
             lifecycle: Mutex::new(LinkLifecycle::new(lifecycle_config)),
         }
     }

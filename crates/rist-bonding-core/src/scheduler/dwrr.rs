@@ -1,3 +1,4 @@
+use crate::config::SchedulerConfig;
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,6 +14,7 @@ pub(crate) struct LinkState<L: ?Sized> {
     pub last_sent_at: Instant,
     pub measured_bps: f64,
     pub spare_capacity_bps: f64,
+    pub has_traffic: bool,
     pub prev_capacity_bps: f64,
     pub prev_rtt_ms: f64,
     pub prev_loss_rate: f64,
@@ -27,6 +29,7 @@ pub struct Dwrr<L: LinkSender + ?Sized> {
     links: HashMap<usize, LinkState<L>>,
     sorted_ids: Vec<usize>,
     current_rr_idx: usize,
+    config: SchedulerConfig,
 }
 
 fn compute_burst_window_s(phase: LinkPhase, loss_rate: f64) -> f64 {
@@ -44,11 +47,24 @@ fn compute_burst_window_s(phase: LinkPhase, loss_rate: f64) -> f64 {
 
 impl<L: LinkSender + ?Sized> Dwrr<L> {
     pub fn new() -> Self {
+        Self::with_config(SchedulerConfig::default())
+    }
+
+    pub fn with_config(config: SchedulerConfig) -> Self {
         Self {
             links: HashMap::new(),
             sorted_ids: Vec::new(),
             current_rr_idx: 0,
+            config,
         }
+    }
+
+    pub fn config(&self) -> &SchedulerConfig {
+        &self.config
+    }
+
+    pub fn update_config(&mut self, config: SchedulerConfig) {
+        self.config = config;
     }
 
     pub fn add_link(&mut self, link: Arc<L>) {
@@ -66,7 +82,8 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 last_sent_bytes: 0,
                 last_sent_at: now,
                 measured_bps: 0.0,
-                spare_capacity_bps: metrics.capacity_bps,
+                spare_capacity_bps: 0.0,
+                has_traffic: false,
                 prev_capacity_bps: metrics.capacity_bps,
                 prev_rtt_ms: metrics.rtt_ms,
                 prev_loss_rate: metrics.loss_rate,
@@ -82,6 +99,10 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
     }
 
     pub fn refresh_metrics(&mut self) {
+        let capacity_floor = self.config.capacity_floor_bps;
+        let penalty_decay = self.config.penalty_decay;
+        let penalty_recovery = self.config.penalty_recovery;
+
         for state in self.links.values_mut() {
             let now = Instant::now();
             state.metrics = state.link.get_metrics();
@@ -90,6 +111,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 let delta_bytes = state.sent_bytes.saturating_sub(state.last_sent_bytes);
                 if delta_bytes > 0 {
                     state.measured_bps = (delta_bytes as f64 * 8.0) / dt_sent;
+                    state.has_traffic = true;
                 }
                 state.last_sent_bytes = state.sent_bytes;
                 state.last_sent_at = now;
@@ -98,28 +120,33 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             state.metrics.observed_bps = state.measured_bps;
             state.metrics.observed_bytes = state.sent_bytes;
 
-            // Calculate spare capacity: available bandwidth not currently utilized
-            state.spare_capacity_bps = (state.metrics.capacity_bps - state.measured_bps).max(0.0);
+            // Calculate spare capacity: only when we have observed traffic,
+            // otherwise spare is 0 to prevent premature duplication at startup
+            if state.has_traffic {
+                state.spare_capacity_bps =
+                    (state.metrics.capacity_bps - state.measured_bps).max(0.0);
+            } else {
+                state.spare_capacity_bps = 0.0;
+            }
 
             if state.metrics.observed_bps > 0.0 {
                 state.metrics.alive = true;
             }
 
             if state.metrics.capacity_bps < 1_000_000.0 {
-                let default_bps = 5_000_000.0; // Start with 5 Mbps floor
-                                               // Use measured + aggressive probing factor to allow ramp up
-                if state.measured_bps > (default_bps * 0.3) {
+                // Use configured capacity floor for bootstrap
+                if state.measured_bps > (capacity_floor * 0.3) {
                     state.metrics.capacity_bps = state.measured_bps * 2.0;
                 } else {
-                    state.metrics.capacity_bps = default_bps;
+                    state.metrics.capacity_bps = capacity_floor;
                 }
             }
             let prev_capacity = state.prev_capacity_bps;
             let curr_capacity = state.metrics.capacity_bps;
             if prev_capacity > 0.0 && curr_capacity < prev_capacity * 0.5 {
-                state.penalty_factor = (state.penalty_factor * 0.7).max(0.3);
+                state.penalty_factor = (state.penalty_factor * penalty_decay).max(0.3);
             } else {
-                state.penalty_factor = (state.penalty_factor + 0.05).min(1.0);
+                state.penalty_factor = (state.penalty_factor + penalty_recovery).min(1.0);
             }
 
             let dt = now.duration_since(state.last_metrics_update).as_secs_f64();
@@ -157,6 +184,15 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
     pub fn record_send(&mut self, id: usize, bytes: u64) {
         if let Some(state) = self.links.get_mut(&id) {
             state.sent_bytes = state.sent_bytes.saturating_add(bytes);
+            state.has_traffic = true;
+        }
+    }
+
+    /// Mark a link as having traffic (for testing). In production, this is set
+    /// automatically when bytes are sent or observed.
+    pub fn mark_has_traffic(&mut self, id: usize) {
+        if let Some(state) = self.links.get_mut(&id) {
+            state.has_traffic = true;
         }
     }
 
@@ -166,10 +202,8 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         self.links
             .values()
             .filter(|state| {
-                matches!(
-                    state.metrics.phase,
-                    LinkPhase::Live | LinkPhase::Warm
-                ) && state.metrics.alive
+                matches!(state.metrics.phase, LinkPhase::Live | LinkPhase::Warm)
+                    && state.metrics.alive
             })
             .map(|state| state.spare_capacity_bps)
             .sum()
@@ -215,10 +249,10 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                     LinkPhase::Probe => 0.3,
                     _ => 0.1,
                 };
-                
+
                 let quality_score = state.metrics.capacity_bps
                     * (loss_quality * 0.5 + rtt_quality * 0.3 + phase_weight * 0.2);
-                
+
                 (*id, quality_score, state.metrics.link_kind.clone())
             })
             .collect();
@@ -234,10 +268,10 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
 
             // Diversity preference: prefer new link_kind if we have multiple links
             let is_diverse = match link_kind {
-                None => true,  // Unknown kind is always considered diverse
+                None => true, // Unknown kind is always considered diverse
                 Some(kind) => !used_kinds.contains(kind.as_str()),
             };
-            
+
             // Always select if we haven't reached N, but prefer diverse links first
             if is_diverse || selected.len() < n {
                 if let Some(state) = self.links.get_mut(id) {
@@ -275,6 +309,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
 
         let packet_cost = packet_len as f64;
         let now = Instant::now();
+        let horizon_s = self.config.prediction_horizon_s;
 
         // 1. Update Credits
         let any_alive = self.links.values().any(|state| state.metrics.alive);
@@ -284,8 +319,6 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 let elapsed = now.duration_since(state.last_update).as_secs_f64();
 
                 // Calculate Effective Capacity (Quality Aware)
-                // Penalty for loss: (1.0 - loss_rate)^4 to aggressively penalize bad links.
-                let horizon_s = 0.5;
                 let predicted_bw =
                     (metrics.capacity_bps + state.bw_slope_bps_s * horizon_s).max(0.0);
                 let predicted_loss =
@@ -554,17 +587,21 @@ mod tests {
         let mut dwrr = Dwrr::new();
         dwrr.add_link(link.clone());
 
-        // Initial state - no observed traffic yet
+        // Initial state - no traffic yet, spare should be 0 (not full capacity)
         dwrr.refresh_metrics();
         let state = dwrr.links.get(&1).unwrap();
-        assert_eq!(state.spare_capacity_bps, 10_000_000.0);
+        assert_eq!(
+            state.spare_capacity_bps, 0.0,
+            "spare should be 0 before any traffic"
+        );
 
-        // Simulate observed traffic at 6 Mbps
+        // Simulate observed traffic at 6 Mbps (mark has_traffic)
         if let Some(state) = dwrr.links.get_mut(&1) {
             state.measured_bps = 6_000_000.0;
+            state.has_traffic = true;
         }
         dwrr.refresh_metrics();
-        
+
         let state = dwrr.links.get(&1).unwrap();
         assert_eq!(state.spare_capacity_bps, 4_000_000.0); // 10M - 6M
     }
@@ -574,25 +611,28 @@ mod tests {
         let link1 = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
         let link2 = Arc::new(MockLink::new(2, 5_000_000.0, LinkPhase::Live));
         let link3 = Arc::new(MockLink::new(3, 8_000_000.0, LinkPhase::Probe));
-        
+
         let mut dwrr = Dwrr::new();
         dwrr.add_link(link1.clone());
         dwrr.add_link(link2.clone());
         dwrr.add_link(link3.clone());
 
-        // Set observed traffic
+        // Set observed traffic and mark as having traffic
         if let Some(state) = dwrr.links.get_mut(&1) {
             state.measured_bps = 7_000_000.0; // 3M spare
+            state.has_traffic = true;
         }
         if let Some(state) = dwrr.links.get_mut(&2) {
             state.measured_bps = 3_000_000.0; // 2M spare
+            state.has_traffic = true;
         }
         if let Some(state) = dwrr.links.get_mut(&3) {
             state.measured_bps = 1_000_000.0; // 7M spare but link is Probe
+            state.has_traffic = true;
         }
-        
+
         dwrr.refresh_metrics();
-        
+
         let total_spare = dwrr.total_spare_capacity();
         // Only Link1 (3M) + Link2 (2M) = 5M (Link3 excluded as Probe phase)
         assert_eq!(total_spare, 5_000_000.0);
@@ -604,7 +644,7 @@ mod tests {
         let wifi_link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
         let cellular_link = Arc::new(MockLink::new(2, 8_000_000.0, LinkPhase::Live));
         let wired_link = Arc::new(MockLink::new(3, 12_000_000.0, LinkPhase::Live));
-        
+
         // Set link_kind for diversity
         if let Ok(mut m) = wifi_link.metrics.lock() {
             m.link_kind = Some("wifi".to_string());
@@ -615,18 +655,18 @@ mod tests {
         if let Ok(mut m) = wired_link.metrics.lock() {
             m.link_kind = Some("wired".to_string());
         }
-        
+
         let mut dwrr = Dwrr::new();
         dwrr.add_link(wifi_link.clone());
         dwrr.add_link(cellular_link.clone());
         dwrr.add_link(wired_link.clone());
-        
+
         dwrr.refresh_metrics();
-        
+
         // Select best 2 links - should prefer diverse kinds
         let selected = dwrr.select_best_n_links(1000, 2);
         assert_eq!(selected.len(), 2);
-        
+
         // Should get wired (highest capacity) and wifi (second highest)
         let ids: Vec<usize> = selected.iter().map(|l| l.id()).collect();
         assert!(ids.contains(&3)); // Wired should be selected

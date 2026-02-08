@@ -12,6 +12,7 @@ pub struct BondingConfigInput {
     pub links: Vec<LinkConfigInput>,
     pub receiver: ReceiverConfigInput,
     pub lifecycle: LinkLifecycleConfigInput,
+    pub scheduler: SchedulerConfigInput,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -51,6 +52,49 @@ pub struct LinkLifecycleConfigInput {
     pub degrade_to_warm_good: Option<u32>,
     pub degrade_to_cooldown_bad: Option<u32>,
     pub cooldown_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct SchedulerConfigInput {
+    /// Master toggle for adaptive packet duplication
+    pub redundancy_enabled: Option<bool>,
+    /// Spare capacity ratio threshold to trigger duplication (0.0-1.0)
+    pub redundancy_spare_ratio: Option<f64>,
+    /// Max packet size in bytes eligible for duplication
+    pub redundancy_max_packet_bytes: Option<usize>,
+    /// Number of links to duplicate to
+    pub redundancy_target_links: Option<usize>,
+    /// Whether critical packets (keyframes) broadcast to all alive links
+    pub critical_broadcast: Option<bool>,
+    /// Master toggle for fast-failover mode
+    pub failover_enabled: Option<bool>,
+    /// Duration of failover broadcast after trigger (ms)
+    pub failover_duration_ms: Option<u64>,
+    /// RTT multiple to trigger failover
+    pub failover_rtt_spike_factor: Option<f64>,
+    /// Recommended bitrate as fraction of capacity (0.0-1.0)
+    pub congestion_headroom_ratio: Option<f64>,
+    /// Observed/capacity ratio that triggers congestion recommendation (0.0-1.0)
+    pub congestion_trigger_ratio: Option<f64>,
+    /// EWMA smoothing factor for link stats (0.0-1.0)
+    pub ewma_alpha: Option<f64>,
+    /// How far ahead to predict link trends (seconds)
+    pub prediction_horizon_s: Option<f64>,
+    /// Bootstrap floor for links with unknown capacity (bps)
+    pub capacity_floor_bps: Option<f64>,
+    /// Penalty factor multiplier on capacity drops (0.0-1.0)
+    pub penalty_decay: Option<f64>,
+    /// Penalty factor recovery per refresh (0.0-1.0)
+    pub penalty_recovery: Option<f64>,
+    /// Multiplier for p95 jitter in adaptive latency
+    pub jitter_latency_multiplier: Option<f64>,
+    /// Hard ceiling on adaptive reassembly latency (ms)
+    pub max_latency_ms: Option<u64>,
+    /// Stats emission interval for GStreamer bus messages (ms)
+    pub stats_interval_ms: Option<u64>,
+    /// Runtime packet channel depth
+    pub channel_capacity: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,11 +160,61 @@ impl Default for LinkLifecycleConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct SchedulerConfig {
+    pub redundancy_enabled: bool,
+    pub redundancy_spare_ratio: f64,
+    pub redundancy_max_packet_bytes: usize,
+    pub redundancy_target_links: usize,
+    pub critical_broadcast: bool,
+    pub failover_enabled: bool,
+    pub failover_duration_ms: u64,
+    pub failover_rtt_spike_factor: f64,
+    pub congestion_headroom_ratio: f64,
+    pub congestion_trigger_ratio: f64,
+    pub ewma_alpha: f64,
+    pub prediction_horizon_s: f64,
+    pub capacity_floor_bps: f64,
+    pub penalty_decay: f64,
+    pub penalty_recovery: f64,
+    pub jitter_latency_multiplier: f64,
+    pub max_latency_ms: u64,
+    pub stats_interval_ms: u64,
+    pub channel_capacity: usize,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            redundancy_enabled: true,
+            redundancy_spare_ratio: 0.5,
+            redundancy_max_packet_bytes: 10_000,
+            redundancy_target_links: 2,
+            critical_broadcast: true,
+            failover_enabled: true,
+            failover_duration_ms: 3000,
+            failover_rtt_spike_factor: 3.0,
+            congestion_headroom_ratio: 0.85,
+            congestion_trigger_ratio: 0.90,
+            ewma_alpha: 0.125,
+            prediction_horizon_s: 0.5,
+            capacity_floor_bps: 5_000_000.0,
+            penalty_decay: 0.7,
+            penalty_recovery: 0.05,
+            jitter_latency_multiplier: 4.0,
+            max_latency_ms: 500,
+            stats_interval_ms: 1000,
+            channel_capacity: 1000,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct BondingConfig {
     pub version: u32,
     pub links: Vec<LinkConfig>,
     pub receiver: ReceiverConfig,
     pub lifecycle: LinkLifecycleConfig,
+    pub scheduler: SchedulerConfig,
 }
 
 impl Default for BondingConfig {
@@ -130,6 +224,7 @@ impl Default for BondingConfig {
             links: Vec::new(),
             receiver: ReceiverConfig::default(),
             lifecycle: LinkLifecycleConfig::default(),
+            scheduler: SchedulerConfig::default(),
         }
     }
 }
@@ -168,6 +263,73 @@ impl LinkLifecycleConfigInput {
     }
 }
 
+impl SchedulerConfigInput {
+    pub fn resolve(self) -> SchedulerConfig {
+        let defaults = SchedulerConfig::default();
+        SchedulerConfig {
+            redundancy_enabled: self
+                .redundancy_enabled
+                .unwrap_or(defaults.redundancy_enabled),
+            redundancy_spare_ratio: self
+                .redundancy_spare_ratio
+                .unwrap_or(defaults.redundancy_spare_ratio),
+            redundancy_max_packet_bytes: self
+                .redundancy_max_packet_bytes
+                .unwrap_or(defaults.redundancy_max_packet_bytes),
+            redundancy_target_links: self
+                .redundancy_target_links
+                .unwrap_or(defaults.redundancy_target_links)
+                .max(1),
+            critical_broadcast: self
+                .critical_broadcast
+                .unwrap_or(defaults.critical_broadcast),
+            failover_enabled: self.failover_enabled.unwrap_or(defaults.failover_enabled),
+            failover_duration_ms: self
+                .failover_duration_ms
+                .unwrap_or(defaults.failover_duration_ms),
+            failover_rtt_spike_factor: self
+                .failover_rtt_spike_factor
+                .unwrap_or(defaults.failover_rtt_spike_factor),
+            congestion_headroom_ratio: self
+                .congestion_headroom_ratio
+                .unwrap_or(defaults.congestion_headroom_ratio),
+            congestion_trigger_ratio: self
+                .congestion_trigger_ratio
+                .unwrap_or(defaults.congestion_trigger_ratio),
+            ewma_alpha: self
+                .ewma_alpha
+                .unwrap_or(defaults.ewma_alpha)
+                .clamp(0.001, 1.0),
+            prediction_horizon_s: self
+                .prediction_horizon_s
+                .unwrap_or(defaults.prediction_horizon_s),
+            capacity_floor_bps: self
+                .capacity_floor_bps
+                .unwrap_or(defaults.capacity_floor_bps),
+            penalty_decay: self
+                .penalty_decay
+                .unwrap_or(defaults.penalty_decay)
+                .clamp(0.0, 1.0),
+            penalty_recovery: self
+                .penalty_recovery
+                .unwrap_or(defaults.penalty_recovery)
+                .clamp(0.0, 1.0),
+            jitter_latency_multiplier: self
+                .jitter_latency_multiplier
+                .unwrap_or(defaults.jitter_latency_multiplier),
+            max_latency_ms: self.max_latency_ms.unwrap_or(defaults.max_latency_ms),
+            stats_interval_ms: self
+                .stats_interval_ms
+                .unwrap_or(defaults.stats_interval_ms)
+                .max(100),
+            channel_capacity: self
+                .channel_capacity
+                .unwrap_or(defaults.channel_capacity)
+                .max(16),
+        }
+    }
+}
+
 impl BondingConfigInput {
     pub fn resolve(self) -> Result<BondingConfig, String> {
         let version = if self.version == 0 {
@@ -194,29 +356,19 @@ impl BondingConfigInput {
         };
 
         let lifecycle = self.lifecycle.resolve();
+        let scheduler = self.scheduler.resolve();
 
-        let mut used = HashSet::new();
         let mut out = Vec::new();
+        let mut seen_ids = HashSet::new();
         for (idx, link) in self.links.into_iter().enumerate() {
             let id = link.id.unwrap_or(idx);
-            if !used.insert(id) {
+            if !seen_ids.insert(id) {
                 continue;
             }
-            let uri = link.uri.trim().to_string();
-            if uri.is_empty() {
-                continue;
-            }
-            let iface = link.interface.and_then(|iface| {
-                let trimmed = iface.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            });
+            let iface = link.interface.filter(|s| !s.is_empty());
             out.push(LinkConfig {
                 id,
-                uri,
+                uri: link.uri,
                 interface: iface,
                 recovery_maxbitrate: link.recovery_maxbitrate,
                 recovery_rtt_max: link.recovery_rtt_max,
@@ -229,6 +381,7 @@ impl BondingConfigInput {
             links: out,
             receiver,
             lifecycle,
+            scheduler,
         })
     }
 }
@@ -352,13 +505,13 @@ mod tests {
 
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.links.len(), 2);
-        
+
         // Link 1 with all recovery params
         assert_eq!(cfg.links[0].id, 1);
         assert_eq!(cfg.links[0].recovery_maxbitrate, Some(20000));
         assert_eq!(cfg.links[0].recovery_rtt_max, Some(800));
         assert_eq!(cfg.links[0].recovery_reorder_buffer, Some(50));
-        
+
         // Link 2 with partial recovery params
         assert_eq!(cfg.links[1].id, 2);
         assert_eq!(cfg.links[1].recovery_maxbitrate, None);
@@ -378,10 +531,81 @@ mod tests {
 
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.links.len(), 1);
-        
+
         // Recovery params should be None when not specified
         assert_eq!(cfg.links[0].recovery_maxbitrate, None);
         assert_eq!(cfg.links[0].recovery_rtt_max, None);
         assert_eq!(cfg.links[0].recovery_reorder_buffer, None);
+    }
+
+    #[test]
+    fn parse_toml_scheduler_config() {
+        let toml = r#"
+            version = 1
+
+            [[links]]
+            uri = "rist://10.0.0.1:5000"
+
+            [scheduler]
+            redundancy_enabled = false
+            redundancy_spare_ratio = 0.6
+            redundancy_max_packet_bytes = 8000
+            redundancy_target_links = 3
+            critical_broadcast = false
+            failover_enabled = false
+            failover_duration_ms = 5000
+            failover_rtt_spike_factor = 4.0
+            congestion_headroom_ratio = 0.80
+            congestion_trigger_ratio = 0.85
+            ewma_alpha = 0.2
+            prediction_horizon_s = 1.0
+            capacity_floor_bps = 2000000.0
+            penalty_decay = 0.5
+            penalty_recovery = 0.1
+            jitter_latency_multiplier = 3.0
+            max_latency_ms = 300
+            stats_interval_ms = 500
+            channel_capacity = 2000
+        "#;
+
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!(!cfg.scheduler.redundancy_enabled);
+        assert!((cfg.scheduler.redundancy_spare_ratio - 0.6).abs() < 1e-6);
+        assert_eq!(cfg.scheduler.redundancy_max_packet_bytes, 8000);
+        assert_eq!(cfg.scheduler.redundancy_target_links, 3);
+        assert!(!cfg.scheduler.critical_broadcast);
+        assert!(!cfg.scheduler.failover_enabled);
+        assert_eq!(cfg.scheduler.failover_duration_ms, 5000);
+        assert!((cfg.scheduler.failover_rtt_spike_factor - 4.0).abs() < 1e-6);
+        assert!((cfg.scheduler.congestion_headroom_ratio - 0.80).abs() < 1e-6);
+        assert!((cfg.scheduler.congestion_trigger_ratio - 0.85).abs() < 1e-6);
+        assert!((cfg.scheduler.ewma_alpha - 0.2).abs() < 1e-6);
+        assert!((cfg.scheduler.prediction_horizon_s - 1.0).abs() < 1e-6);
+        assert!((cfg.scheduler.capacity_floor_bps - 2_000_000.0).abs() < 1e-6);
+        assert!((cfg.scheduler.penalty_decay - 0.5).abs() < 1e-6);
+        assert!((cfg.scheduler.penalty_recovery - 0.1).abs() < 1e-6);
+        assert!((cfg.scheduler.jitter_latency_multiplier - 3.0).abs() < 1e-6);
+        assert_eq!(cfg.scheduler.max_latency_ms, 300);
+        assert_eq!(cfg.scheduler.stats_interval_ms, 500);
+        assert_eq!(cfg.scheduler.channel_capacity, 2000);
+    }
+
+    #[test]
+    fn parse_toml_scheduler_defaults() {
+        let toml = r#"
+            version = 1
+            [[links]]
+            uri = "rist://10.0.0.1:5000"
+        "#;
+
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        let defaults = SchedulerConfig::default();
+        assert_eq!(
+            cfg.scheduler.redundancy_enabled,
+            defaults.redundancy_enabled
+        );
+        assert_eq!(cfg.scheduler.failover_enabled, defaults.failover_enabled);
+        assert_eq!(cfg.scheduler.channel_capacity, defaults.channel_capacity);
+        assert!((cfg.scheduler.ewma_alpha - defaults.ewma_alpha).abs() < 1e-6);
     }
 }

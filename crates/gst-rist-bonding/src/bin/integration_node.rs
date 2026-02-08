@@ -34,6 +34,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut dest_str = "";
     let mut stats_dest = "";
     let mut bitrate_kbps = 3000; // Default 3000kbps (3Mbps)
+    let mut config_path = "";
 
     let mut i = 0;
     while i < args.len() {
@@ -45,6 +46,9 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             i += 1;
         } else if args[i] == "--bitrate" && i + 1 < args.len() {
             bitrate_kbps = args[i + 1].parse().unwrap_or(3000);
+            i += 1;
+        } else if args[i] == "--config" && i + 1 < args.len() {
+            config_path = &args[i + 1];
             i += 1;
         }
         i += 1;
@@ -70,6 +74,14 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "Failed to cast to pipeline")?;
 
     if let Some(sink) = pipeline.by_name("rsink") {
+        // Apply TOML config file if provided
+        if !config_path.is_empty() {
+            let config_toml = std::fs::read_to_string(config_path)
+                .map_err(|e| format!("Failed to read config file '{}': {}", config_path, e))?;
+            sink.set_property("config", &config_toml);
+            eprintln!("Applied config from {}", config_path);
+        }
+
         for (idx, uri) in dest_str.split(',').enumerate() {
             let uri = uri.trim();
             if uri.is_empty() {
@@ -228,6 +240,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut bind_str = "";
     let mut output_file = "";
+    let mut _config_path = "";
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--bind" && i + 1 < args.len() {
@@ -235,6 +248,9 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             i += 1;
         } else if args[i] == "--output" && i + 1 < args.len() {
             output_file = &args[i + 1];
+            i += 1;
+        } else if args[i] == "--config" && i + 1 < args.len() {
+            _config_path = &args[i + 1];
             i += 1;
         }
         i += 1;

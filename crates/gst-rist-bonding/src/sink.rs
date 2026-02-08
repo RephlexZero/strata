@@ -3,14 +3,32 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
-use rist_bonding_core::config::{BondingConfig, LinkConfig};
+use rist_bonding_core::config::{BondingConfig, LinkConfig, SchedulerConfig};
 use rist_bonding_core::runtime::{BondingRuntime, PacketSendError};
 use rist_bonding_core::scheduler::PacketProfile;
 use std::collections::HashMap;
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
 fn parse_config(config: &str) -> Result<BondingConfig, String> {
     BondingConfig::from_toml_str(config)
+}
+
+fn compute_congestion_recommendation(
+    total_capacity_bps: f64,
+    observed_bps: f64,
+    headroom_ratio: f64,
+    trigger_ratio: f64,
+) -> Option<u64> {
+    if total_capacity_bps <= 0.0 {
+        return None;
+    }
+    let recommended = (total_capacity_bps * headroom_ratio).round() as u64;
+    if observed_bps > total_capacity_bps * trigger_ratio {
+        Some(recommended)
+    } else {
+        None
+    }
 }
 
 mod imp {
@@ -37,6 +55,7 @@ mod imp {
         pub(crate) config_toml: Mutex<String>,
         pub(crate) pad_map: Mutex<HashMap<String, usize>>,
         pub(crate) pending_links: Mutex<HashMap<usize, LinkConfig>>,
+        pub(crate) scheduler_config: Mutex<SchedulerConfig>,
     }
 
     impl Default for RsRistBondSink {
@@ -49,6 +68,7 @@ mod imp {
                 config_toml: Mutex::new(String::new()),
                 pad_map: Mutex::new(HashMap::new()),
                 pending_links: Mutex::new(HashMap::new()),
+                scheduler_config: Mutex::new(SchedulerConfig::default()),
             }
         }
     }
@@ -142,6 +162,7 @@ mod imp {
             }
             match parse_config(config) {
                 Ok(parsed) => {
+                    *self.scheduler_config.lock().unwrap() = parsed.scheduler.clone();
                     if let Some(rt) = self.runtime.lock().unwrap().as_ref() {
                         let _ = rt.apply_config(parsed);
                     }
@@ -315,7 +336,8 @@ mod imp {
 
     impl BaseSinkImpl for RsRistBondSink {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
-            let runtime = BondingRuntime::new();
+            let sched_cfg = self.scheduler_config.lock().unwrap().clone();
+            let runtime = BondingRuntime::with_config(sched_cfg.clone());
             let metrics_handle = runtime.metrics_handle();
             *self.runtime.lock().unwrap() = Some(runtime);
 
@@ -344,9 +366,11 @@ mod imp {
             let element_weak = self.obj().downgrade();
             let running = self.stats_running.clone();
             running.store(true, Ordering::Relaxed);
+            let congestion_headroom = sched_cfg.congestion_headroom_ratio;
+            let congestion_trigger = sched_cfg.congestion_trigger_ratio;
 
             let handle = std::thread::spawn(move || {
-                let stats_interval = Duration::from_secs(1);
+                let stats_interval = Duration::from_millis(sched_cfg.stats_interval_ms);
                 let mut last_stats = Instant::now();
                 let start = Instant::now();
                 let mut stats_seq: u64 = 0;
@@ -362,10 +386,12 @@ mod imp {
                                 .unwrap_or(0);
 
                             let mut total_capacity = 0.0;
+                            let mut total_observed_bps = 0.0;
                             let mut alive_links = 0u64;
                             for m in metrics.values() {
                                 if m.alive {
                                     total_capacity += m.capacity_bps;
+                                    total_observed_bps += m.observed_bps;
                                     alive_links += 1;
                                 }
                             }
@@ -399,6 +425,20 @@ mod imp {
                             }
                             let _ = element
                                 .post_message(gst::message::Element::new(msg_struct.build()));
+
+                            if let Some(recommended) = compute_congestion_recommendation(
+                                total_capacity,
+                                total_observed_bps,
+                                congestion_headroom,
+                                congestion_trigger,
+                            ) {
+                                let msg = gst::Structure::builder("congestion-control")
+                                    .field("recommended-bitrate", recommended)
+                                    .field("total_capacity", total_capacity)
+                                    .field("observed_bps", total_observed_bps)
+                                    .build();
+                                let _ = element.post_message(gst::message::Element::new(msg));
+                            }
                         }
                         stats_seq = stats_seq.wrapping_add(1);
                         last_stats = Instant::now();
@@ -465,7 +505,7 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_config;
+    use super::{compute_congestion_recommendation, parse_config};
 
     #[test]
     fn parse_config_links_basic() {
@@ -529,6 +569,24 @@ mod tests {
         assert_eq!(cfg.links[1].id, 3);
         assert_eq!(cfg.links[1].uri, "rist://9.9.9.10:5000");
         assert!(cfg.links[1].interface.is_none());
+    }
+
+    #[test]
+    fn congestion_recommendation_respects_headroom() {
+        let recommended = compute_congestion_recommendation(10_000_000.0, 9_200_000.0, 0.85, 0.90);
+        assert_eq!(recommended, Some(8_500_000));
+    }
+
+    #[test]
+    fn congestion_recommendation_skips_below_trigger() {
+        let recommended = compute_congestion_recommendation(10_000_000.0, 8_000_000.0, 0.85, 0.90);
+        assert!(recommended.is_none());
+    }
+
+    #[test]
+    fn congestion_recommendation_skips_zero_capacity() {
+        let recommended = compute_congestion_recommendation(0.0, 9_000_000.0, 0.85, 0.90);
+        assert!(recommended.is_none());
     }
 }
 

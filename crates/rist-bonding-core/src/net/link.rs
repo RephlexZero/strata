@@ -28,7 +28,7 @@ impl Link {
         iface: Option<String>,
         lifecycle_config: crate::config::LinkLifecycleConfig,
     ) -> Result<Self> {
-        Self::new_with_full_config(id, url, iface, lifecycle_config, None)
+        Self::new_with_full_config(id, url, iface, lifecycle_config, None, None)
     }
 
     pub fn new_with_full_config(
@@ -37,11 +37,16 @@ impl Link {
         iface: Option<String>,
         lifecycle_config: crate::config::LinkLifecycleConfig,
         recovery: Option<RecoveryConfig>,
+        ewma_alpha: Option<f64>,
     ) -> Result<Self> {
         let mut ctx = RistContext::new(crate::net::wrapper::RIST_PROFILE_SIMPLE)?;
         ctx.peer_add(url, recovery.as_ref())?;
 
-        let stats = Arc::new(LinkStats::new(lifecycle_config));
+        let stats = Arc::new(if let Some(alpha) = ewma_alpha {
+            LinkStats::with_ewma_alpha(lifecycle_config, alpha)
+        } else {
+            LinkStats::new(lifecycle_config)
+        });
         // Register stats callback (e.g. every 100ms)
         ctx.register_stats(stats.clone(), 100)?;
 

@@ -6,7 +6,7 @@ pub mod src;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     sink::register(Some(plugin))?;
-    // Register the pad type implicitly or explicitly via sink
+    src::register(Some(plugin))?;
     Ok(())
 }
 

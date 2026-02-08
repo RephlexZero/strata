@@ -1,7 +1,6 @@
 pub mod bonding;
 pub mod dwrr;
 pub mod ewma;
-pub mod wrr;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PacketProfile {

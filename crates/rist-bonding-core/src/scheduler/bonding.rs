@@ -1,3 +1,4 @@
+use crate::config::SchedulerConfig;
 use crate::net::interface::LinkSender;
 use crate::scheduler::dwrr::Dwrr;
 use anyhow::Result;
@@ -17,13 +18,25 @@ pub struct BondingScheduler<L: LinkSender + ?Sized> {
 
 impl<L: LinkSender + ?Sized> BondingScheduler<L> {
     pub fn new() -> Self {
+        Self::with_config(SchedulerConfig::default())
+    }
+
+    pub fn with_config(config: SchedulerConfig) -> Self {
         Self {
-            scheduler: Dwrr::new(),
+            scheduler: Dwrr::with_config(config),
             next_seq: 0,
             failover_until: None,
             prev_phases: HashMap::new(),
             prev_rtts: HashMap::new(),
         }
+    }
+
+    pub fn config(&self) -> &SchedulerConfig {
+        self.scheduler.config()
+    }
+
+    pub fn update_config(&mut self, config: SchedulerConfig) {
+        self.scheduler.update_config(config);
     }
 
     pub fn add_link(&mut self, link: Arc<L>) {
@@ -42,9 +55,14 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
     /// Detects link instability (phase degradation or RTT spikes) and triggers fast-failover mode.
     fn check_failover_conditions(&mut self) {
         use crate::net::interface::LinkPhase;
-        
+
+        if !self.scheduler.config().failover_enabled {
+            return;
+        }
+
         let metrics = self.scheduler.get_active_links();
         let mut trigger_failover = false;
+        let rtt_spike_factor = self.scheduler.config().failover_rtt_spike_factor;
 
         for (id, m) in &metrics {
             // Check for phase degradation (Live -> Degrade or any -> Cooldown/Reset)
@@ -60,9 +78,9 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
                 }
             }
 
-            // Check for RTT spike (>3x previous smoothed value)
+            // Check for RTT spike (>Nx previous smoothed value)
             if let Some(prev_rtt) = self.prev_rtts.get(id) {
-                if m.rtt_ms > prev_rtt * 3.0 && *prev_rtt > 0.0 {
+                if m.rtt_ms > prev_rtt * rtt_spike_factor && *prev_rtt > 0.0 {
                     trigger_failover = true;
                 }
             }
@@ -72,8 +90,8 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         }
 
         if trigger_failover {
-            // Enter failover mode for 3 seconds, then exponentially decay
-            let failover_duration = Duration::from_secs(3);
+            let failover_duration =
+                Duration::from_millis(self.scheduler.config().failover_duration_ms);
             self.failover_until = Some(Instant::now() + failover_duration);
         }
     }
@@ -93,9 +111,11 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
 
     pub fn send(&mut self, payload: Bytes, profile: crate::scheduler::PacketProfile) -> Result<()> {
         let packet_len = payload.len();
+        let config = self.scheduler.config();
 
         // Fast-failover: Broadcast during link instability
-        let should_broadcast = profile.is_critical || self.in_failover_mode();
+        let should_broadcast = (config.critical_broadcast && profile.is_critical)
+            || (config.failover_enabled && self.in_failover_mode());
 
         if should_broadcast {
             let links = self.scheduler.broadcast_links(packet_len);
@@ -118,47 +138,53 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         }
 
         // Adaptive Redundancy: Use spare capacity for important packets
-        let spare_capacity = self.scheduler.total_spare_capacity();
-        let total_capacity: f64 = self
-            .scheduler
-            .get_active_links()
-            .iter()
-            .filter(|(_, m)| {
-                m.alive && matches!(m.phase, crate::net::interface::LinkPhase::Live | crate::net::interface::LinkPhase::Warm)
-            })
-            .map(|(_, m)| m.capacity_bps)
-            .sum();
+        if config.redundancy_enabled {
+            let spare_capacity = self.scheduler.total_spare_capacity();
+            let total_capacity: f64 = self
+                .scheduler
+                .get_active_links()
+                .iter()
+                .filter(|(_, m)| {
+                    m.alive
+                        && matches!(
+                            m.phase,
+                            crate::net::interface::LinkPhase::Live
+                                | crate::net::interface::LinkPhase::Warm
+                        )
+                })
+                .map(|(_, m)| m.capacity_bps)
+                .sum();
 
-        // Calculate spare capacity ratio
-        let spare_ratio = if total_capacity > 0.0 {
-            spare_capacity / total_capacity
-        } else {
-            0.0
-        };
+            let spare_ratio = if total_capacity > 0.0 {
+                spare_capacity / total_capacity
+            } else {
+                0.0
+            };
 
-        // Decide duplication level based on spare capacity and packet characteristics
-        let should_duplicate = spare_ratio > 0.5  // At least 50% spare capacity
-            && !profile.can_drop  // Important reference frames
-            && profile.size_bytes < 10_000;  // Avoid duplicating very large packets
+            let should_duplicate = spare_ratio > config.redundancy_spare_ratio
+                && !profile.can_drop
+                && profile.size_bytes < config.redundancy_max_packet_bytes;
 
-        if should_duplicate {
-            // Duplicate to 2 best diverse links
-            let links = self.scheduler.select_best_n_links(packet_len, 2);
-            if !links.is_empty() {
-                let seq = self.next_seq;
-                self.next_seq += 1;
+            if should_duplicate {
+                let links = self
+                    .scheduler
+                    .select_best_n_links(packet_len, config.redundancy_target_links);
+                if !links.is_empty() {
+                    let seq = self.next_seq;
+                    self.next_seq += 1;
 
-                let header = crate::protocol::header::BondingHeader::new(seq);
-                let wrapped = header.wrap(payload);
+                    let header = crate::protocol::header::BondingHeader::new(seq);
+                    let wrapped = header.wrap(payload);
 
-                for link in links {
-                    if link.send(&wrapped).is_ok() {
-                        self.scheduler.record_send(link.id(), packet_len as u64);
+                    for link in links {
+                        if link.send(&wrapped).is_ok() {
+                            self.scheduler.record_send(link.id(), packet_len as u64);
+                        }
                     }
+                    return Ok(());
                 }
-                return Ok(());
+                // Fall through to standard if duplication failed
             }
-            // Fall through to standard if duplication failed
         }
 
         // Standard Load Balancing
@@ -244,7 +270,7 @@ mod tests {
         let mut scheduler = BondingScheduler::new();
         // High capacity link
         let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        // Low capacity link  
+        // Low capacity link
         let l2 = Arc::new(MockLink::new(2, 1_000_000.0, 10.0));
 
         scheduler.add_link(l1.clone());
@@ -258,13 +284,13 @@ mod tests {
             can_drop: true, // Droppable packets are not duplicated
             size_bytes: payload.len(),
         };
-        
+
         scheduler.send(payload, profile).unwrap();
 
         // Higher capacity link (L1) should be selected
         let l1_count = l1.sent_packets.lock().unwrap().len();
         let l2_count = l2.sent_packets.lock().unwrap().len();
-        
+
         // Exactly one of them should have received it (single link selection)
         assert_eq!(l1_count + l2_count, 1);
         // And it should be the higher capacity link
@@ -330,14 +356,14 @@ mod tests {
 
         // Initial refresh - establish baseline
         scheduler.refresh_metrics();
-        
+
         // Verify not in failover initially
         assert!(!scheduler.in_failover_mode());
 
         // Simulate link degradation
         l1.set_phase(LinkPhase::Degrade);
         scheduler.refresh_metrics();
-        
+
         // Should now be in failover mode
         assert!(scheduler.in_failover_mode());
 
@@ -348,9 +374,9 @@ mod tests {
             can_drop: false,
             size_bytes: payload.len(),
         };
-        
+
         scheduler.send(payload, profile).unwrap();
-        
+
         // Both links should receive packet despite non-critical
         assert_eq!(l1.sent_packets.lock().unwrap().len(), 1);
         assert_eq!(l2.sent_packets.lock().unwrap().len(), 1);
@@ -369,7 +395,7 @@ mod tests {
         // Simulate RTT spike (>3x previous)
         l1.set_rtt(50.0); // 5x of original
         scheduler.refresh_metrics();
-        
+
         // Should trigger failover
         assert!(scheduler.in_failover_mode());
     }
@@ -377,17 +403,21 @@ mod tests {
     #[test]
     fn test_adaptive_redundancy_with_spare_capacity() {
         let mut scheduler = BondingScheduler::new();
-        
+
         // Link 1: 10 Mbps capacity, 3 Mbps observed (70% spare)
         let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
         l1.set_observed_bps(3_000_000.0);
-        
+
         // Link 2: 10 Mbps capacity, 3 Mbps observed (70% spare)
         let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
         l2.set_observed_bps(3_000_000.0);
-        
+
         scheduler.add_link(l1.clone());
         scheduler.add_link(l2.clone());
+
+        // Mark links as having traffic so spare capacity is computed
+        scheduler.scheduler.mark_has_traffic(1);
+        scheduler.scheduler.mark_has_traffic(2);
         scheduler.refresh_metrics();
 
         // Important non-droppable small packet with spare capacity
@@ -397,13 +427,13 @@ mod tests {
             can_drop: false,
             size_bytes: payload.len(),
         };
-        
+
         scheduler.send(payload, profile).unwrap();
-        
+
         // With >50% spare capacity and important packet, should duplicate
         let l1_count = l1.sent_packets.lock().unwrap().len();
         let l2_count = l2.sent_packets.lock().unwrap().len();
-        
+
         // Should be duplicated to 2 links
         assert_eq!(l1_count + l2_count, 2);
     }
@@ -411,12 +441,16 @@ mod tests {
     #[test]
     fn test_adaptive_redundancy_skips_large_packets() {
         let mut scheduler = BondingScheduler::new();
-        
+
         let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        l1.set_observed_bps(3_000_000.0);
         let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
-        
+        l2.set_observed_bps(3_000_000.0);
+
         scheduler.add_link(l1.clone());
         scheduler.add_link(l2.clone());
+        scheduler.scheduler.mark_has_traffic(1);
+        scheduler.scheduler.mark_has_traffic(2);
         scheduler.refresh_metrics();
 
         // Large packet (>10KB) should not be duplicated even with spare capacity
@@ -426,12 +460,12 @@ mod tests {
             can_drop: false,
             size_bytes: payload.len(),
         };
-        
+
         scheduler.send(payload, profile).unwrap();
-        
+
         let l1_count = l1.sent_packets.lock().unwrap().len();
         let l2_count = l2.sent_packets.lock().unwrap().len();
-        
+
         // Should use single link (not duplicated)
         assert_eq!(l1_count + l2_count, 1);
     }
@@ -439,12 +473,16 @@ mod tests {
     #[test]
     fn test_adaptive_redundancy_skips_droppable_packets() {
         let mut scheduler = BondingScheduler::new();
-        
+
         let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        l1.set_observed_bps(3_000_000.0);
         let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
-        
+        l2.set_observed_bps(3_000_000.0);
+
         scheduler.add_link(l1.clone());
         scheduler.add_link(l2.clone());
+        scheduler.scheduler.mark_has_traffic(1);
+        scheduler.scheduler.mark_has_traffic(2);
         scheduler.refresh_metrics();
 
         // Droppable packet should not be duplicated
@@ -454,13 +492,109 @@ mod tests {
             can_drop: true,
             size_bytes: payload.len(),
         };
-        
+
         scheduler.send(payload, profile).unwrap();
-        
+
         let l1_count = l1.sent_packets.lock().unwrap().len();
         let l2_count = l2.sent_packets.lock().unwrap().len();
-        
+
         // Should use single link (not duplicated)
+        assert_eq!(l1_count + l2_count, 1);
+    }
+
+    #[test]
+    fn test_redundancy_disabled_by_config() {
+        use crate::config::SchedulerConfig;
+        let config = SchedulerConfig {
+            redundancy_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut scheduler = BondingScheduler::with_config(config);
+
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        l1.set_observed_bps(3_000_000.0);
+        let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
+        l2.set_observed_bps(3_000_000.0);
+
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+        scheduler.scheduler.mark_has_traffic(1);
+        scheduler.scheduler.mark_has_traffic(2);
+        scheduler.refresh_metrics();
+
+        // Important non-droppable small packet — but redundancy disabled
+        let payload = Bytes::from_static(b"ImportantData");
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: false,
+            can_drop: false,
+            size_bytes: payload.len(),
+        };
+
+        scheduler.send(payload, profile).unwrap();
+
+        let l1_count = l1.sent_packets.lock().unwrap().len();
+        let l2_count = l2.sent_packets.lock().unwrap().len();
+
+        // Single link only — no duplication
+        assert_eq!(l1_count + l2_count, 1);
+    }
+
+    #[test]
+    fn test_failover_disabled_by_config() {
+        use crate::config::SchedulerConfig;
+        let config = SchedulerConfig {
+            failover_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut scheduler = BondingScheduler::with_config(config);
+
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+
+        // Initial refresh
+        scheduler.refresh_metrics();
+        assert!(!scheduler.in_failover_mode());
+
+        // Simulate phase degradation
+        l1.set_phase(LinkPhase::Degrade);
+        scheduler.refresh_metrics();
+
+        // Failover should NOT trigger because it is disabled
+        assert!(!scheduler.in_failover_mode());
+    }
+
+    #[test]
+    fn test_critical_broadcast_disabled_by_config() {
+        use crate::config::SchedulerConfig;
+        let config = SchedulerConfig {
+            critical_broadcast: false,
+            redundancy_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut scheduler = BondingScheduler::with_config(config);
+
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+        scheduler.refresh_metrics();
+
+        // Critical packet but broadcast disabled
+        let payload = Bytes::from_static(b"Critical");
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: true,
+            can_drop: false,
+            size_bytes: payload.len(),
+        };
+
+        scheduler.send(payload, profile).unwrap();
+
+        let l1_count = l1.sent_packets.lock().unwrap().len();
+        let l2_count = l2.sent_packets.lock().unwrap().len();
+
+        // Should be sent to single link, not broadcast
         assert_eq!(l1_count + l2_count, 1);
     }
 }

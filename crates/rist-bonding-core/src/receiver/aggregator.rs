@@ -16,6 +16,8 @@ pub struct ReassemblyBuffer {
     latency: Duration,
     start_latency: Duration,
     skip_after: Option<Duration>,
+    jitter_latency_multiplier: f64,
+    max_latency: Duration,
     pub lost_packets: u64,
     pub late_packets: u64,
     pub duplicate_packets: u64,
@@ -32,6 +34,10 @@ pub struct ReassemblyConfig {
     pub start_latency: Duration,
     pub buffer_capacity: usize,
     pub skip_after: Option<Duration>,
+    /// Multiplier for p95 jitter in adaptive latency (default: 4.0)
+    pub jitter_latency_multiplier: f64,
+    /// Hard ceiling on adaptive reassembly latency (default: 500ms)
+    pub max_latency_ms: u64,
 }
 
 impl Default for ReassemblyConfig {
@@ -40,6 +46,8 @@ impl Default for ReassemblyConfig {
             start_latency: Duration::from_millis(50),
             buffer_capacity: 2048,
             skip_after: None,
+            jitter_latency_multiplier: 4.0,
+            max_latency_ms: 500,
         }
     }
 }
@@ -85,6 +93,8 @@ impl ReassemblyBuffer {
             latency: config.start_latency,
             start_latency: config.start_latency,
             skip_after: config.skip_after,
+            jitter_latency_multiplier: config.jitter_latency_multiplier,
+            max_latency: Duration::from_millis(config.max_latency_ms),
             lost_packets: 0,
             late_packets: 0,
             duplicate_packets: 0,
@@ -127,16 +137,17 @@ impl ReassemblyBuffer {
                 self.jitter_samples.pop_front();
             }
 
-            // Update target latency: Start Latency + 4 * p95(Jitter)
+            // Update target latency: Start Latency + multiplier * p95(Jitter)
             let jitter_est = if self.jitter_samples.len() >= 5 {
                 percentile(&self.jitter_samples, 0.95)
             } else {
                 self.jitter_smoothed
             };
             let jitter_ms = jitter_est * 1000.0;
-            let additional_latency = Duration::from_millis((4.0 * jitter_ms) as u64);
+            let additional_latency =
+                Duration::from_millis((self.jitter_latency_multiplier * jitter_ms) as u64);
 
-            self.latency = self.start_latency + additional_latency;
+            self.latency = (self.start_latency + additional_latency).min(self.max_latency);
         }
         self.last_arrival = Some(now);
 
@@ -161,7 +172,7 @@ impl ReassemblyBuffer {
             if existing.seq_id == seq_id {
                 // Duplicate packet (same seq_id arrived again)
                 self.duplicate_packets += 1;
-                return;  // Don't overwrite
+                return; // Don't overwrite
             } else if existing.seq_id >= self.next_seq {
                 // Different packet in this slot, was lost
                 self.lost_packets += 1;
@@ -386,6 +397,8 @@ mod tests {
             start_latency: Duration::from_millis(100),
             buffer_capacity: 64,
             skip_after: Some(Duration::from_millis(30)),
+            jitter_latency_multiplier: 4.0,
+            max_latency_ms: 500,
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -405,6 +418,8 @@ mod tests {
             start_latency: Duration::from_millis(10),
             buffer_capacity: 8,
             skip_after: None,
+            jitter_latency_multiplier: 4.0,
+            max_latency_ms: 500,
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -458,8 +473,12 @@ mod tests {
 
         // Now push seq_id 0 again - this is LATE, not duplicate
         // (because next_seq has advanced past it)
-        buf.push(0, Bytes::from_static(b"P0-late"), start + Duration::from_millis(120));
-        
+        buf.push(
+            0,
+            Bytes::from_static(b"P0-late"),
+            start + Duration::from_millis(120),
+        );
+
         assert_eq!(buf.late_packets, 1);
         assert_eq!(buf.duplicate_packets, 0); // Not counted as duplicate
     }
