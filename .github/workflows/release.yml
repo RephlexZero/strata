@@ -133,6 +133,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch tags
+        run: git fetch --force --tags
+
+      - name: Read tag message
+        id: tag_body
+        run: |
+          body="$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")"
+          printf "body<<EOF\n%s\nEOF\n" "$body" >> "$GITHUB_OUTPUT"
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -140,7 +149,8 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          generate_release_notes: ${{ steps.tag_body.outputs.body == '' }}
+          body: ${{ steps.tag_body.outputs.body }}
           files: |
             artifacts/release-x86_64/*.tar.gz
             artifacts/release-aarch64/*.tar.gz
