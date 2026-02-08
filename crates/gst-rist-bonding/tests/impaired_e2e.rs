@@ -14,7 +14,7 @@ fn spawn_in_ns(ns_name: &str, cmd: &str, args: &[&str]) -> std::process::Child {
     // Determine command wrapper based on privs / environment
     // Assuming sudo or root is available as per rist-network-sim
     std::process::Command::new("sudo")
-    .args(["ip", "netns", "exec", ns_name, cmd])
+        .args(["ip", "netns", "exec", ns_name, cmd])
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit()) // Only show stderr
@@ -374,7 +374,17 @@ fn plot_results_to_file(data: &[Value], truth: &[TruthPoint], filename: &str, cs
         let t_loss = point.loss_percent;
         truth_caps.push((t, t_cap));
         truth_losses.push((t, t_loss));
-        csv_rows.push((t, None, None, None, None, None, None, Some(t_cap), Some(t_loss)));
+        csv_rows.push((
+            t,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(t_cap),
+            Some(t_loss),
+        ));
     }
 
     let mut chart = ChartBuilder::on(&root)

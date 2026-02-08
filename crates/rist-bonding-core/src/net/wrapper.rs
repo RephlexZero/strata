@@ -12,9 +12,9 @@ use std::sync::Arc;
 /// Optional RIST recovery tuning parameters per link
 #[derive(Debug, Clone)]
 pub struct RecoveryConfig {
-    pub recovery_maxbitrate: Option<u32>,       // kbps
-    pub recovery_rtt_max: Option<u32>,          // ms
-    pub recovery_reorder_buffer: Option<u32>,   // ms
+    pub recovery_maxbitrate: Option<u32>,     // kbps
+    pub recovery_rtt_max: Option<u32>,        // ms
+    pub recovery_reorder_buffer: Option<u32>, // ms
 }
 
 unsafe extern "C" fn log_cb(

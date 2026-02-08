@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "[pre-push] Running rustfmt check..."
+cargo fmt --all -- --check
+
 echo "[pre-push] Running clippy..."
 cargo clippy --workspace --all-targets -- -D warnings
 

@@ -39,7 +39,13 @@ fn output_dir() -> PathBuf {
 /// Build integration_node if it doesn't exist yet.
 fn build_integration_binary() -> PathBuf {
     let status = Command::new("cargo")
-        .args(["build", "-p", "gst-rist-bonding", "--bin", "integration_node"])
+        .args([
+            "build",
+            "-p",
+            "gst-rist-bonding",
+            "--bin",
+            "integration_node",
+        ])
         .status()
         .expect("Failed to invoke cargo build");
     assert!(status.success(), "cargo build integration_node failed");
@@ -131,11 +137,7 @@ fn video_loopback_clean() {
     let _ = receiver.wait();
 
     // Validate output
-    assert!(
-        ts_path.exists(),
-        "Output file not created at {:?}",
-        ts_path
-    );
+    assert!(ts_path.exists(), "Output file not created at {:?}", ts_path);
     let meta = fs::metadata(&ts_path).expect("metadata");
     assert!(meta.len() > 0, "Output file is empty");
     eprintln!(
@@ -268,7 +270,9 @@ fn video_bonded_two_link() {
         );
         assert!(meta.len() > 0, "Output file is empty");
     } else {
-        eprintln!("WARNING: Output file not created — sender may have finished before receiver connected");
+        eprintln!(
+            "WARNING: Output file not created — sender may have finished before receiver connected"
+        );
     }
 }
 
@@ -417,6 +421,8 @@ fn video_bonded_impaired() {
         );
         assert!(meta.len() > 0, "Output file is empty");
     } else {
-        eprintln!("WARNING: Output file not created — sender may have finished before receiver connected");
+        eprintln!(
+            "WARNING: Output file not created — sender may have finished before receiver connected"
+        );
     }
 }

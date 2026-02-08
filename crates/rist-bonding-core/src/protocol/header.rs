@@ -41,12 +41,13 @@ mod tests {
     fn test_round_trip() {
         let original_payload = Bytes::from_static(b"Hello World");
         let header = BondingHeader::new(123456789);
-        
+
         let wrapped = header.wrap(original_payload.clone());
         assert_eq!(wrapped.len(), BondingHeader::SIZE + original_payload.len());
-        
-        let (decoded_header, decoded_payload) = BondingHeader::unwrap(wrapped).expect("Should unwrap successfully");
-        
+
+        let (decoded_header, decoded_payload) =
+            BondingHeader::unwrap(wrapped).expect("Should unwrap successfully");
+
         assert_eq!(decoded_header, header);
         assert_eq!(decoded_payload, original_payload);
     }
@@ -62,11 +63,12 @@ mod tests {
     fn test_empty_payload() {
         let payload = Bytes::new();
         let header = BondingHeader::new(42);
-        
+
         let wrapped = header.wrap(payload.clone());
         assert_eq!(wrapped.len(), BondingHeader::SIZE);
-        
-        let (decoded_header, decoded_payload) = BondingHeader::unwrap(wrapped).expect("Should unwrap");
+
+        let (decoded_header, decoded_payload) =
+            BondingHeader::unwrap(wrapped).expect("Should unwrap");
         assert_eq!(decoded_header.seq_id, 42);
         assert!(decoded_payload.is_empty());
     }

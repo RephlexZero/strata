@@ -10,7 +10,7 @@ use std::time::Duration;
 // Helper: Spawn process in netns
 fn spawn_in_ns(ns_name: &str, cmd: &str, args: &[&str]) -> std::process::Child {
     std::process::Command::new("sudo")
-    .args(["ip", "netns", "exec", ns_name, cmd])
+        .args(["ip", "netns", "exec", ns_name, cmd])
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())
@@ -419,6 +419,6 @@ fn setup_mgmt_link(h_name: &str, c_name: &str, netns: &str, h_ip: &str, c_ip: &s
 
 fn cleanup_mgmt_link(h_name: &str) {
     let _ = std::process::Command::new("sudo")
-    .args(["ip", "link", "del", h_name])
+        .args(["ip", "link", "del", h_name])
         .output();
 }
