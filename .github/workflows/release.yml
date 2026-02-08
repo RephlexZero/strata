@@ -20,6 +20,27 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Verify tag matches crate version
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+
+          tag = os.environ.get("GITHUB_REF_NAME", "")
+          if not tag.startswith("v"):
+              raise SystemExit(f"Tag '{tag}' must start with 'v'.")
+
+          with open("crates/gst-rist-bonding/Cargo.toml", "rb") as f:
+              cargo = tomllib.load(f)
+
+          version = cargo.get("package", {}).get("version", "")
+          expected = f"v{version}"
+          if tag != expected:
+              raise SystemExit(f"Tag '{tag}' does not match crate version '{expected}'.")
+
+          print(f"Tag '{tag}' matches crate version '{version}'.")
+          PY
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -43,9 +64,6 @@ jobs:
         run: |
           mkdir -p staging
           cp target/release/libgstristbonding.so staging/
-          cp target/release/integration_node staging/ 2>/dev/null || true
-          cp README.md staging/
-          cp LICENSE staging/ 2>/dev/null || true
           cd staging && tar czf ../strata-${{ github.ref_name }}-x86_64-linux-gnu.tar.gz *
 
       - uses: actions/upload-artifact@v4
@@ -60,6 +78,27 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Verify tag matches crate version
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+
+          tag = os.environ.get("GITHUB_REF_NAME", "")
+          if not tag.startswith("v"):
+              raise SystemExit(f"Tag '{tag}' must start with 'v'.")
+
+          with open("crates/gst-rist-bonding/Cargo.toml", "rb") as f:
+              cargo = tomllib.load(f)
+
+          version = cargo.get("package", {}).get("version", "")
+          expected = f"v{version}"
+          if tag != expected:
+              raise SystemExit(f"Tag '{tag}' does not match crate version '{expected}'.")
+
+          print(f"Tag '{tag}' matches crate version '{version}'.")
+          PY
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -80,9 +119,6 @@ jobs:
         run: |
           mkdir -p staging
           cp cross-output/libgstristbonding.so staging/ 2>/dev/null || true
-          cp cross-output/integration_node staging/ 2>/dev/null || true
-          cp README.md staging/
-          cp LICENSE staging/ 2>/dev/null || true
           cd staging && tar czf ../strata-${{ github.ref_name }}-aarch64-linux-gnu.tar.gz *
 
       - uses: actions/upload-artifact@v4
