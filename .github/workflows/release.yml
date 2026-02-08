@@ -12,34 +12,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── Verify tag matches crate version ────────────────────────
+  verify-tag:
+    name: Verify tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match crate version
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          tag = os.environ["GITHUB_REF_NAME"]
+          with open("crates/gst-rist-bonding/Cargo.toml", "rb") as f:
+              version = tomllib.load(f)["package"]["version"]
+          expected = f"v{version}"
+          if tag != expected:
+              raise SystemExit(f"Tag '{tag}' ≠ crate version '{expected}'")
+          print(f"✓ {tag} matches crate version {version}")
+          PY
+
+  # ── x86_64 build (required) ────────────────────────────────
   build-x86_64:
     name: Build x86_64
+    needs: verify-tag
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      - name: Verify tag matches crate version
-        run: |
-          python - <<'PY'
-          import os
-          import tomllib
-
-          tag = os.environ.get("GITHUB_REF_NAME", "")
-          if not tag.startswith("v"):
-              raise SystemExit(f"Tag '{tag}' must start with 'v'.")
-
-          with open("crates/gst-rist-bonding/Cargo.toml", "rb") as f:
-              cargo = tomllib.load(f)
-
-          version = cargo.get("package", {}).get("version", "")
-          expected = f"v{version}"
-          if tag != expected:
-              raise SystemExit(f"Tag '{tag}' does not match crate version '{expected}'.")
-
-          print(f"Tag '{tag}' matches crate version '{version}'.")
-          PY
 
       - name: Install system dependencies
         run: |
@@ -50,6 +50,7 @@ jobs:
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev \
+            libfontconfig1-dev \
             gstreamer1.0-plugins-base \
             gstreamer1.0-plugins-good \
             gstreamer1.0-tools
@@ -71,34 +72,16 @@ jobs:
           name: release-x86_64
           path: staging/*.so
 
+  # ── aarch64 cross-compile (optional — does not block release)
   build-aarch64:
     name: Build aarch64
+    needs: verify-tag
     runs-on: ubuntu-24.04
+    continue-on-error: true          # don't block the release if cross fails
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      - name: Verify tag matches crate version
-        run: |
-          python - <<'PY'
-          import os
-          import tomllib
-
-          tag = os.environ.get("GITHUB_REF_NAME", "")
-          if not tag.startswith("v"):
-              raise SystemExit(f"Tag '{tag}' must start with 'v'.")
-
-          with open("crates/gst-rist-bonding/Cargo.toml", "rb") as f:
-              cargo = tomllib.load(f)
-
-          version = cargo.get("package", {}).get("version", "")
-          expected = f"v{version}"
-          if tag != expected:
-              raise SystemExit(f"Tag '{tag}' does not match crate version '{expected}'.")
-
-          print(f"Tag '{tag}' matches crate version '{version}'.")
-          PY
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -126,9 +109,11 @@ jobs:
           name: release-aarch64
           path: staging/*.so
 
+  # ── Create GitHub Release ──────────────────────────────────
   release:
     name: Create GitHub Release
     needs: [build-x86_64, build-aarch64]
+    if: always() && needs.build-x86_64.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -154,5 +139,6 @@ jobs:
           files: |
             artifacts/release-x86_64/*.so
             artifacts/release-aarch64/*.so
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

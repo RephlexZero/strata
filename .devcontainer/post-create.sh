@@ -13,6 +13,12 @@ fi
 echo "Running initial cargo check…"
 cargo check --workspace 2>&1 | tail -5
 
+# Install cargo-release for automated versioning/tagging
+if ! cargo release -V >/dev/null 2>&1; then
+    echo "Installing cargo-release…"
+    cargo install cargo-release
+fi
+
 # Enable repo git hooks (pre-commit/pre-push)
 git config core.hooksPath .githooks
 chmod +x .githooks/pre-commit .githooks/pre-push 2>/dev/null || true

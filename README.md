@@ -15,12 +15,13 @@ Designed for field deployment on constrained hardware (e.g. Orange Pi 5 Plus wit
 Pre-built plugin binaries are published for **x86_64** and **aarch64** Linux on the [Releases](https://github.com/RephlexZero/strata/releases) page.
 
 ```bash
-# Download the latest release for your architecture
-curl -LO https://github.com/RephlexZero/strata/releases/latest/download/strata-v0.1.0-$(uname -m)-linux-gnu.tar.gz
-tar xzf strata-*-linux-gnu.tar.gz
+# Download the latest release for your architecture (example: v0.1.2)
+VERSION="v0.1.2"
+ARCH="$(uname -m)"
+curl -LO "https://github.com/RephlexZero/strata/releases/download/${VERSION}/strata-${VERSION}-${ARCH}-linux-gnu.so"
 
-# Copy the plugin to your GStreamer plugin path
-sudo cp libgstristbonding.so /usr/lib/$(uname -m)-linux-gnu/gstreamer-1.0/
+# Install the plugin
+sudo cp strata-*-linux-gnu.so /usr/lib/${ARCH}-linux-gnu/gstreamer-1.0/libgstristbonding.so
 
 # Verify
 gst-inspect-1.0 rsristbondsink
@@ -161,16 +162,23 @@ docker/
 
 ## Releasing
 
-Releases are automated via GitHub Actions. To publish a new version:
+Releases are automated via GitHub Actions. One command does everything:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+# Patch release (0.1.1 → 0.1.2) — bumps version, commits, tags, pushes
+cargo release -p gst-rist-bonding patch --execute
+
+# With release notes
+cargo release -p gst-rist-bonding patch --execute \
+  --tag-message "Fix reconnection timeout under high packet loss"
 ```
 
 This triggers the [Release workflow](.github/workflows/release.yml) which:
-1. Builds the plugin for x86_64 (native) and aarch64 (cross-compiled via Docker)
-2. Creates a GitHub Release with pre-built tarballs for both architectures
+1. Verifies the tag matches the crate version
+2. Builds the plugin for x86_64 (native) and aarch64 (cross-compiled via Docker)
+3. Creates a GitHub Release with pre-built `.so` assets for both architectures
+
+See the [wiki](https://github.com/RephlexZero/strata/wiki/Getting-Started#releasing) for the full release guide.
 
 ---
 
