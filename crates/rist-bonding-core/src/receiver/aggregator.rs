@@ -2,12 +2,19 @@ use bytes::Bytes;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+/// An incoming packet with its bonding sequence ID and arrival timestamp.
 pub struct Packet {
     pub seq_id: u64,
     pub payload: Bytes,
     pub arrival_time: Instant,
 }
 
+/// Jitter buffer that reorders and releases packets in sequence order.
+///
+/// Packets are held for at least the configured latency before release.
+/// The latency adapts upward based on observed inter-arrival jitter
+/// (p95 × multiplier), capped at `max_latency`. Missing packets are
+/// skipped after the `skip_after` timeout to prevent head-of-line blocking.
 pub struct ReassemblyBuffer {
     buffer: Vec<Option<Packet>>,
     capacity: usize,
@@ -29,6 +36,7 @@ pub struct ReassemblyBuffer {
     jitter_samples: VecDeque<f64>,
 }
 
+/// Configuration for the reassembly jitter buffer.
 #[derive(Debug, Clone)]
 pub struct ReassemblyConfig {
     pub start_latency: Duration,
@@ -52,6 +60,7 @@ impl Default for ReassemblyConfig {
     }
 }
 
+/// Snapshot of reassembly buffer statistics for telemetry.
 #[derive(Default, Clone, Debug)]
 pub struct ReassemblyStats {
     pub queue_depth: usize,
@@ -481,5 +490,115 @@ mod tests {
 
         assert_eq!(buf.late_packets, 1);
         assert_eq!(buf.duplicate_packets, 0); // Not counted as duplicate
+    }
+
+    #[test]
+    fn test_latency_max_capping() {
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(10),
+            buffer_capacity: 64,
+            skip_after: None,
+            jitter_latency_multiplier: 100.0,
+            max_latency_ms: 200,
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        buf.push(0, Bytes::from_static(b"P0"), start);
+        buf.push(
+            1,
+            Bytes::from_static(b"P1"),
+            start + Duration::from_millis(1),
+        );
+        buf.push(
+            2,
+            Bytes::from_static(b"P2"),
+            start + Duration::from_millis(100),
+        );
+        buf.push(
+            3,
+            Bytes::from_static(b"P3"),
+            start + Duration::from_millis(101),
+        );
+        buf.push(
+            4,
+            Bytes::from_static(b"P4"),
+            start + Duration::from_millis(300),
+        );
+
+        assert!(
+            buf.latency <= Duration::from_millis(200),
+            "Latency should be capped at max_latency_ms (200ms), got: {:?}",
+            buf.latency
+        );
+    }
+
+    #[test]
+    fn test_buffer_capacity_boundary() {
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(10),
+            buffer_capacity: 16,
+            skip_after: None,
+            jitter_latency_multiplier: 4.0,
+            max_latency_ms: 500,
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        for i in 0..16u64 {
+            buf.push(i, Bytes::from(format!("P{}", i)), start);
+        }
+        assert_eq!(buf.buffered, 16);
+
+        let out = buf.tick(start + Duration::from_millis(10));
+        assert_eq!(out.len(), 16);
+    }
+
+    #[test]
+    fn test_stats_during_operation() {
+        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(50));
+        let start = Instant::now();
+
+        buf.push(0, Bytes::from_static(b"P0"), start);
+        buf.push(1, Bytes::from_static(b"P1"), start);
+
+        let stats = buf.get_stats();
+        assert_eq!(stats.queue_depth, 2);
+        assert_eq!(stats.next_seq, 0);
+        assert_eq!(stats.lost_packets, 0);
+
+        let _ = buf.tick(start + Duration::from_millis(50));
+        let stats = buf.get_stats();
+        assert_eq!(stats.queue_depth, 0);
+        assert_eq!(stats.next_seq, 2);
+    }
+
+    #[test]
+    fn test_percentile_single_sample() {
+        let mut samples = VecDeque::new();
+        samples.push_back(5.0);
+        assert_eq!(percentile(&samples, 0.5), 5.0);
+        assert_eq!(percentile(&samples, 0.95), 5.0);
+    }
+
+    #[test]
+    fn test_percentile_empty() {
+        let samples = VecDeque::new();
+        assert_eq!(percentile(&samples, 0.5), 0.0);
+    }
+
+    #[test]
+    fn test_many_packets_in_order() {
+        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(10));
+        let start = Instant::now();
+
+        for i in 0..1000u64 {
+            buf.push(i, Bytes::from(vec![i as u8; 100]), start);
+        }
+
+        let out = buf.tick(start + Duration::from_millis(10));
+        assert_eq!(out.len(), 1000);
+        assert_eq!(buf.lost_packets, 0);
+        assert_eq!(buf.duplicate_packets, 0);
     }
 }

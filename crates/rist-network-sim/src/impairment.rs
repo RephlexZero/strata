@@ -1,6 +1,7 @@
 use crate::topology::Namespace;
 use std::io;
 
+/// Gilbert-Elliott (4-state) loss model parameters for `tc netem`.
 #[derive(Debug, Clone, Default)]
 pub struct GemodelConfig {
     pub p: f32,     // Probability Good -> Bad (%)
@@ -9,6 +10,10 @@ pub struct GemodelConfig {
     pub one_k: f32, // Loss probability in Bad state (%)
 }
 
+/// Network impairment parameters applied via `tc netem`.
+///
+/// All fields are optional — only non-`None` parameters are passed to netem.
+/// If all fields are `None`, any existing qdisc is removed (clearing impairments).
 #[derive(Debug, Clone, Default)]
 pub struct ImpairmentConfig {
     pub delay_ms: Option<u32>,
@@ -22,6 +27,10 @@ pub struct ImpairmentConfig {
     pub corrupt_percent: Option<f32>,
 }
 
+/// Applies network impairment to an interface inside a namespace using `tc netem`.
+///
+/// Removes any existing root qdisc first, then configures the specified
+/// delay, loss, rate-limit, duplication, reorder, and corruption parameters.
 pub fn apply_impairment(
     ns: &Namespace,
     interface: &str,
@@ -119,14 +128,7 @@ pub fn apply_impairment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-
-    fn check_privileges() -> bool {
-        match Command::new("ip").arg("netns").output() {
-            Ok(o) => o.status.success(),
-            Err(_) => false,
-        }
-    }
+    use crate::test_util::check_privileges;
 
     // Helper to extract ping time from output
     fn get_ping_time(output: &str) -> Option<f32> {

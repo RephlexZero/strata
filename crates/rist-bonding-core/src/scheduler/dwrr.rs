@@ -4,6 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Per-link state tracked by the DWRR scheduler.
+///
+/// Holds the link's credit balance, throughput measurements, trend slopes,
+/// and penalty factors used to compute effective capacity during link selection.
 pub(crate) struct LinkState<L: ?Sized> {
     pub link: Arc<L>,
     pub credits: f64,
@@ -25,6 +29,16 @@ pub(crate) struct LinkState<L: ?Sized> {
     pub penalty_factor: f64,
 }
 
+/// Deficit Weighted Round Robin (DWRR) packet scheduler.
+///
+/// Distributes packets across links proportional to their effective capacity.
+/// Each link accumulates byte "credits" at a rate proportional to its
+/// quality-adjusted bandwidth. A link is selected when it has enough credits
+/// to cover the packet cost. Credits are capped to a burst window that
+/// scales with the link's lifecycle phase and loss rate.
+///
+/// The scheduler also provides broadcast, best-N selection (for redundancy),
+/// and spare-capacity queries used by higher-level bonding logic.
 pub struct Dwrr<L: LinkSender + ?Sized> {
     links: HashMap<usize, LinkState<L>>,
     sorted_ids: Vec<usize>,
@@ -32,6 +46,11 @@ pub struct Dwrr<L: LinkSender + ?Sized> {
     config: SchedulerConfig,
 }
 
+/// Computes the burst window (in seconds) for credit capping.
+///
+/// Links in healthier phases (Live) get larger burst windows, allowing
+/// them to absorb short traffic spikes. Degraded or probing links are
+/// tightly limited. Loss further reduces the window.
 fn compute_burst_window_s(phase: LinkPhase, loss_rate: f64) -> f64 {
     let base = match phase {
         LinkPhase::Probe => 0.02,
@@ -675,5 +694,153 @@ mod tests {
         let ids: Vec<usize> = selected.iter().map(|l| l.id()).collect();
         assert!(ids.contains(&3)); // Wired should be selected
         assert!(ids.len() == 2); // Got 2 links
+    }
+
+    #[test]
+    fn select_link_with_zero_links() {
+        let mut dwrr: Dwrr<MockLink> = Dwrr::new();
+        assert!(dwrr.select_link(1200).is_none());
+    }
+
+    #[test]
+    fn select_link_with_all_dead_links() {
+        let link1 = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let link2 = Arc::new(MockLink::new(2, 5_000_000.0, LinkPhase::Live));
+
+        if let Ok(mut m) = link1.metrics.lock() {
+            m.alive = false;
+        }
+        if let Ok(mut m) = link2.metrics.lock() {
+            m.alive = false;
+        }
+
+        let mut dwrr = Dwrr::new();
+        dwrr.add_link(link1);
+        dwrr.add_link(link2);
+        dwrr.refresh_metrics();
+
+        // Dead links are skipped in both main loop and fallback
+        let result = dwrr.select_link(1200);
+        assert!(result.is_none(), "All dead links should return None");
+    }
+
+    #[test]
+    fn broadcast_links_with_no_alive() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        if let Ok(mut m) = link.metrics.lock() {
+            m.alive = false;
+        }
+
+        let mut dwrr = Dwrr::new();
+        dwrr.add_link(link);
+        dwrr.refresh_metrics();
+
+        let links = dwrr.broadcast_links(100);
+        assert_eq!(links.len(), 1);
+    }
+
+    #[test]
+    fn broadcast_links_empty_scheduler() {
+        let mut dwrr: Dwrr<MockLink> = Dwrr::new();
+        let links = dwrr.broadcast_links(100);
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn record_send_tracks_bytes() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let mut dwrr = Dwrr::new();
+        dwrr.add_link(link);
+
+        dwrr.record_send(1, 1500);
+        assert_eq!(dwrr.links.get(&1).unwrap().sent_bytes, 1500);
+
+        dwrr.record_send(1, 1000);
+        assert_eq!(dwrr.links.get(&1).unwrap().sent_bytes, 2500);
+    }
+
+    #[test]
+    fn record_send_nonexistent_link() {
+        let mut dwrr: Dwrr<MockLink> = Dwrr::new();
+        dwrr.record_send(999, 1500); // Should not panic
+    }
+
+    #[test]
+    fn remove_link_resets_rr_index() {
+        let link1 = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let link2 = Arc::new(MockLink::new(2, 5_000_000.0, LinkPhase::Live));
+        let link3 = Arc::new(MockLink::new(3, 8_000_000.0, LinkPhase::Live));
+
+        let mut dwrr = Dwrr::new();
+        dwrr.add_link(link1);
+        dwrr.add_link(link2);
+        dwrr.add_link(link3);
+
+        assert_eq!(dwrr.sorted_ids.len(), 3);
+
+        dwrr.remove_link(2);
+        assert_eq!(dwrr.sorted_ids.len(), 2);
+        assert!(!dwrr.sorted_ids.contains(&2));
+        assert!(dwrr.current_rr_idx < dwrr.sorted_ids.len());
+    }
+
+    #[test]
+    fn remove_nonexistent_link() {
+        let mut dwrr: Dwrr<MockLink> = Dwrr::new();
+        dwrr.remove_link(999); // Should not panic
+    }
+
+    #[test]
+    fn os_down_reduces_credits() {
+        let link1 = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let link2 = Arc::new(MockLink::new(2, 10_000_000.0, LinkPhase::Live));
+
+        if let Ok(mut m) = link1.metrics.lock() {
+            m.os_up = Some(false);
+        }
+
+        let mut dwrr = Dwrr::new();
+        dwrr.add_link(link1.clone());
+        dwrr.add_link(link2.clone());
+        dwrr.refresh_metrics();
+
+        for state in dwrr.links.values_mut() {
+            state.last_update -= Duration::from_secs(1);
+        }
+
+        let _ = dwrr.select_link(0);
+        let link1_credits = dwrr.links.get(&1).unwrap().credits;
+        let link2_credits = dwrr.links.get(&2).unwrap().credits;
+
+        assert!(
+            link2_credits > link1_credits,
+            "Link with os_up=false should have fewer credits ({} vs {})",
+            link1_credits,
+            link2_credits
+        );
+    }
+
+    #[test]
+    fn get_active_links_returns_all() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let mut dwrr = Dwrr::new();
+        dwrr.add_link(link);
+
+        let links = dwrr.get_active_links();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].0, 1);
+    }
+
+    #[test]
+    fn update_config_applies() {
+        let mut dwrr: Dwrr<MockLink> = Dwrr::new();
+        assert!(dwrr.config().redundancy_enabled);
+
+        let new_cfg = SchedulerConfig {
+            redundancy_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        dwrr.update_config(new_cfg);
+        assert!(!dwrr.config().redundancy_enabled);
     }
 }

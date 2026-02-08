@@ -1,5 +1,10 @@
 use std::process::Command;
 
+/// A Linux network namespace managed via `ip netns`.
+///
+/// Creates the namespace on construction, initializes loopback, and
+/// deletes the namespace on drop. Supports executing commands inside
+/// the namespace and creating veth links to other namespaces.
 pub struct Namespace {
     pub name: String,
 }
@@ -143,15 +148,7 @@ impl Drop for Namespace {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn check_privileges() -> bool {
-        // Simple check: try to list netns (might not work if ip not installed, or no perms)
-        // If we can't run ip netns command, we definitely can't create them.
-        match Command::new("ip").arg("netns").output() {
-            Ok(o) => o.status.success(),
-            Err(_) => false,
-        }
-    }
+    use crate::test_util::check_privileges;
 
     #[test]
     fn test_create_namespace_pair() {

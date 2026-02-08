@@ -1,3 +1,12 @@
+/// Exponentially Weighted Moving Average filter.
+///
+/// Smooths a noisy measurement series by weighting recent samples more
+/// heavily. Used throughout the scheduler to smooth RTT, bandwidth, and
+/// loss rate observations from librist stats callbacks.
+///
+/// The smoothing factor `alpha` controls responsiveness:
+/// - `alpha` near 1.0: tracks input closely (low smoothing)
+/// - `alpha` near 0.0: retains history (high smoothing)
 pub struct Ewma {
     value: f64,
     alpha: f64,
@@ -5,6 +14,7 @@ pub struct Ewma {
 }
 
 impl Ewma {
+    /// Creates a new EWMA filter with the given smoothing factor (`0.0 < alpha ≤ 1.0`).
     pub fn new(alpha: f64) -> Self {
         Self {
             value: 0.0,
@@ -13,6 +23,7 @@ impl Ewma {
         }
     }
 
+    /// Feeds a new measurement into the filter, updating the smoothed value.
     pub fn update(&mut self, measurement: f64) {
         if !self.initialized {
             self.value = measurement;
@@ -22,6 +33,7 @@ impl Ewma {
         }
     }
 
+    /// Returns the current smoothed value.
     pub fn value(&self) -> f64 {
         self.value
     }
@@ -58,5 +70,51 @@ mod tests {
         ewma.update(0.0);
         // value = 100 * 0.9 + 0 * 0.1 = 90
         assert!((ewma.value() - 90.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_ewma_uninitialized_value_is_zero() {
+        let ewma = Ewma::new(0.5);
+        assert!((ewma.value() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_ewma_alpha_one_follows_input() {
+        let mut ewma = Ewma::new(1.0);
+        ewma.update(10.0);
+        assert!((ewma.value() - 10.0).abs() < f64::EPSILON);
+
+        ewma.update(50.0);
+        assert!((ewma.value() - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_ewma_alpha_near_zero_retains_history() {
+        let mut ewma = Ewma::new(0.001);
+        ewma.update(100.0);
+        assert!((ewma.value() - 100.0).abs() < f64::EPSILON);
+
+        ewma.update(0.0);
+        // value = 100 * 0.999 + 0 * 0.001 = 99.9
+        assert!((ewma.value() - 99.9).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_ewma_negative_values() {
+        let mut ewma = Ewma::new(0.5);
+        ewma.update(-10.0);
+        assert!((ewma.value() - (-10.0)).abs() < f64::EPSILON);
+
+        ewma.update(10.0);
+        assert!((ewma.value() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_ewma_converges_to_constant() {
+        let mut ewma = Ewma::new(0.5);
+        for _ in 0..100 {
+            ewma.update(42.0);
+        }
+        assert!((ewma.value() - 42.0).abs() < 0.001);
     }
 }

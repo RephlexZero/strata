@@ -4,12 +4,15 @@ use std::ffi::CStr;
 use std::ffi::CString;
 use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, trace};
 
 use crate::net::state::LinkStats;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-/// Optional RIST recovery tuning parameters per link
+/// Optional per-link RIST recovery (ARQ) tuning parameters.
+///
+/// When set, these override the librist defaults parsed from the RIST URL.
 #[derive(Debug, Clone)]
 pub struct RecoveryConfig {
     pub recovery_maxbitrate: Option<u32>,     // kbps
@@ -19,24 +22,49 @@ pub struct RecoveryConfig {
 
 unsafe extern "C" fn log_cb(
     _arg: *mut libc::c_void,
-    _level: rist_log_level,
+    level: rist_log_level,
     msg: *const libc::c_char,
 ) -> libc::c_int {
     if !msg.is_null() {
         let message = CStr::from_ptr(msg).to_string_lossy();
-        eprint!("[LIBRIST] {}", message);
+        // Route librist log levels to tracing levels
+        match level {
+            l if l <= rist_log_level_RIST_LOG_ERROR => {
+                tracing::error!(target: "librist", "{}", message.trim_end());
+            }
+            l if l <= rist_log_level_RIST_LOG_WARN => {
+                tracing::warn!(target: "librist", "{}", message.trim_end());
+            }
+            l if l <= rist_log_level_RIST_LOG_NOTICE => {
+                tracing::info!(target: "librist", "{}", message.trim_end());
+            }
+            l if l <= rist_log_level_RIST_LOG_INFO => {
+                debug!(target: "librist", "{}", message.trim_end());
+            }
+            _ => {
+                trace!(target: "librist", "{}", message.trim_end());
+            }
+        }
     }
     0
 }
 
+/// librist sender context wrapper.
+///
+/// Manages the lifecycle of a `rist_ctx` pointer including peer creation,
+/// stats callback registration, data transmission, and cleanup on drop.
 pub struct RistContext {
     ctx: *mut rist_ctx,
     stats_arg: *mut libc::c_void,
+    logging_settings: *mut rist_logging_settings,
 }
 
-// RIST contexts are thread-safe (internally locked by librist), so we can mark Send/Sync.
-// Caution: we must verify this assumption for every API we use.
-// rist_sender_data_write is thread safe.
+// SAFETY: librist contexts are internally locked — all sender API functions
+// (rist_sender_data_write, rist_peer_create, rist_start, rist_stats_callback_set)
+// are documented as thread-safe in the librist API. The ctx pointer is only
+// accessed through librist functions which hold internal locks.
+// The stats_arg pointer is only read from the stats callback (which librist
+// serializes) and cleaned up in Drop.
 unsafe impl Send for RistContext {}
 unsafe impl Sync for RistContext {}
 
@@ -49,6 +77,11 @@ impl Drop for RistContext {
             if !self.stats_arg.is_null() {
                 // Return ownership to Arc so it can drop if count goes to zero
                 let _ = Arc::from_raw(self.stats_arg as *const LinkStats);
+            }
+            // Free logging settings — safe to call after rist_destroy since the
+            // context no longer references the logging handle.
+            if !self.logging_settings.is_null() {
+                libc::free(self.logging_settings as *mut libc::c_void);
             }
         }
     }
@@ -150,26 +183,26 @@ unsafe extern "C" fn stats_cb(
 impl RistContext {
     pub fn new(profile: rist_profile) -> Result<Self> {
         let mut ctx: *mut rist_ctx = ptr::null_mut();
+        let logging_settings;
         unsafe {
-            let mut logging_settings: *mut rist_logging_settings = ptr::null_mut();
+            let mut log_settings: *mut rist_logging_settings = ptr::null_mut();
             rist_logging_set(
-                &mut logging_settings,
+                &mut log_settings,
                 rist_log_level_RIST_LOG_DEBUG,
                 Some(log_cb),
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
             );
+            logging_settings = log_settings;
 
-            // function signature: rist_sender_create(ctx, profile, flow_id, logging_settings)
-            // flow_id 0 is fine for simple profile/unmanaged? Or should use random?
-            // "The flow_id is a unique identifier for the stream."
-            // In simple profile, it might be ignored or used for muxing. 0 is safe default.
-            let ret = rist_sender_create(&mut ctx, profile, 0, logging_settings);
-
-            // Intentionally leaking logging_settings to avoid segfault on free (known issue in some versions or bindings)
+            let ret = rist_sender_create(&mut ctx, profile, 0, log_settings);
 
             if ret != 0 {
+                // Clean up logging settings on failure
+                if !log_settings.is_null() {
+                    libc::free(log_settings as *mut libc::c_void);
+                }
                 return Err(anyhow::anyhow!(
                     "Failed to create RIST sender context: {}",
                     ret
@@ -180,6 +213,7 @@ impl RistContext {
         Ok(Self {
             ctx,
             stats_arg: ptr::null_mut(),
+            logging_settings,
         })
     }
 
@@ -260,10 +294,18 @@ impl RistContext {
     }
 }
 
+/// librist receiver context wrapper.
+///
+/// Manages a `rist_ctx` in receiver mode for binding to incoming RIST
+/// streams, reading data blocks, and cleaning up on drop.
 pub struct RistReceiverContext {
     ctx: *mut rist_ctx,
+    logging_settings: *mut rist_logging_settings,
 }
 
+// SAFETY: librist receiver contexts are internally locked — rist_receiver_data_read
+// and rist_peer_create are documented as thread-safe. The ctx pointer is only
+// accessed through librist functions which hold internal locks.
 unsafe impl Send for RistReceiverContext {}
 unsafe impl Sync for RistReceiverContext {}
 
@@ -273,6 +315,9 @@ impl Drop for RistReceiverContext {
             if !self.ctx.is_null() {
                 rist_destroy(self.ctx);
             }
+            if !self.logging_settings.is_null() {
+                libc::free(self.logging_settings as *mut libc::c_void);
+            }
         }
     }
 }
@@ -280,27 +325,35 @@ impl Drop for RistReceiverContext {
 impl RistReceiverContext {
     pub fn new(profile: rist_profile) -> Result<Self> {
         let mut ctx: *mut rist_ctx = ptr::null_mut();
+        let logging_settings;
         unsafe {
-            let mut logging_settings: *mut rist_logging_settings = ptr::null_mut();
+            let mut log_settings: *mut rist_logging_settings = ptr::null_mut();
             rist_logging_set(
-                &mut logging_settings,
+                &mut log_settings,
                 rist_log_level_RIST_LOG_DEBUG,
                 Some(log_cb),
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
             );
+            logging_settings = log_settings;
 
-            let ret = rist_receiver_create(&mut ctx, profile, logging_settings);
+            let ret = rist_receiver_create(&mut ctx, profile, log_settings);
 
             if ret != 0 {
+                if !log_settings.is_null() {
+                    libc::free(log_settings as *mut libc::c_void);
+                }
                 return Err(anyhow::anyhow!(
                     "Failed to create RIST receiver context: {}",
                     ret
                 ));
             }
         }
-        Ok(Self { ctx })
+        Ok(Self {
+            ctx,
+            logging_settings,
+        })
     }
 
     pub fn start(&self) -> Result<()> {
@@ -332,41 +385,26 @@ impl RistReceiverContext {
         Ok(())
     }
 
-    // Reads a single data block. Blocks until data is available or timeout?
-    // librist `rist_receiver_data_read` has a timeout param.
+    /// Reads a single data block from the receiver.
+    ///
+    /// Blocks up to `timeout_ms` milliseconds waiting for data. Returns `None`
+    /// on timeout. The returned payload is an owned copy — the underlying
+    /// librist data block is freed immediately after copying.
     pub fn read_data(&self, timeout_ms: i32) -> Result<Option<RistDataBlock>> {
         unsafe {
             let mut data_block: *const rist_data_block = ptr::null();
-            // 5th arg is timeout.
             let ret = rist_receiver_data_read(self.ctx, &mut data_block, timeout_ms);
             if ret < 0 {
-                // Error
                 return Err(anyhow::anyhow!("rist_receiver_data_read failed: {}", ret));
             }
             if ret == 0 || data_block.is_null() {
-                // Timeout / No data
                 return Ok(None);
             }
 
-            // Convert to owned struct
+            // Copy payload into owned memory before freeing the librist block.
             let db = &*data_block;
-            // We need to copy payload because data_block is freed by free_data_block?
-            // Actually `rist_receiver_data_read` gives us a pointer that we must free via `rist_receiver_data_block_free`?
-            // Documentation says: "The data block must be freed by the caller using rist_receiver_data_block_free".
-
             let payload =
                 std::slice::from_raw_parts(db.payload as *const u8, db.payload_len).to_vec();
-
-            // Free the block inside librist
-            // Wait, bindgen might name it slightly differently.
-            // Usually it's `rist_receiver_data_block_free` or `rist_receiver_data_block_free2`.
-            // Checking headers would be good but let's assume standard name.
-            // Actually, since I can't check headers easily without grepping:
-            // "int rist_receiver_data_block_free(struct rist_data_block **block);"
-            // Note double pointer.
-
-            // Let's defer free to a wrapper if possible, or copy and free immediately.
-            // Immediate copy is safer for Rust model.
 
             let block = RistDataBlock {
                 payload,
@@ -374,13 +412,10 @@ impl RistReceiverContext {
                 virt_dst_port: db.virt_dst_port,
                 seq: db.seq,
                 flow_id: db.flow_id,
-                // ... other fields
             };
 
-            // Free
-            // Pointer to pointer
+            // Free the librist-allocated data block (free2 replaces deprecated free).
             let mut db_ptr = data_block as *mut rist_data_block;
-            // Use free2 as free is deprecated
             rist_receiver_data_block_free2(&mut db_ptr);
 
             Ok(Some(block))
@@ -388,6 +423,10 @@ impl RistReceiverContext {
     }
 }
 
+/// Owned copy of a received RIST data block.
+///
+/// Payload is copied from the librist-allocated block, which is freed
+/// immediately after copying.
 pub struct RistDataBlock {
     pub payload: Vec<u8>,
     pub virt_src_port: u16,
@@ -476,5 +515,74 @@ mod tests {
         }
 
         assert!(bind_ok, "Did not receive data or bind failed");
+    }
+
+    #[test]
+    fn test_peer_add_invalid_url() {
+        let ctx = RistContext::new(RIST_PROFILE_SIMPLE).unwrap();
+        // CString::new fails on embedded null bytes, exercising the error path
+        let result = ctx.peer_add("rist://127.0.0.1\0:9999", None);
+        assert!(result.is_err(), "URL with null byte should fail peer_add");
+    }
+
+    #[test]
+    fn test_register_stats_twice_fails() {
+        let mut ctx = RistContext::new(RIST_PROFILE_SIMPLE).unwrap();
+        let stats1 = Arc::new(LinkStats::default());
+        let stats2 = Arc::new(LinkStats::default());
+
+        ctx.register_stats(stats1, 100).unwrap();
+        let result = ctx.register_stats(stats2, 100);
+        assert!(result.is_err(), "Double stats registration should fail");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("already registered"));
+    }
+
+    #[test]
+    fn test_send_data_without_peer() {
+        let ctx = RistContext::new(RIST_PROFILE_SIMPLE).unwrap();
+        let data = b"test data";
+        let _ = ctx.send_data(data);
+    }
+
+    #[test]
+    fn test_recovery_config_applied() {
+        let ctx = RistContext::new(RIST_PROFILE_SIMPLE).unwrap();
+        let recovery = RecoveryConfig {
+            recovery_maxbitrate: Some(50000),
+            recovery_rtt_max: Some(1000),
+            recovery_reorder_buffer: Some(100),
+        };
+        let result = ctx.peer_add("rist://127.0.0.1:19200", Some(&recovery));
+        assert!(
+            result.is_ok(),
+            "peer_add with recovery config should succeed"
+        );
+    }
+
+    #[test]
+    fn test_receiver_context_creation() {
+        let ctx = RistReceiverContext::new(RIST_PROFILE_SIMPLE);
+        assert!(ctx.is_ok());
+    }
+
+    #[test]
+    fn test_receiver_invalid_peer_url() {
+        let ctx = RistReceiverContext::new(RIST_PROFILE_SIMPLE).unwrap();
+        // CString::new fails on embedded null bytes, exercising the error path
+        let result = ctx.peer_config("rist://127.0.0.1\0:9999");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_context_drop_safety() {
+        {
+            let mut ctx = RistContext::new(RIST_PROFILE_SIMPLE).unwrap();
+            ctx.peer_add("rist://127.0.0.1:19201", None).unwrap();
+            let stats = Arc::new(LinkStats::default());
+            ctx.register_stats(stats, 100).unwrap();
+            ctx.start().unwrap();
+        }
+        // Context dropped — should not crash or leak
     }
 }

@@ -1,13 +1,15 @@
+use crate::util::lock_or_recover;
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
+use std::sync::Mutex;
 
 mod imp {
     use super::*;
 
     #[derive(Default)]
     pub struct RsRistBondSinkPad {
-        pub uri: std::sync::Mutex<String>,
+        pub uri: Mutex<String>,
     }
 
     #[glib::object_subclass]
@@ -34,7 +36,7 @@ mod imp {
             match pspec.name() {
                 "uri" => {
                     let new_uri: String = value.get().expect("type checked upstream");
-                    let mut uri = self.uri.lock().unwrap();
+                    let mut uri = lock_or_recover(&self.uri);
                     let should_notify = *uri != new_uri;
                     *uri = new_uri;
                     drop(uri);
@@ -47,17 +49,22 @@ mod imp {
                         self.obj().notify("uri");
                     }
                 }
-                _ => unimplemented!(),
+                _ => {
+                    gst::warning!(gst::CAT_DEFAULT, "Unknown pad property: {}", pspec.name());
+                }
             }
         }
 
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
             match pspec.name() {
                 "uri" => {
-                    let uri = self.uri.lock().unwrap();
+                    let uri = lock_or_recover(&self.uri);
                     uri.to_value()
                 }
-                _ => unimplemented!(),
+                _ => {
+                    gst::warning!(gst::CAT_DEFAULT, "Unknown pad property: {}", pspec.name());
+                    "".to_value()
+                }
             }
         }
     }
@@ -73,6 +80,6 @@ glib::wrapper! {
 
 impl RsRistBondSinkPad {
     pub fn get_uri(&self) -> String {
-        self.imp().uri.lock().unwrap().clone()
+        lock_or_recover(&self.imp().uri).clone()
     }
 }

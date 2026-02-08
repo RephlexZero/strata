@@ -72,4 +72,71 @@ mod tests {
         assert_eq!(decoded_header.seq_id, 42);
         assert!(decoded_payload.is_empty());
     }
+
+    #[test]
+    fn test_max_seq_id() {
+        let header = BondingHeader::new(u64::MAX);
+        let payload = Bytes::from_static(b"test");
+        let wrapped = header.wrap(payload.clone());
+        let (decoded, decoded_payload) = BondingHeader::unwrap(wrapped).unwrap();
+        assert_eq!(decoded.seq_id, u64::MAX);
+        assert_eq!(decoded_payload, payload);
+    }
+
+    #[test]
+    fn test_zero_seq_id() {
+        let header = BondingHeader::new(0);
+        let payload = Bytes::from_static(b"test");
+        let wrapped = header.wrap(payload.clone());
+        let (decoded, decoded_payload) = BondingHeader::unwrap(wrapped).unwrap();
+        assert_eq!(decoded.seq_id, 0);
+        assert_eq!(decoded_payload, payload);
+    }
+
+    #[test]
+    fn test_exact_header_size_buffer_no_payload() {
+        let buf = Bytes::from(vec![0u8; 8]);
+        let result = BondingHeader::unwrap(buf);
+        assert!(result.is_some());
+        let (header, payload) = result.unwrap();
+        assert_eq!(header.seq_id, 0);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_unwrap_seven_bytes_fails() {
+        let buf = Bytes::from(vec![0u8; 7]);
+        assert!(BondingHeader::unwrap(buf).is_none());
+    }
+
+    #[test]
+    fn test_unwrap_zero_bytes_fails() {
+        let buf = Bytes::new();
+        assert!(BondingHeader::unwrap(buf).is_none());
+    }
+
+    #[test]
+    fn test_large_payload() {
+        let payload = Bytes::from(vec![0xABu8; 65535]);
+        let header = BondingHeader::new(42);
+        let wrapped = header.wrap(payload.clone());
+        assert_eq!(wrapped.len(), 8 + 65535);
+        let (decoded, decoded_payload) = BondingHeader::unwrap(wrapped).unwrap();
+        assert_eq!(decoded.seq_id, 42);
+        assert_eq!(decoded_payload, payload);
+    }
+
+    #[test]
+    fn test_header_size_constant() {
+        assert_eq!(BondingHeader::SIZE, 8);
+    }
+
+    #[test]
+    fn test_header_equality() {
+        let h1 = BondingHeader::new(100);
+        let h2 = BondingHeader::new(100);
+        let h3 = BondingHeader::new(200);
+        assert_eq!(h1, h2);
+        assert_ne!(h1, h3);
+    }
 }

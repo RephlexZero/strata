@@ -10,20 +10,24 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
+use tracing::{debug, warn};
 
+/// Multi-link RIST receiver with jitter-buffer reassembly.
+///
+/// Spawns per-link reader threads that feed received packets (after
+/// stripping the bonding header) into a shared [`ReassemblyBuffer`].
+/// A dedicated jitter-buffer thread ticks the buffer and emits
+/// ordered payloads on `output_rx`.
+///
+/// [`ReassemblyBuffer`]: crate::receiver::aggregator::ReassemblyBuffer
 pub struct BondingReceiver {
-    // We can have multiple receivers, or one RIST context listening on multiple peers?
-    // Usually RIST is 1 context -> N peers.
-    // But if we want physical separation (binding to eth0 vs wlan0), we might need multiple contexts if simple profile binds to all.
-    // For now, let's support adding multiple `RistReceiverContext`s, each running in its own thread?
-    // Or just one if we bind 0.0.0.0.
-    // Spec says: "We do NOT use librist groups. Each LinkManager creates a standalone rist_ctx."
-    // So receiver side also likely needs multiple contexts if we want per-interface statistics/control.
     input_tx: Option<Sender<Packet>>,
     output_tx: Option<Sender<Bytes>>,
     pub output_rx: Receiver<Bytes>, // Public so GStreamer can pull
     running: Arc<AtomicBool>,
     stats: Arc<Mutex<ReassemblyStats>>,
+    /// Track spawned thread handles for clean shutdown
+    thread_handles: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 impl BondingReceiver {
@@ -45,61 +49,68 @@ impl BondingReceiver {
         let output_tx_clone = output_tx.clone();
 
         // Dedicated jitter buffer/tick thread
-        thread::spawn(move || {
-            let mut buffer = ReassemblyBuffer::with_config(0, config);
-            let tick_interval = Duration::from_millis(10);
+        let jitter_handle = thread::Builder::new()
+            .name("rist-rcv-jitter".into())
+            .spawn(move || {
+                let mut buffer = ReassemblyBuffer::with_config(0, config);
+                let tick_interval = Duration::from_millis(10);
 
-            while running_clone.load(Ordering::Relaxed) {
-                match input_rx.recv_timeout(tick_interval) {
-                    Ok(packet) => {
-                        buffer.push(packet.seq_id, packet.payload, packet.arrival_time);
+                while running_clone.load(Ordering::Relaxed) {
+                    match input_rx.recv_timeout(tick_interval) {
+                        Ok(packet) => {
+                            buffer.push(packet.seq_id, packet.payload, packet.arrival_time);
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            // No packet; still tick below
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        // No packet; still tick below
+
+                    let now = Instant::now();
+                    let ready = buffer.tick(now);
+
+                    if let Ok(mut s) = stats_clone.lock() {
+                        *s = buffer.get_stats();
                     }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                }
 
-                let now = Instant::now();
-                let ready = buffer.tick(now);
-
-                if let Ok(mut s) = stats_clone.lock() {
-                    *s = buffer.get_stats();
-                }
-
-                for p in ready {
-                    if output_tx_clone.send(p).is_err() {
-                        return;
+                    for p in ready {
+                        if output_tx_clone.send(p).is_err() {
+                            return;
+                        }
                     }
                 }
-            }
-        });
+            })
+            .expect("failed to spawn jitter buffer thread");
+
         Self {
             input_tx: Some(input_tx),
             output_tx: Some(output_tx),
             output_rx,
             running,
             stats,
+            thread_handles: Mutex::new(vec![jitter_handle]),
         }
     }
 
     pub fn shutdown(&mut self) {
         self.running.store(false, Ordering::Relaxed);
-        // Drop the main sender handle to unblock receiver if no threads are running
+        // Drop the main sender handles to unblock receiver threads
         self.input_tx = None;
         self.output_tx = None;
+        // Join all spawned threads for clean shutdown
+        if let Ok(mut handles) = self.thread_handles.lock() {
+            for handle in handles.drain(..) {
+                let _ = handle.join();
+            }
+        }
     }
 
     pub fn get_stats(&self) -> crate::receiver::aggregator::ReassemblyStats {
-        self.stats.lock().unwrap().clone()
+        self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn add_link(&self, bind_url: &str) -> Result<()> {
         let ctx = RistReceiverContext::new(RIST_PROFILE_SIMPLE)?;
-        // bind_url usually format "rist://@0.0.0.0:5000" or similar?
-        // librist URL format:
-        // rist://@<interface_ip>:<port> for receiver binding.
-        // The '@' indicates listening.
         ctx.peer_config(bind_url)?;
         ctx.start()?;
 
@@ -109,40 +120,46 @@ impl BondingReceiver {
             .ok_or_else(|| anyhow::anyhow!("Receiver shut down"))?
             .clone();
         let running = self.running.clone();
+        let link_url = bind_url.to_string();
 
-        thread::spawn(move || {
-            while running.load(Ordering::Relaxed) {
-                // Read with 50ms timeout
-                match ctx.read_data(50) {
-                    Ok(Some(block)) => {
-                        // Process Packet
-                        let payload = Bytes::from(block.payload);
-                        // eprintln!("Debug: Got {} bytes from librist", payload.len());
+        let handle = thread::Builder::new()
+            .name(format!("rist-rcv-{}", bind_url))
+            .spawn(move || {
+                while running.load(Ordering::Relaxed) {
+                    match ctx.read_data(50) {
+                        Ok(Some(block)) => {
+                            let payload = Bytes::from(block.payload);
 
-                        // Parse Header
-                        if let Some((header, original_payload)) = BondingHeader::unwrap(payload) {
-                            let packet = Packet {
-                                seq_id: header.seq_id,
-                                payload: original_payload,
-                                arrival_time: Instant::now(),
-                            };
-                            let _ = input_tx.send(packet);
-                        } else {
-                            eprintln!("BondingReceiver: Dropped packet with invalid header");
+                            if let Some((header, original_payload)) = BondingHeader::unwrap(payload)
+                            {
+                                let packet = Packet {
+                                    seq_id: header.seq_id,
+                                    payload: original_payload,
+                                    arrival_time: Instant::now(),
+                                };
+                                let _ = input_tx.send(packet);
+                            } else {
+                                debug!(
+                                    "BondingReceiver: Dropped packet with invalid header on {}",
+                                    link_url
+                                );
+                            }
+                        }
+                        Ok(None) => {
+                            // No data; jitter thread handles tick.
+                        }
+                        Err(e) => {
+                            warn!("Receiver error on {}: {}", link_url, e);
+                            thread::sleep(Duration::from_millis(100));
                         }
                     }
-                    Ok(None) => {
-                        // No data; jitter thread handles tick.
-                    }
-                    Err(e) => {
-                        // Log error
-                        eprintln!("Receiver Error: {}", e);
-                        // Backoff?
-                        thread::sleep(Duration::from_millis(100));
-                    }
                 }
-            }
-        });
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to spawn receiver thread: {}", e))?;
+
+        if let Ok(mut handles) = self.thread_handles.lock() {
+            handles.push(handle);
+        }
 
         Ok(())
     }

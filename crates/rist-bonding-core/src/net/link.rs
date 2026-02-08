@@ -1,3 +1,4 @@
+use crate::net::interface::bind_url_to_iface;
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
 use crate::net::state::LinkStats;
 use crate::net::wrapper::{RecoveryConfig, RistContext};
@@ -5,9 +6,15 @@ use anyhow::Result;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::info;
 
 const OS_POLL_INTERVAL_MS: u64 = 500;
 
+/// A concrete network link backed by a librist sender context.
+///
+/// Each link owns a [`RistContext`] for sending data and an [`Arc<LinkStats>`]
+/// populated by the librist stats callback. The link also tracks its OS
+/// interface name for operstate/MTU polling and carrier-type inference.
 pub struct Link {
     pub id: usize,
     ctx: RistContext,
@@ -39,8 +46,33 @@ impl Link {
         recovery: Option<RecoveryConfig>,
         ewma_alpha: Option<f64>,
     ) -> Result<Self> {
+        // If an interface is specified, bind the RIST URL to the interface's local IP.
+        // This ensures traffic is routed through the correct physical interface.
+        let effective_url = if let Some(ref iface_name) = iface {
+            match bind_url_to_iface(url, iface_name) {
+                Some(bound_url) => {
+                    info!(
+                        "Link {}: binding to interface {} -> {}",
+                        id, iface_name, bound_url
+                    );
+                    bound_url
+                }
+                None => {
+                    // Interface exists but has no IPv4 address, or URL format unrecognized.
+                    // Fall back to original URL but log a warning.
+                    tracing::warn!(
+                        "Link {}: interface '{}' has no IPv4 address or URL format unrecognized, using original URL",
+                        id, iface_name
+                    );
+                    url.to_string()
+                }
+            }
+        } else {
+            url.to_string()
+        };
+
         let mut ctx = RistContext::new(crate::net::wrapper::RIST_PROFILE_SIMPLE)?;
-        ctx.peer_add(url, recovery.as_ref())?;
+        ctx.peer_add(&effective_url, recovery.as_ref())?;
 
         let stats = Arc::new(if let Some(alpha) = ewma_alpha {
             LinkStats::with_ewma_alpha(lifecycle_config, alpha)

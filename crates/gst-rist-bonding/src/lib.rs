@@ -1,8 +1,14 @@
+//! GStreamer plugin providing RIST bonding sink and source elements.
+//!
+//! - `rsristbondsink` — Sends packets via bonded RIST links with DWRR scheduling
+//! - `rsristbondsrc` — Receives packets from bonded RIST links with jitter-buffer reassembly
+
 use gst::glib;
 
 pub mod pad;
 pub mod sink;
 pub mod src;
+mod util;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     sink::register(Some(plugin))?;

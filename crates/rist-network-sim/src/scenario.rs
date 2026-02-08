@@ -3,6 +3,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::time::Duration;
 
+/// Configuration for a deterministic network impairment scenario.
 #[derive(Debug, Clone)]
 pub struct ScenarioConfig {
     pub seed: u64,
@@ -11,6 +12,7 @@ pub struct ScenarioConfig {
     pub links: Vec<LinkScenarioConfig>,
 }
 
+/// Per-link bounds and step sizes for scenario generation.
 #[derive(Debug, Clone)]
 pub struct LinkScenarioConfig {
     pub min_rate_kbit: u64,
@@ -23,12 +25,18 @@ pub struct LinkScenarioConfig {
     pub loss_step_percent: f32,
 }
 
+/// A single time-step of impairment values across all links.
 #[derive(Debug, Clone)]
 pub struct ScenarioFrame {
     pub t: Duration,
     pub configs: Vec<ImpairmentConfig>,
 }
 
+/// Deterministic random-walk scenario generator.
+///
+/// Given a seed, produces reproducible sequences of [`ScenarioFrame`]s
+/// where each link's rate, delay, and loss evolve via random-walk steps
+/// clamped to configured bounds.
 #[derive(Debug)]
 pub struct Scenario {
     cfg: ScenarioConfig,

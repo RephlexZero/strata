@@ -1,5 +1,77 @@
 use anyhow::Result;
+use std::net::IpAddr;
 
+/// Resolve a network interface name (e.g., "eth0") to its first IPv4 address.
+/// Returns `None` if the interface doesn't exist or has no IPv4 address.
+pub fn resolve_iface_ipv4(iface: &str) -> Option<IpAddr> {
+    let path = format!("/sys/class/net/{}/", iface);
+    if !std::path::Path::new(&path).exists() {
+        return None;
+    }
+
+    // Use libc getifaddrs for reliable interface address resolution.
+    unsafe {
+        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifaddrs) != 0 {
+            return None;
+        }
+
+        let mut current = ifaddrs;
+        let mut result = None;
+
+        while !current.is_null() {
+            let ifa = &*current;
+            if !ifa.ifa_addr.is_null() {
+                let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
+                if name == iface && (*ifa.ifa_addr).sa_family == libc::AF_INET as u16 {
+                    let addr = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    let ip =
+                        IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)));
+                    result = Some(ip);
+                    break;
+                }
+            }
+            current = ifa.ifa_next;
+        }
+
+        libc::freeifaddrs(ifaddrs);
+        result
+    }
+}
+
+/// Modify a RIST URL to bind to a specific local IP address.
+/// e.g., "rist://1.2.3.4:5000" + iface "eth0" (IP 10.0.0.1) -> "rist://10.0.0.1@1.2.3.4:5000"
+/// This tells librist to use the specified local address for the socket,
+/// effectively binding traffic to that interface.
+pub fn bind_url_to_iface(url: &str, iface: &str) -> Option<String> {
+    let local_ip = resolve_iface_ipv4(iface)?;
+
+    // RIST URL format: rist://[local_ip@]remote_ip:port[?params]
+    // We need to insert local_ip@ before the remote address.
+    if let Some(rest) = url.strip_prefix("rist://") {
+        // Check if there's already a local binding (@)
+        if rest.contains('@') {
+            // Already has a local binding, don't override
+            return Some(url.to_string());
+        }
+        Some(format!("rist://{}@{}", local_ip, rest))
+    } else {
+        None
+    }
+}
+
+/// Lifecycle phase of a network link.
+///
+/// Links progress through these phases based on observed statistics:
+///
+/// ```text
+/// Init → Probe → Warm → Live ⇄ Degrade → Cooldown → Probe → …
+///                                    ↓
+///                                  Reset → Probe
+/// ```
+///
+/// The scheduler uses the phase to weight link credit accrual —
+/// `Live` links get full credit, `Probe` links are rate-limited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LinkPhase {
     #[default]
@@ -26,6 +98,11 @@ impl LinkPhase {
     }
 }
 
+/// Snapshot of a link's current telemetry.
+///
+/// Populated by [`LinkSender::get_metrics()`] from smoothed EWMA values
+/// and OS-level interface state (operstate, MTU). The scheduler uses these
+/// to compute effective capacity and credit accrual rates.
 #[derive(Default, Debug, Clone)]
 pub struct LinkMetrics {
     pub rtt_ms: f64,
@@ -43,8 +120,15 @@ pub struct LinkMetrics {
     pub link_kind: Option<String>,
 }
 
+/// Abstraction for a network link capable of sending packets and reporting metrics.
+///
+/// Implemented by [`crate::net::link::Link`] (backed by librist) and by
+/// mock links in tests.
 pub trait LinkSender: Send + Sync {
+    /// Returns the unique identifier of this link.
     fn id(&self) -> usize;
+    /// Sends raw bytes over this link. Returns the number of bytes written.
     fn send(&self, packet: &[u8]) -> Result<usize>;
+    /// Returns a snapshot of the link's current metrics.
     fn get_metrics(&self) -> LinkMetrics;
 }

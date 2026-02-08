@@ -76,6 +76,20 @@ jobs:
       - name: Run unit tests
         run: cargo test --workspace --lib
 
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run security audit
+        run: cargo audit
+
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}

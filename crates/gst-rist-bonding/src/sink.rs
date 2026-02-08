@@ -1,4 +1,5 @@
 use crate::pad::RsRistBondSinkPad;
+use crate::util::lock_or_recover;
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
@@ -75,7 +76,7 @@ mod imp {
 
     impl RsRistBondSink {
         pub(crate) fn send_msg(&self, msg: SinkMessage) {
-            let runtime = self.runtime.lock().unwrap();
+            let runtime = lock_or_recover(&self.runtime);
             if let Some(rt) = &*runtime {
                 match msg {
                     SinkMessage::AddLink { id, uri, iface } => {
@@ -95,7 +96,7 @@ mod imp {
             } else {
                 match msg {
                     SinkMessage::AddLink { id, uri, iface } => {
-                        self.pending_links.lock().unwrap().insert(
+                        lock_or_recover(&self.pending_links).insert(
                             id,
                             LinkConfig {
                                 id,
@@ -108,7 +109,7 @@ mod imp {
                         );
                     }
                     SinkMessage::RemoveLink { id } => {
-                        self.pending_links.lock().unwrap().remove(&id);
+                        lock_or_recover(&self.pending_links).remove(&id);
                     }
                 }
             }
@@ -131,14 +132,14 @@ mod imp {
         }
 
         pub(crate) fn remove_link_by_pad_name(&self, pad_name: &str) {
-            if let Some(id) = self.pad_map.lock().unwrap().remove(pad_name) {
+            if let Some(id) = lock_or_recover(&self.pad_map).remove(pad_name) {
                 self.send_msg(SinkMessage::RemoveLink { id });
             }
         }
 
         fn get_id_for_pad(&self, pad_name: &str) -> usize {
             // Find existing or create ID
-            let mut map = self.pad_map.lock().unwrap();
+            let mut map = lock_or_recover(&self.pad_map);
             if let Some(&id) = map.get(pad_name) {
                 return id;
             }
@@ -162,8 +163,8 @@ mod imp {
             }
             match parse_config(config) {
                 Ok(parsed) => {
-                    *self.scheduler_config.lock().unwrap() = parsed.scheduler.clone();
-                    if let Some(rt) = self.runtime.lock().unwrap().as_ref() {
+                    *lock_or_recover(&self.scheduler_config) = parsed.scheduler.clone();
+                    if let Some(rt) = lock_or_recover(&self.runtime).as_ref() {
                         let _ = rt.apply_config(parsed);
                     }
                 }
@@ -174,7 +175,7 @@ mod imp {
         }
 
         fn reconfigure_legacy(&self) {
-            let config = self.links_config.lock().unwrap().clone();
+            let config = lock_or_recover(&self.links_config).clone();
             if config.is_empty() {
                 return;
             }
@@ -226,13 +227,13 @@ mod imp {
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
             match pspec.name() {
                 "links" => {
-                    *self.links_config.lock().unwrap() =
+                    *lock_or_recover(&self.links_config) =
                         value.get().expect("type checked upstream");
                     self.reconfigure_legacy();
                 }
                 "config" => {
                     let cfg: String = value.get().expect("type checked upstream");
-                    *self.config_toml.lock().unwrap() = cfg.clone();
+                    *lock_or_recover(&self.config_toml) = cfg.clone();
                     self.apply_config(&cfg);
                 }
                 "config-file" => {
@@ -240,9 +241,19 @@ mod imp {
                     if path.is_empty() {
                         return;
                     }
+                    // Validate path: reject absolute paths outside expected directories
+                    // to mitigate path traversal when set from untrusted input.
+                    if path.contains("..") {
+                        gst::warning!(
+                            gst::CAT_DEFAULT,
+                            "Rejected config-file path with '..': {}",
+                            path
+                        );
+                        return;
+                    }
                     match std::fs::read_to_string(&path) {
                         Ok(cfg) => {
-                            *self.config_toml.lock().unwrap() = cfg.clone();
+                            *lock_or_recover(&self.config_toml) = cfg.clone();
                             self.apply_config(&cfg);
                         }
                         Err(e) => {
@@ -255,15 +266,20 @@ mod imp {
                         }
                     }
                 }
-                _ => unimplemented!(),
+                _ => {
+                    gst::warning!(gst::CAT_DEFAULT, "Unknown property: {}", pspec.name());
+                }
             }
         }
 
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
             match pspec.name() {
-                "links" => self.links_config.lock().unwrap().to_value(),
-                "config" | "config-file" => self.config_toml.lock().unwrap().to_value(),
-                _ => unimplemented!(),
+                "links" => lock_or_recover(&self.links_config).to_value(),
+                "config" | "config-file" => lock_or_recover(&self.config_toml).to_value(),
+                _ => {
+                    gst::warning!(gst::CAT_DEFAULT, "Unknown property: {}", pspec.name());
+                    "".to_value()
+                }
             }
         }
     }
@@ -279,7 +295,7 @@ mod imp {
                     "RIST Bonding Sink",
                     "Sink/Network",
                     "Sends packets via bonded RIST links",
-                    "Author <author@example.com>",
+                    "Strata Contributors <https://github.com/rist-bonding>",
                 )
             });
             Some(ELEMENT_METADATA.get().unwrap())
@@ -323,7 +339,7 @@ mod imp {
                     let mut i = 0;
                     loop {
                         let candidate = format!("link_{}", i);
-                        if !self.pad_map.lock().unwrap().contains_key(&candidate) {
+                        if !lock_or_recover(&self.pad_map).contains_key(&candidate) {
                             break candidate;
                         }
                         i += 1;
@@ -361,10 +377,10 @@ mod imp {
 
     impl BaseSinkImpl for RsRistBondSink {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
-            let sched_cfg = self.scheduler_config.lock().unwrap().clone();
+            let sched_cfg = lock_or_recover(&self.scheduler_config).clone();
             let runtime = BondingRuntime::with_config(sched_cfg.clone());
             let metrics_handle = runtime.metrics_handle();
-            *self.runtime.lock().unwrap() = Some(runtime);
+            *lock_or_recover(&self.runtime) = Some(runtime);
 
             for pad in self.obj().pads() {
                 if let Some(bond_pad) = pad.downcast_ref::<RsRistBondSinkPad>() {
@@ -372,11 +388,8 @@ mod imp {
                 }
             }
 
-            if let Some(rt) = self.runtime.lock().unwrap().as_ref() {
-                let pending: Vec<LinkConfig> = self
-                    .pending_links
-                    .lock()
-                    .unwrap()
+            if let Some(rt) = lock_or_recover(&self.runtime).as_ref() {
+                let pending: Vec<LinkConfig> = lock_or_recover(&self.pending_links)
                     .drain()
                     .map(|(_, v)| v)
                     .collect();
@@ -386,7 +399,7 @@ mod imp {
             }
 
             self.reconfigure_legacy();
-            self.apply_config(&self.config_toml.lock().unwrap());
+            self.apply_config(&lock_or_recover(&self.config_toml));
 
             let element_weak = self.obj().downgrade();
             let running = self.stats_running.clone();
@@ -394,95 +407,101 @@ mod imp {
             let congestion_headroom = sched_cfg.congestion_headroom_ratio;
             let congestion_trigger = sched_cfg.congestion_trigger_ratio;
 
-            let handle = std::thread::spawn(move || {
-                let stats_interval = Duration::from_millis(sched_cfg.stats_interval_ms);
-                let mut last_stats = Instant::now();
-                let start = Instant::now();
-                let mut stats_seq: u64 = 0;
+            let handle = std::thread::Builder::new()
+                .name("rist-bond-stats".into())
+                .spawn(move || {
+                    let stats_interval = Duration::from_millis(sched_cfg.stats_interval_ms);
+                    let mut last_stats = Instant::now();
+                    let start = Instant::now();
+                    let mut stats_seq: u64 = 0;
 
-                while running.load(Ordering::Relaxed) {
-                    if last_stats.elapsed() >= stats_interval {
-                        if let Some(element) = element_weak.upgrade() {
-                            let metrics = metrics_handle.lock().unwrap().clone();
-                            let mono_time_ns = start.elapsed().as_nanos() as u64;
-                            let wall_time_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_millis() as u64)
-                                .unwrap_or(0);
+                    while running.load(Ordering::Relaxed) {
+                        if last_stats.elapsed() >= stats_interval {
+                            if let Some(element) = element_weak.upgrade() {
+                                let metrics = lock_or_recover(&metrics_handle).clone();
+                                let mono_time_ns = start.elapsed().as_nanos() as u64;
+                                let wall_time_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
 
-                            let mut total_capacity = 0.0;
-                            let mut total_observed_bps = 0.0;
-                            let mut alive_links = 0u64;
-                            for m in metrics.values() {
-                                if m.alive {
-                                    total_capacity += m.capacity_bps;
-                                    total_observed_bps += m.observed_bps;
-                                    alive_links += 1;
+                                let mut total_capacity = 0.0;
+                                let mut total_observed_bps = 0.0;
+                                let mut alive_links = 0u64;
+                                for m in metrics.values() {
+                                    if m.alive {
+                                        total_capacity += m.capacity_bps;
+                                        total_observed_bps += m.observed_bps;
+                                        alive_links += 1;
+                                    }
+                                }
+
+                                let mut msg_struct = gst::Structure::builder("rist-bonding-stats")
+                                    .field("schema_version", 1i32)
+                                    .field("stats_seq", stats_seq)
+                                    .field("heartbeat", true)
+                                    .field("mono_time_ns", mono_time_ns)
+                                    .field("wall_time_ms", wall_time_ms)
+                                    .field("total_capacity", total_capacity)
+                                    .field("alive_links", alive_links);
+                                for (id, m) in metrics {
+                                    let os_up =
+                                        m.os_up.map(|v| if v { 1i32 } else { 0i32 }).unwrap_or(-1);
+                                    let mtu = m.mtu.map(|v| v as i32).unwrap_or(-1);
+                                    let iface = m.iface.as_deref().unwrap_or("");
+                                    let link_kind = m.link_kind.as_deref().unwrap_or("");
+                                    msg_struct = msg_struct
+                                        .field(format!("link_{}_rtt", id), m.rtt_ms)
+                                        .field(format!("link_{}_capacity", id), m.capacity_bps)
+                                        .field(format!("link_{}_loss", id), m.loss_rate)
+                                        .field(format!("link_{}_observed_bps", id), m.observed_bps)
+                                        .field(
+                                            format!("link_{}_observed_bytes", id),
+                                            m.observed_bytes,
+                                        )
+                                        .field(format!("link_{}_alive", id), m.alive)
+                                        .field(format!("link_{}_phase", id), m.phase.as_str())
+                                        .field(format!("link_{}_os_up", id), os_up)
+                                        .field(format!("link_{}_mtu", id), mtu)
+                                        .field(format!("link_{}_iface", id), iface)
+                                        .field(format!("link_{}_kind", id), link_kind);
+                                }
+                                let _ = element
+                                    .post_message(gst::message::Element::new(msg_struct.build()));
+
+                                if let Some(recommended) = compute_congestion_recommendation(
+                                    total_capacity,
+                                    total_observed_bps,
+                                    congestion_headroom,
+                                    congestion_trigger,
+                                ) {
+                                    let msg = gst::Structure::builder("congestion-control")
+                                        .field("recommended-bitrate", recommended)
+                                        .field("total_capacity", total_capacity)
+                                        .field("observed_bps", total_observed_bps)
+                                        .build();
+                                    let _ = element.post_message(gst::message::Element::new(msg));
                                 }
                             }
-
-                            let mut msg_struct = gst::Structure::builder("rist-bonding-stats")
-                                .field("schema_version", 1i32)
-                                .field("stats_seq", stats_seq)
-                                .field("heartbeat", true)
-                                .field("mono_time_ns", mono_time_ns)
-                                .field("wall_time_ms", wall_time_ms)
-                                .field("total_capacity", total_capacity)
-                                .field("alive_links", alive_links);
-                            for (id, m) in metrics {
-                                let os_up =
-                                    m.os_up.map(|v| if v { 1i32 } else { 0i32 }).unwrap_or(-1);
-                                let mtu = m.mtu.map(|v| v as i32).unwrap_or(-1);
-                                let iface = m.iface.as_deref().unwrap_or("");
-                                let link_kind = m.link_kind.as_deref().unwrap_or("");
-                                msg_struct = msg_struct
-                                    .field(format!("link_{}_rtt", id), m.rtt_ms)
-                                    .field(format!("link_{}_capacity", id), m.capacity_bps)
-                                    .field(format!("link_{}_loss", id), m.loss_rate)
-                                    .field(format!("link_{}_observed_bps", id), m.observed_bps)
-                                    .field(format!("link_{}_observed_bytes", id), m.observed_bytes)
-                                    .field(format!("link_{}_alive", id), m.alive)
-                                    .field(format!("link_{}_phase", id), m.phase.as_str())
-                                    .field(format!("link_{}_os_up", id), os_up)
-                                    .field(format!("link_{}_mtu", id), mtu)
-                                    .field(format!("link_{}_iface", id), iface)
-                                    .field(format!("link_{}_kind", id), link_kind);
-                            }
-                            let _ = element
-                                .post_message(gst::message::Element::new(msg_struct.build()));
-
-                            if let Some(recommended) = compute_congestion_recommendation(
-                                total_capacity,
-                                total_observed_bps,
-                                congestion_headroom,
-                                congestion_trigger,
-                            ) {
-                                let msg = gst::Structure::builder("congestion-control")
-                                    .field("recommended-bitrate", recommended)
-                                    .field("total_capacity", total_capacity)
-                                    .field("observed_bps", total_observed_bps)
-                                    .build();
-                                let _ = element.post_message(gst::message::Element::new(msg));
-                            }
+                            stats_seq = stats_seq.wrapping_add(1);
+                            last_stats = Instant::now();
                         }
-                        stats_seq = stats_seq.wrapping_add(1);
-                        last_stats = Instant::now();
+                        std::thread::sleep(Duration::from_millis(50));
                     }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            });
+                })
+                .expect("failed to spawn stats thread");
 
-            *self.stats_thread.lock().unwrap() = Some(handle);
+            *lock_or_recover(&self.stats_thread) = Some(handle);
             Ok(())
         }
 
         fn stop(&self) -> Result<(), gst::ErrorMessage> {
             self.stats_running.store(false, Ordering::Relaxed);
-            if let Some(handle) = self.stats_thread.lock().unwrap().take() {
+            if let Some(handle) = lock_or_recover(&self.stats_thread).take() {
                 let _ = handle.join();
             }
 
-            if let Some(mut runtime) = self.runtime.lock().unwrap().take() {
+            if let Some(mut runtime) = lock_or_recover(&self.runtime).take() {
                 runtime.shutdown();
             }
             Ok(())
@@ -506,7 +525,7 @@ mod imp {
                 size_bytes: data.len(),
             };
 
-            if let Some(rt) = self.runtime.lock().unwrap().as_ref() {
+            if let Some(rt) = lock_or_recover(&self.runtime).as_ref() {
                 match rt.try_send_packet(data, profile) {
                     Ok(_) => (),
                     Err(PacketSendError::Full) => {

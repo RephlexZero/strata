@@ -1,3 +1,4 @@
+use crate::util::lock_or_recover;
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
@@ -41,7 +42,7 @@ mod imp {
             }
             match rist_bonding_core::config::BondingConfig::from_toml_str(toml_str) {
                 Ok(cfg) => {
-                    let mut settings = self.settings.lock().unwrap();
+                    let mut settings = lock_or_recover(&self.settings);
                     settings.config_toml = toml_str.to_string();
                     // Apply receiver config: override latency and links if specified
                     settings.latency = cfg.receiver.start_latency.as_millis() as u32;
@@ -56,7 +57,11 @@ mod imp {
                     }
                 }
                 Err(e) => {
-                    eprintln!("RsRistBondSrc: Invalid config TOML: {}", e);
+                    gst::warning!(
+                        gst::CAT_DEFAULT,
+                        "RsRistBondSrc: Invalid config TOML: {}",
+                        e
+                    );
                 }
             }
         }
@@ -102,11 +107,11 @@ mod imp {
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
             match pspec.name() {
                 "links" => {
-                    let mut settings = self.settings.lock().unwrap();
+                    let mut settings = lock_or_recover(&self.settings);
                     settings.links = value.get().expect("type checked upstream");
                 }
                 "latency" => {
-                    let mut settings = self.settings.lock().unwrap();
+                    let mut settings = lock_or_recover(&self.settings);
                     settings.latency = value.get().expect("type checked upstream");
                 }
                 "config" => {
@@ -118,37 +123,52 @@ mod imp {
                     if path.is_empty() {
                         return;
                     }
+                    if path.contains("..") {
+                        gst::warning!(
+                            gst::CAT_DEFAULT,
+                            "Rejected config-file path with '..': {}",
+                            path
+                        );
+                        return;
+                    }
                     match std::fs::read_to_string(&path) {
                         Ok(cfg) => {
                             self.apply_config_toml(&cfg);
                         }
                         Err(e) => {
-                            eprintln!(
+                            gst::warning!(
+                                gst::CAT_DEFAULT,
                                 "RsRistBondSrc: Failed to read config file '{}': {}",
-                                path, e
+                                path,
+                                e
                             );
                         }
                     }
                 }
-                _ => unimplemented!(),
+                _ => {
+                    gst::warning!(gst::CAT_DEFAULT, "Unknown property: {}", pspec.name());
+                }
             }
         }
 
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
             match pspec.name() {
                 "links" => {
-                    let settings = self.settings.lock().unwrap();
+                    let settings = lock_or_recover(&self.settings);
                     settings.links.to_value()
                 }
                 "latency" => {
-                    let settings = self.settings.lock().unwrap();
+                    let settings = lock_or_recover(&self.settings);
                     settings.latency.to_value()
                 }
                 "config" | "config-file" => {
-                    let settings = self.settings.lock().unwrap();
+                    let settings = lock_or_recover(&self.settings);
                     settings.config_toml.to_value()
                 }
-                _ => unimplemented!(),
+                _ => {
+                    gst::warning!(gst::CAT_DEFAULT, "Unknown property: {}", pspec.name());
+                    "".to_value()
+                }
             }
         }
     }
@@ -165,7 +185,7 @@ mod imp {
                     "RIST Bonding Source",
                     "Source/Network",
                     "Receives packets via bonded RIST links",
-                    "Author <author@example.com>",
+                    "Strata Contributors <https://github.com/rist-bonding>",
                 )
             });
             Some(ELEMENT_METADATA.get().unwrap())
@@ -191,8 +211,8 @@ mod imp {
 
     impl BaseSrcImpl for RsRistBondSrc {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
-            let settings = self.settings.lock().unwrap();
-            let mut receiver_guard = self.receiver.lock().unwrap();
+            let settings = lock_or_recover(&self.settings);
+            let mut receiver_guard = lock_or_recover(&self.receiver);
 
             if receiver_guard.is_some() {
                 return Ok(());
@@ -209,7 +229,7 @@ mod imp {
 
                 receiver.add_link(link).map_err(|e| {
                     let err_msg = format!("Failed to bind link {}: {}", link, e);
-                    eprintln!("RsRistBondSrc Error: {}", err_msg);
+                    gst::error!(gst::CAT_DEFAULT, "RsRistBondSrc Error: {}", err_msg);
                     gst::error_msg!(gst::ResourceError::OpenRead, ["{}", err_msg])
                 })?;
             }
@@ -221,57 +241,60 @@ mod imp {
             let running = self.stats_running.clone();
             let element_weak = self.obj().downgrade();
 
-            let handle = std::thread::spawn(move || {
-                let start = Instant::now();
-                let mut stats_seq: u64 = 0;
-                while running.load(Ordering::Relaxed) {
-                    if let Some(element) = element_weak.upgrade() {
-                        let imp = element.imp();
-                        if let Ok(receiver_guard) = imp.receiver.lock() {
-                            if let Some(receiver) = &*receiver_guard {
-                                let stats = receiver.get_stats();
-                                let mono_time_ns = start.elapsed().as_nanos() as u64;
-                                let wall_time_ms = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0);
-                                let msg = gst::Structure::builder("rist-bonding-stats")
-                                    .field("schema_version", 1i32)
-                                    .field("stats_seq", stats_seq)
-                                    .field("heartbeat", true)
-                                    .field("mono_time_ns", mono_time_ns)
-                                    .field("wall_time_ms", wall_time_ms)
-                                    .field("total_capacity", 0.0f64)
-                                    .field("alive_links", 0u64)
-                                    .field("queue_depth", stats.queue_depth as u64)
-                                    .field("next_seq", stats.next_seq)
-                                    .field("lost_packets", stats.lost_packets)
-                                    .field("late_packets", stats.late_packets)
-                                    .field("current_latency_ms", stats.current_latency_ms) // Added
-                                    .build();
-                                let _ = element.post_message(gst::message::Element::new(msg));
-                                stats_seq = stats_seq.wrapping_add(1);
+            let handle = std::thread::Builder::new()
+                .name("rist-rcv-stats".into())
+                .spawn(move || {
+                    let start = Instant::now();
+                    let mut stats_seq: u64 = 0;
+                    while running.load(Ordering::Relaxed) {
+                        if let Some(element) = element_weak.upgrade() {
+                            let imp = element.imp();
+                            if let Ok(receiver_guard) = imp.receiver.lock() {
+                                if let Some(receiver) = &*receiver_guard {
+                                    let stats = receiver.get_stats();
+                                    let mono_time_ns = start.elapsed().as_nanos() as u64;
+                                    let wall_time_ms = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0);
+                                    let msg = gst::Structure::builder("rist-bonding-stats")
+                                        .field("schema_version", 1i32)
+                                        .field("stats_seq", stats_seq)
+                                        .field("heartbeat", true)
+                                        .field("mono_time_ns", mono_time_ns)
+                                        .field("wall_time_ms", wall_time_ms)
+                                        .field("total_capacity", 0.0f64)
+                                        .field("alive_links", 0u64)
+                                        .field("queue_depth", stats.queue_depth as u64)
+                                        .field("next_seq", stats.next_seq)
+                                        .field("lost_packets", stats.lost_packets)
+                                        .field("late_packets", stats.late_packets)
+                                        .field("current_latency_ms", stats.current_latency_ms) // Added
+                                        .build();
+                                    let _ = element.post_message(gst::message::Element::new(msg));
+                                    stats_seq = stats_seq.wrapping_add(1);
+                                }
                             }
+                        } else {
+                            break;
                         }
-                    } else {
-                        break;
-                    }
 
-                    std::thread::sleep(Duration::from_secs(1));
-                }
-            });
-            *self.stats_thread.lock().unwrap() = Some(handle);
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                })
+                .expect("failed to spawn receiver stats thread");
+            *lock_or_recover(&self.stats_thread) = Some(handle);
 
             Ok(())
         }
 
         fn stop(&self) -> Result<(), gst::ErrorMessage> {
             self.stats_running.store(false, Ordering::Relaxed);
-            if let Some(handle) = self.stats_thread.lock().unwrap().take() {
+            if let Some(handle) = lock_or_recover(&self.stats_thread).take() {
                 let _ = handle.join();
             }
 
-            let mut receiver_guard = self.receiver.lock().unwrap();
+            let mut receiver_guard = lock_or_recover(&self.receiver);
             if let Some(mut receiver) = receiver_guard.take() {
                 receiver.shutdown();
                 // We leave flushing/closing to Drop?
@@ -280,7 +303,7 @@ mod imp {
         }
 
         fn unlock(&self) -> Result<(), gst::ErrorMessage> {
-            let mut receiver_guard = self.receiver.lock().unwrap();
+            let mut receiver_guard = lock_or_recover(&self.receiver);
             if let Some(receiver) = &mut *receiver_guard {
                 receiver.shutdown();
             }
@@ -293,7 +316,7 @@ mod imp {
             &self,
             _buf: Option<&mut gst::BufferRef>,
         ) -> Result<gst_base::subclass::base_src::CreateSuccess, gst::FlowError> {
-            let receiver_guard = self.receiver.lock().unwrap();
+            let receiver_guard = lock_or_recover(&self.receiver);
 
             let rx = if let Some(receiver) = &*receiver_guard {
                 receiver.output_rx.clone()

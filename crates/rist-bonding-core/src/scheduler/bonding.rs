@@ -4,9 +4,20 @@ use crate::scheduler::dwrr::Dwrr;
 use anyhow::Result;
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing::{error, warn};
 
+/// Top-level bonding packet scheduler.
+///
+/// Wraps the [`Dwrr`] scheduler with higher-level bonding logic:
+/// - Critical packet broadcast (keyframes sent to all alive links)
+/// - Fast-failover mode (broadcasts all traffic on link instability)
+/// - Adaptive redundancy (duplicates important packets when spare capacity allows)
+/// - Escalating dead-link logging
+///
+/// Used by [`crate::runtime::BondingRuntime`] on the worker thread.
 pub struct BondingScheduler<L: LinkSender + ?Sized> {
     scheduler: Dwrr<L>,
     next_seq: u64,
@@ -14,13 +25,19 @@ pub struct BondingScheduler<L: LinkSender + ?Sized> {
     failover_until: Option<Instant>,
     prev_phases: HashMap<usize, crate::net::interface::LinkPhase>,
     prev_rtts: HashMap<usize, f64>,
+    /// Counter for consecutive all-links-dead failures (for escalation)
+    consecutive_dead_count: u64,
+    /// Total packets dropped due to all links being dead
+    pub total_dead_drops: Arc<AtomicU64>,
 }
 
 impl<L: LinkSender + ?Sized> BondingScheduler<L> {
+    /// Creates a scheduler with default configuration.
     pub fn new() -> Self {
         Self::with_config(SchedulerConfig::default())
     }
 
+    /// Creates a scheduler with the given configuration.
     pub fn with_config(config: SchedulerConfig) -> Self {
         Self {
             scheduler: Dwrr::with_config(config),
@@ -28,25 +45,32 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             failover_until: None,
             prev_phases: HashMap::new(),
             prev_rtts: HashMap::new(),
+            consecutive_dead_count: 0,
+            total_dead_drops: Arc::new(AtomicU64::new(0)),
         }
     }
 
+    /// Returns a reference to the current scheduler configuration.
     pub fn config(&self) -> &SchedulerConfig {
         self.scheduler.config()
     }
 
+    /// Replaces the scheduler configuration at runtime.
     pub fn update_config(&mut self, config: SchedulerConfig) {
         self.scheduler.update_config(config);
     }
 
+    /// Registers a new link with the scheduler.
     pub fn add_link(&mut self, link: Arc<L>) {
         self.scheduler.add_link(link);
     }
 
+    /// Removes a link by ID, stopping all traffic to it.
     pub fn remove_link(&mut self, id: usize) {
         self.scheduler.remove_link(id);
     }
 
+    /// Refreshes link metrics from all links and checks for failover conditions.
     pub fn refresh_metrics(&mut self) {
         self.scheduler.refresh_metrics();
         self.check_failover_conditions();
@@ -105,10 +129,17 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         }
     }
 
+    /// Returns a snapshot of metrics for all registered links.
     pub fn get_all_metrics(&self) -> HashMap<usize, crate::net::interface::LinkMetrics> {
         self.scheduler.get_active_links().into_iter().collect()
     }
 
+    /// Schedules a packet for transmission across the bonded links.
+    ///
+    /// Routing decision depends on the packet profile and current link state:
+    /// 1. **Broadcast** — critical packets or failover mode → sent to all alive links
+    /// 2. **Redundancy** — spare capacity available → duplicated to N best links
+    /// 3. **Standard** — DWRR selects the best single link
     pub fn send(&mut self, payload: Bytes, profile: crate::scheduler::PacketProfile) -> Result<()> {
         let packet_len = payload.len();
         let config = self.scheduler.config();
@@ -197,10 +228,33 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
 
             link.send(&wrapped)?;
             self.scheduler.record_send(link.id(), packet_len as u64);
+            self.consecutive_dead_count = 0;
             return Ok(());
         }
 
-        Err(anyhow::anyhow!("Link selection failed (all dead?)"))
+        // All links dead — escalate logging based on consecutive failures.
+        self.consecutive_dead_count += 1;
+        self.total_dead_drops.fetch_add(1, Ordering::Relaxed);
+
+        // Log at escalating severity: first occurrence is a warning,
+        // sustained failures (100+ consecutive) escalate to error.
+        if self.consecutive_dead_count == 1 {
+            warn!("All links dead: dropped packet (seq={})", self.next_seq);
+        } else if self.consecutive_dead_count == 100 {
+            error!(
+                "All links dead for {} consecutive packets — total drops: {}",
+                self.consecutive_dead_count,
+                self.total_dead_drops.load(Ordering::Relaxed)
+            );
+        } else if self.consecutive_dead_count.is_multiple_of(1000) {
+            error!(
+                "All links still dead after {} consecutive drops (total: {})",
+                self.consecutive_dead_count,
+                self.total_dead_drops.load(Ordering::Relaxed)
+            );
+        }
+
+        Err(anyhow::anyhow!("Link selection failed (all links dead)"))
     }
 }
 

@@ -4,6 +4,10 @@ use std::env;
 use std::sync::{Arc, Mutex};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize structured logging for production use.
+    // Controlled by RUST_LOG env var (e.g., RUST_LOG=info,librist=warn).
+    rist_bonding_core::init();
+
     gst::init()?;
 
     let args: Vec<String> = env::args().collect();

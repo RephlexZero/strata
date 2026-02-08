@@ -5,6 +5,11 @@ use std::sync::atomic::{AtomicI32, AtomicU64};
 use std::sync::Mutex;
 use std::time::Instant;
 
+/// Smoothed statistics state for a single link's stats callback.
+///
+/// Updated by the librist stats callback at each interval (~100ms),
+/// holding the EWMA filters for RTT, bandwidth, and loss, plus
+/// counters for delta computation.
 pub struct EwmaStats {
     pub rtt: Ewma,
     pub bandwidth: Ewma,
@@ -35,6 +40,12 @@ impl Default for EwmaStats {
     }
 }
 
+/// Shared atomic state for a single network link.
+///
+/// Written by the librist stats callback (via `Arc`) and read by
+/// [`LinkSender::get_metrics()`](crate::net::interface::LinkSender::get_metrics)
+/// on the scheduler thread. Atomic fields avoid lock contention on the hot
+/// path; the `ewma_state` mutex is taken only in the stats callback.
 pub struct LinkStats {
     pub rtt: AtomicU64,
     pub bandwidth: AtomicU64,
@@ -83,6 +94,11 @@ impl Default for LinkStats {
     }
 }
 
+/// Link lifecycle state machine.
+///
+/// Tracks phase transitions based on consecutive good/bad observations
+/// and stats freshness. See [`LinkPhase`]
+/// for the phase diagram.
 pub struct LinkLifecycle {
     pub phase: LinkPhase,
     pub last_transition: Instant,
@@ -256,5 +272,214 @@ mod tests {
         let now = start + Duration::from_secs(5);
         let phase = lc.update(now, 0.0, 1.0, 0.0, Duration::from_secs(5));
         assert_eq!(phase, LinkPhase::Reset);
+    }
+
+    #[test]
+    fn lifecycle_init_to_probe_on_fresh_stats() {
+        let mut lc = LinkLifecycle::new(LinkLifecycleConfig::default());
+        let start = Instant::now();
+        let phase = lc.update(start, 10.0, 0.01, 1_000_000.0, Duration::from_millis(200));
+        assert_eq!(phase, LinkPhase::Probe);
+    }
+
+    #[test]
+    fn lifecycle_init_stays_without_fresh_stats() {
+        let mut lc = LinkLifecycle::new(LinkLifecycleConfig::default());
+        let start = Instant::now();
+        let phase = lc.update(start, 10.0, 0.01, 1_000_000.0, Duration::from_secs(5));
+        assert_eq!(phase, LinkPhase::Init);
+    }
+
+    #[test]
+    fn lifecycle_probe_to_warm() {
+        let config = LinkLifecycleConfig {
+            probe_to_warm_good: 3,
+            ..LinkLifecycleConfig::default()
+        };
+        let mut lc = LinkLifecycle::new(config);
+        let start = Instant::now();
+
+        lc.update(start, 10.0, 0.01, 1_000_000.0, Duration::from_millis(200));
+        assert_eq!(lc.phase, LinkPhase::Probe);
+
+        for i in 1..=3 {
+            let now = start + Duration::from_millis(i * 100);
+            lc.update(now, 10.0, 0.01, 1_000_000.0, Duration::from_millis(200));
+        }
+        assert_eq!(lc.phase, LinkPhase::Warm);
+    }
+
+    #[test]
+    fn lifecycle_probe_to_reset_on_stale() {
+        let config = LinkLifecycleConfig {
+            stats_stale_ms: 3000,
+            ..LinkLifecycleConfig::default()
+        };
+        let mut lc = LinkLifecycle::new(config);
+        let start = Instant::now();
+
+        lc.update(start, 10.0, 0.01, 1_000_000.0, Duration::from_millis(200));
+        assert_eq!(lc.phase, LinkPhase::Probe);
+
+        let phase = lc.update(
+            start + Duration::from_secs(1),
+            0.0,
+            1.0,
+            0.0,
+            Duration::from_secs(5),
+        );
+        assert_eq!(phase, LinkPhase::Reset);
+    }
+
+    #[test]
+    fn lifecycle_degrade_to_warm_on_recovery() {
+        let config = LinkLifecycleConfig {
+            degrade_to_warm_good: 5,
+            ..LinkLifecycleConfig::default()
+        };
+        let mut lc = LinkLifecycle::new(config);
+        let start = Instant::now();
+
+        for i in 0..12 {
+            let now = start + Duration::from_millis(i * 100);
+            lc.update(now, 10.0, 0.01, 1_000_000.0, Duration::from_millis(200));
+        }
+        assert_eq!(lc.phase, LinkPhase::Live);
+
+        for i in 0..3 {
+            let now = start + Duration::from_secs(2) + Duration::from_millis(i * 50);
+            lc.update(now, 200.0, 0.9, 100_000.0, Duration::from_millis(200));
+        }
+        assert_eq!(lc.phase, LinkPhase::Degrade);
+
+        for i in 0..5 {
+            let now = start + Duration::from_secs(3) + Duration::from_millis(i * 100);
+            lc.update(now, 10.0, 0.01, 1_000_000.0, Duration::from_millis(200));
+        }
+        assert_eq!(lc.phase, LinkPhase::Warm);
+    }
+
+    #[test]
+    fn lifecycle_degrade_to_cooldown_on_persistent_bad() {
+        let config = LinkLifecycleConfig {
+            degrade_to_cooldown_bad: 10,
+            ..LinkLifecycleConfig::default()
+        };
+        let mut lc = LinkLifecycle::new(config);
+        let start = Instant::now();
+
+        for i in 0..12 {
+            let now = start + Duration::from_millis(i * 100);
+            lc.update(now, 10.0, 0.01, 1_000_000.0, Duration::from_millis(200));
+        }
+        assert_eq!(lc.phase, LinkPhase::Live);
+
+        for i in 0..3 {
+            let now = start + Duration::from_secs(2) + Duration::from_millis(i * 50);
+            lc.update(now, 200.0, 0.9, 100_000.0, Duration::from_millis(200));
+        }
+        assert_eq!(lc.phase, LinkPhase::Degrade);
+
+        for i in 0..10 {
+            let now = start + Duration::from_secs(3) + Duration::from_millis(i * 50);
+            lc.update(now, 200.0, 0.9, 100_000.0, Duration::from_millis(200));
+        }
+        assert_eq!(lc.phase, LinkPhase::Cooldown);
+    }
+
+    #[test]
+    fn lifecycle_cooldown_to_probe_after_timeout() {
+        let config = LinkLifecycleConfig {
+            degrade_to_cooldown_bad: 10,
+            cooldown_ms: 2000,
+            ..LinkLifecycleConfig::default()
+        };
+        let mut lc = LinkLifecycle::new(config);
+        let start = Instant::now();
+
+        // Drive to Cooldown
+        for i in 0..12 {
+            let now = start + Duration::from_millis(i * 100);
+            lc.update(now, 10.0, 0.01, 1_000_000.0, Duration::from_millis(200));
+        }
+        for i in 0..3 {
+            let now = start + Duration::from_secs(2) + Duration::from_millis(i * 50);
+            lc.update(now, 200.0, 0.9, 100_000.0, Duration::from_millis(200));
+        }
+        for i in 0..10 {
+            let now = start + Duration::from_secs(3) + Duration::from_millis(i * 50);
+            lc.update(now, 200.0, 0.9, 100_000.0, Duration::from_millis(200));
+        }
+        assert_eq!(lc.phase, LinkPhase::Cooldown);
+
+        // Wait less than cooldown -> stays Cooldown
+        let now = start + Duration::from_secs(4);
+        lc.update(now, 10.0, 0.01, 1_000_000.0, Duration::from_millis(200));
+        assert_eq!(lc.phase, LinkPhase::Cooldown);
+
+        // Wait past cooldown -> Probe
+        let now = start + Duration::from_secs(10);
+        lc.update(now, 10.0, 0.01, 1_000_000.0, Duration::from_millis(200));
+        assert_eq!(lc.phase, LinkPhase::Probe);
+    }
+
+    #[test]
+    fn lifecycle_reset_to_probe_on_fresh() {
+        let mut lc = LinkLifecycle::new(LinkLifecycleConfig::default());
+        let start = Instant::now();
+
+        for i in 0..12 {
+            let now = start + Duration::from_millis(i * 100);
+            lc.update(now, 10.0, 0.01, 1_000_000.0, Duration::from_millis(200));
+        }
+        let now = start + Duration::from_secs(5);
+        lc.update(now, 0.0, 1.0, 0.0, Duration::from_secs(5));
+        assert_eq!(lc.phase, LinkPhase::Reset);
+
+        let now = start + Duration::from_secs(6);
+        let phase = lc.update(now, 10.0, 0.01, 1_000_000.0, Duration::from_millis(200));
+        assert_eq!(phase, LinkPhase::Probe);
+    }
+
+    #[test]
+    fn lifecycle_reset_stays_without_fresh_stats() {
+        let mut lc = LinkLifecycle::new(LinkLifecycleConfig::default());
+        let start = Instant::now();
+
+        for i in 0..12 {
+            let now = start + Duration::from_millis(i * 100);
+            lc.update(now, 10.0, 0.01, 1_000_000.0, Duration::from_millis(200));
+        }
+        lc.update(
+            start + Duration::from_secs(5),
+            0.0,
+            1.0,
+            0.0,
+            Duration::from_secs(5),
+        );
+        assert_eq!(lc.phase, LinkPhase::Reset);
+
+        let now = start + Duration::from_secs(8);
+        let phase = lc.update(now, 0.0, 1.0, 0.0, Duration::from_secs(10));
+        assert_eq!(phase, LinkPhase::Reset);
+    }
+
+    #[test]
+    fn ewma_stats_default_alpha() {
+        let s = EwmaStats::default();
+        assert!((s.rtt.value() - 0.0).abs() < f64::EPSILON);
+        assert_eq!(s.last_sent, 0);
+    }
+
+    #[test]
+    fn link_stats_default_values() {
+        use std::sync::atomic::Ordering;
+        let ls = LinkStats::default();
+        assert_eq!(ls.rtt.load(Ordering::Relaxed), 0);
+        assert_eq!(ls.bandwidth.load(Ordering::Relaxed), 0);
+        assert_eq!(ls.os_up_i32.load(Ordering::Relaxed), -1);
+        assert_eq!(ls.mtu_i32.load(Ordering::Relaxed), -1);
+        let lc = ls.lifecycle.lock().unwrap();
+        assert_eq!(lc.phase, LinkPhase::Init);
     }
 }

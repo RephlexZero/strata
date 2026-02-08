@@ -5,6 +5,10 @@ use serde::Deserialize;
 
 pub const CONFIG_VERSION: u32 = 1;
 
+/// Raw deserialized TOML configuration (pre-resolution).
+///
+/// All fields use `Option` to support partial overrides; defaults are
+/// filled in by [`BondingConfigInput::resolve()`].
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct BondingConfigInput {
@@ -15,6 +19,7 @@ pub struct BondingConfigInput {
     pub scheduler: SchedulerConfigInput,
 }
 
+/// Raw link configuration from TOML input.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct LinkConfigInput {
@@ -29,6 +34,7 @@ pub struct LinkConfigInput {
     pub recovery_reorder_buffer: Option<u32>,
 }
 
+/// Raw receiver configuration from TOML input.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ReceiverConfigInput {
@@ -37,6 +43,7 @@ pub struct ReceiverConfigInput {
     pub skip_after_ms: Option<u64>,
 }
 
+/// Raw lifecycle thresholds from TOML input.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct LinkLifecycleConfigInput {
@@ -54,6 +61,7 @@ pub struct LinkLifecycleConfigInput {
     pub cooldown_ms: Option<u64>,
 }
 
+/// Raw scheduler tuning parameters from TOML input.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct SchedulerConfigInput {
@@ -97,6 +105,7 @@ pub struct SchedulerConfigInput {
     pub channel_capacity: Option<usize>,
 }
 
+/// Resolved link configuration with concrete values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkConfig {
     pub id: usize,
@@ -107,6 +116,7 @@ pub struct LinkConfig {
     pub recovery_reorder_buffer: Option<u32>,
 }
 
+/// Resolved receiver configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiverConfig {
     pub start_latency: Duration,
@@ -114,6 +124,10 @@ pub struct ReceiverConfig {
     pub skip_after: Option<Duration>,
 }
 
+/// Resolved link lifecycle state-machine thresholds.
+///
+/// Controls phase transitions (Probe→Warm→Live→Degrade→Cooldown) based
+/// on consecutive good/bad stats observations and timeout durations.
 #[derive(Debug, Clone)]
 pub struct LinkLifecycleConfig {
     pub good_loss_rate_max: f64,
@@ -159,6 +173,10 @@ impl Default for LinkLifecycleConfig {
     }
 }
 
+/// Resolved scheduler tuning parameters.
+///
+/// Controls DWRR credit computation, redundancy, failover, congestion
+/// feedback, and EWMA smoothing across the bonding scheduler.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
     pub redundancy_enabled: bool,
@@ -208,6 +226,7 @@ impl Default for SchedulerConfig {
     }
 }
 
+/// Fully resolved bonding configuration ready for use by the runtime.
 #[derive(Debug, Clone)]
 pub struct BondingConfig {
     pub version: u32,
@@ -607,5 +626,158 @@ mod tests {
         assert_eq!(cfg.scheduler.failover_enabled, defaults.failover_enabled);
         assert_eq!(cfg.scheduler.channel_capacity, defaults.channel_capacity);
         assert!((cfg.scheduler.ewma_alpha - defaults.ewma_alpha).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_toml_config_invalid_syntax() {
+        let bad_toml = r#"
+            version = 1
+            [[links
+        "#;
+        let result = BondingConfig::from_toml_str(bad_toml);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("Invalid config TOML"),
+            "Error should mention invalid TOML, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn parse_toml_config_unsupported_version() {
+        let toml = r#"
+            version = 99
+            [[links]]
+            uri = "rist://1.2.3.4:5000"
+        "#;
+        let result = BondingConfig::from_toml_str(toml);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("Unsupported config version"),
+            "Expected unsupported version error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn ewma_alpha_clamped_to_minimum() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            ewma_alpha = 0.0
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!(
+            (cfg.scheduler.ewma_alpha - 0.001).abs() < 1e-6,
+            "ewma_alpha should be clamped to 0.001, got: {}",
+            cfg.scheduler.ewma_alpha
+        );
+    }
+
+    #[test]
+    fn ewma_alpha_clamped_to_maximum() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            ewma_alpha = 5.0
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!(
+            (cfg.scheduler.ewma_alpha - 1.0).abs() < 1e-6,
+            "ewma_alpha should be clamped to 1.0, got: {}",
+            cfg.scheduler.ewma_alpha
+        );
+    }
+
+    #[test]
+    fn channel_capacity_clamped_to_minimum() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            channel_capacity = 0
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.scheduler.channel_capacity, 16);
+    }
+
+    #[test]
+    fn buffer_capacity_clamped_to_minimum() {
+        let toml = r#"
+            version = 1
+            [receiver]
+            buffer_capacity = 1
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.receiver.buffer_capacity, 16);
+    }
+
+    #[test]
+    fn stats_interval_clamped_to_minimum() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            stats_interval_ms = 10
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.scheduler.stats_interval_ms, 100);
+    }
+
+    #[test]
+    fn penalty_decay_clamped() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            penalty_decay = -0.5
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!((cfg.scheduler.penalty_decay - 0.0).abs() < 1e-6);
+
+        let toml2 = r#"
+            version = 1
+            [scheduler]
+            penalty_decay = 2.0
+        "#;
+        let cfg2 = BondingConfig::from_toml_str(toml2).unwrap();
+        assert!((cfg2.scheduler.penalty_decay - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn redundancy_target_links_clamped_to_one() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            redundancy_target_links = 0
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.scheduler.redundancy_target_links, 1);
+    }
+
+    #[test]
+    fn link_with_empty_interface_becomes_none() {
+        let toml = r#"
+            version = 1
+            [[links]]
+            id = 1
+            uri = "rist://1.2.3.4:5000"
+            interface = ""
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.links[0].interface.is_none());
+    }
+
+    #[test]
+    fn link_ids_auto_assigned_from_index() {
+        let toml = r#"
+            version = 1
+            [[links]]
+            uri = "rist://1.2.3.4:5000"
+            [[links]]
+            uri = "rist://5.6.7.8:5000"
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.links[0].id, 0);
+        assert_eq!(cfg.links[1].id, 1);
     }
 }

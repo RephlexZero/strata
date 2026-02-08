@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
+/// Error returned when a packet cannot be sent to the bonding worker thread.
 #[derive(Debug)]
 pub enum PacketSendError {
     Full,
@@ -26,6 +27,14 @@ enum RuntimeMessage {
     Shutdown,
 }
 
+/// Thread-safe handle to the bonding scheduler worker.
+///
+/// Owns a background thread that runs the [`BondingScheduler`]
+/// loop, processing packets, applying configuration changes, and refreshing
+/// link metrics. All public methods are non-blocking and communicate with
+/// the worker via a bounded channel.
+///
+/// Dropping the runtime triggers a graceful shutdown of the worker thread.
 pub struct BondingRuntime {
     sender: Sender<RuntimeMessage>,
     metrics: Arc<Mutex<HashMap<usize, LinkMetrics>>>,
@@ -33,17 +42,22 @@ pub struct BondingRuntime {
 }
 
 impl BondingRuntime {
+    /// Creates a runtime with the default scheduler configuration.
     pub fn new() -> Self {
         Self::with_config(SchedulerConfig::default())
     }
 
+    /// Creates a runtime with the given scheduler configuration.
     pub fn with_config(scheduler_config: SchedulerConfig) -> Self {
         let channel_capacity = scheduler_config.channel_capacity;
         let (tx, rx) = bounded(channel_capacity);
         let metrics = Arc::new(Mutex::new(HashMap::new()));
         let metrics_clone = metrics.clone();
 
-        let handle = thread::spawn(move || runtime_worker(rx, metrics_clone, scheduler_config));
+        let handle = thread::Builder::new()
+            .name("rist-bond-worker".into())
+            .spawn(move || runtime_worker(rx, metrics_clone, scheduler_config))
+            .expect("failed to spawn bonding runtime worker");
 
         Self {
             sender: tx,
@@ -52,6 +66,10 @@ impl BondingRuntime {
         }
     }
 
+    /// Enqueues a packet for transmission. Returns immediately.
+    ///
+    /// Returns `PacketSendError::Full` if the internal channel is saturated,
+    /// or `PacketSendError::Disconnected` if the worker thread has exited.
     pub fn try_send_packet(
         &self,
         data: Bytes,
@@ -64,32 +82,41 @@ impl BondingRuntime {
         }
     }
 
+    /// Sends a full configuration update to the worker thread.
     pub fn apply_config(&self, config: BondingConfig) -> anyhow::Result<()> {
         self.sender
             .send(RuntimeMessage::ApplyConfig(config))
             .map_err(|e| anyhow::anyhow!("Failed to send config: {}", e))
     }
 
+    /// Adds a single link dynamically at runtime.
     pub fn add_link(&self, link: LinkConfig) -> anyhow::Result<()> {
         self.sender
             .send(RuntimeMessage::AddLink(link))
             .map_err(|e| anyhow::anyhow!("Failed to add link: {}", e))
     }
 
+    /// Removes a link by ID at runtime.
     pub fn remove_link(&self, id: usize) -> anyhow::Result<()> {
         self.sender
             .send(RuntimeMessage::RemoveLink(id))
             .map_err(|e| anyhow::anyhow!("Failed to remove link: {}", e))
     }
 
+    /// Returns a snapshot of all link metrics (thread-safe clone).
     pub fn get_metrics(&self) -> HashMap<usize, LinkMetrics> {
-        self.metrics.lock().unwrap().clone()
+        self.metrics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
+    /// Returns a shared handle to the metrics map for external polling.
     pub fn metrics_handle(&self) -> Arc<Mutex<HashMap<usize, LinkMetrics>>> {
         self.metrics.clone()
     }
 
+    /// Gracefully shuts down the worker thread. Idempotent.
     pub fn shutdown(&mut self) {
         let _ = self.sender.send(RuntimeMessage::Shutdown);
         if let Some(handle) = self.handle.take() {
@@ -179,6 +206,7 @@ fn apply_config(
 ) {
     let desired_ids: std::collections::HashSet<usize> = config.links.iter().map(|l| l.id).collect();
 
+    // Remove links no longer present in config
     let existing_ids: Vec<usize> = current_links.keys().copied().collect();
     for id in existing_ids {
         if !desired_ids.contains(&id) {
@@ -187,6 +215,7 @@ fn apply_config(
         }
     }
 
+    // Add or update links that changed
     for link in config.links {
         let needs_update = match current_links.get(&link.id) {
             Some(existing) => existing != &link,
@@ -194,27 +223,7 @@ fn apply_config(
         };
 
         if needs_update {
-            scheduler.remove_link(link.id);
-            let recovery = recovery_config_from_link(&link);
-            match Link::new_with_full_config(
-                link.id,
-                &link.uri,
-                link.interface.clone(),
-                lifecycle_config.clone(),
-                recovery,
-                Some(ewma_alpha),
-            ) {
-                Ok(new_link) => {
-                    scheduler.add_link(Arc::new(new_link));
-                    current_links.insert(link.id, link);
-                }
-                Err(err) => {
-                    warn!(
-                        "Failed to create link id={} uri={}: {}",
-                        link.id, link.uri, err
-                    );
-                }
-            }
+            apply_link(scheduler, current_links, lifecycle_config, link, ewma_alpha);
         }
     }
 }
@@ -262,5 +271,222 @@ fn recovery_config_from_link(link: &LinkConfig) -> Option<RecoveryConfig> {
         })
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BondingConfig;
+    use crate::scheduler::PacketProfile;
+    use bytes::Bytes;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn runtime_new_defaults() {
+        let mut rt = BondingRuntime::new();
+        let metrics = rt.get_metrics();
+        assert!(metrics.is_empty(), "No links added yet");
+        rt.shutdown();
+    }
+
+    #[test]
+    fn runtime_with_custom_config() {
+        let cfg = SchedulerConfig {
+            channel_capacity: 32,
+            ..SchedulerConfig::default()
+        };
+        let mut rt = BondingRuntime::with_config(cfg);
+        assert!(rt.get_metrics().is_empty());
+        rt.shutdown();
+    }
+
+    #[test]
+    fn try_send_packet_disconnected_after_shutdown() {
+        let mut rt = BondingRuntime::new();
+        rt.shutdown();
+        let err = rt
+            .try_send_packet(Bytes::from_static(b"data"), PacketProfile::default())
+            .unwrap_err();
+        assert!(matches!(err, PacketSendError::Disconnected));
+    }
+
+    #[test]
+    fn try_send_packet_full_channel() {
+        let cfg = SchedulerConfig {
+            channel_capacity: 16,
+            ..SchedulerConfig::default()
+        };
+        let rt = BondingRuntime::with_config(cfg);
+
+        let mut got_full = false;
+        for _ in 0..10_000 {
+            match rt.try_send_packet(Bytes::from_static(b"x"), PacketProfile::default()) {
+                Err(PacketSendError::Full) => {
+                    got_full = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(PacketSendError::Disconnected) => break,
+            }
+        }
+        assert!(got_full, "Channel should report Full when saturated");
+    }
+
+    #[test]
+    fn add_link_via_message() {
+        let rt = BondingRuntime::new();
+        let link = LinkConfig {
+            id: 1,
+            uri: "rist://127.0.0.1:19100".to_string(),
+            interface: None,
+            recovery_maxbitrate: None,
+            recovery_rtt_max: None,
+            recovery_reorder_buffer: None,
+        };
+        assert!(rt.add_link(link).is_ok());
+        thread::sleep(Duration::from_millis(250));
+        let metrics = rt.get_metrics();
+        assert!(metrics.contains_key(&1), "Link 1 should appear in metrics");
+    }
+
+    #[test]
+    fn remove_link_via_message() {
+        let rt = BondingRuntime::new();
+        let link = LinkConfig {
+            id: 1,
+            uri: "rist://127.0.0.1:19101".to_string(),
+            interface: None,
+            recovery_maxbitrate: None,
+            recovery_rtt_max: None,
+            recovery_reorder_buffer: None,
+        };
+        rt.add_link(link).unwrap();
+        thread::sleep(Duration::from_millis(250));
+        assert!(rt.get_metrics().contains_key(&1));
+
+        rt.remove_link(1).unwrap();
+        thread::sleep(Duration::from_millis(250));
+        assert!(
+            !rt.get_metrics().contains_key(&1),
+            "Link 1 should be removed"
+        );
+    }
+
+    #[test]
+    fn apply_config_adds_and_removes_links() {
+        let rt = BondingRuntime::new();
+        let config = BondingConfig {
+            links: vec![
+                LinkConfig {
+                    id: 1,
+                    uri: "rist://127.0.0.1:19102".to_string(),
+                    interface: None,
+                    recovery_maxbitrate: None,
+                    recovery_rtt_max: None,
+                    recovery_reorder_buffer: None,
+                },
+                LinkConfig {
+                    id: 2,
+                    uri: "rist://127.0.0.1:19103".to_string(),
+                    interface: None,
+                    recovery_maxbitrate: None,
+                    recovery_rtt_max: None,
+                    recovery_reorder_buffer: None,
+                },
+            ],
+            ..BondingConfig::default()
+        };
+        rt.apply_config(config).unwrap();
+        thread::sleep(Duration::from_millis(350));
+        let m = rt.get_metrics();
+        assert!(m.contains_key(&1));
+        assert!(m.contains_key(&2));
+
+        let config2 = BondingConfig {
+            links: vec![LinkConfig {
+                id: 2,
+                uri: "rist://127.0.0.1:19103".to_string(),
+                interface: None,
+                recovery_maxbitrate: None,
+                recovery_rtt_max: None,
+                recovery_reorder_buffer: None,
+            }],
+            ..BondingConfig::default()
+        };
+        rt.apply_config(config2).unwrap();
+        thread::sleep(Duration::from_millis(350));
+        let m = rt.get_metrics();
+        assert!(
+            !m.contains_key(&1),
+            "Link 1 should be removed by new config"
+        );
+        assert!(m.contains_key(&2), "Link 2 should still exist");
+    }
+
+    #[test]
+    fn shutdown_is_idempotent() {
+        let mut rt = BondingRuntime::new();
+        rt.shutdown();
+        rt.shutdown();
+    }
+
+    #[test]
+    fn drop_triggers_shutdown() {
+        let rt = BondingRuntime::new();
+        drop(rt);
+    }
+
+    #[test]
+    fn metrics_handle_shared() {
+        let rt = BondingRuntime::new();
+        let handle = rt.metrics_handle();
+        let m = handle.lock().unwrap();
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn recovery_config_all_set() {
+        let link = LinkConfig {
+            id: 1,
+            uri: "rist://1.2.3.4:5000".to_string(),
+            interface: None,
+            recovery_maxbitrate: Some(20000),
+            recovery_rtt_max: Some(800),
+            recovery_reorder_buffer: Some(50),
+        };
+        let rc = recovery_config_from_link(&link).unwrap();
+        assert_eq!(rc.recovery_maxbitrate, Some(20000));
+        assert_eq!(rc.recovery_rtt_max, Some(800));
+        assert_eq!(rc.recovery_reorder_buffer, Some(50));
+    }
+
+    #[test]
+    fn recovery_config_none_when_all_empty() {
+        let link = LinkConfig {
+            id: 1,
+            uri: "rist://1.2.3.4:5000".to_string(),
+            interface: None,
+            recovery_maxbitrate: None,
+            recovery_rtt_max: None,
+            recovery_reorder_buffer: None,
+        };
+        assert!(recovery_config_from_link(&link).is_none());
+    }
+
+    #[test]
+    fn recovery_config_partial() {
+        let link = LinkConfig {
+            id: 1,
+            uri: "rist://1.2.3.4:5000".to_string(),
+            interface: None,
+            recovery_maxbitrate: None,
+            recovery_rtt_max: Some(200),
+            recovery_reorder_buffer: None,
+        };
+        let rc = recovery_config_from_link(&link).unwrap();
+        assert_eq!(rc.recovery_maxbitrate, None);
+        assert_eq!(rc.recovery_rtt_max, Some(200));
     }
 }
