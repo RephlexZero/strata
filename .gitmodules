@@ -1,3 +1,6 @@
 [submodule "vendor/librist"]
 	path = vendor/librist
 	url = https://code.videolan.org/rist/librist.git
+[submodule "wiki"]
+	path = wiki
+	url = https://github.com/RephlexZero/strata.wiki.git
