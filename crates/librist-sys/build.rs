@@ -46,6 +46,12 @@ fn main() {
         "--buildtype=release",
     ]);
 
+    // Support cross-compilation via MESON_CROSS_FILE env var
+    if let Ok(cross_file) = env::var("MESON_CROSS_FILE") {
+        cmd.arg("--cross-file");
+        cmd.arg(&cross_file);
+    }
+
     // Check if we need to reconfigure (if build dir exists)
     // Meson usually handles this, or fails if we try to setup on existing dir.
     // If build_dir exists, we might want to use "configure" or "setup --reconfigure"
@@ -87,6 +93,7 @@ fn main() {
         lib_path.clone(),
         install_dir.join("lib64"),
         install_dir.join("lib").join("x86_64-linux-gnu"),
+        install_dir.join("lib").join("aarch64-linux-gnu"),
     ];
 
     let mut found_lib = false;

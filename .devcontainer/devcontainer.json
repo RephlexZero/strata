@@ -10,8 +10,13 @@
                 "rust-lang.rust-analyzer",
                 "tamasfe.even-better-toml",
                 "vadimcn.vscode-lldb",
-                "fill-labs.dependi"
-            ]
+                "fill-labs.dependi",
+                "mhutchie.git-graph"
+            ],
+            "settings": {
+                "rust-analyzer.cargo.allTargets": true,
+                "rust-analyzer.check.command": "clippy"
+            }
         }
     },
     // "privileged": true is required for ip netns creation (mount operations)
@@ -28,5 +33,6 @@
     ],
     "features": {
         "ghcr.io/devcontainers/features/rust:1": {}
-    }
+    },
+    "postCreateCommand": ".devcontainer/post-create.sh"
 }
