@@ -355,8 +355,7 @@ impl RistReceiverContext {
             // Documentation says: "The data block must be freed by the caller using rist_receiver_data_block_free".
 
             let payload =
-                std::slice::from_raw_parts(db.payload as *const u8, db.payload_len as usize)
-                    .to_vec();
+                std::slice::from_raw_parts(db.payload as *const u8, db.payload_len).to_vec();
 
             // Free the block inside librist
             // Wait, bindgen might name it slightly differently.
