@@ -1,5 +1,5 @@
 {
-    "name": "Rust RIST Bonding",
+    "name": "Strata - RIST Link Aggregation",
     "build": {
         "dockerfile": "Dockerfile",
         "context": ".."
