@@ -214,6 +214,11 @@ mod imp {
                         .blurb("TOML config with versioned schema")
                         .mutable_ready()
                         .build(),
+                    glib::ParamSpecString::builder("config-file")
+                        .nick("Config File")
+                        .blurb("Path to TOML config file (alternative to inline config property)")
+                        .mutable_ready()
+                        .build(),
                 ]
             })
         }
@@ -230,6 +235,26 @@ mod imp {
                     *self.config_toml.lock().unwrap() = cfg.clone();
                     self.apply_config(&cfg);
                 }
+                "config-file" => {
+                    let path: String = value.get().expect("type checked upstream");
+                    if path.is_empty() {
+                        return;
+                    }
+                    match std::fs::read_to_string(&path) {
+                        Ok(cfg) => {
+                            *self.config_toml.lock().unwrap() = cfg.clone();
+                            self.apply_config(&cfg);
+                        }
+                        Err(e) => {
+                            gst::warning!(
+                                gst::CAT_DEFAULT,
+                                "Failed to read config file '{}': {}",
+                                path,
+                                e
+                            );
+                        }
+                    }
+                }
                 _ => unimplemented!(),
             }
         }
@@ -237,7 +262,7 @@ mod imp {
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
             match pspec.name() {
                 "links" => self.links_config.lock().unwrap().to_value(),
-                "config" => self.config_toml.lock().unwrap().to_value(),
+                "config" | "config-file" => self.config_toml.lock().unwrap().to_value(),
                 _ => unimplemented!(),
             }
         }

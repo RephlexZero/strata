@@ -13,6 +13,7 @@ mod imp {
     struct Settings {
         links: String,
         latency: u32,
+        config_toml: String,
     }
 
     impl Default for Settings {
@@ -20,6 +21,7 @@ mod imp {
             Self {
                 links: String::new(),
                 latency: 100, // Default 100ms
+                config_toml: String::new(),
             }
         }
     }
@@ -30,6 +32,34 @@ mod imp {
         receiver: Mutex<Option<BondingReceiver>>,
         stats_running: Arc<AtomicBool>,
         stats_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    }
+
+    impl RsRistBondSrc {
+        fn apply_config_toml(&self, toml_str: &str) {
+            if toml_str.trim().is_empty() {
+                return;
+            }
+            match rist_bonding_core::config::BondingConfig::from_toml_str(toml_str) {
+                Ok(cfg) => {
+                    let mut settings = self.settings.lock().unwrap();
+                    settings.config_toml = toml_str.to_string();
+                    // Apply receiver config: override latency and links if specified
+                    settings.latency = cfg.receiver.start_latency.as_millis() as u32;
+                    // If links are specified in config, override the links property
+                    if !cfg.links.is_empty() {
+                        settings.links = cfg
+                            .links
+                            .iter()
+                            .map(|l| l.uri.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("RsRistBondSrc: Invalid config TOML: {}", e);
+                }
+            }
+        }
     }
 
     #[glib::object_subclass]
@@ -55,6 +85,16 @@ mod imp {
                         .blurb("Reassembly buffer latency in milliseconds")
                         .default_value(100)
                         .build(),
+                    glib::ParamSpecString::builder("config")
+                        .nick("Config (TOML)")
+                        .blurb("TOML config with versioned schema (receiver section)")
+                        .mutable_ready()
+                        .build(),
+                    glib::ParamSpecString::builder("config-file")
+                        .nick("Config File")
+                        .blurb("Path to TOML config file (alternative to inline config property)")
+                        .mutable_ready()
+                        .build(),
                 ]
             })
         }
@@ -69,6 +109,27 @@ mod imp {
                     let mut settings = self.settings.lock().unwrap();
                     settings.latency = value.get().expect("type checked upstream");
                 }
+                "config" => {
+                    let cfg: String = value.get().expect("type checked upstream");
+                    self.apply_config_toml(&cfg);
+                }
+                "config-file" => {
+                    let path: String = value.get().expect("type checked upstream");
+                    if path.is_empty() {
+                        return;
+                    }
+                    match std::fs::read_to_string(&path) {
+                        Ok(cfg) => {
+                            self.apply_config_toml(&cfg);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "RsRistBondSrc: Failed to read config file '{}': {}",
+                                path, e
+                            );
+                        }
+                    }
+                }
                 _ => unimplemented!(),
             }
         }
@@ -82,6 +143,10 @@ mod imp {
                 "latency" => {
                     let settings = self.settings.lock().unwrap();
                     settings.latency.to_value()
+                }
+                "config" | "config-file" => {
+                    let settings = self.settings.lock().unwrap();
+                    settings.config_toml.to_value()
                 }
                 _ => unimplemented!(),
             }

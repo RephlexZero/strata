@@ -41,3 +41,6 @@ docs/archive/
 # Test result artifacts
 *.csv
 *.svg
+
+# Video test output directory (reviewable locally, never committed)
+test_output/
