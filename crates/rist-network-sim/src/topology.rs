@@ -7,13 +7,12 @@ pub struct Namespace {
 impl Namespace {
     pub fn new(name: &str) -> Result<Self, std::io::Error> {
         // cleanup any existing namespace with the same name
-        let _ = Command::new("sudo").args(&["ip", "netns", "del", name]).output();
+        let _ = Command::new("sudo").args(["ip", "netns", "del", name]).output();
 
-        let output = Command::new("sudo").args(&["ip", "netns", "add", name]).output()?;
+        let output = Command::new("sudo").args(["ip", "netns", "add", name]).output()?;
 
         if !output.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!(
                     "Failed to create netns: {}",
                     String::from_utf8_lossy(&output.stderr)
@@ -23,7 +22,7 @@ impl Namespace {
 
         // Initialize loopback
         let _ = Command::new("sudo")
-            .args(&["ip", "netns", "exec", name, "ip", "link", "set", "lo", "up"])
+            .args(["ip", "netns", "exec", name, "ip", "link", "set", "lo", "up"])
             .output();
 
         Ok(Self {
@@ -33,7 +32,7 @@ impl Namespace {
 
     pub fn exec(&self, cmd: &str, args: &[&str]) -> Result<std::process::Output, std::io::Error> {
         Command::new("sudo")
-            .args(&["ip", "netns", "exec", &self.name, cmd])
+            .args(["ip", "netns", "exec", &self.name, cmd])
             .args(args)
             .output()
     }
@@ -48,12 +47,12 @@ impl Namespace {
     ) -> std::io::Result<()> {
         // Clean up potential leftovers in host
         let _ = Command::new("sudo")
-            .args(&["ip", "link", "del", veth_name_local])
+            .args(["ip", "link", "del", veth_name_local])
             .output();
 
         // 1. Create veth pair in host
         let output = Command::new("sudo")
-            .args(&[
+            .args([
                 "ip",
                 "link",
                 "add",
@@ -67,8 +66,7 @@ impl Namespace {
             .output()?;
 
         if !output.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!(
                     "Failed to create veth pair: {}",
                     String::from_utf8_lossy(&output.stderr)
@@ -78,11 +76,10 @@ impl Namespace {
 
         // 2. Move veth_local to self
         let output = Command::new("sudo")
-            .args(&["ip", "link", "set", veth_name_local, "netns", &self.name])
+            .args(["ip", "link", "set", veth_name_local, "netns", &self.name])
             .output()?;
         if !output.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!(
                     "Failed to move local veth: {}",
                     String::from_utf8_lossy(&output.stderr)
@@ -92,11 +89,10 @@ impl Namespace {
 
         // 3. Move veth_peer to other
         let output = Command::new("sudo")
-            .args(&["ip", "link", "set", veth_name_peer, "netns", &other.name])
+            .args(["ip", "link", "set", veth_name_peer, "netns", &other.name])
             .output()?;
         if !output.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!(
                     "Failed to move peer veth: {}",
                     String::from_utf8_lossy(&output.stderr)
@@ -107,8 +103,7 @@ impl Namespace {
         // 4. Configure self (local side)
         let output = self.exec("ip", &["addr", "add", ip_local, "dev", veth_name_local])?;
         if !output.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!(
                     "Failed to set local IP: {}",
                     String::from_utf8_lossy(&output.stderr)
@@ -117,8 +112,7 @@ impl Namespace {
         }
         let output = self.exec("ip", &["link", "set", veth_name_local, "up"])?;
         if !output.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!(
                     "Failed to set local link up: {}",
                     String::from_utf8_lossy(&output.stderr)
@@ -129,8 +123,7 @@ impl Namespace {
         // 5. Configure other (peer side)
         let output = other.exec("ip", &["addr", "add", ip_peer, "dev", veth_name_peer])?;
         if !output.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!(
                     "Failed to set peer IP: {}",
                     String::from_utf8_lossy(&output.stderr)
@@ -139,8 +132,7 @@ impl Namespace {
         }
         let output = other.exec("ip", &["link", "set", veth_name_peer, "up"])?;
         if !output.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!(
                     "Failed to set peer link up: {}",
                     String::from_utf8_lossy(&output.stderr)
@@ -155,7 +147,7 @@ impl Namespace {
 impl Drop for Namespace {
     fn drop(&mut self) {
         let _ = Command::new("sudo")
-            .args(&["ip", "netns", "del", &self.name])
+            .args(["ip", "netns", "del", &self.name])
             .status();
     }
 }

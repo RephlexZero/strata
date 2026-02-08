@@ -1,7 +1,8 @@
 use anyhow::Result;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LinkPhase {
+    #[default]
     Init,
     Probe,
     Warm,
@@ -9,12 +10,6 @@ pub enum LinkPhase {
     Degrade,
     Cooldown,
     Reset,
-}
-
-impl Default for LinkPhase {
-    fn default() -> Self {
-        LinkPhase::Init
-    }
 }
 
 impl LinkPhase {

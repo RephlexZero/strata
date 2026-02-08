@@ -204,6 +204,12 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
     }
 }
 
+impl<L: LinkSender + ?Sized> Default for BondingScheduler<L> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

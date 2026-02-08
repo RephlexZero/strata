@@ -11,7 +11,7 @@ fn main() {
     if !source_dir.join("meson.build").exists() {
         // Try to initialize it if we can
         let status = Command::new("git")
-            .args(&["submodule", "update", "--init", "--recursive"])
+            .args(["submodule", "update", "--init", "--recursive"])
             .current_dir(root_dir)
             .status()
             .ok();
@@ -33,7 +33,7 @@ fn main() {
     // We deliberately disable encryption (mbedtls) to avoid complex dependency linkage for this static build
     // unless strictly required.
     let mut cmd = Command::new("meson");
-    cmd.args(&[
+    cmd.args([
         "setup",
         build_dir.to_str().unwrap(),
         source_dir.to_str().unwrap(),
@@ -66,7 +66,7 @@ fn main() {
 
     // Compile
     let status = Command::new("meson")
-        .args(&["compile", "-C", build_dir.to_str().unwrap()])
+        .args(["compile", "-C", build_dir.to_str().unwrap()])
         .status()
         .expect("Failed to run meson compile");
     if !status.success() {
@@ -75,7 +75,7 @@ fn main() {
 
     // Install (to local dist)
     let status = Command::new("meson")
-        .args(&["install", "-C", build_dir.to_str().unwrap()])
+        .args(["install", "-C", build_dir.to_str().unwrap()])
         .status()
         .expect("Failed to run meson install");
     if !status.success() {

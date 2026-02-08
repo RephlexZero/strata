@@ -98,6 +98,12 @@ impl BondingRuntime {
     }
 }
 
+impl Default for BondingRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for BondingRuntime {
     fn drop(&mut self) {
         self.shutdown();

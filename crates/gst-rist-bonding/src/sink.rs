@@ -436,17 +436,17 @@ mod imp {
                                 let iface = m.iface.as_deref().unwrap_or("");
                                 let link_kind = m.link_kind.as_deref().unwrap_or("");
                                 msg_struct = msg_struct
-                                    .field(&format!("link_{}_rtt", id), m.rtt_ms)
-                                    .field(&format!("link_{}_capacity", id), m.capacity_bps)
-                                    .field(&format!("link_{}_loss", id), m.loss_rate)
-                                    .field(&format!("link_{}_observed_bps", id), m.observed_bps)
-                                    .field(&format!("link_{}_observed_bytes", id), m.observed_bytes)
-                                    .field(&format!("link_{}_alive", id), m.alive)
-                                    .field(&format!("link_{}_phase", id), m.phase.as_str())
-                                    .field(&format!("link_{}_os_up", id), os_up)
-                                    .field(&format!("link_{}_mtu", id), mtu)
-                                    .field(&format!("link_{}_iface", id), iface)
-                                    .field(&format!("link_{}_kind", id), link_kind);
+                                    .field(format!("link_{}_rtt", id), m.rtt_ms)
+                                    .field(format!("link_{}_capacity", id), m.capacity_bps)
+                                    .field(format!("link_{}_loss", id), m.loss_rate)
+                                    .field(format!("link_{}_observed_bps", id), m.observed_bps)
+                                    .field(format!("link_{}_observed_bytes", id), m.observed_bytes)
+                                    .field(format!("link_{}_alive", id), m.alive)
+                                    .field(format!("link_{}_phase", id), m.phase.as_str())
+                                    .field(format!("link_{}_os_up", id), os_up)
+                                    .field(format!("link_{}_mtu", id), mtu)
+                                    .field(format!("link_{}_iface", id), iface)
+                                    .field(format!("link_{}_kind", id), link_kind);
                             }
                             let _ = element
                                 .post_message(gst::message::Element::new(msg_struct.build()));

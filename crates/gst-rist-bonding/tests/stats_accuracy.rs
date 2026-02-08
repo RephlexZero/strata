@@ -10,7 +10,7 @@ use std::time::Duration;
 // Helper: Spawn process in netns
 fn spawn_in_ns(ns_name: &str, cmd: &str, args: &[&str]) -> std::process::Child {
     std::process::Command::new("sudo")
-        .args(&["ip", "netns", "exec", ns_name, cmd])
+    .args(["ip", "netns", "exec", ns_name, cmd])
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())
@@ -39,7 +39,7 @@ fn setup_env() -> Option<PathBuf> {
 
     if !bin_path.exists() {
         let _ = std::process::Command::new("cargo")
-            .args(&["build", "--bin", "integration_node"])
+            .args(["build", "--bin", "integration_node"])
             .status();
     }
     Some(bin_path)
@@ -114,7 +114,9 @@ fn test_cellular_single_link_accuracy() {
     thread::sleep(Duration::from_secs(12));
 
     send_child.kill().unwrap();
+    let _ = send_child.wait();
     recv_child.kill().unwrap();
+    let _ = recv_child.wait();
     collector.stop();
     cleanup_mgmt_link("veth_mgmt_ch");
 
@@ -245,7 +247,9 @@ fn test_dual_link_load_balance() {
     thread::sleep(Duration::from_secs(12));
 
     send_child.kill().unwrap();
+    let _ = send_child.wait();
     recv_child.kill().unwrap();
+    let _ = recv_child.wait();
     collector.stop();
     cleanup_mgmt_link("veth_mgmt_dh");
 
@@ -385,29 +389,29 @@ impl StatsCollector {
 
 fn setup_mgmt_link(h_name: &str, c_name: &str, netns: &str, h_ip: &str, c_ip: &str) {
     let _ = std::process::Command::new("sudo")
-        .args(&["ip", "link", "del", h_name])
+        .args(["ip", "link", "del", h_name])
         .output();
     let _ = std::process::Command::new("sudo")
-        .args(&[
+        .args([
             "ip", "link", "add", h_name, "type", "veth", "peer", "name", c_name,
         ])
         .output();
     let _ = std::process::Command::new("sudo")
-        .args(&["ip", "link", "set", c_name, "netns", netns])
+        .args(["ip", "link", "set", c_name, "netns", netns])
         .output();
     let _ = std::process::Command::new("sudo")
-        .args(&["ip", "addr", "add", h_ip, "dev", h_name])
+        .args(["ip", "addr", "add", h_ip, "dev", h_name])
         .output();
     let _ = std::process::Command::new("sudo")
-        .args(&["ip", "link", "set", h_name, "up"])
+        .args(["ip", "link", "set", h_name, "up"])
         .output();
     let _ = std::process::Command::new("sudo")
-        .args(&[
+        .args([
             "ip", "netns", "exec", netns, "ip", "addr", "add", c_ip, "dev", c_name,
         ])
         .output();
     let _ = std::process::Command::new("sudo")
-        .args(&[
+        .args([
             "ip", "netns", "exec", netns, "ip", "link", "set", c_name, "up",
         ])
         .output();
@@ -415,6 +419,6 @@ fn setup_mgmt_link(h_name: &str, c_name: &str, netns: &str, h_ip: &str, c_ip: &s
 
 fn cleanup_mgmt_link(h_name: &str) {
     let _ = std::process::Command::new("sudo")
-        .args(&["ip", "link", "del", h_name])
+    .args(["ip", "link", "del", h_name])
         .output();
 }

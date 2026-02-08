@@ -14,7 +14,7 @@ fn spawn_in_ns(ns_name: &str, cmd: &str, args: &[&str]) -> std::process::Child {
     // Determine command wrapper based on privs / environment
     // Assuming sudo or root is available as per rist-network-sim
     std::process::Command::new("sudo")
-        .args(&["ip", "netns", "exec", ns_name, cmd])
+    .args(["ip", "netns", "exec", ns_name, cmd])
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit()) // Only show stderr
@@ -38,7 +38,7 @@ fn test_impaired_bonding_visualization() {
     if !bin_path.exists() {
         // Fallback: build it
         let _ = std::process::Command::new("cargo")
-            .args(&["build", "--bin", "integration_node"])
+            .args(["build", "--bin", "integration_node"])
             .status();
     }
 
@@ -68,10 +68,10 @@ fn test_impaired_bonding_visualization() {
 
     // Mgmt Link for Stats: Host (192.168.100.1) <-> ns_snd (192.168.100.2)
     let _ = std::process::Command::new("sudo")
-        .args(&["ip", "link", "del", "veth_mgmt_h"])
+        .args(["ip", "link", "del", "veth_mgmt_h"])
         .output();
     let _ = std::process::Command::new("sudo")
-        .args(&[
+        .args([
             "ip",
             "link",
             "add",
@@ -84,11 +84,11 @@ fn test_impaired_bonding_visualization() {
         ])
         .output();
     let _ = std::process::Command::new("sudo")
-        .args(&["ip", "link", "set", "veth_mgmt_c", "netns", "rst_bond_snd"])
+        .args(["ip", "link", "set", "veth_mgmt_c", "netns", "rst_bond_snd"])
         .output();
 
     let _ = std::process::Command::new("sudo")
-        .args(&[
+        .args([
             "ip",
             "addr",
             "add",
@@ -98,7 +98,7 @@ fn test_impaired_bonding_visualization() {
         ])
         .output();
     let _ = std::process::Command::new("sudo")
-        .args(&["ip", "link", "set", "veth_mgmt_h", "up"])
+        .args(["ip", "link", "set", "veth_mgmt_h", "up"])
         .output();
 
     let _ = ns_snd.exec(
@@ -220,12 +220,14 @@ fn test_impaired_bonding_visualization() {
     running.store(false, std::sync::atomic::Ordering::Relaxed);
 
     let _ = send_child.kill();
+    let _ = send_child.wait();
     let _ = recv_child.kill();
+    let _ = recv_child.wait();
     let _ = collector_handle.join();
 
     // Cleanup mgmt link
     let _ = std::process::Command::new("sudo")
-        .args(&["ip", "link", "del", "veth_mgmt_h"])
+        .args(["ip", "link", "del", "veth_mgmt_h"])
         .output();
 
     // 6. Plot Results
@@ -288,6 +290,18 @@ struct TruthPoint {
     loss_percent: f64,
 }
 
+type CsvRow = (
+    f64,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+);
+
 fn plot_results(data: &[Value], truth: &[TruthPoint]) {
     plot_results_to_file(
         data,
@@ -298,17 +312,7 @@ fn plot_results(data: &[Value], truth: &[TruthPoint]) {
 }
 
 fn plot_results_to_file(data: &[Value], truth: &[TruthPoint], filename: &str, csv_filename: &str) {
-    let mut csv_rows: Vec<(
-        f64,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-    )> = Vec::new();
+    let mut csv_rows: Vec<CsvRow> = Vec::new();
     let root = SVGBackend::new(filename, (1024, 768)).into_drawing_area();
     root.fill(&WHITE).unwrap();
 
@@ -403,44 +407,44 @@ fn plot_results_to_file(data: &[Value], truth: &[TruthPoint], filename: &str, cs
     chart
         .draw_series(LineSeries::new(
             ts.iter().zip(caps.iter()).map(|(&t, &c)| (t, c)),
-            &BLUE,
+            BLUE,
         ))
         .unwrap()
         .label("Link 2 Capacity (Mbps)")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLUE));
 
     chart
         .draw_series(LineSeries::new(
             truth_caps.iter().map(|(t, c)| (*t, *c)),
-            &BLUE.mix(0.4),
+            BLUE.mix(0.4),
         ))
         .unwrap()
         .label("Truth Capacity (Mbps)")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE.mix(0.4)));
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLUE.mix(0.4)));
 
     // Draw Loss line (Red) - Secondary Axis
     chart
         .draw_secondary_series(LineSeries::new(
             ts.iter().zip(losses.iter()).map(|(&t, &l)| (t, l)),
-            &RED,
+            RED,
         ))
         .unwrap()
         .label("Link 2 Loss (%)")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED));
 
     chart
         .draw_secondary_series(LineSeries::new(
             truth_losses.iter().map(|(t, l)| (*t, *l)),
-            &RED.mix(0.4),
+            RED.mix(0.4),
         ))
         .unwrap()
         .label("Truth Loss (%)")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED.mix(0.4)));
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED.mix(0.4)));
 
     chart
         .configure_series_labels()
-        .background_style(&WHITE.mix(0.8))
-        .border_style(&BLACK)
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK)
         .draw()
         .unwrap();
 
@@ -485,7 +489,7 @@ fn test_step_change_convergence_visualization() {
 
     if !bin_path.exists() {
         let _ = std::process::Command::new("cargo")
-            .args(&["build", "--bin", "integration_node"])
+            .args(["build", "--bin", "integration_node"])
             .status();
     }
 
@@ -523,10 +527,10 @@ fn test_step_change_convergence_visualization() {
 
     // Mgmt Link for Stats: Host (192.168.101.1) <-> ns_snd (192.168.101.2)
     let _ = std::process::Command::new("sudo")
-        .args(&["ip", "link", "del", "veth_step_h"])
+        .args(["ip", "link", "del", "veth_step_h"])
         .output();
     let _ = std::process::Command::new("sudo")
-        .args(&[
+        .args([
             "ip",
             "link",
             "add",
@@ -539,11 +543,11 @@ fn test_step_change_convergence_visualization() {
         ])
         .output();
     let _ = std::process::Command::new("sudo")
-        .args(&["ip", "link", "set", "veth_step_c", "netns", "rst_step_snd"])
+        .args(["ip", "link", "set", "veth_step_c", "netns", "rst_step_snd"])
         .output();
 
     let _ = std::process::Command::new("sudo")
-        .args(&[
+        .args([
             "ip",
             "addr",
             "add",
@@ -553,7 +557,7 @@ fn test_step_change_convergence_visualization() {
         ])
         .output();
     let _ = std::process::Command::new("sudo")
-        .args(&["ip", "link", "set", "veth_step_h", "up"])
+        .args(["ip", "link", "set", "veth_step_h", "up"])
         .output();
 
     let _ = ns_snd.exec(
@@ -659,11 +663,13 @@ fn test_step_change_convergence_visualization() {
     running.store(false, std::sync::atomic::Ordering::Relaxed);
 
     let _ = send_child.kill();
+    let _ = send_child.wait();
     let _ = recv_child.kill();
+    let _ = recv_child.wait();
     let _ = collector_handle.join();
 
     let _ = std::process::Command::new("sudo")
-        .args(&["ip", "link", "del", "veth_step_h"])
+        .args(["ip", "link", "del", "veth_step_h"])
         .output();
 
     let data = collected_data.lock().unwrap();

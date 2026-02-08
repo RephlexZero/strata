@@ -106,14 +106,11 @@ pub fn apply_impairment(
     let output = ns.exec("tc", &args)?;
 
     if !output.status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "Failed to apply tc netem: {}\nCommand: tc {}",
-                String::from_utf8_lossy(&output.stderr),
-                args.join(" ")
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "Failed to apply tc netem: {}\nCommand: tc {}",
+            String::from_utf8_lossy(&output.stderr),
+            args.join(" ")
+        )));
     }
 
     Ok(())

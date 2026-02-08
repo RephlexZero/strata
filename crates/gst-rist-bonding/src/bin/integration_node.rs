@@ -90,7 +90,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let pad = sink
                 .request_pad_simple("link_%u")
                 .ok_or("Failed to request link pad")?;
-            pad.set_property("uri", &uri);
+            pad.set_property("uri", uri);
             eprintln!("Configured link {} -> {}", idx, uri);
         }
     } else {
@@ -170,7 +170,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             // Let's assume max 16 links and query them.
                             for i in 0..16 {
                                 let prefix = format!("link_{}_", i);
-                                if s.has_field(&format!("{}alive", prefix)) {
+                                if s.has_field(format!("{}alive", prefix)) {
                                     let alive =
                                         s.get::<bool>(&format!("{}alive", prefix)).unwrap_or(false);
                                     let cap =
@@ -372,7 +372,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(s) = element.structure() {
                     // Filter spammy stats if needed, or keep for visualization
                     if s.name() == "rist-bonding-stats" {
-                        eprintln!("Element Message: {}", s.to_string());
+                        eprintln!("Element Message: {}", s);
                     }
                 }
             }

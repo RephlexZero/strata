@@ -195,10 +195,11 @@ impl LinkLifecycle {
             }
         };
 
-        if self.phase != LinkPhase::Cooldown && self.phase != LinkPhase::Reset {
-            if self.phase != LinkPhase::Init {
-                self.last_transition = now;
-            }
+        if self.phase != LinkPhase::Cooldown
+            && self.phase != LinkPhase::Reset
+            && self.phase != LinkPhase::Init
+        {
+            self.last_transition = now;
         }
 
         self.phase

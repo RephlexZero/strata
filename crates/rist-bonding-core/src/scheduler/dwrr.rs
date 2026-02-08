@@ -392,11 +392,9 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
 
         for &id in &self.sorted_ids {
             if let Some(state) = self.links.get(&id) {
-                if state.metrics.alive {
-                    if state.credits > max_creds {
-                        max_creds = state.credits;
-                        best_id = Some(id);
-                    }
+                if state.metrics.alive && state.credits > max_creds {
+                    max_creds = state.credits;
+                    best_id = Some(id);
                 }
             }
         }
@@ -409,6 +407,12 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         }
 
         None
+    }
+}
+
+impl<L: LinkSender + ?Sized> Default for Dwrr<L> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -497,10 +501,10 @@ mod tests {
         // Force metrics refresh and provide elapsed time for credit accrual
         dwrr.refresh_metrics();
         if let Some(state) = dwrr.links.get_mut(&1) {
-            state.last_update = state.last_update - Duration::from_secs(1);
+              state.last_update -= Duration::from_secs(1);
         }
         if let Some(state) = dwrr.links.get_mut(&2) {
-            state.last_update = state.last_update - Duration::from_secs(1);
+              state.last_update -= Duration::from_secs(1);
         }
 
         let _ = dwrr.select_link(1200);
@@ -520,10 +524,10 @@ mod tests {
         dwrr.add_link(probe.clone());
 
         if let Some(state) = dwrr.links.get_mut(&1) {
-            state.last_update = state.last_update - Duration::from_secs(1);
+              state.last_update -= Duration::from_secs(1);
         }
         if let Some(state) = dwrr.links.get_mut(&2) {
-            state.last_update = state.last_update - Duration::from_secs(1);
+              state.last_update -= Duration::from_secs(1);
         }
 
         let _ = dwrr.select_link(1);

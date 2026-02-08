@@ -7,7 +7,7 @@ use std::time::Duration;
 /// Build the integration binary and return its path.
 fn build_integration_binary() -> PathBuf {
     let mut command = Command::new("cargo");
-    command.args(&[
+    command.args([
         "build",
         "-p",
         "gst-rist-bonding",
@@ -147,8 +147,8 @@ fn test_bonded_transmission() {
     ];
 
     let mut receiver_child = Command::new("sudo")
-        .args(&["ip"])
-        .args(&receiver_cmd_args)
+        .args(["ip"])
+        .args(receiver_cmd_args)
         // .env("GST_DEBUG", ...) // Removing this as we use 'env' command inside netns
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -171,8 +171,8 @@ fn test_bonded_transmission() {
     ];
 
     let sender_status = Command::new("sudo")
-        .args(&["ip"])
-        .args(&sender_cmd_args)
+        .args(["ip"])
+        .args(sender_cmd_args)
         .status()
         .expect("Failed to execute sender process");
 
@@ -184,7 +184,7 @@ fn test_bonded_transmission() {
     // Send SIGINT to receiver to trigger graceful shutdown (and MP4 finalization)
     println!("Sender finished. Sending SIGINT to receiver...");
     let status = Command::new("sudo")
-        .args(&[
+        .args([
             "ip",
             "netns",
             "exec",
@@ -227,7 +227,7 @@ fn test_bonded_transmission() {
     assert!(sender_status.success(), "Sender process failed");
 
     // Check Receiver Output for errors
-    let stdout = String::from_utf8_lossy(&receiver_output.stdout);
+    let _stdout = String::from_utf8_lossy(&receiver_output.stdout);
     let stderr = String::from_utf8_lossy(&receiver_output.stderr);
 
     // println!("Receiver Stdout:\n{}", stdout);

@@ -244,9 +244,9 @@ mod imp {
                                     .field("total_capacity", 0.0f64)
                                     .field("alive_links", 0u64)
                                     .field("queue_depth", stats.queue_depth as u64)
-                                    .field("next_seq", stats.next_seq as u64)
-                                    .field("lost_packets", stats.lost_packets as u64)
-                                    .field("late_packets", stats.late_packets as u64)
+                                    .field("next_seq", stats.next_seq)
+                                    .field("lost_packets", stats.lost_packets)
+                                    .field("late_packets", stats.late_packets)
                                     .field("current_latency_ms", stats.current_latency_ms) // Added
                                     .build();
                                 let _ = element.post_message(gst::message::Element::new(msg));
