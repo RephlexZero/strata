@@ -76,9 +76,11 @@ fn percentile(samples: &VecDeque<f64>, pct: f64) -> f64 {
         return 0.0;
     }
     let mut v: Vec<f64> = samples.iter().copied().collect();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let idx = ((v.len() - 1) as f64 * pct).round() as usize;
-    v[idx.min(v.len() - 1)]
+    let idx = idx.min(v.len() - 1);
+    // Use select_nth_unstable for O(n) partial sort instead of full O(n log n) sort.
+    v.select_nth_unstable_by(idx, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v[idx]
 }
 
 impl ReassemblyBuffer {

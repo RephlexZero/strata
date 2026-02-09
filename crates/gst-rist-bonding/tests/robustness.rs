@@ -91,7 +91,7 @@ fn test_race_car_scenarios() {
     let sender_ns_clone = sender_ns.clone();
     let exec_send = executable.clone();
 
-    let _sender_handle = thread::spawn(move || {
+    let sender_handle = thread::spawn(move || {
         thread::sleep(Duration::from_secs(1));
         let output = sender_ns_clone
             .exec(
@@ -174,9 +174,35 @@ fn test_race_car_scenarios() {
 
     // Wait for Sender to finish (Now using 1200 buffers @ 60fps = 20s of video)
     // The test runs for 35s, so sender will finish before the test ends
-    // Just drop the sender_ns handles to kill processes?
     println!(">>> SIMULATION: End. Cleaning up.");
-    // Dropping namespaces will kill processes.
-    // However, threads might panic if exec returns error.
-    // Sender Handle join might return error.
+
+    // --- Assertions ---
+
+    // 1. The scenario reached the link-flap phase (t >= 15s)
+    assert!(
+        flapped,
+        "Simulation should have reached the link-flap phase at t=15s"
+    );
+
+    // 2. The sender thread completed without panicking
+    let sender_output = sender_handle
+        .join()
+        .expect("Sender thread panicked during impaired scenario");
+
+    // 3. The sender process exited successfully
+    assert!(
+        sender_output.status.success(),
+        "Sender process should exit cleanly. Exit code: {:?}, stderr: {}",
+        sender_output.status.code(),
+        String::from_utf8_lossy(&sender_output.stderr)
+    );
+
+    // 4. The sender produced output (wrote data to links)
+    let stderr_str = String::from_utf8_lossy(&sender_output.stderr);
+    assert!(
+        !stderr_str.is_empty(),
+        "Sender should produce log output on stderr"
+    );
+
+    // Dropping namespaces will kill remaining processes (receiver).
 }

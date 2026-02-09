@@ -81,7 +81,7 @@ impl Drop for RistContext {
             // Free logging settings — safe to call after rist_destroy since the
             // context no longer references the logging handle.
             if !self.logging_settings.is_null() {
-                libc::free(self.logging_settings as *mut libc::c_void);
+                rist_logging_settings_free2(&mut self.logging_settings);
             }
         }
     }
@@ -201,7 +201,7 @@ impl RistContext {
             if ret != 0 {
                 // Clean up logging settings on failure
                 if !log_settings.is_null() {
-                    libc::free(log_settings as *mut libc::c_void);
+                    rist_logging_settings_free2(&mut log_settings);
                 }
                 return Err(anyhow::anyhow!(
                     "Failed to create RIST sender context: {}",
@@ -223,14 +223,19 @@ impl RistContext {
         }
 
         let arg_ptr = Arc::into_raw(stats) as *mut libc::c_void;
-        self.stats_arg = arg_ptr;
 
         unsafe {
             let ret = rist_stats_callback_set(self.ctx, interval_ms, Some(stats_cb), arg_ptr);
             if ret != 0 {
+                // Reclaim the Arc to avoid leaking it — registration failed so
+                // the callback will never be invoked and Drop won't free it.
+                let _ = Arc::from_raw(arg_ptr as *const LinkStats);
                 return Err(anyhow::anyhow!("Failed to set stats callback: {}", ret));
             }
         }
+
+        // Only store the pointer after successful registration.
+        self.stats_arg = arg_ptr;
         Ok(())
     }
 
@@ -269,7 +274,7 @@ impl RistContext {
             let ret = rist_peer_create(self.ctx, &mut peer, peer_config);
 
             // We must free the config allocated by parse_address2
-            libc::free(peer_config as *mut libc::c_void);
+            rist_peer_config_free2(&mut peer_config);
 
             if ret != 0 {
                 return Err(anyhow::anyhow!("Failed to create peer: {}", ret));
@@ -316,7 +321,7 @@ impl Drop for RistReceiverContext {
                 rist_destroy(self.ctx);
             }
             if !self.logging_settings.is_null() {
-                libc::free(self.logging_settings as *mut libc::c_void);
+                rist_logging_settings_free2(&mut self.logging_settings);
             }
         }
     }
@@ -342,7 +347,7 @@ impl RistReceiverContext {
 
             if ret != 0 {
                 if !log_settings.is_null() {
-                    libc::free(log_settings as *mut libc::c_void);
+                    rist_logging_settings_free2(&mut log_settings);
                 }
                 return Err(anyhow::anyhow!(
                     "Failed to create RIST receiver context: {}",
@@ -376,7 +381,7 @@ impl RistReceiverContext {
 
             let mut peer: *mut rist_peer = ptr::null_mut();
             let ret = rist_peer_create(self.ctx, &mut peer, peer_config);
-            libc::free(peer_config as *mut libc::c_void);
+            rist_peer_config_free2(&mut peer_config);
 
             if ret != 0 {
                 return Err(anyhow::anyhow!("Failed to create receiver peer: {}", ret));

@@ -333,21 +333,22 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         // 1. Update Credits
         let any_alive = self.links.values().any(|state| state.metrics.alive);
         for state in self.links.values_mut() {
-            let metrics = state.metrics.clone();
-            if metrics.alive || !any_alive {
+            if state.metrics.alive || !any_alive {
                 let elapsed = now.duration_since(state.last_update).as_secs_f64();
 
                 // Calculate Effective Capacity (Quality Aware)
+                // Read fields directly from state.metrics to avoid cloning on the hot path.
                 let predicted_bw =
-                    (metrics.capacity_bps + state.bw_slope_bps_s * horizon_s).max(0.0);
+                    (state.metrics.capacity_bps + state.bw_slope_bps_s * horizon_s).max(0.0);
                 let predicted_loss =
-                    (metrics.loss_rate + state.loss_slope_per_s * horizon_s).clamp(0.0, 1.0);
-                let predicted_rtt = (metrics.rtt_ms + state.rtt_slope_ms_s * horizon_s).max(0.0);
+                    (state.metrics.loss_rate + state.loss_slope_per_s * horizon_s).clamp(0.0, 1.0);
+                let predicted_rtt =
+                    (state.metrics.rtt_ms + state.rtt_slope_ms_s * horizon_s).max(0.0);
 
                 let quality_factor = (1.0 - predicted_loss).powi(4);
                 let rtt_factor = 1.0 / (1.0 + predicted_rtt / 200.0);
 
-                let phase_factor = match metrics.phase {
+                let phase_factor = match state.metrics.phase {
                     LinkPhase::Probe => 0.2,
                     LinkPhase::Warm => 0.6,
                     LinkPhase::Live => 1.0,
@@ -355,7 +356,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                     LinkPhase::Cooldown | LinkPhase::Reset | LinkPhase::Init => 0.1,
                 };
 
-                let os_up_factor = if matches!(metrics.os_up, Some(false)) {
+                let os_up_factor = if matches!(state.metrics.os_up, Some(false)) {
                     0.2
                 } else {
                     1.0
@@ -374,7 +375,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 state.credits += bytes_per_sec * elapsed;
 
                 // Cap credits (adaptive burst window based on phase/loss)
-                let burst_window_s = compute_burst_window_s(metrics.phase, predicted_loss);
+                let burst_window_s = compute_burst_window_s(state.metrics.phase, predicted_loss);
                 let max_credits = bytes_per_sec * burst_window_s;
                 if state.credits > max_credits {
                     state.credits = max_credits;
@@ -392,8 +393,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             let id = self.sorted_ids[idx];
 
             if let Some(state) = self.links.get_mut(&id) {
-                let metrics = state.metrics.clone();
-                if !metrics.alive {
+                if !state.metrics.alive {
                     continue;
                 }
 

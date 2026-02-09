@@ -4,11 +4,9 @@ version = "0.1.2"
 edition = "2021"
 
 [dependencies]
-tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 bytes = { workspace = true }
-thiserror = { workspace = true }
 anyhow = { workspace = true }
 crossbeam-channel = { workspace = true }
 serde = { workspace = true }
@@ -17,4 +15,3 @@ librist-sys = { path = "../librist-sys" }
 libc = "0.2.180"
 
 [dev-dependencies]
-mockall = { workspace = true }

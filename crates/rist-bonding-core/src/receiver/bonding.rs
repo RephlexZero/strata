@@ -164,3 +164,9 @@ impl BondingReceiver {
         Ok(())
     }
 }
+
+impl Drop for BondingReceiver {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
