@@ -67,9 +67,11 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     // Pipeline: videotestsrc ! x264enc ! mpegtsmux ! rsristbondsink (request pads)
     // We send 1200 buffers (20s at 60fps) to ensure continuous flow beyond test duration.
+    // VBV buffer = bitrate (1-second buffer) constrains the peak rate to ~2× target,
+    // preventing unconstrained VBR overshoot with tune=zerolatency.
     let pipeline_str = format!(
-        "videotestsrc num-buffers=1200 is-live=true pattern=smpte ! video/x-raw,width=1920,height=1080,framerate=60/1 ! x264enc name=enc tune=zerolatency bitrate={} ! mpegtsmux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink name=rsink",
-        bitrate_kbps
+        "videotestsrc num-buffers=1200 is-live=true pattern=smpte ! video/x-raw,width=1920,height=1080,framerate=60/1 ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps} ! mpegtsmux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink name=rsink",
+        bps = bitrate_kbps
     );
     eprintln!("Sender Pipeline: {}", pipeline_str);
 

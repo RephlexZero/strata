@@ -78,8 +78,9 @@ fn video_loopback_clean() {
     // Remove stale output
     let _ = fs::remove_file(&ts_path);
 
-    gstristbonding::sink::register(None).ok();
-    gstristbonding::src::register(None).ok();
+    // Note: GStreamer type registration is handled by integration_node
+    // internally. Registering types here without gst::init() causes
+    // GLib GObject-CRITICAL assertions when tests run in parallel.
 
     let bin_str = bin.to_str().unwrap().to_string();
     let ts_str = ts_path.to_str().unwrap().to_string();

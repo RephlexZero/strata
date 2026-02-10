@@ -25,10 +25,12 @@ pub struct Link {
 }
 
 impl Link {
+    #[cfg(test)]
     pub fn new(id: usize, url: &str) -> Result<Self> {
         Self::new_with_iface(id, url, None, crate::config::LinkLifecycleConfig::default())
     }
 
+    #[cfg(test)]
     pub fn new_with_iface(
         id: usize,
         url: &str,
@@ -137,7 +139,11 @@ impl LinkSender for Link {
     }
 
     fn send(&self, packet: &[u8]) -> Result<usize> {
-        self.ctx.send_data(packet)
+        let n = self.ctx.send_data(packet)?;
+        self.stats
+            .bytes_written
+            .fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
     }
 
     fn get_metrics(&self) -> LinkMetrics {
@@ -225,8 +231,8 @@ impl LinkSender for Link {
             rtt_ms,
             capacity_bps: bw,
             loss_rate,
-            observed_bps: 0.0,
-            observed_bytes: 0,
+            observed_bps: bw, // Use smoothed bandwidth as observed rate
+            observed_bytes: self.stats.bytes_written.load(Ordering::Relaxed),
             queue_depth: 0, // Need to implement if possible via stats or wrapper tracking
             max_queue: 1000,
             alive,

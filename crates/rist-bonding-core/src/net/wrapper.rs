@@ -21,6 +21,12 @@ pub struct RecoveryConfig {
     pub recovery_reorder_buffer: Option<u32>, // ms
 }
 
+// Rate-limit counter for repetitive librist log messages.
+// Counts consecutive suppressed messages per thread.
+std::thread_local! {
+    static SUPPRESSED_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 unsafe extern "C" fn log_cb(
     _arg: *mut libc::c_void,
     level: rist_log_level,
@@ -30,22 +36,37 @@ unsafe extern "C" fn log_cb(
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if !msg.is_null() {
             let message = CStr::from_ptr(msg).to_string_lossy();
+            let trimmed = message.trim_end();
+
+            // Rate-limit repetitive messages (e.g. "Sender queue is full")
+            // to avoid flooding logs during congestion. Log every 500th.
+            if level <= rist_log_level_RIST_LOG_ERROR && trimmed.contains("Sender queue is full") {
+                SUPPRESSED_COUNT.with(|c| {
+                    let n = c.get() + 1;
+                    c.set(n);
+                    if n == 1 || n % 500 == 0 {
+                        tracing::warn!(target: "librist", "{} (repeated {} times)", trimmed, n);
+                    }
+                });
+                return;
+            }
+
             // Route librist log levels to tracing levels
             match level {
                 l if l <= rist_log_level_RIST_LOG_ERROR => {
-                    tracing::error!(target: "librist", "{}", message.trim_end());
+                    tracing::error!(target: "librist", "{}", trimmed);
                 }
                 l if l <= rist_log_level_RIST_LOG_WARN => {
-                    tracing::warn!(target: "librist", "{}", message.trim_end());
+                    tracing::warn!(target: "librist", "{}", trimmed);
                 }
                 l if l <= rist_log_level_RIST_LOG_NOTICE => {
-                    tracing::info!(target: "librist", "{}", message.trim_end());
+                    tracing::info!(target: "librist", "{}", trimmed);
                 }
                 l if l <= rist_log_level_RIST_LOG_INFO => {
-                    debug!(target: "librist", "{}", message.trim_end());
+                    debug!(target: "librist", "{}", trimmed);
                 }
                 _ => {
-                    trace!(target: "librist", "{}", message.trim_end());
+                    trace!(target: "librist", "{}", trimmed);
                 }
             }
         }
@@ -127,43 +148,40 @@ unsafe extern "C" fn stats_cb(
             if let Ok(mut ewma) = link_stats.ewma_state.lock() {
                 ewma.rtt.update(sender_stats.rtt as f64);
 
+                // Note: librist's `stats_sender_instant` counters are
+                // **per-interval** — zeroed via memset after each stats
+                // callback (see vendor/librist/src/stats.c). Use the raw
+                // values directly instead of computing deltas against
+                // the previous callback's values.
                 let sent = sender_stats.sent;
                 let rex = sender_stats.retransmitted;
-
-                let delta_sent = sent.saturating_sub(ewma.last_sent);
-                let delta_rex = rex.saturating_sub(ewma.last_rex);
-
-                let dt_ms = if ewma.last_stats_ms > 0 {
-                    now_ms.saturating_sub(ewma.last_stats_ms)
-                } else {
-                    0
-                };
 
                 ewma.last_sent = sent;
                 ewma.last_rex = rex;
                 ewma.last_stats_ms = now_ms;
 
-                // Calculate "Badness" ratio: (Retransmitted) / Sent
-                // If sent is 0 (idle), we keep previous estimate or decay?
-                // If idle, loss is 0.
-                let loss_ratio = if delta_sent > 0 {
-                    delta_rex as f64 / delta_sent as f64
-                } else {
-                    0.0
-                };
-
-                // Update EWMA with current loss ratio (0.0 - 1.0+)
-                ewma.loss.update(loss_ratio);
-
-                // Bandwidth update (fallback if librist reports 0)
-                let mut bw_bps = sender_stats.bandwidth as f64;
-                if bw_bps <= 0.0 && dt_ms > 0 && delta_sent > 0 {
-                    bw_bps = (delta_sent as f64 * 8.0 * 1000.0) / dt_ms as f64;
+                // Loss: only update when packets were sent this interval.
+                if sent > 0 {
+                    let loss_ratio = rex as f64 / sent as f64;
+                    ewma.loss.update(loss_ratio);
                 }
-                ewma.bandwidth.update(bw_bps);
-                link_stats
-                    .bandwidth
-                    .store(bw_bps.max(0.0) as u64, Ordering::Relaxed);
+
+                // Bandwidth: use librist's native estimation.
+                //
+                // librist maintains a rolling bitrate estimator (peer->bw)
+                // updated on every UDP send via rist_calculate_bitrate().
+                // The reported `bandwidth` field is eight_times_bitrate_fast/8
+                // — an EWMA over 100ms windows of actual wire-rate bytes.
+                // This is NOT zeroed by the per-interval memset of
+                // stats_sender_instant (which only affects sent/retransmitted
+                // counters). See vendor/librist/src/stats.c:59,102.
+                let bw_bps = sender_stats.bandwidth as f64;
+                if bw_bps > 0.0 {
+                    ewma.bandwidth.update(bw_bps);
+                    link_stats
+                        .bandwidth
+                        .store(bw_bps as u64, Ordering::Relaxed);
+                }
 
                 // Update Cached Smooth Values
                 // RTT in micros

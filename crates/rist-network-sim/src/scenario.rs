@@ -1,6 +1,6 @@
 use crate::impairment::ImpairmentConfig;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt as _, SeedableRng};
 use std::time::Duration;
 
 /// Configuration for a deterministic network impairment scenario.
@@ -59,9 +59,9 @@ impl Scenario {
             .iter()
             .map(|link| {
                 let rate_range = link.max_rate_kbit.saturating_sub(link.min_rate_kbit) as f64;
-                let rate = link.min_rate_kbit as f64 + rng.gen::<f64>() * rate_range;
+                let rate = link.min_rate_kbit as f64 + rng.random::<f64>() * rate_range;
                 let delay = link.base_delay_ms as f64;
-                let loss = rng.gen::<f64>() * link.max_loss_percent as f64 * 0.2;
+                let loss = rng.random::<f64>() * link.max_loss_percent as f64 * 0.2;
                 LinkState {
                     rate_kbit: rate,
                     delay_ms: delay,
@@ -125,8 +125,8 @@ fn rand_signed(rng: &mut StdRng, max_step: f64) -> f64 {
     if max_step <= 0.0 {
         return 0.0;
     }
-    let mag = rng.gen::<f64>() * max_step;
-    if rng.gen::<bool>() {
+    let mag = rng.random::<f64>() * max_step;
+    if rng.random::<bool>() {
         mag
     } else {
         -mag

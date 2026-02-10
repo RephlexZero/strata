@@ -343,9 +343,9 @@ mod imp {
                 match rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(bytes) => {
                         let buffer = gst::Buffer::from_slice(bytes);
-                        return Ok(
-                            gst_base::subclass::base_src::CreateSuccess::NewBuffer(buffer),
-                        );
+                        return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(
+                            buffer,
+                        ));
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                         // Loop back to check flushing flag

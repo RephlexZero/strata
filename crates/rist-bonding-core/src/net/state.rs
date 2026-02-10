@@ -55,6 +55,7 @@ pub struct LinkStats {
     pub smoothed_rtt_us: AtomicU64,
     pub smoothed_bw_bps: AtomicU64,
     pub smoothed_loss_permille: AtomicU64, // Stored as * 1000. 1000 = 100% loss.
+    pub bytes_written: AtomicU64,
     pub last_stats_ms: AtomicU64,
     pub os_up_i32: AtomicI32, // -1 unknown, 0 down, 1 up
     pub mtu_i32: AtomicI32,   // -1 unknown
@@ -78,6 +79,7 @@ impl LinkStats {
             smoothed_rtt_us: AtomicU64::new(0),
             smoothed_bw_bps: AtomicU64::new(0),
             smoothed_loss_permille: AtomicU64::new(0),
+            bytes_written: AtomicU64::new(0),
             last_stats_ms: AtomicU64::new(0),
             os_up_i32: AtomicI32::new(-1),
             mtu_i32: AtomicI32::new(-1),

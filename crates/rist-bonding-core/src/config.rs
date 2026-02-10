@@ -215,7 +215,7 @@ impl Default for SchedulerConfig {
             congestion_trigger_ratio: 0.90,
             ewma_alpha: 0.125,
             prediction_horizon_s: 0.5,
-            capacity_floor_bps: 5_000_000.0,
+            capacity_floor_bps: 1_000_000.0,
             penalty_decay: 0.7,
             penalty_recovery: 0.05,
             jitter_latency_multiplier: 4.0,
