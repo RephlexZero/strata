@@ -626,7 +626,9 @@ mod tests {
         for i in 0..num_packets {
             // Create payload with varying sizes and content
             let payload_len = 100 + (i % 1300);
-            let payload: Vec<u8> = (0..payload_len).map(|j| ((i * 7 + j * 13) % 256) as u8).collect();
+            let payload: Vec<u8> = (0..payload_len)
+                .map(|j| ((i * 7 + j * 13) % 256) as u8)
+                .collect();
             let payload_bytes = Bytes::from(payload.clone());
 
             // Hash the original payload on the sender side

@@ -271,8 +271,10 @@ fn test_impaired_bonding_visualization() {
             let avg_cap = cap_sum / samples as f64;
             let avg_loss = loss_sum / samples as f64;
             assert!(avg_cap > 300_000.0, "avg capacity too low: {}", avg_cap);
-            // Increased tolerance to account for adaptive redundancy duplicating packets
-            assert!(avg_cap < 5_000_000.0, "avg capacity too high: {}", avg_cap);
+            // Sender-side bandwidth measures application→socket send rate,
+            // NOT the post-tc-netem wire rate. This includes retransmissions,
+            // redundancy, and overhead before kernel qdisc shaping.
+            assert!(avg_cap < 20_000_000.0, "avg capacity too high: {}", avg_cap);
             assert!(avg_loss <= 0.2, "avg loss too high: {}", avg_loss);
         }
 

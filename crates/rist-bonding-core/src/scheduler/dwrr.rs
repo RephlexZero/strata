@@ -194,8 +194,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             .links
             .values()
             .filter(|s| {
-                s.metrics.alive
-                    && matches!(s.metrics.phase, LinkPhase::Live | LinkPhase::Warm)
+                s.metrics.alive && matches!(s.metrics.phase, LinkPhase::Live | LinkPhase::Warm)
             })
             .map(|s| s.metrics.capacity_bps)
             .sum();

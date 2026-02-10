@@ -178,9 +178,7 @@ unsafe extern "C" fn stats_cb(
                 let bw_bps = sender_stats.bandwidth as f64;
                 if bw_bps > 0.0 {
                     ewma.bandwidth.update(bw_bps);
-                    link_stats
-                        .bandwidth
-                        .store(bw_bps as u64, Ordering::Relaxed);
+                    link_stats.bandwidth.store(bw_bps as u64, Ordering::Relaxed);
                 }
 
                 // Update Cached Smooth Values

@@ -14,6 +14,7 @@ Thumbs.db
 .idea/
 .vscode/*.log
 .vscode/chrome-debug_*
+.claude/
 
 # Project specific test artifacts (media files, captures)
 *.mp4
