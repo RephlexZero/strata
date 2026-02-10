@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ── Submodule check ──────────────────────────────────────────────
+# Ensure every submodule commit recorded in the index exists on its
+# remote. Prevents CI failures caused by pushing a main-repo ref
+# that points to an unpushed submodule commit.
+echo "[pre-push] Checking submodule commits are pushed..."
+
+git submodule foreach --quiet '
+  commit=$(git rev-parse HEAD)
+  remote_url=$(git remote get-url origin)
+  if ! git ls-remote --exit-code origin "$commit" >/dev/null 2>&1 &&
+     ! git branch -r --contains "$commit" 2>/dev/null | grep -q .; then
+    echo "ERROR: submodule \"$name\" commit $commit is not on remote ($remote_url)."
+    echo "       Push the submodule first:  cd $toplevel/$sm_path && git push"
+    exit 1
+  fi
+'
+
 echo "[pre-push] Running rustfmt check..."
 cargo fmt --all -- --check
 
