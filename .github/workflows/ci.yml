@@ -82,6 +82,46 @@ jobs:
       - name: Run unit tests
         run: cargo test --workspace --lib
 
+      - name: Run doc tests
+        run: cargo test --workspace --doc
+
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Fetch required submodules
+        run: git submodule update --init --recursive vendor/librist
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake pkg-config \
+            meson ninja-build \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            libfontconfig1-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
+            gstreamer1.0-tools \
+            iproute2 \
+            iptables
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run end-to-end integration tests
+        run: sudo -E env "PATH=$PATH" cargo test -p gst-rist-bonding --test end_to_end -- --nocapture
+
   audit:
     name: Security Audit
     runs-on: ubuntu-24.04

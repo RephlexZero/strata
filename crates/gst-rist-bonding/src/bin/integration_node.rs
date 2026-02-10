@@ -110,6 +110,10 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         stats_socket = Some(sock);
     }
 
+    // Additive-increase step: ramp bitrate back up by this amount (kbps)
+    // each stats interval when bandwidth-available is signalled.
+    let ramp_step_kbps: u32 = (bitrate_kbps / 10).max(100);
+
     pipeline.set_state(gst::State::Playing)?;
 
     let bus = pipeline.bus().unwrap();
@@ -125,111 +129,42 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(s) = element.structure() {
                     if s.name() == "congestion-control" {
                         if let Ok(recommended) = s.get::<u64>("recommended-bitrate") {
-                            eprintln!(
-                                "Congestion Control: Adjusting Bitrate to {} bps...",
-                                recommended
-                            );
-                            // Update encoder
+                            // Update encoder: only reduce bitrate (congestion relief),
+                            // never increase beyond the configured value.
                             if let Some(enc) = pipeline.by_name("enc") {
                                 // x264enc bitrate is in kbit/sec
-                                let bitrate_kbps = (recommended / 1000) as u32;
-                                let target = std::cmp::max(bitrate_kbps, 500);
+                                let recommended_kbps = (recommended / 1000) as u32;
+                                let current: u32 = enc.property("bitrate");
+                                let target = std::cmp::max(recommended_kbps, 500);
+                                if target < current {
+                                    eprintln!(
+                                        "Congestion Control: Reducing Bitrate from {} to {} kbps",
+                                        current, target
+                                    );
+                                    enc.set_property("bitrate", target);
+                                }
+                            }
+                        }
+                    } else if s.name() == "bandwidth-available" {
+                        // AIMD additive increase: ramp bitrate back up
+                        // towards the configured ceiling.
+                        if let Some(enc) = pipeline.by_name("enc") {
+                            let current: u32 = enc.property("bitrate");
+                            if current < bitrate_kbps {
+                                let target =
+                                    std::cmp::min(current + ramp_step_kbps, bitrate_kbps);
+                                eprintln!(
+                                    "Bandwidth Available: Increasing Bitrate from {} to {} kbps",
+                                    current, target
+                                );
                                 enc.set_property("bitrate", target);
                             }
                         }
                     } else if s.name() == "rist-bonding-stats" {
                         // Relay to UDP if configured
                         if let Some(sock) = &stats_socket {
-                            // Convert GST Structure to JSON
-                            // Naive manual conversion for specific fields we know
-                            // Debug string
-                            let _s_str = s.to_string();
-                            // Better: extract fields
-                            // The structure is flat: link_0_rtt, link_0_capacity...
-                            // We need to parse this into the hierarchy the test expects
-                            // Test expects: { "timestamp": f64, "total_capacity": f64, "links": { "0": { "loss": ... } } }
-
-                            // Reconstruct hierarchy from the flat stats structure.
-                            // The schema provides aggregate fields plus per-link metrics.
-                            let schema_version = s.get::<i32>("schema_version").unwrap_or(0);
-                            let stats_seq = s.get::<u64>("stats_seq").unwrap_or(0);
-                            let heartbeat = s.get::<bool>("heartbeat").unwrap_or(false);
-                            let mono_time_ns = s.get::<u64>("mono_time_ns").unwrap_or(0);
-                            let wall_time_ms = s.get::<u64>("wall_time_ms").unwrap_or(0);
-                            let total_capacity_field =
-                                s.get::<f64>("total_capacity").unwrap_or(0.0);
-                            let alive_links = s.get::<u64>("alive_links").unwrap_or(0);
-
-                            let mut total_cap = if total_capacity_field > 0.0 {
-                                total_capacity_field
-                            } else {
-                                0.0
-                            };
-                            let mut links_map = serde_json::Map::new();
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs_f64();
-
-                            // Iterate fields? GstStructure doesn't expose iter easily in bindings sometimes.
-                            // But we know keys "link_0_rtt".
-                            // Let's assume max 16 links and query them.
-                            for i in 0..16 {
-                                let prefix = format!("link_{}_", i);
-                                if s.has_field(format!("{}alive", prefix)) {
-                                    let alive =
-                                        s.get::<bool>(&format!("{}alive", prefix)).unwrap_or(false);
-                                    let cap =
-                                        s.get::<f64>(&format!("{}capacity", prefix)).unwrap_or(0.0);
-                                    let observed_bps = s
-                                        .get::<f64>(&format!("{}observed_bps", prefix))
-                                        .unwrap_or(0.0);
-                                    let observed_bytes = s
-                                        .get::<u64>(&format!("{}observed_bytes", prefix))
-                                        .unwrap_or(0);
-                                    let cap = if cap > 0.0 { cap } else { observed_bps };
-                                    let rtt =
-                                        s.get::<f64>(&format!("{}rtt", prefix)).unwrap_or(0.0);
-                                    let loss =
-                                        s.get::<f64>(&format!("{}loss", prefix)).unwrap_or(0.0);
-
-                                    if alive && total_capacity_field == 0.0 {
-                                        total_cap += cap;
-                                    }
-
-                                    let link_json = serde_json::json!({
-                                        "rtt": rtt,
-                                        "capacity": cap,
-                                        "loss": loss,
-                                        "alive": alive,
-                                        "queue": 0,
-                                        "observed_bps": observed_bps,
-                                        "observed_bytes": observed_bytes
-                                    });
-                                    links_map.insert(i.to_string(), link_json);
-                                }
-                            }
-
-                            let timestamp = if wall_time_ms > 0 {
-                                wall_time_ms as f64 / 1000.0
-                            } else {
-                                now
-                            };
-
-                            let json_stats = serde_json::json!({
-                                "schema_version": schema_version,
-                                "stats_seq": stats_seq,
-                                "heartbeat": heartbeat,
-                                "mono_time_ns": mono_time_ns,
-                                "wall_time_ms": wall_time_ms,
-                                "timestamp": timestamp,
-                                "total_capacity": total_cap,
-                                "alive_links": alive_links,
-                                "links": links_map
-                            });
-
-                            if let Ok(data) = serde_json::to_vec(&json_stats) {
-                                let _ = sock.send_to(&data, stats_dest);
+                            if let Ok(stats_json) = s.get::<&str>("stats_json") {
+                                let _ = sock.send_to(stats_json.as_bytes(), stats_dest);
                             }
                         }
                     }

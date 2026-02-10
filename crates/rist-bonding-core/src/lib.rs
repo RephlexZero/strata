@@ -19,6 +19,7 @@ pub mod protocol;
 pub mod receiver;
 pub mod runtime;
 pub mod scheduler;
+pub mod stats;
 
 // Re-export types that downstream crates need from `net`.
 pub use net::interface::{LinkMetrics, LinkPhase, LinkSender};

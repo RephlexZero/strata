@@ -7,6 +7,7 @@ use gst_base::subclass::prelude::*;
 use rist_bonding_core::config::{BondingConfig, LinkConfig, SchedulerConfig};
 use rist_bonding_core::runtime::{BondingRuntime, PacketSendError};
 use rist_bonding_core::scheduler::PacketProfile;
+use rist_bonding_core::stats::{LinkStatsSnapshot, StatsSnapshot};
 use std::collections::HashMap;
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -436,46 +437,47 @@ mod imp {
                                 let mut total_capacity = 0.0;
                                 let mut total_observed_bps = 0.0;
                                 let mut alive_links = 0u64;
-                                for m in metrics.values() {
+                                let mut links_map = std::collections::HashMap::new();
+
+                                for (id, m) in &metrics {
                                     if m.alive {
                                         total_capacity += m.capacity_bps;
                                         total_observed_bps += m.observed_bps;
                                         alive_links += 1;
                                     }
+                                    links_map
+                                        .insert(id.to_string(), LinkStatsSnapshot::from_metrics(m));
                                 }
 
-                                let mut msg_struct = gst::Structure::builder("rist-bonding-stats")
-                                    .field("schema_version", 1i32)
-                                    .field("stats_seq", stats_seq)
-                                    .field("heartbeat", true)
-                                    .field("mono_time_ns", mono_time_ns)
-                                    .field("wall_time_ms", wall_time_ms)
+                                let timestamp = if wall_time_ms > 0 {
+                                    wall_time_ms as f64 / 1000.0
+                                } else {
+                                    0.0
+                                };
+
+                                let snapshot = StatsSnapshot {
+                                    schema_version: 2,
+                                    stats_seq,
+                                    heartbeat: true,
+                                    mono_time_ns,
+                                    wall_time_ms,
+                                    timestamp,
+                                    total_capacity,
+                                    alive_links,
+                                    links: links_map,
+                                };
+
+                                let stats_json =
+                                    serde_json::to_string(&snapshot).unwrap_or_default();
+
+                                let msg_struct = gst::Structure::builder("rist-bonding-stats")
+                                    .field("schema_version", 2i32)
+                                    .field("stats_json", &stats_json)
                                     .field("total_capacity", total_capacity)
-                                    .field("alive_links", alive_links);
-                                for (id, m) in metrics {
-                                    let os_up =
-                                        m.os_up.map(|v| if v { 1i32 } else { 0i32 }).unwrap_or(-1);
-                                    let mtu = m.mtu.map(|v| v as i32).unwrap_or(-1);
-                                    let iface = m.iface.as_deref().unwrap_or("");
-                                    let link_kind = m.link_kind.as_deref().unwrap_or("");
-                                    msg_struct = msg_struct
-                                        .field(format!("link_{}_rtt", id), m.rtt_ms)
-                                        .field(format!("link_{}_capacity", id), m.capacity_bps)
-                                        .field(format!("link_{}_loss", id), m.loss_rate)
-                                        .field(format!("link_{}_observed_bps", id), m.observed_bps)
-                                        .field(
-                                            format!("link_{}_observed_bytes", id),
-                                            m.observed_bytes,
-                                        )
-                                        .field(format!("link_{}_alive", id), m.alive)
-                                        .field(format!("link_{}_phase", id), m.phase.as_str())
-                                        .field(format!("link_{}_os_up", id), os_up)
-                                        .field(format!("link_{}_mtu", id), mtu)
-                                        .field(format!("link_{}_iface", id), iface)
-                                        .field(format!("link_{}_kind", id), link_kind);
-                                }
-                                let _ = element
-                                    .post_message(gst::message::Element::new(msg_struct.build()));
+                                    .field("alive_links", alive_links)
+                                    .build();
+                                let _ =
+                                    element.post_message(gst::message::Element::new(msg_struct));
 
                                 if let Some(recommended) = compute_congestion_recommendation(
                                     total_capacity,
@@ -485,6 +487,19 @@ mod imp {
                                 ) {
                                     let msg = gst::Structure::builder("congestion-control")
                                         .field("recommended-bitrate", recommended)
+                                        .field("total_capacity", total_capacity)
+                                        .field("observed_bps", total_observed_bps)
+                                        .build();
+                                    let _ = element.post_message(gst::message::Element::new(msg));
+                                } else if total_capacity > 0.0
+                                    && total_observed_bps < total_capacity * congestion_headroom
+                                {
+                                    // Utilization is well under capacity — signal
+                                    // the application that it's safe to probe higher.
+                                    let headroom_bps =
+                                        (total_capacity * congestion_headroom).round() as u64;
+                                    let msg = gst::Structure::builder("bandwidth-available")
+                                        .field("max-bitrate", headroom_bps)
                                         .field("total_capacity", total_capacity)
                                         .field("observed_bps", total_observed_bps)
                                         .build();

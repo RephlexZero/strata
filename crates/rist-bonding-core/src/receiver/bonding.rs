@@ -175,3 +175,59 @@ impl Drop for BondingReceiver {
         self.shutdown();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn new_and_shutdown() {
+        let mut rcv = BondingReceiver::new(Duration::from_millis(50));
+        assert!(rcv.input_tx.is_some());
+        rcv.shutdown();
+        assert!(rcv.input_tx.is_none());
+        assert!(rcv.output_tx.is_none());
+    }
+
+    #[test]
+    fn shutdown_is_idempotent() {
+        let mut rcv = BondingReceiver::new(Duration::from_millis(50));
+        rcv.shutdown();
+        rcv.shutdown(); // must not panic
+    }
+
+    #[test]
+    fn add_link_after_shutdown_fails() {
+        let mut rcv = BondingReceiver::new(Duration::from_millis(50));
+        rcv.shutdown();
+        let result = rcv.add_link("rist://127.0.0.1:9999");
+        assert!(result.is_err(), "add_link after shutdown should fail");
+    }
+
+    #[test]
+    fn get_stats_returns_defaults() {
+        let rcv = BondingReceiver::new(Duration::from_millis(50));
+        let stats = rcv.get_stats();
+        assert_eq!(stats.queue_depth, 0);
+        assert_eq!(stats.lost_packets, 0);
+        assert_eq!(stats.late_packets, 0);
+        assert_eq!(stats.duplicate_packets, 0);
+    }
+
+    #[test]
+    fn drop_triggers_shutdown() {
+        let rcv = BondingReceiver::new(Duration::from_millis(50));
+        assert!(rcv.running.load(Ordering::Relaxed));
+        let running = rcv.running.clone();
+        drop(rcv);
+        assert!(!running.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn output_rx_available_after_new() {
+        let rcv = BondingReceiver::new(Duration::from_millis(50));
+        // output_rx should be available and empty (no data sent)
+        assert!(rcv.output_rx.try_recv().is_err());
+    }
+}

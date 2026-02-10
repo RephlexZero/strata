@@ -1,6 +1,6 @@
-use crate::net::interface::bind_url_to_iface;
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
 use crate::net::state::LinkStats;
+use crate::net::util::bind_url_to_iface;
 use crate::net::wrapper::{RecoveryConfig, RistContext};
 use anyhow::Result;
 use std::sync::atomic::Ordering;
@@ -227,12 +227,42 @@ impl LinkSender for Link {
             (None, None, None, None)
         };
 
+        // Compute observed_bps from application-level bytes_written rate,
+        // independent of librist's bandwidth metric used for capacity_bps.
+        let current_bytes = self.stats.bytes_written.load(Ordering::Relaxed);
+        let prev_bytes = self.stats.observed_prev_bytes.load(Ordering::Relaxed);
+        let prev_ts = self.stats.observed_prev_ts_ms.load(Ordering::Relaxed);
+        let dt_ms = now_ms.saturating_sub(prev_ts);
+        let observed_bps = if dt_ms >= 50 {
+            let delta_bytes = current_bytes.saturating_sub(prev_bytes);
+            let rate = (delta_bytes as f64 * 8.0 * 1000.0) / dt_ms as f64;
+            self.stats
+                .observed_prev_bytes
+                .store(current_bytes, Ordering::Relaxed);
+            self.stats
+                .observed_prev_ts_ms
+                .store(now_ms, Ordering::Relaxed);
+            rate
+        } else if prev_ts == 0 {
+            // First call: initialize tracking, no rate yet
+            self.stats
+                .observed_prev_bytes
+                .store(current_bytes, Ordering::Relaxed);
+            self.stats
+                .observed_prev_ts_ms
+                .store(now_ms, Ordering::Relaxed);
+            0.0
+        } else {
+            // Too short interval, reuse last capacity as fallback
+            0.0
+        };
+
         LinkMetrics {
             rtt_ms,
             capacity_bps: bw,
             loss_rate,
-            observed_bps: bw, // Use smoothed bandwidth as observed rate
-            observed_bytes: self.stats.bytes_written.load(Ordering::Relaxed),
+            observed_bps,
+            observed_bytes: current_bytes,
             queue_depth: 0, // Need to implement if possible via stats or wrapper tracking
             max_queue: 1000,
             alive,
