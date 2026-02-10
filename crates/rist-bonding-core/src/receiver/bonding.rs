@@ -137,7 +137,12 @@ impl BondingReceiver {
                                     payload: original_payload,
                                     arrival_time: Instant::now(),
                                 };
-                                let _ = input_tx.send(packet);
+                                if let Err(e) = input_tx.send(packet) {
+                                    debug!(
+                                        "BondingReceiver: input channel full/closed on {}: {}",
+                                        link_url, e
+                                    );
+                                }
                             } else {
                                 debug!(
                                     "BondingReceiver: Dropped packet with invalid header on {}",

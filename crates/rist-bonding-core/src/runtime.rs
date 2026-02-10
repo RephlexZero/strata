@@ -154,7 +154,9 @@ fn runtime_worker(
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(msg) => match msg {
                 RuntimeMessage::Packet(data, profile) => {
-                    let _ = scheduler.send(data, profile);
+                    if let Err(e) = scheduler.send(data, profile) {
+                        tracing::debug!("Scheduler send failed: {}", e);
+                    }
                 }
                 RuntimeMessage::AddLink(link) => {
                     apply_link(

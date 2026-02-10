@@ -21,7 +21,7 @@ mod imp {
         fn default() -> Self {
             Self {
                 links: String::new(),
-                latency: 100, // Default 100ms
+                latency: 50, // Default 50ms — matches ReceiverConfig::default().start_latency
                 config_toml: String::new(),
             }
         }
@@ -33,6 +33,9 @@ mod imp {
         receiver: Mutex<Option<BondingReceiver>>,
         stats_running: Arc<AtomicBool>,
         stats_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+        /// Set by `unlock()` to interrupt the blocking `create()` call;
+        /// cleared by `unlock_stop()` so normal operation can resume.
+        flushing: AtomicBool,
     }
 
     impl RsRistBondSrc {
@@ -88,7 +91,7 @@ mod imp {
                     glib::ParamSpecUInt::builder("latency")
                         .nick("Latency")
                         .blurb("Reassembly buffer latency in milliseconds")
-                        .default_value(100)
+                        .default_value(50)
                         .build(),
                     glib::ParamSpecString::builder("config")
                         .nick("Config (TOML)")
@@ -303,10 +306,14 @@ mod imp {
         }
 
         fn unlock(&self) -> Result<(), gst::ErrorMessage> {
-            let mut receiver_guard = lock_or_recover(&self.receiver);
-            if let Some(receiver) = &mut *receiver_guard {
-                receiver.shutdown();
-            }
+            // Non-destructive: just set the flushing flag so create() returns Flushing.
+            // The receiver stays alive and can resume after unlock_stop().
+            self.flushing.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn unlock_stop(&self) -> Result<(), gst::ErrorMessage> {
+            self.flushing.store(false, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -325,14 +332,29 @@ mod imp {
             };
             drop(receiver_guard);
 
-            match rx.recv() {
-                Ok(bytes) => {
-                    let buffer = gst::Buffer::from_slice(bytes);
-                    Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(
-                        buffer,
-                    ))
+            // Use recv_timeout in a loop so we can check the flushing flag
+            // periodically. This allows unlock() to interrupt us without
+            // destroying the receiver.
+            loop {
+                if self.flushing.load(Ordering::SeqCst) {
+                    return Err(gst::FlowError::Flushing);
                 }
-                Err(_) => Err(gst::FlowError::Eos),
+
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(bytes) => {
+                        let buffer = gst::Buffer::from_slice(bytes);
+                        return Ok(
+                            gst_base::subclass::base_src::CreateSuccess::NewBuffer(buffer),
+                        );
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        // Loop back to check flushing flag
+                        continue;
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        return Err(gst::FlowError::Eos);
+                    }
+                }
             }
         }
     }

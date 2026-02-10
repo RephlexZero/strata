@@ -14,11 +14,15 @@
 //! - [`runtime`] — Thread-safe runtime that owns the scheduler loop
 
 pub mod config;
-pub mod net;
+pub(crate) mod net;
 pub mod protocol;
 pub mod receiver;
 pub mod runtime;
 pub mod scheduler;
+
+// Re-export types that downstream crates need from `net`.
+pub use net::interface::{LinkMetrics, LinkPhase, LinkSender};
+pub use net::wrapper::{RecoveryConfig, RistContext, RistReceiverContext};
 
 /// Initialize the rist-bonding-core library.
 ///

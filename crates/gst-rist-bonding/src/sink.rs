@@ -80,17 +80,21 @@ mod imp {
             if let Some(rt) = &*runtime {
                 match msg {
                     SinkMessage::AddLink { id, uri, iface } => {
-                        let _ = rt.add_link(LinkConfig {
+                        if let Err(e) = rt.add_link(LinkConfig {
                             id,
-                            uri,
+                            uri: uri.clone(),
                             interface: iface,
                             recovery_maxbitrate: None,
                             recovery_rtt_max: None,
                             recovery_reorder_buffer: None,
-                        });
+                        }) {
+                            gst::warning!(gst::CAT_DEFAULT, "Failed to add link {}: {}", uri, e);
+                        }
                     }
                     SinkMessage::RemoveLink { id } => {
-                        let _ = rt.remove_link(id);
+                        if let Err(e) = rt.remove_link(id) {
+                            gst::warning!(gst::CAT_DEFAULT, "Failed to remove link {}: {}", id, e);
+                        }
                     }
                 }
             } else {
@@ -165,7 +169,9 @@ mod imp {
                 Ok(parsed) => {
                     *lock_or_recover(&self.scheduler_config) = parsed.scheduler.clone();
                     if let Some(rt) = lock_or_recover(&self.runtime).as_ref() {
-                        let _ = rt.apply_config(parsed);
+                        if let Err(e) = rt.apply_config(parsed) {
+                            gst::warning!(gst::CAT_DEFAULT, "Failed to apply config: {}", e);
+                        }
                     }
                 }
                 Err(err) => {
@@ -394,7 +400,9 @@ mod imp {
                     .map(|(_, v)| v)
                     .collect();
                 for link in pending {
-                    let _ = rt.add_link(link);
+                    if let Err(e) = rt.add_link(link) {
+                        gst::warning!(gst::CAT_DEFAULT, "Failed to add pending link: {}", e);
+                    }
                 }
             }
 

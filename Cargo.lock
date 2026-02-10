@@ -591,6 +591,7 @@ name = "gst-rist-bonding"
 version = "0.2.1"
 dependencies = [
  "bytes",
+ "crossbeam-channel",
  "ctrlc",
  "gstreamer",
  "gstreamer-app",

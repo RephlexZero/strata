@@ -605,4 +605,70 @@ mod tests {
         assert_eq!(buf.lost_packets, 0);
         assert_eq!(buf.duplicate_packets, 0);
     }
+
+    /// Data integrity hash test (spec §7): sender-hash = receiver-hash.
+    ///
+    /// Verifies that data pushed through the bonding header wrap/unwrap and
+    /// reassembly buffer pipeline is bit-for-bit identical to the original
+    /// payload.
+    #[test]
+    fn test_data_integrity_hash_verification() {
+        use crate::protocol::header::BondingHeader;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let num_packets = 500;
+        let mut sender_hasher = DefaultHasher::new();
+        let mut receiver_hasher = DefaultHasher::new();
+
+        // Generate deterministic test payloads and compute sender hash
+        let mut wrapped_packets = Vec::new();
+        for i in 0..num_packets {
+            // Create payload with varying sizes and content
+            let payload_len = 100 + (i % 1300);
+            let payload: Vec<u8> = (0..payload_len).map(|j| ((i * 7 + j * 13) % 256) as u8).collect();
+            let payload_bytes = Bytes::from(payload.clone());
+
+            // Hash the original payload on the sender side
+            payload.hash(&mut sender_hasher);
+
+            // Wrap with bonding header (simulating sender)
+            let header = BondingHeader::new(i as u64);
+            let wrapped = header.wrap(payload_bytes);
+            wrapped_packets.push(wrapped);
+        }
+
+        let sender_hash = sender_hasher.finish();
+
+        // Simulate receiver: unwrap headers and feed into reassembly buffer
+        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(10));
+        let start = Instant::now();
+
+        for wrapped in wrapped_packets {
+            let (header, original_payload) =
+                BondingHeader::unwrap(wrapped).expect("Header unwrap should succeed");
+            buf.push(header.seq_id, original_payload, start);
+        }
+
+        // Tick to release all packets
+        let out = buf.tick(start + Duration::from_millis(10));
+        assert_eq!(out.len(), num_packets, "All packets should be released");
+
+        // Compute receiver hash from reassembled output
+        for payload in &out {
+            payload.to_vec().hash(&mut receiver_hasher);
+        }
+
+        let receiver_hash = receiver_hasher.finish();
+
+        assert_eq!(
+            sender_hash, receiver_hash,
+            "Data integrity check failed: sender hash ({:#x}) != receiver hash ({:#x})",
+            sender_hash, receiver_hash
+        );
+
+        // Verify no data loss or corruption
+        assert_eq!(buf.lost_packets, 0, "No packets should be lost");
+        assert_eq!(buf.duplicate_packets, 0, "No duplicates should be counted");
+    }
 }

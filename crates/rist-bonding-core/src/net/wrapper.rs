@@ -2,6 +2,7 @@ use anyhow::Result;
 use librist_sys::*;
 use std::ffi::CStr;
 use std::ffi::CString;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, trace};
@@ -25,27 +26,30 @@ unsafe extern "C" fn log_cb(
     level: rist_log_level,
     msg: *const libc::c_char,
 ) -> libc::c_int {
-    if !msg.is_null() {
-        let message = CStr::from_ptr(msg).to_string_lossy();
-        // Route librist log levels to tracing levels
-        match level {
-            l if l <= rist_log_level_RIST_LOG_ERROR => {
-                tracing::error!(target: "librist", "{}", message.trim_end());
-            }
-            l if l <= rist_log_level_RIST_LOG_WARN => {
-                tracing::warn!(target: "librist", "{}", message.trim_end());
-            }
-            l if l <= rist_log_level_RIST_LOG_NOTICE => {
-                tracing::info!(target: "librist", "{}", message.trim_end());
-            }
-            l if l <= rist_log_level_RIST_LOG_INFO => {
-                debug!(target: "librist", "{}", message.trim_end());
-            }
-            _ => {
-                trace!(target: "librist", "{}", message.trim_end());
+    // SAFETY: catch_unwind prevents panics from crossing the FFI boundary (UB).
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !msg.is_null() {
+            let message = CStr::from_ptr(msg).to_string_lossy();
+            // Route librist log levels to tracing levels
+            match level {
+                l if l <= rist_log_level_RIST_LOG_ERROR => {
+                    tracing::error!(target: "librist", "{}", message.trim_end());
+                }
+                l if l <= rist_log_level_RIST_LOG_WARN => {
+                    tracing::warn!(target: "librist", "{}", message.trim_end());
+                }
+                l if l <= rist_log_level_RIST_LOG_NOTICE => {
+                    tracing::info!(target: "librist", "{}", message.trim_end());
+                }
+                l if l <= rist_log_level_RIST_LOG_INFO => {
+                    debug!(target: "librist", "{}", message.trim_end());
+                }
+                _ => {
+                    trace!(target: "librist", "{}", message.trim_end());
+                }
             }
         }
-    }
+    }));
     0
 }
 
@@ -95,86 +99,90 @@ unsafe extern "C" fn stats_cb(
         return 0;
     }
 
-    let stats_ref = &*stats_container;
-    // Check type
-    if stats_ref.stats_type == rist_stats_type_RIST_STATS_SENDER_PEER {
-        let sender_stats = &stats_ref.stats.sender_peer;
-        let link_stats = &*(arg as *const LinkStats);
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        link_stats.last_stats_ms.store(now_ms, Ordering::Relaxed);
+    // SAFETY: catch_unwind prevents panics from crossing the FFI boundary (UB).
+    // The stats container is freed in all paths (including panic) to avoid leaks.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let stats_ref = &*stats_container;
+        // Check type
+        if stats_ref.stats_type == rist_stats_type_RIST_STATS_SENDER_PEER {
+            let sender_stats = &stats_ref.stats.sender_peer;
+            let link_stats = &*(arg as *const LinkStats);
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            link_stats.last_stats_ms.store(now_ms, Ordering::Relaxed);
 
-        // Raw updates
-        link_stats
-            .rtt
-            .store(sender_stats.rtt as u64, Ordering::Relaxed);
-        link_stats.sent.store(sender_stats.sent, Ordering::Relaxed);
-        link_stats
-            .retransmitted
-            .store(sender_stats.retransmitted, Ordering::Relaxed);
+            // Raw updates
+            link_stats
+                .rtt
+                .store(sender_stats.rtt as u64, Ordering::Relaxed);
+            link_stats.sent.store(sender_stats.sent, Ordering::Relaxed);
+            link_stats
+                .retransmitted
+                .store(sender_stats.retransmitted, Ordering::Relaxed);
 
-        // EWMA Update
-        // We take the lock. Since this runs infrequently (100ms), lock contention is negligible.
-        if let Ok(mut ewma) = link_stats.ewma_state.lock() {
-            ewma.rtt.update(sender_stats.rtt as f64);
+            // EWMA Update
+            // We take the lock. Since this runs infrequently (100ms), lock contention is negligible.
+            if let Ok(mut ewma) = link_stats.ewma_state.lock() {
+                ewma.rtt.update(sender_stats.rtt as f64);
 
-            let sent = sender_stats.sent;
-            let rex = sender_stats.retransmitted;
+                let sent = sender_stats.sent;
+                let rex = sender_stats.retransmitted;
 
-            let delta_sent = sent.saturating_sub(ewma.last_sent);
-            let delta_rex = rex.saturating_sub(ewma.last_rex);
+                let delta_sent = sent.saturating_sub(ewma.last_sent);
+                let delta_rex = rex.saturating_sub(ewma.last_rex);
 
-            let dt_ms = if ewma.last_stats_ms > 0 {
-                now_ms.saturating_sub(ewma.last_stats_ms)
-            } else {
-                0
-            };
+                let dt_ms = if ewma.last_stats_ms > 0 {
+                    now_ms.saturating_sub(ewma.last_stats_ms)
+                } else {
+                    0
+                };
 
-            ewma.last_sent = sent;
-            ewma.last_rex = rex;
-            ewma.last_stats_ms = now_ms;
+                ewma.last_sent = sent;
+                ewma.last_rex = rex;
+                ewma.last_stats_ms = now_ms;
 
-            // Calculate "Badness" ratio: (Retransmitted) / Sent
-            // If sent is 0 (idle), we keep previous estimate or decay?
-            // If idle, loss is 0.
-            let loss_ratio = if delta_sent > 0 {
-                delta_rex as f64 / delta_sent as f64
-            } else {
-                0.0
-            };
+                // Calculate "Badness" ratio: (Retransmitted) / Sent
+                // If sent is 0 (idle), we keep previous estimate or decay?
+                // If idle, loss is 0.
+                let loss_ratio = if delta_sent > 0 {
+                    delta_rex as f64 / delta_sent as f64
+                } else {
+                    0.0
+                };
 
-            // Update EWMA with current loss ratio (0.0 - 1.0+)
-            ewma.loss.update(loss_ratio);
+                // Update EWMA with current loss ratio (0.0 - 1.0+)
+                ewma.loss.update(loss_ratio);
 
-            // Bandwidth update (fallback if librist reports 0)
-            let mut bw_bps = sender_stats.bandwidth as f64;
-            if bw_bps <= 0.0 && dt_ms > 0 && delta_sent > 0 {
-                bw_bps = (delta_sent as f64 * 8.0 * 1000.0) / dt_ms as f64;
+                // Bandwidth update (fallback if librist reports 0)
+                let mut bw_bps = sender_stats.bandwidth as f64;
+                if bw_bps <= 0.0 && dt_ms > 0 && delta_sent > 0 {
+                    bw_bps = (delta_sent as f64 * 8.0 * 1000.0) / dt_ms as f64;
+                }
+                ewma.bandwidth.update(bw_bps);
+                link_stats
+                    .bandwidth
+                    .store(bw_bps.max(0.0) as u64, Ordering::Relaxed);
+
+                // Update Cached Smooth Values
+                // RTT in micros
+                let rtt_us = (ewma.rtt.value() * 1000.0) as u64;
+                link_stats.smoothed_rtt_us.store(rtt_us, Ordering::Relaxed);
+
+                let bw = ewma.bandwidth.value() as u64;
+                link_stats.smoothed_bw_bps.store(bw, Ordering::Relaxed);
+
+                // Loss in permille (0-1000)
+                let loss_pm = (ewma.loss.value() * 1000.0) as u64;
+                link_stats
+                    .smoothed_loss_permille
+                    .store(loss_pm, Ordering::Relaxed);
             }
-            ewma.bandwidth.update(bw_bps);
-            link_stats
-                .bandwidth
-                .store(bw_bps.max(0.0) as u64, Ordering::Relaxed);
-
-            // Update Cached Smooth Values
-            // RTT in micros
-            let rtt_us = (ewma.rtt.value() * 1000.0) as u64;
-            link_stats.smoothed_rtt_us.store(rtt_us, Ordering::Relaxed);
-
-            let bw = ewma.bandwidth.value() as u64;
-            link_stats.smoothed_bw_bps.store(bw, Ordering::Relaxed);
-
-            // Loss in permille (0-1000)
-            let loss_pm = (ewma.loss.value() * 1000.0) as u64;
-            link_stats
-                .smoothed_loss_permille
-                .store(loss_pm, Ordering::Relaxed);
         }
-    }
+    }));
 
-    // Free the stats container
+    // Free the stats container — must happen even if the closure panicked.
     rist_stats_free(stats_container);
 
     0

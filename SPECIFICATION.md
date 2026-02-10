@@ -108,6 +108,16 @@ The system operates in a Hybrid Sync/Async model.
     - **Discard Heuristics:** Aggressively drop "poison" packets (too late to show) to unblock the head-of-line.
     - **NACK Suppression:** Do not request retransmission for packets that will definitely arrive past the playout deadline.
 
+> **Known Limitation — NACK Suppression:** The current implementation does not
+> intercept or suppress librist's automatic NACK (ARQ) requests for packets
+> that have already been skipped past in the reassembly buffer. Because librist
+> manages retransmission internally per-context and does not expose a hook to
+> filter individual NACK requests, implementing this requires either patching
+> librist or manually managing sequence tracking at the bonding layer. Packets
+> retransmitted after the playout deadline are correctly discarded by the
+> receiver's late-packet detection, but the retransmission itself wastes
+> bandwidth. This is tracked as a future optimization.
+
 ---
 
 ## 4. Scheduler Design

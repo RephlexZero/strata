@@ -170,27 +170,9 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
 
         // Adaptive Redundancy: Use spare capacity for important packets
         if config.redundancy_enabled {
-            let spare_capacity = self.scheduler.total_spare_capacity();
-            let total_capacity: f64 = self
-                .scheduler
-                .get_active_links()
-                .iter()
-                .filter(|(_, m)| {
-                    m.alive
-                        && matches!(
-                            m.phase,
-                            crate::net::interface::LinkPhase::Live
-                                | crate::net::interface::LinkPhase::Warm
-                        )
-                })
-                .map(|(_, m)| m.capacity_bps)
-                .sum();
-
-            let spare_ratio = if total_capacity > 0.0 {
-                spare_capacity / total_capacity
-            } else {
-                0.0
-            };
+            // Use cached spare ratio (updated by refresh_metrics) to avoid
+            // cloning all LinkMetrics on the hot packet path.
+            let spare_ratio = self.scheduler.cached_spare_ratio();
 
             let should_duplicate = spare_ratio > config.redundancy_spare_ratio
                 && !profile.can_drop

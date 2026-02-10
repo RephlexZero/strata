@@ -44,6 +44,11 @@ pub struct Dwrr<L: LinkSender + ?Sized> {
     sorted_ids: Vec<usize>,
     current_rr_idx: usize,
     config: SchedulerConfig,
+    /// Cached spare-capacity ratio updated by `refresh_metrics()`.
+    /// Avoids cloning all LinkMetrics on the hot packet path.
+    cached_spare_ratio: f64,
+    /// Cached total capacity of alive Live/Warm links (bps).
+    cached_total_capacity: f64,
 }
 
 /// Computes the burst window (in seconds) for credit capping.
@@ -75,6 +80,8 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             sorted_ids: Vec::new(),
             current_rr_idx: 0,
             config,
+            cached_spare_ratio: 0.0,
+            cached_total_capacity: 0.0,
         }
     }
 
@@ -180,6 +187,24 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             state.prev_loss_rate = state.metrics.loss_rate;
             state.last_metrics_update = now;
         }
+
+        // Update cached spare-capacity ratio for hot-path use
+        let total_spare = self.total_spare_capacity();
+        let total_cap: f64 = self
+            .links
+            .values()
+            .filter(|s| {
+                s.metrics.alive
+                    && matches!(s.metrics.phase, LinkPhase::Live | LinkPhase::Warm)
+            })
+            .map(|s| s.metrics.capacity_bps)
+            .sum();
+        self.cached_total_capacity = total_cap;
+        self.cached_spare_ratio = if total_cap > 0.0 {
+            total_spare / total_cap
+        } else {
+            0.0
+        };
     }
 
     pub fn remove_link(&mut self, id: usize) {
@@ -226,6 +251,12 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             })
             .map(|state| state.spare_capacity_bps)
             .sum()
+    }
+
+    /// Returns the cached spare-capacity ratio, updated by `refresh_metrics()`.
+    /// Use this on the hot packet path instead of calling `get_active_links()`.
+    pub fn cached_spare_ratio(&self) -> f64 {
+        self.cached_spare_ratio
     }
 
     /// Returns all alive links and deducts the cost from their credits.

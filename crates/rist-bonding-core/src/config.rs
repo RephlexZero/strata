@@ -10,7 +10,7 @@ pub const CONFIG_VERSION: u32 = 1;
 /// All fields use `Option` to support partial overrides; defaults are
 /// filled in by [`BondingConfigInput::resolve()`].
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BondingConfigInput {
     pub version: u32,
     pub links: Vec<LinkConfigInput>,
@@ -21,7 +21,7 @@ pub struct BondingConfigInput {
 
 /// Raw link configuration from TOML input.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LinkConfigInput {
     pub id: Option<usize>,
     pub uri: String,
@@ -36,7 +36,7 @@ pub struct LinkConfigInput {
 
 /// Raw receiver configuration from TOML input.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ReceiverConfigInput {
     pub start_latency_ms: Option<u64>,
     pub buffer_capacity: Option<usize>,
@@ -45,7 +45,7 @@ pub struct ReceiverConfigInput {
 
 /// Raw lifecycle thresholds from TOML input.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LinkLifecycleConfigInput {
     pub good_loss_rate_max: Option<f64>,
     pub good_rtt_ms_min: Option<f64>,
@@ -63,7 +63,7 @@ pub struct LinkLifecycleConfigInput {
 
 /// Raw scheduler tuning parameters from TOML input.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SchedulerConfigInput {
     /// Master toggle for adaptive packet duplication
     pub redundancy_enabled: Option<bool>,
@@ -254,7 +254,8 @@ impl LinkLifecycleConfigInput {
         LinkLifecycleConfig {
             good_loss_rate_max: self
                 .good_loss_rate_max
-                .unwrap_or(defaults.good_loss_rate_max),
+                .unwrap_or(defaults.good_loss_rate_max)
+                .clamp(0.0, 1.0),
             good_rtt_ms_min: self.good_rtt_ms_min.unwrap_or(defaults.good_rtt_ms_min),
             good_capacity_bps_min: self
                 .good_capacity_bps_min
@@ -291,7 +292,8 @@ impl SchedulerConfigInput {
                 .unwrap_or(defaults.redundancy_enabled),
             redundancy_spare_ratio: self
                 .redundancy_spare_ratio
-                .unwrap_or(defaults.redundancy_spare_ratio),
+                .unwrap_or(defaults.redundancy_spare_ratio)
+                .clamp(0.0, 1.0),
             redundancy_max_packet_bytes: self
                 .redundancy_max_packet_bytes
                 .unwrap_or(defaults.redundancy_max_packet_bytes),
@@ -308,13 +310,16 @@ impl SchedulerConfigInput {
                 .unwrap_or(defaults.failover_duration_ms),
             failover_rtt_spike_factor: self
                 .failover_rtt_spike_factor
-                .unwrap_or(defaults.failover_rtt_spike_factor),
+                .unwrap_or(defaults.failover_rtt_spike_factor)
+                .clamp(1.0, 100.0),
             congestion_headroom_ratio: self
                 .congestion_headroom_ratio
-                .unwrap_or(defaults.congestion_headroom_ratio),
+                .unwrap_or(defaults.congestion_headroom_ratio)
+                .clamp(0.0, 1.0),
             congestion_trigger_ratio: self
                 .congestion_trigger_ratio
-                .unwrap_or(defaults.congestion_trigger_ratio),
+                .unwrap_or(defaults.congestion_trigger_ratio)
+                .clamp(0.0, 1.0),
             ewma_alpha: self
                 .ewma_alpha
                 .unwrap_or(defaults.ewma_alpha)
@@ -335,7 +340,8 @@ impl SchedulerConfigInput {
                 .clamp(0.0, 1.0),
             jitter_latency_multiplier: self
                 .jitter_latency_multiplier
-                .unwrap_or(defaults.jitter_latency_multiplier),
+                .unwrap_or(defaults.jitter_latency_multiplier)
+                .clamp(0.0, 100.0),
             max_latency_ms: self.max_latency_ms.unwrap_or(defaults.max_latency_ms),
             stats_interval_ms: self
                 .stats_interval_ms
@@ -779,5 +785,88 @@ mod tests {
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.links[0].id, 0);
         assert_eq!(cfg.links[1].id, 1);
+    }
+
+    #[test]
+    fn unknown_toml_keys_rejected() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            ewma_alpha = 0.2
+            typo_field = 42
+        "#;
+        let result = BondingConfig::from_toml_str(toml);
+        assert!(result.is_err(), "Unknown keys should be rejected");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("typo_field"),
+            "Error should mention the unknown field, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn redundancy_spare_ratio_clamped() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            redundancy_spare_ratio = 1.5
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!((cfg.scheduler.redundancy_spare_ratio - 1.0).abs() < 1e-6);
+
+        let toml2 = r#"
+            version = 1
+            [scheduler]
+            redundancy_spare_ratio = -0.5
+        "#;
+        let cfg2 = BondingConfig::from_toml_str(toml2).unwrap();
+        assert!((cfg2.scheduler.redundancy_spare_ratio - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn congestion_ratios_clamped() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            congestion_headroom_ratio = 2.0
+            congestion_trigger_ratio = -1.0
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!((cfg.scheduler.congestion_headroom_ratio - 1.0).abs() < 1e-6);
+        assert!((cfg.scheduler.congestion_trigger_ratio - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn failover_rtt_spike_factor_clamped() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            failover_rtt_spike_factor = 0.5
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!((cfg.scheduler.failover_rtt_spike_factor - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn jitter_latency_multiplier_clamped() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            jitter_latency_multiplier = -2.0
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!((cfg.scheduler.jitter_latency_multiplier - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn good_loss_rate_max_clamped() {
+        let toml = r#"
+            version = 1
+            [lifecycle]
+            good_loss_rate_max = 5.0
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!((cfg.lifecycle.good_loss_rate_max - 1.0).abs() < 1e-6);
     }
 }
