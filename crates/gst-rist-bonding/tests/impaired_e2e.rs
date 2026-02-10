@@ -236,7 +236,7 @@ fn test_impaired_bonding_visualization() {
         eprintln!("No stats collected! Check connectivity.");
     } else {
         if let Some(first) = data.first() {
-            assert_eq!(first["schema_version"].as_i64().unwrap_or(0), 2);
+            assert_eq!(first["schema_version"].as_i64().unwrap_or(0), 3);
             assert!(first["heartbeat"].as_bool().unwrap_or(false));
             assert!(first["mono_time_ns"].as_u64().unwrap_or(0) > 0);
             assert!(first["wall_time_ms"].as_u64().unwrap_or(0) > 0);

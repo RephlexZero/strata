@@ -1,8 +1,8 @@
 use crate::config::SchedulerConfig;
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Per-link state tracked by the DWRR scheduler.
 ///
@@ -27,6 +27,19 @@ pub(crate) struct LinkState<L: ?Sized> {
     pub loss_slope_per_s: f64,
     pub last_metrics_update: Instant,
     pub penalty_factor: f64,
+    // --- AIMD Capacity Estimator state ---
+    /// The AIMD delay-gradient capacity estimate (bps).
+    pub estimated_capacity_bps: f64,
+    /// Fast sliding window (~3s) for min RTT baseline tracking.
+    pub rtt_min_fast_window: VecDeque<f64>,
+    /// Slow sliding window (~30s) for min RTT baseline tracking.
+    pub rtt_min_slow_window: VecDeque<f64>,
+    /// Effective RTT baseline: min(fast_min, slow_min).
+    pub rtt_baseline: f64,
+    /// Timestamp of the last multiplicative decrease (for cooldown).
+    pub last_decrease_at: Instant,
+    /// Whether the AIMD estimate has been initialized from first traffic.
+    pub aimd_initialized: bool,
 }
 
 /// Deficit Weighted Round Robin (DWRR) packet scheduler.
@@ -118,6 +131,13 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 loss_slope_per_s: 0.0,
                 last_metrics_update: Instant::now(),
                 penalty_factor: 1.0,
+                // AIMD state
+                estimated_capacity_bps: 0.0,
+                rtt_min_fast_window: VecDeque::new(),
+                rtt_min_slow_window: VecDeque::new(),
+                rtt_baseline: 0.0,
+                last_decrease_at: now - Duration::from_secs(10), // allow immediate first MD
+                aimd_initialized: false,
             },
         );
         self.sorted_ids.push(id);
@@ -128,6 +148,20 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         let capacity_floor = self.config.capacity_floor_bps;
         let penalty_decay = self.config.penalty_decay;
         let penalty_recovery = self.config.penalty_recovery;
+
+        // AIMD config snapshot (avoid repeated field access)
+        let aimd_enabled = self.config.capacity_estimate_enabled;
+        let rtt_congestion_ratio = self.config.rtt_congestion_ratio;
+        let rtt_headroom_ratio = self.config.rtt_headroom_ratio;
+        let md_factor = self.config.md_factor;
+        let ai_step_ratio = self.config.ai_step_ratio;
+        let decrease_cooldown = Duration::from_millis(self.config.decrease_cooldown_ms);
+        let fast_window_samples =
+            (self.config.rtt_min_fast_window_s / 0.1).round().max(1.0) as usize; // ~100ms per sample
+        let slow_window_samples =
+            (self.config.rtt_min_slow_window_s / 0.1).round().max(1.0) as usize;
+        let max_capacity_bps = self.config.max_capacity_bps;
+        let loss_md_threshold = self.config.loss_md_threshold;
 
         for state in self.links.values_mut() {
             let now = Instant::now();
@@ -145,15 +179,6 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
 
             state.metrics.observed_bps = state.measured_bps;
             state.metrics.observed_bytes = state.sent_bytes;
-
-            // Calculate spare capacity: only when we have observed traffic,
-            // otherwise spare is 0 to prevent premature duplication at startup
-            if state.has_traffic {
-                state.spare_capacity_bps =
-                    (state.metrics.capacity_bps - state.measured_bps).max(0.0);
-            } else {
-                state.spare_capacity_bps = 0.0;
-            }
 
             if state.metrics.observed_bps > 0.0 {
                 state.metrics.alive = true;
@@ -177,6 +202,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
 
             let dt = now.duration_since(state.last_metrics_update).as_secs_f64();
             if dt > 0.0 {
+                // Keep bw_slope tracking raw wire-rate (capacity_bps), NOT estimated_capacity_bps
                 state.bw_slope_bps_s = (curr_capacity - state.prev_capacity_bps) / dt;
                 state.rtt_slope_ms_s = (state.metrics.rtt_ms - state.prev_rtt_ms) / dt;
                 state.loss_slope_per_s = (state.metrics.loss_rate - state.prev_loss_rate) / dt;
@@ -186,17 +212,142 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             state.prev_rtt_ms = state.metrics.rtt_ms;
             state.prev_loss_rate = state.metrics.loss_rate;
             state.last_metrics_update = now;
+
+            // ======== AIMD Delay-Gradient Capacity Estimator ========
+            if aimd_enabled {
+                let current_rtt = state.metrics.rtt_ms;
+
+                // Initialize AIMD from first observed traffic
+                if !state.aimd_initialized && state.has_traffic && state.metrics.capacity_bps > 0.0
+                {
+                    state.estimated_capacity_bps = state.metrics.capacity_bps;
+                    state.rtt_baseline = current_rtt;
+                    state.aimd_initialized = true;
+                }
+
+                // Reset RTT windows on lifecycle phase transitions (Probe, Warm, Reset)
+                let phase_reset = matches!(
+                    state.metrics.phase,
+                    LinkPhase::Probe | LinkPhase::Warm | LinkPhase::Reset
+                );
+
+                if state.aimd_initialized {
+                    // --- RTT Baseline Tracking (dual-speed windowed minimum) ---
+                    if phase_reset {
+                        state.rtt_min_fast_window.clear();
+                        state.rtt_min_slow_window.clear();
+                    }
+
+                    if current_rtt > 0.0 {
+                        // Fast window (~3s)
+                        state.rtt_min_fast_window.push_back(current_rtt);
+                        while state.rtt_min_fast_window.len() > fast_window_samples {
+                            state.rtt_min_fast_window.pop_front();
+                        }
+
+                        // Slow window (~30s)
+                        state.rtt_min_slow_window.push_back(current_rtt);
+                        while state.rtt_min_slow_window.len() > slow_window_samples {
+                            state.rtt_min_slow_window.pop_front();
+                        }
+
+                        // Effective baseline = min(fast_min, slow_min)
+                        let fast_min = state
+                            .rtt_min_fast_window
+                            .iter()
+                            .copied()
+                            .fold(f64::MAX, f64::min);
+                        let slow_min = state
+                            .rtt_min_slow_window
+                            .iter()
+                            .copied()
+                            .fold(f64::MAX, f64::min);
+                        state.rtt_baseline = fast_min.min(slow_min);
+                    }
+
+                    // --- AIMD Algorithm ---
+                    if state.rtt_baseline > 0.0 {
+                        let rtt_ratio = current_rtt / state.rtt_baseline;
+                        let since_last_decrease = now.duration_since(state.last_decrease_at);
+
+                        // Suppress AI during Probe/Cooldown/Init/Reset
+                        let suppress_increase = matches!(
+                            state.metrics.phase,
+                            LinkPhase::Probe
+                                | LinkPhase::Cooldown
+                                | LinkPhase::Init
+                                | LinkPhase::Reset
+                        );
+
+                        // --- Multiplicative Decrease ---
+                        // Two independent triggers, both subject to cooldown:
+                        // 1. Delay-gradient: elevated RTT ratio AND rising RTT slope
+                        //    (avoids false positives on cell handovers with stable high RTT)
+                        // 2. Loss-based: sustained loss above threshold with stable RTT
+                        //    (catches non-queuing radio-layer fading loss)
+                        let delay_md =
+                            rtt_ratio > rtt_congestion_ratio && state.rtt_slope_ms_s > 0.0;
+                        let loss_md = state.metrics.loss_rate > loss_md_threshold;
+
+                        if (delay_md || loss_md) && since_last_decrease > decrease_cooldown {
+                            state.estimated_capacity_bps *= md_factor;
+                            state.last_decrease_at = now;
+                        }
+                        // --- Additive Increase ---
+                        else if rtt_ratio < rtt_headroom_ratio
+                            && state.has_traffic
+                            && state.measured_bps > state.estimated_capacity_bps * 0.3
+                            && !suppress_increase
+                        {
+                            state.estimated_capacity_bps +=
+                                state.estimated_capacity_bps * ai_step_ratio;
+                        }
+                    }
+
+                    // --- Clamping ---
+                    let upper = if max_capacity_bps > 0.0 {
+                        max_capacity_bps
+                    } else {
+                        state.measured_bps.max(state.metrics.capacity_bps) * 2.0
+                    };
+                    state.estimated_capacity_bps =
+                        state.estimated_capacity_bps.clamp(capacity_floor, upper);
+
+                    // Propagate to metrics
+                    state.metrics.estimated_capacity_bps = state.estimated_capacity_bps;
+                }
+            }
+
+            // Calculate spare capacity using estimated_capacity when AIMD is active
+            let effective_capacity = if aimd_enabled && state.aimd_initialized {
+                state.estimated_capacity_bps
+            } else {
+                state.metrics.capacity_bps
+            };
+
+            if state.has_traffic {
+                state.spare_capacity_bps = (effective_capacity - state.measured_bps).max(0.0);
+            } else {
+                state.spare_capacity_bps = 0.0;
+            }
         }
 
         // Update cached spare-capacity ratio for hot-path use
         let total_spare = self.total_spare_capacity();
+        let aimd_active = aimd_enabled;
         let total_cap: f64 = self
             .links
             .values()
             .filter(|s| {
                 s.metrics.alive && matches!(s.metrics.phase, LinkPhase::Live | LinkPhase::Warm)
             })
-            .map(|s| s.metrics.capacity_bps)
+            .map(|s| {
+                if aimd_active && s.aimd_initialized {
+                    s.estimated_capacity_bps
+                } else {
+                    s.metrics.capacity_bps
+                }
+            })
             .sum();
         self.cached_total_capacity = total_cap;
         self.cached_spare_ratio = if total_cap > 0.0 {
@@ -359,6 +510,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         let packet_cost = packet_len as f64;
         let now = Instant::now();
         let horizon_s = self.config.prediction_horizon_s;
+        let aimd_enabled = self.config.capacity_estimate_enabled;
 
         // 1. Update Credits
         let any_alive = self.links.values().any(|state| state.metrics.alive);
@@ -367,9 +519,13 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 let elapsed = now.duration_since(state.last_update).as_secs_f64();
 
                 // Calculate Effective Capacity (Quality Aware)
-                // Read fields directly from state.metrics to avoid cloning on the hot path.
-                let predicted_bw =
-                    (state.metrics.capacity_bps + state.bw_slope_bps_s * horizon_s).max(0.0);
+                // Use estimated_capacity_bps when AIMD is active, else raw capacity_bps.
+                let base_capacity = if aimd_enabled && state.aimd_initialized {
+                    state.estimated_capacity_bps
+                } else {
+                    state.metrics.capacity_bps
+                };
+                let predicted_bw = (base_capacity + state.bw_slope_bps_s * horizon_s).max(0.0);
                 let predicted_loss =
                     (state.metrics.loss_rate + state.loss_slope_per_s * horizon_s).clamp(0.0, 1.0);
                 let predicted_rtt =
@@ -496,6 +652,7 @@ mod tests {
                     mtu: None,
                     iface: None,
                     link_kind: None,
+                    estimated_capacity_bps: 0.0,
                 }),
             }
         }
@@ -503,6 +660,24 @@ mod tests {
         fn set_capacity(&self, capacity_bps: f64) {
             if let Ok(mut m) = self.metrics.lock() {
                 m.capacity_bps = capacity_bps;
+            }
+        }
+
+        fn set_rtt(&self, rtt_ms: f64) {
+            if let Ok(mut m) = self.metrics.lock() {
+                m.rtt_ms = rtt_ms;
+            }
+        }
+
+        fn set_loss_rate(&self, rate: f64) {
+            if let Ok(mut m) = self.metrics.lock() {
+                m.loss_rate = rate;
+            }
+        }
+
+        fn set_phase(&self, phase: LinkPhase) {
+            if let Ok(mut m) = self.metrics.lock() {
+                m.phase = phase;
             }
         }
     }
@@ -637,7 +812,11 @@ mod tests {
     #[test]
     fn test_spare_capacity_calculation() {
         let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
-        let mut dwrr = Dwrr::new();
+        let config = SchedulerConfig {
+            capacity_estimate_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut dwrr = Dwrr::with_config(config);
         dwrr.add_link(link.clone());
 
         // Initial state - no traffic yet, spare should be 0 (not full capacity)
@@ -665,7 +844,11 @@ mod tests {
         let link2 = Arc::new(MockLink::new(2, 5_000_000.0, LinkPhase::Live));
         let link3 = Arc::new(MockLink::new(3, 8_000_000.0, LinkPhase::Probe));
 
-        let mut dwrr = Dwrr::new();
+        let config = SchedulerConfig {
+            capacity_estimate_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut dwrr = Dwrr::with_config(config);
         dwrr.add_link(link1.clone());
         dwrr.add_link(link2.clone());
         dwrr.add_link(link3.clone());
@@ -872,5 +1055,451 @@ mod tests {
         };
         dwrr.update_config(new_cfg);
         assert!(!dwrr.config().redundancy_enabled);
+    }
+
+    // ====== AIMD Capacity Estimator Tests ======
+
+    fn aimd_config() -> SchedulerConfig {
+        SchedulerConfig {
+            capacity_estimate_enabled: true,
+            rtt_congestion_ratio: 1.8,
+            rtt_headroom_ratio: 1.3,
+            md_factor: 0.7,
+            ai_step_ratio: 0.08,
+            decrease_cooldown_ms: 500,
+            rtt_min_fast_window_s: 3.0,
+            rtt_min_slow_window_s: 30.0,
+            max_capacity_bps: 0.0,
+            loss_md_threshold: 0.03,
+            ..SchedulerConfig::default()
+        }
+    }
+
+    /// Helper: initialize AIMD by setting traffic and running a refresh cycle.
+    fn init_aimd(dwrr: &mut Dwrr<MockLink>, link_id: usize) {
+        if let Some(state) = dwrr.links.get_mut(&link_id) {
+            state.has_traffic = true;
+            state.measured_bps = 5_000_000.0;
+        }
+        dwrr.refresh_metrics();
+    }
+
+    #[test]
+    fn aimd_initializes_from_first_traffic() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let mut dwrr = Dwrr::with_config(aimd_config());
+        dwrr.add_link(link.clone());
+
+        // Before traffic, AIMD should not be initialized
+        dwrr.refresh_metrics();
+        let state = dwrr.links.get(&1).unwrap();
+        assert!(!state.aimd_initialized);
+        assert_eq!(state.estimated_capacity_bps, 0.0);
+
+        // After traffic, AIMD initializes from capacity_bps
+        init_aimd(&mut dwrr, 1);
+        let state = dwrr.links.get(&1).unwrap();
+        assert!(state.aimd_initialized);
+        assert!(state.estimated_capacity_bps > 0.0);
+    }
+
+    #[test]
+    fn aimd_md_triggers_on_high_rtt_with_rising_slope() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let mut dwrr = Dwrr::with_config(aimd_config());
+        dwrr.add_link(link.clone());
+        init_aimd(&mut dwrr, 1);
+
+        let initial_estimate = dwrr.links.get(&1).unwrap().estimated_capacity_bps;
+
+        // Set RTT high enough to trigger MD (baseline is ~10ms, so 1.8× = 18ms)
+        link.set_rtt(25.0);
+
+        // We need a rising RTT slope, so set prev_rtt below current
+        if let Some(state) = dwrr.links.get_mut(&1) {
+            state.prev_rtt_ms = 10.0;
+            // Set last_decrease_at far in the past to clear cooldown
+            state.last_decrease_at = Instant::now() - Duration::from_secs(10);
+            // Set last_metrics_update to compute slope correctly
+            state.last_metrics_update = Instant::now() - Duration::from_millis(100);
+        }
+        dwrr.refresh_metrics();
+
+        let state = dwrr.links.get(&1).unwrap();
+        // After MD, estimate should be reduced by md_factor (0.7)
+        assert!(
+            state.estimated_capacity_bps < initial_estimate,
+            "MD should reduce estimated capacity: {} should be < {}",
+            state.estimated_capacity_bps,
+            initial_estimate
+        );
+    }
+
+    #[test]
+    fn aimd_md_does_not_trigger_with_stable_rtt() {
+        // High RTT ratio but ZERO slope → cell handover, not congestion
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let mut dwrr = Dwrr::with_config(aimd_config());
+        dwrr.add_link(link.clone());
+        init_aimd(&mut dwrr, 1);
+
+        let initial_estimate = dwrr.links.get(&1).unwrap().estimated_capacity_bps;
+
+        // Set high RTT but with the same prev_rtt → zero slope
+        link.set_rtt(25.0);
+        if let Some(state) = dwrr.links.get_mut(&1) {
+            state.prev_rtt_ms = 25.0; // same as current → slope = 0
+            state.last_decrease_at = Instant::now() - Duration::from_secs(10);
+            state.last_metrics_update = Instant::now() - Duration::from_millis(100);
+        }
+        dwrr.refresh_metrics();
+
+        let state = dwrr.links.get(&1).unwrap();
+        // Should NOT have decreased (stable RTT, not congestion)
+        assert!(
+            state.estimated_capacity_bps >= initial_estimate,
+            "Stable high RTT should not trigger MD: {} should be >= {}",
+            state.estimated_capacity_bps,
+            initial_estimate
+        );
+    }
+
+    #[test]
+    fn aimd_ai_ramps_up_when_rtt_below_headroom() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let mut dwrr = Dwrr::with_config(aimd_config());
+        dwrr.add_link(link.clone());
+        init_aimd(&mut dwrr, 1);
+
+        // Set RTT low (at or below baseline → ratio ~1.0 < headroom 1.3)
+        link.set_rtt(10.0);
+
+        // Record the initial estimate
+        let initial_estimate = dwrr.links.get(&1).unwrap().estimated_capacity_bps;
+
+        // Multiple AI cycles
+        for _ in 0..5 {
+            if let Some(state) = dwrr.links.get_mut(&1) {
+                state.measured_bps = initial_estimate * 0.5; // Using 50% → above 0.3× guard
+                state.last_metrics_update = Instant::now() - Duration::from_millis(100);
+            }
+            dwrr.refresh_metrics();
+        }
+
+        let state = dwrr.links.get(&1).unwrap();
+        assert!(
+            state.estimated_capacity_bps > initial_estimate,
+            "AI should increase estimated capacity: {} should be > {}",
+            state.estimated_capacity_bps,
+            initial_estimate
+        );
+    }
+
+    #[test]
+    fn aimd_hold_zone_no_change() {
+        // RTT ratio between headroom (1.3) and congestion (1.8) → no change
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let mut dwrr = Dwrr::with_config(aimd_config());
+        dwrr.add_link(link.clone());
+        init_aimd(&mut dwrr, 1);
+
+        let initial_estimate = dwrr.links.get(&1).unwrap().estimated_capacity_bps;
+
+        // Set RTT to be in the hold zone: ratio ~1.5 (between 1.3 and 1.8)
+        // baseline ~10ms, so 15ms → ratio 1.5
+        link.set_rtt(15.0);
+        if let Some(state) = dwrr.links.get_mut(&1) {
+            state.prev_rtt_ms = 15.0; // stable
+            state.last_metrics_update = Instant::now() - Duration::from_millis(100);
+        }
+        dwrr.refresh_metrics();
+
+        let state = dwrr.links.get(&1).unwrap();
+        assert!(
+            (state.estimated_capacity_bps - initial_estimate).abs() < 1.0,
+            "Hold zone should not change estimate: {} vs {}",
+            state.estimated_capacity_bps,
+            initial_estimate
+        );
+    }
+
+    #[test]
+    fn aimd_cooldown_prevents_rapid_md() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let config = SchedulerConfig {
+            decrease_cooldown_ms: 5000, // 5s cooldown
+            ..aimd_config()
+        };
+        let mut dwrr = Dwrr::with_config(config);
+        dwrr.add_link(link.clone());
+        init_aimd(&mut dwrr, 1);
+
+        // First MD
+        link.set_rtt(25.0);
+        if let Some(state) = dwrr.links.get_mut(&1) {
+            state.prev_rtt_ms = 10.0;
+            state.last_decrease_at = Instant::now() - Duration::from_secs(10);
+            state.last_metrics_update = Instant::now() - Duration::from_millis(100);
+        }
+        dwrr.refresh_metrics();
+        let after_first_md = dwrr.links.get(&1).unwrap().estimated_capacity_bps;
+
+        // Second MD attempt immediately → should NOT trigger due to cooldown
+        link.set_rtt(30.0);
+        if let Some(state) = dwrr.links.get_mut(&1) {
+            state.prev_rtt_ms = 25.0;
+            state.last_metrics_update = Instant::now() - Duration::from_millis(100);
+        }
+        dwrr.refresh_metrics();
+        let after_second_attempt = dwrr.links.get(&1).unwrap().estimated_capacity_bps;
+
+        assert!(
+            (after_second_attempt - after_first_md).abs() < 1.0,
+            "Cooldown should prevent second MD: {} vs {}",
+            after_second_attempt,
+            after_first_md
+        );
+    }
+
+    #[test]
+    fn aimd_loss_md_triggers_on_high_loss() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let mut dwrr = Dwrr::with_config(aimd_config());
+        dwrr.add_link(link.clone());
+        init_aimd(&mut dwrr, 1);
+
+        let initial_estimate = dwrr.links.get(&1).unwrap().estimated_capacity_bps;
+
+        // Set high loss (above threshold 0.03) with stable RTT
+        link.set_loss_rate(0.05);
+        link.set_rtt(10.0);
+        if let Some(state) = dwrr.links.get_mut(&1) {
+            state.prev_rtt_ms = 10.0;
+            state.last_decrease_at = Instant::now() - Duration::from_secs(10);
+            state.last_metrics_update = Instant::now() - Duration::from_millis(100);
+        }
+        dwrr.refresh_metrics();
+
+        let state = dwrr.links.get(&1).unwrap();
+        assert!(
+            state.estimated_capacity_bps < initial_estimate,
+            "Loss-based MD should reduce estimate: {} should be < {}",
+            state.estimated_capacity_bps,
+            initial_estimate
+        );
+    }
+
+    #[test]
+    fn aimd_suppresses_ai_during_probe_phase() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Probe));
+        let mut dwrr = Dwrr::with_config(aimd_config());
+        dwrr.add_link(link.clone());
+        init_aimd(&mut dwrr, 1);
+
+        let initial_estimate = dwrr.links.get(&1).unwrap().estimated_capacity_bps;
+
+        // Low RTT ratio → would normally trigger AI, but suppressed in Probe
+        link.set_rtt(10.0);
+        for _ in 0..5 {
+            if let Some(state) = dwrr.links.get_mut(&1) {
+                state.measured_bps = initial_estimate * 0.5;
+                state.last_metrics_update = Instant::now() - Duration::from_millis(100);
+            }
+            dwrr.refresh_metrics();
+        }
+
+        let state = dwrr.links.get(&1).unwrap();
+        // Estimate should NOT have increased during Probe
+        assert!(
+            state.estimated_capacity_bps <= initial_estimate + 1.0,
+            "AI should be suppressed in Probe: {} should be <= {}",
+            state.estimated_capacity_bps,
+            initial_estimate
+        );
+    }
+
+    #[test]
+    fn aimd_max_capacity_clamp() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let config = SchedulerConfig {
+            max_capacity_bps: 15_000_000.0,
+            ..aimd_config()
+        };
+        let mut dwrr = Dwrr::with_config(config);
+        dwrr.add_link(link.clone());
+        init_aimd(&mut dwrr, 1);
+
+        // Run many AI cycles to push estimate up
+        link.set_rtt(10.0);
+        for _ in 0..100 {
+            if let Some(state) = dwrr.links.get_mut(&1) {
+                state.measured_bps = state.estimated_capacity_bps * 0.5;
+                state.last_metrics_update = Instant::now() - Duration::from_millis(100);
+            }
+            dwrr.refresh_metrics();
+        }
+
+        let state = dwrr.links.get(&1).unwrap();
+        assert!(
+            state.estimated_capacity_bps <= 15_000_000.0,
+            "Estimate should be clamped at max_capacity_bps: {}",
+            state.estimated_capacity_bps
+        );
+    }
+
+    #[test]
+    fn aimd_estimate_clamps_to_floor() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let config = SchedulerConfig {
+            capacity_floor_bps: 500_000.0,
+            decrease_cooldown_ms: 0, // Remove cooldown for test
+            ..aimd_config()
+        };
+        let mut dwrr = Dwrr::with_config(config);
+        dwrr.add_link(link.clone());
+        init_aimd(&mut dwrr, 1);
+
+        // Repeatedly trigger MD to drive estimate down
+        for _ in 0..50 {
+            link.set_rtt(30.0);
+            if let Some(state) = dwrr.links.get_mut(&1) {
+                state.prev_rtt_ms = 10.0;
+                state.last_decrease_at = Instant::now() - Duration::from_secs(10);
+                state.last_metrics_update = Instant::now() - Duration::from_millis(100);
+            }
+            dwrr.refresh_metrics();
+        }
+
+        let state = dwrr.links.get(&1).unwrap();
+        assert!(
+            state.estimated_capacity_bps >= 500_000.0,
+            "Estimate should not go below capacity_floor: {}",
+            state.estimated_capacity_bps
+        );
+    }
+
+    #[test]
+    fn aimd_disabled_keeps_zero_estimate() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let config = SchedulerConfig {
+            capacity_estimate_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut dwrr = Dwrr::with_config(config);
+        dwrr.add_link(link.clone());
+
+        if let Some(state) = dwrr.links.get_mut(&1) {
+            state.has_traffic = true;
+            state.measured_bps = 5_000_000.0;
+        }
+        dwrr.refresh_metrics();
+
+        let state = dwrr.links.get(&1).unwrap();
+        assert_eq!(
+            state.estimated_capacity_bps, 0.0,
+            "AIMD disabled should keep estimate at 0"
+        );
+        assert!(!state.aimd_initialized);
+    }
+
+    #[test]
+    fn aimd_estimate_propagated_to_metrics() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let mut dwrr = Dwrr::with_config(aimd_config());
+        dwrr.add_link(link.clone());
+        init_aimd(&mut dwrr, 1);
+
+        let metrics = dwrr.get_active_links();
+        let (_, m) = metrics.iter().find(|(id, _)| *id == 1).unwrap();
+        assert!(
+            m.estimated_capacity_bps > 0.0,
+            "estimated_capacity_bps should propagate to LinkMetrics"
+        );
+    }
+
+    #[test]
+    fn aimd_rtt_baseline_tracks_dual_window() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let mut dwrr = Dwrr::with_config(aimd_config());
+        dwrr.add_link(link.clone());
+        init_aimd(&mut dwrr, 1);
+
+        let state = dwrr.links.get(&1).unwrap();
+        assert!(
+            state.rtt_baseline > 0.0,
+            "RTT baseline should be set after init"
+        );
+        assert!(!state.rtt_min_fast_window.is_empty());
+        assert!(!state.rtt_min_slow_window.is_empty());
+    }
+
+    #[test]
+    fn aimd_phase_transition_resets_rtt_windows() {
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let mut dwrr = Dwrr::with_config(aimd_config());
+        dwrr.add_link(link.clone());
+        init_aimd(&mut dwrr, 1);
+
+        // Fill windows with some samples
+        for _ in 0..10 {
+            if let Some(state) = dwrr.links.get_mut(&1) {
+                state.last_metrics_update = Instant::now() - Duration::from_millis(100);
+            }
+            dwrr.refresh_metrics();
+        }
+        let window_size_before = dwrr.links.get(&1).unwrap().rtt_min_fast_window.len();
+        assert!(window_size_before > 1);
+
+        // Transition to Probe phase → should clear windows
+        link.set_phase(LinkPhase::Probe);
+        dwrr.refresh_metrics();
+
+        let state = dwrr.links.get(&1).unwrap();
+        // After reset, windows should have exactly 1 new sample
+        assert_eq!(
+            state.rtt_min_fast_window.len(),
+            1,
+            "Fast window should be reset on phase transition"
+        );
+    }
+
+    #[test]
+    fn aimd_credit_computation_uses_estimate() {
+        let link1 = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let link2 = Arc::new(MockLink::new(2, 10_000_000.0, LinkPhase::Live));
+        let mut dwrr = Dwrr::with_config(aimd_config());
+        dwrr.add_link(link1.clone());
+        dwrr.add_link(link2.clone());
+        init_aimd(&mut dwrr, 1);
+        init_aimd(&mut dwrr, 2);
+
+        // Reduce link1's estimated capacity via MD
+        link1.set_rtt(25.0);
+        if let Some(state) = dwrr.links.get_mut(&1) {
+            state.prev_rtt_ms = 10.0;
+            state.last_decrease_at = Instant::now() - Duration::from_secs(10);
+            state.last_metrics_update = Instant::now() - Duration::from_millis(100);
+        }
+        dwrr.refresh_metrics();
+
+        // Reset link1 RTT for credit computation
+        link1.set_rtt(10.0);
+
+        // Give time for credit accrual
+        for state in dwrr.links.values_mut() {
+            state.last_update -= Duration::from_secs(1);
+        }
+        let _ = dwrr.select_link(0);
+
+        let link1_credits = dwrr.links.get(&1).unwrap().credits;
+        let link2_credits = dwrr.links.get(&2).unwrap().credits;
+
+        // Link1 with reduced AIMD estimate should get fewer credits
+        assert!(
+            link2_credits > link1_credits,
+            "Link with lower AIMD estimate should get fewer credits: l1={} l2={}",
+            link1_credits,
+            link2_credits
+        );
     }
 }

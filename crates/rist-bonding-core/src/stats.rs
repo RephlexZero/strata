@@ -18,6 +18,8 @@ pub struct LinkStatsSnapshot {
     pub iface: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// AIMD delay-gradient capacity estimate (0.0 if estimator disabled).
+    pub estimated_capacity_bps: f64,
 }
 
 impl LinkStatsSnapshot {
@@ -34,6 +36,7 @@ impl LinkStatsSnapshot {
             mtu: m.mtu,
             iface: m.iface.clone(),
             kind: m.link_kind.clone(),
+            estimated_capacity_bps: m.estimated_capacity_bps,
         }
     }
 }

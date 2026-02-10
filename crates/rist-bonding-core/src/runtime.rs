@@ -21,7 +21,7 @@ pub enum PacketSendError {
 
 enum RuntimeMessage {
     Packet(Bytes, PacketProfile),
-    ApplyConfig(BondingConfig),
+    ApplyConfig(Box<BondingConfig>),
     AddLink(LinkConfig),
     RemoveLink(usize),
     Shutdown,
@@ -85,7 +85,7 @@ impl BondingRuntime {
     /// Sends a full configuration update to the worker thread.
     pub fn apply_config(&self, config: BondingConfig) -> anyhow::Result<()> {
         self.sender
-            .send(RuntimeMessage::ApplyConfig(config))
+            .send(RuntimeMessage::ApplyConfig(Box::new(config)))
             .map_err(|e| anyhow::anyhow!("Failed to send config: {}", e))
     }
 
@@ -179,7 +179,7 @@ fn runtime_worker(
                         &mut scheduler,
                         &mut current_links,
                         &lifecycle_config,
-                        config,
+                        *config,
                         ewma_alpha,
                     );
                 }

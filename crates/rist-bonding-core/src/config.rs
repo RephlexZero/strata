@@ -103,6 +103,28 @@ pub struct SchedulerConfigInput {
     pub stats_interval_ms: Option<u64>,
     /// Runtime packet channel depth
     pub channel_capacity: Option<usize>,
+
+    // --- AIMD Capacity Estimator knobs ---
+    /// Master toggle for delay-gradient AIMD capacity estimation
+    pub capacity_estimate_enabled: Option<bool>,
+    /// RTT / baseline ratio that triggers multiplicative decrease (e.g. 1.8)
+    pub rtt_congestion_ratio: Option<f64>,
+    /// RTT / baseline ratio below which additive increase is allowed (e.g. 1.3)
+    pub rtt_headroom_ratio: Option<f64>,
+    /// Multiplicative decrease factor (0.0-1.0, e.g. 0.7)
+    pub md_factor: Option<f64>,
+    /// Additive increase step as fraction of estimated capacity (e.g. 0.08)
+    pub ai_step_ratio: Option<f64>,
+    /// Minimum time between consecutive multiplicative decreases (ms)
+    pub decrease_cooldown_ms: Option<u64>,
+    /// Fast sliding window duration for baseline RTT (seconds)
+    pub rtt_min_fast_window_s: Option<f64>,
+    /// Slow sliding window duration for baseline RTT (seconds)
+    pub rtt_min_slow_window_s: Option<f64>,
+    /// Per-link hard ceiling on estimated capacity (0 = disabled)
+    pub max_capacity_bps: Option<f64>,
+    /// Sustained loss rate threshold triggering independent MD (0.0-1.0)
+    pub loss_md_threshold: Option<f64>,
 }
 
 /// Resolved link configuration with concrete values.
@@ -198,6 +220,28 @@ pub struct SchedulerConfig {
     pub max_latency_ms: u64,
     pub stats_interval_ms: u64,
     pub channel_capacity: usize,
+
+    // --- AIMD Capacity Estimator ---
+    /// Master toggle for delay-gradient AIMD capacity estimation.
+    pub capacity_estimate_enabled: bool,
+    /// RTT / baseline ratio that triggers multiplicative decrease.
+    pub rtt_congestion_ratio: f64,
+    /// RTT / baseline ratio below which additive increase is allowed.
+    pub rtt_headroom_ratio: f64,
+    /// Multiplicative decrease factor.
+    pub md_factor: f64,
+    /// Additive increase step as fraction of estimated capacity.
+    pub ai_step_ratio: f64,
+    /// Minimum time between consecutive multiplicative decreases (ms).
+    pub decrease_cooldown_ms: u64,
+    /// Fast sliding window duration for baseline RTT (seconds).
+    pub rtt_min_fast_window_s: f64,
+    /// Slow sliding window duration for baseline RTT (seconds).
+    pub rtt_min_slow_window_s: f64,
+    /// Per-link hard ceiling on estimated capacity (0 = disabled).
+    pub max_capacity_bps: f64,
+    /// Sustained loss rate threshold triggering independent MD.
+    pub loss_md_threshold: f64,
 }
 
 impl Default for SchedulerConfig {
@@ -222,6 +266,17 @@ impl Default for SchedulerConfig {
             max_latency_ms: 500,
             stats_interval_ms: 1000,
             channel_capacity: 1000,
+            // AIMD defaults
+            capacity_estimate_enabled: true,
+            rtt_congestion_ratio: 1.8,
+            rtt_headroom_ratio: 1.3,
+            md_factor: 0.7,
+            ai_step_ratio: 0.08,
+            decrease_cooldown_ms: 500,
+            rtt_min_fast_window_s: 3.0,
+            rtt_min_slow_window_s: 30.0,
+            max_capacity_bps: 0.0,
+            loss_md_threshold: 0.03,
         }
     }
 }
@@ -351,6 +406,43 @@ impl SchedulerConfigInput {
                 .channel_capacity
                 .unwrap_or(defaults.channel_capacity)
                 .max(16),
+            // AIMD knobs
+            capacity_estimate_enabled: self
+                .capacity_estimate_enabled
+                .unwrap_or(defaults.capacity_estimate_enabled),
+            rtt_congestion_ratio: self
+                .rtt_congestion_ratio
+                .unwrap_or(defaults.rtt_congestion_ratio)
+                .clamp(1.0, 10.0),
+            rtt_headroom_ratio: self
+                .rtt_headroom_ratio
+                .unwrap_or(defaults.rtt_headroom_ratio)
+                .clamp(1.0, 10.0),
+            md_factor: self.md_factor.unwrap_or(defaults.md_factor).clamp(0.1, 1.0),
+            ai_step_ratio: self
+                .ai_step_ratio
+                .unwrap_or(defaults.ai_step_ratio)
+                .clamp(0.001, 1.0),
+            decrease_cooldown_ms: self
+                .decrease_cooldown_ms
+                .unwrap_or(defaults.decrease_cooldown_ms)
+                .max(50),
+            rtt_min_fast_window_s: self
+                .rtt_min_fast_window_s
+                .unwrap_or(defaults.rtt_min_fast_window_s)
+                .clamp(0.5, 60.0),
+            rtt_min_slow_window_s: self
+                .rtt_min_slow_window_s
+                .unwrap_or(defaults.rtt_min_slow_window_s)
+                .clamp(5.0, 300.0),
+            max_capacity_bps: self
+                .max_capacity_bps
+                .unwrap_or(defaults.max_capacity_bps)
+                .max(0.0),
+            loss_md_threshold: self
+                .loss_md_threshold
+                .unwrap_or(defaults.loss_md_threshold)
+                .clamp(0.0, 1.0),
         }
     }
 }
@@ -868,5 +960,78 @@ mod tests {
         "#;
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
         assert!((cfg.lifecycle.good_loss_rate_max - 1.0).abs() < 1e-6);
+    }
+
+    // ====== AIMD Config Tests ======
+
+    #[test]
+    fn aimd_config_defaults() {
+        let cfg = BondingConfig::from_toml_str("").unwrap();
+        assert!(cfg.scheduler.capacity_estimate_enabled);
+        assert!((cfg.scheduler.rtt_congestion_ratio - 1.8).abs() < 1e-6);
+        assert!((cfg.scheduler.rtt_headroom_ratio - 1.3).abs() < 1e-6);
+        assert!((cfg.scheduler.md_factor - 0.7).abs() < 1e-6);
+        assert!((cfg.scheduler.ai_step_ratio - 0.08).abs() < 1e-6);
+        assert_eq!(cfg.scheduler.decrease_cooldown_ms, 500);
+        assert!((cfg.scheduler.rtt_min_fast_window_s - 3.0).abs() < 1e-6);
+        assert!((cfg.scheduler.rtt_min_slow_window_s - 30.0).abs() < 1e-6);
+        assert!((cfg.scheduler.max_capacity_bps - 0.0).abs() < 1e-6);
+        assert!((cfg.scheduler.loss_md_threshold - 0.03).abs() < 1e-6);
+    }
+
+    #[test]
+    fn aimd_config_custom_values() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            capacity_estimate_enabled = false
+            rtt_congestion_ratio = 2.5
+            rtt_headroom_ratio = 1.5
+            md_factor = 0.5
+            ai_step_ratio = 0.1
+            decrease_cooldown_ms = 1000
+            rtt_min_fast_window_s = 5.0
+            rtt_min_slow_window_s = 60.0
+            max_capacity_bps = 150000000.0
+            loss_md_threshold = 0.05
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!(!cfg.scheduler.capacity_estimate_enabled);
+        assert!((cfg.scheduler.rtt_congestion_ratio - 2.5).abs() < 1e-6);
+        assert!((cfg.scheduler.rtt_headroom_ratio - 1.5).abs() < 1e-6);
+        assert!((cfg.scheduler.md_factor - 0.5).abs() < 1e-6);
+        assert!((cfg.scheduler.ai_step_ratio - 0.1).abs() < 1e-6);
+        assert_eq!(cfg.scheduler.decrease_cooldown_ms, 1000);
+        assert!((cfg.scheduler.rtt_min_fast_window_s - 5.0).abs() < 1e-6);
+        assert!((cfg.scheduler.rtt_min_slow_window_s - 60.0).abs() < 1e-6);
+        assert!((cfg.scheduler.max_capacity_bps - 150_000_000.0).abs() < 1e-3);
+        assert!((cfg.scheduler.loss_md_threshold - 0.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn aimd_config_clamping() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            rtt_congestion_ratio = 0.5
+            rtt_headroom_ratio = 0.1
+            md_factor = 0.01
+            ai_step_ratio = 5.0
+            decrease_cooldown_ms = 10
+            rtt_min_fast_window_s = 0.01
+            rtt_min_slow_window_s = 1.0
+            max_capacity_bps = -100.0
+            loss_md_threshold = 2.0
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!((cfg.scheduler.rtt_congestion_ratio - 1.0).abs() < 1e-6);
+        assert!((cfg.scheduler.rtt_headroom_ratio - 1.0).abs() < 1e-6);
+        assert!((cfg.scheduler.md_factor - 0.1).abs() < 1e-6);
+        assert!((cfg.scheduler.ai_step_ratio - 1.0).abs() < 1e-6);
+        assert_eq!(cfg.scheduler.decrease_cooldown_ms, 50);
+        assert!((cfg.scheduler.rtt_min_fast_window_s - 0.5).abs() < 1e-6);
+        assert!((cfg.scheduler.rtt_min_slow_window_s - 5.0).abs() < 1e-6);
+        assert!((cfg.scheduler.max_capacity_bps - 0.0).abs() < 1e-6);
+        assert!((cfg.scheduler.loss_md_threshold - 1.0).abs() < 1e-6);
     }
 }

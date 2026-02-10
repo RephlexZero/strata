@@ -441,7 +441,14 @@ mod imp {
 
                                 for (id, m) in &metrics {
                                     if m.alive {
-                                        total_capacity += m.capacity_bps;
+                                        // Use estimated capacity if AIMD is active,
+                                        // else fall back to raw capacity_bps.
+                                        let effective_capacity = if m.estimated_capacity_bps > 0.0 {
+                                            m.estimated_capacity_bps
+                                        } else {
+                                            m.capacity_bps
+                                        };
+                                        total_capacity += effective_capacity;
                                         total_observed_bps += m.observed_bps;
                                         alive_links += 1;
                                     }
@@ -456,7 +463,7 @@ mod imp {
                                 };
 
                                 let snapshot = StatsSnapshot {
-                                    schema_version: 2,
+                                    schema_version: 3,
                                     stats_seq,
                                     heartbeat: true,
                                     mono_time_ns,
@@ -471,7 +478,7 @@ mod imp {
                                     serde_json::to_string(&snapshot).unwrap_or_default();
 
                                 let msg_struct = gst::Structure::builder("rist-bonding-stats")
-                                    .field("schema_version", 2i32)
+                                    .field("schema_version", 3i32)
                                     .field("stats_json", &stats_json)
                                     .field("total_capacity", total_capacity)
                                     .field("alive_links", alive_links)

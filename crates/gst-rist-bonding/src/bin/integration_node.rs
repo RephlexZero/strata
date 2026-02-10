@@ -151,8 +151,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(enc) = pipeline.by_name("enc") {
                             let current: u32 = enc.property("bitrate");
                             if current < bitrate_kbps {
-                                let target =
-                                    std::cmp::min(current + ramp_step_kbps, bitrate_kbps);
+                                let target = std::cmp::min(current + ramp_step_kbps, bitrate_kbps);
                                 eprintln!(
                                     "Bandwidth Available: Increasing Bitrate from {} to {} kbps",
                                     current, target

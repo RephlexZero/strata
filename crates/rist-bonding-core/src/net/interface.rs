@@ -58,6 +58,8 @@ pub struct LinkMetrics {
     pub mtu: Option<u32>,
     pub iface: Option<String>,
     pub link_kind: Option<String>,
+    /// AIMD delay-gradient capacity estimate (0.0 if estimator disabled).
+    pub estimated_capacity_bps: f64,
 }
 
 /// Abstraction for a network link capable of sending packets and reporting metrics.
