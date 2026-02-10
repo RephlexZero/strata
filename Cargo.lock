@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "gst-rist-bonding"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytes",
  "crossbeam-channel",
