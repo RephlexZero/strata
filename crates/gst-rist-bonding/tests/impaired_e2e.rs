@@ -882,18 +882,19 @@ fn test_three_link_bandwidth_differentiation() {
         .output();
     let _ = std::process::Command::new("sudo")
         .args([
-            "ip", "link", "add", "veth_3lnk_h", "type", "veth", "peer", "name", "veth_3lnk_c",
+            "ip",
+            "link",
+            "add",
+            "veth_3lnk_h",
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "veth_3lnk_c",
         ])
         .output();
     let _ = std::process::Command::new("sudo")
-        .args([
-            "ip",
-            "link",
-            "set",
-            "veth_3lnk_c",
-            "netns",
-            "rst_3lnk_snd",
-        ])
+        .args(["ip", "link", "set", "veth_3lnk_c", "netns", "rst_3lnk_snd"])
         .output();
     let _ = std::process::Command::new("sudo")
         .args([
@@ -968,8 +969,7 @@ fn test_three_link_bandwidth_differentiation() {
     );
 
     // 7. Start stats collector
-    let stats_socket =
-        UdpSocket::bind("192.168.102.1:9200").expect("Failed to bind stats socket");
+    let stats_socket = UdpSocket::bind("192.168.102.1:9200").expect("Failed to bind stats socket");
     stats_socket
         .set_read_timeout(Some(Duration::from_millis(100)))
         .unwrap();
@@ -1123,11 +1123,7 @@ fn test_three_link_bandwidth_differentiation() {
 
     // === Assertion C: Every link carries traffic ===
     for (i, &bytes) in tbf_sent_bytes.iter().enumerate() {
-        assert!(
-            bytes > 0,
-            "Link {} carried zero traffic through TBF",
-            i
-        );
+        assert!(bytes > 0, "Link {} carried zero traffic through TBF", i);
     }
 
     // === Assertion D: TBF throughput ordering matches link bandwidth ordering ===

@@ -80,9 +80,9 @@ pub fn apply_impairment(
         || config.corrupt_percent.is_some();
 
     if config.tbf_shaping {
-        let rate = config.rate_kbit.ok_or_else(|| {
-            io::Error::other("tbf_shaping requires rate_kbit to be set")
-        })?;
+        let rate = config
+            .rate_kbit
+            .ok_or_else(|| io::Error::other("tbf_shaping requires rate_kbit to be set"))?;
         // Install TBF as root qdisc for bandwidth enforcement.
         // burst = max(rate_bytes_per_sec / 10, 1540) — enough for one MTU at minimum.
         // latency = 1s — large enough to absorb video I-frame bursts without
