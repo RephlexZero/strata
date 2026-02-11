@@ -796,3 +796,346 @@ fn test_step_change_convergence_visualization() {
         );
     }
 }
+
+/// Three-link bandwidth-differentiated bonding test.
+///
+/// Creates 3 bandwidth-limited veth links using real Linux network namespaces
+/// and TBF+netem shaping.  The link rates preserve the 500:1200:1750 ratio
+/// requested by the design, scaled ×10 for reliable RIST at 1080p60.
+///
+/// Verifies:
+///   A) TBF correctly enforces differentiated bandwidth limits (tc stats)
+///   B) All 3 RIST links are alive from the sender's perspective
+///   C) Every link carries traffic (no starvation)
+///   D) The overall system runs without crashing under asymmetric constraints
+///
+/// NOTE: The AIMD capacity estimator currently cannot converge proportionally
+/// in this environment because librist's sender-side stats reflect the
+/// application send rate (what the kernel socket accepted), not what passes
+/// through the TBF qdisc.  RTCP NACK feedback from the receiver is required
+/// for the AIMD to detect loss, but the bonded receiver does not currently
+/// produce per-link NACK traffic in this test topology.  AIMD convergence
+/// is covered by the unit tests in dwrr.rs which inject synthetic signals.
+#[test]
+fn test_three_link_bandwidth_differentiation() {
+    // 0. Build integration_node if needed
+    let pkg_root = std::env::current_dir().unwrap();
+    let bin_path = if let Ok(p) = std::env::var("CARGO_BIN_EXE_integration_node") {
+        std::path::PathBuf::from(p)
+    } else {
+        pkg_root.join("../../target/debug/integration_node")
+    };
+
+    if !bin_path.exists() {
+        let _ = std::process::Command::new("cargo")
+            .args(["build", "--bin", "integration_node"])
+            .status();
+    }
+
+    // 1. Privilege check
+    if !std::process::Command::new("ip")
+        .arg("netns")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        eprintln!("Skipping test: requires root/netns privileges");
+        return;
+    }
+
+    // 2. Namespaces
+    let ns_snd = Arc::new(Namespace::new("rst_3lnk_snd").unwrap());
+    let ns_rcv = Arc::new(Namespace::new("rst_3lnk_rcv").unwrap());
+
+    // 3. Three veth pairs on separate subnets
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "veth3l_a1",
+            "veth3l_b1",
+            "10.30.1.1/24",
+            "10.30.1.2/24",
+        )
+        .unwrap();
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "veth3l_a2",
+            "veth3l_b2",
+            "10.30.2.1/24",
+            "10.30.2.2/24",
+        )
+        .unwrap();
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "veth3l_a3",
+            "veth3l_b3",
+            "10.30.3.1/24",
+            "10.30.3.2/24",
+        )
+        .unwrap();
+
+    // 4. Management link for stats: Host (192.168.102.1) <-> ns_snd (192.168.102.2)
+    let _ = std::process::Command::new("sudo")
+        .args(["ip", "link", "del", "veth_3lnk_h"])
+        .output();
+    let _ = std::process::Command::new("sudo")
+        .args([
+            "ip", "link", "add", "veth_3lnk_h", "type", "veth", "peer", "name", "veth_3lnk_c",
+        ])
+        .output();
+    let _ = std::process::Command::new("sudo")
+        .args([
+            "ip",
+            "link",
+            "set",
+            "veth_3lnk_c",
+            "netns",
+            "rst_3lnk_snd",
+        ])
+        .output();
+    let _ = std::process::Command::new("sudo")
+        .args([
+            "ip",
+            "addr",
+            "add",
+            "192.168.102.1/24",
+            "dev",
+            "veth_3lnk_h",
+        ])
+        .output();
+    let _ = std::process::Command::new("sudo")
+        .args(["ip", "link", "set", "veth_3lnk_h", "up"])
+        .output();
+    let _ = ns_snd.exec(
+        "ip",
+        &["addr", "add", "192.168.102.2/24", "dev", "veth_3lnk_c"],
+    );
+    let _ = ns_snd.exec("ip", &["link", "set", "veth_3lnk_c", "up"]);
+
+    // 5. Apply static bandwidth limits via TBF + netem.
+    //    Ratio 500:1200:1750, scaled ×10 for reliable RIST over veth at 1080p60.
+    let bandwidths_kbit = [5_000u64, 12_000, 17_500];
+    let veth_names = ["veth3l_a1", "veth3l_a2", "veth3l_a3"];
+
+    for (veth, &rate) in veth_names.iter().zip(bandwidths_kbit.iter()) {
+        apply_impairment(
+            &ns_snd,
+            veth,
+            ImpairmentConfig {
+                rate_kbit: Some(rate),
+                delay_ms: Some(20),
+                tbf_shaping: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("Failed to apply impairment to {}: {}", veth, e));
+    }
+
+    // Verify qdiscs are installed
+    for veth in &veth_names {
+        let out = ns_snd
+            .exec("tc", &["-s", "qdisc", "show", "dev", veth])
+            .expect("failed to query tc qdisc");
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            s.contains("tbf"),
+            "TBF qdisc not found on {} — got: {}",
+            veth,
+            s.trim()
+        );
+    }
+
+    // Verify basic connectivity
+    for (i, ip) in ["10.30.1.2", "10.30.2.2", "10.30.3.2"].iter().enumerate() {
+        let out = ns_snd
+            .exec("ping", &["-c", "1", "-W", "2", ip])
+            .expect("ping failed");
+        assert!(
+            out.status.success(),
+            "Cannot reach receiver {} from sender (link {})",
+            ip,
+            i
+        );
+    }
+
+    // 6. Start receiver
+    let mut recv_child = spawn_in_ns(
+        &ns_rcv.name,
+        bin_path.to_str().unwrap(),
+        &["receiver", "--bind", "rist://0.0.0.0:5002"],
+    );
+
+    // 7. Start stats collector
+    let stats_socket =
+        UdpSocket::bind("192.168.102.1:9200").expect("Failed to bind stats socket");
+    stats_socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+
+    let collected_data: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let data_clone = collected_data.clone();
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let running_clone = running.clone();
+
+    let collector_handle = thread::spawn(move || {
+        let mut buf = [0u8; 65535];
+        while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok((amt, _)) = stats_socket.recv_from(&mut buf) {
+                if let Ok(val) = serde_json::from_slice::<Value>(&buf[..amt]) {
+                    data_clone.lock().unwrap().push(val);
+                }
+            }
+        }
+    });
+
+    // 8. Start sender.  Encode at 58% of aggregate link capacity.
+    //    Sender generates 1200 frames at 60fps = 20s of video.
+    let total_link_kbps: u64 = bandwidths_kbit.iter().sum(); // 34500
+    let encode_kbps = (total_link_kbps as f64 * 0.58) as u64;
+    let mut send_child = spawn_in_ns(
+        &ns_snd.name,
+        bin_path.to_str().unwrap(),
+        &[
+            "sender",
+            "--dest",
+            "rist://10.30.1.2:5002,rist://10.30.2.2:5002,rist://10.30.3.2:5002",
+            "--stats-dest",
+            "192.168.102.1:9200",
+            "--bitrate",
+            &encode_kbps.to_string(),
+        ],
+    );
+
+    eprintln!(
+        "Three-link test: encoding at {}kbps across {}/{}/{} kbps links...",
+        encode_kbps, bandwidths_kbit[0], bandwidths_kbit[1], bandwidths_kbit[2]
+    );
+    thread::sleep(Duration::from_secs(22));
+
+    // 9. Cleanup — capture qdisc stats BEFORE destroying namespaces
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = send_child.kill();
+    let _ = send_child.wait();
+    let _ = recv_child.kill();
+    let _ = recv_child.wait();
+    let _ = collector_handle.join();
+
+    // Capture per-link TBF throughput from tc stats
+    let mut tbf_sent_bytes = [0u64; 3];
+    let mut tbf_dropped_pkts = [0u64; 3];
+    for (i, veth) in veth_names.iter().enumerate() {
+        let out = ns_snd
+            .exec("tc", &["-s", "qdisc", "show", "dev", veth])
+            .expect("tc qdisc show failed");
+        let s = String::from_utf8_lossy(&out.stdout);
+        eprintln!("  {}: {}", veth, s.trim());
+
+        // Parse "Sent X bytes Y pkt (dropped Z, ...)" from the TBF line
+        for line in s.lines() {
+            if line.trim_start().starts_with("Sent ") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 6 {
+                    if let Ok(bytes) = parts[1].parse::<u64>() {
+                        tbf_sent_bytes[i] = bytes;
+                    }
+                }
+                // Find "(dropped X,"
+                if let Some(pos) = line.find("dropped ") {
+                    let rest = &line[pos + 8..];
+                    if let Some(end) = rest.find(',') {
+                        if let Ok(d) = rest[..end].parse::<u64>() {
+                            tbf_dropped_pkts[i] = d;
+                        }
+                    }
+                }
+                break; // Only parse the first "Sent" line (TBF root)
+            }
+        }
+    }
+
+    let _ = std::process::Command::new("sudo")
+        .args(["ip", "link", "del", "veth_3lnk_h"])
+        .output();
+
+    // 10. Analyse collected stats
+    let data = collected_data.lock().unwrap();
+    assert!(
+        !data.is_empty(),
+        "No stats collected! Check network connectivity."
+    );
+
+    // Count samples where all 3 links are present
+    let mut all_three_count = 0u64;
+    let mut alive_count = 0u64;
+    for v in data.iter() {
+        let alive = v["alive_links"].as_u64().unwrap_or(0);
+        if alive >= 3 {
+            alive_count += 1;
+        }
+        let links = &v["links"];
+        let has_all = (0..3).all(|i| links.get(i.to_string()).is_some());
+        if has_all {
+            all_three_count += 1;
+        }
+    }
+
+    eprintln!("--- Three-Link Bandwidth Results ---");
+    eprintln!(
+        "  stats_points={}, with_all_3_links={}, alive_3={}",
+        data.len(),
+        all_three_count,
+        alive_count
+    );
+    for i in 0..3 {
+        eprintln!(
+            "  Link {} ({}kbps TBF): sent={} bytes, dropped={} pkts",
+            i, bandwidths_kbit[i], tbf_sent_bytes[i], tbf_dropped_pkts[i]
+        );
+    }
+
+    // === Assertion A: TBF enforces differentiated bandwidth limits ===
+    // The higher-bandwidth link must pass more bytes than the lower-bandwidth link.
+    assert!(
+        tbf_sent_bytes[2] > tbf_sent_bytes[0],
+        "TBF not differentiating: {}kbps link sent {} bytes <= {}kbps link sent {} bytes",
+        bandwidths_kbit[2],
+        tbf_sent_bytes[2],
+        bandwidths_kbit[0],
+        tbf_sent_bytes[0]
+    );
+    assert!(
+        tbf_sent_bytes[1] > tbf_sent_bytes[0],
+        "TBF not differentiating: {}kbps link sent {} bytes <= {}kbps link sent {} bytes",
+        bandwidths_kbit[1],
+        tbf_sent_bytes[1],
+        bandwidths_kbit[0],
+        tbf_sent_bytes[0]
+    );
+
+    // === Assertion B: All 3 links alive from sender perspective ===
+    assert!(
+        alive_count >= 3,
+        "Expected at least 3 stats samples with all links alive, got {}",
+        alive_count
+    );
+
+    // === Assertion C: Every link carries traffic ===
+    for (i, &bytes) in tbf_sent_bytes.iter().enumerate() {
+        assert!(
+            bytes > 0,
+            "Link {} carried zero traffic through TBF",
+            i
+        );
+    }
+
+    // === Assertion D: TBF throughput ordering matches link bandwidth ordering ===
+    // link2 (17500kbps) > link1 (12000kbps) > link0 (5000kbps) in bytes sent
+    assert!(
+        tbf_sent_bytes[2] >= tbf_sent_bytes[1],
+        "TBF throughput ordering violated: link2 ({}) should >= link1 ({})",
+        tbf_sent_bytes[2],
+        tbf_sent_bytes[1]
+    );
+}
