@@ -800,22 +800,18 @@ fn test_step_change_convergence_visualization() {
 /// Three-link bandwidth-differentiated bonding test.
 ///
 /// Creates 3 bandwidth-limited veth links using real Linux network namespaces
-/// and TBF+netem shaping.  The link rates preserve the 500:1200:1750 ratio
-/// requested by the design, scaled ×10 for reliable RIST at 1080p60.
+/// and netem with a finite queue limit to enforce bandwidth.  The netem `rate`
+/// parameter adds serialization delay while the small `limit` causes excess
+/// packets to be dropped — drops that are visible to the receiver and produce
+/// RTCP NACKs, enabling AIMD convergence.
+///
+/// Link rates preserve the 500:1200:1750 ratio, scaled ×10 for reliable RIST.
 ///
 /// Verifies:
-///   A) TBF correctly enforces differentiated bandwidth limits (tc stats)
+///   A) netem correctly enforces differentiated bandwidth limits (tc stats)
 ///   B) All 3 RIST links are alive from the sender's perspective
 ///   C) Every link carries traffic (no starvation)
-///   D) The overall system runs without crashing under asymmetric constraints
-///
-/// NOTE: The AIMD capacity estimator currently cannot converge proportionally
-/// in this environment because librist's sender-side stats reflect the
-/// application send rate (what the kernel socket accepted), not what passes
-/// through the TBF qdisc.  RTCP NACK feedback from the receiver is required
-/// for the AIMD to detect loss, but the bonded receiver does not currently
-/// produce per-link NACK traffic in this test topology.  AIMD convergence
-/// is covered by the unit tests in dwrr.rs which inject synthetic signals.
+///   D) Throughput ordering matches link bandwidth ordering
 #[test]
 fn test_three_link_bandwidth_differentiation() {
     // 0. Build integration_node if needed
@@ -915,8 +911,10 @@ fn test_three_link_bandwidth_differentiation() {
     );
     let _ = ns_snd.exec("ip", &["link", "set", "veth_3lnk_c", "up"]);
 
-    // 5. Apply static bandwidth limits via TBF + netem.
+    // 5. Apply bandwidth limits via netem rate + finite limit.
     //    Ratio 500:1200:1750, scaled ×10 for reliable RIST over veth at 1080p60.
+    //    The auto-calculated netem limit (from BDP) keeps the queue finite so
+    //    excess packets are dropped at the netem level — visible to RTCP.
     let bandwidths_kbit = [5_000u64, 12_000, 17_500];
     let veth_names = ["veth3l_a1", "veth3l_a2", "veth3l_a3"];
 
@@ -927,22 +925,21 @@ fn test_three_link_bandwidth_differentiation() {
             ImpairmentConfig {
                 rate_kbit: Some(rate),
                 delay_ms: Some(20),
-                tbf_shaping: true,
                 ..Default::default()
             },
         )
         .unwrap_or_else(|e| panic!("Failed to apply impairment to {}: {}", veth, e));
     }
 
-    // Verify qdiscs are installed
+    // Verify qdiscs are installed with rate and limit
     for veth in &veth_names {
         let out = ns_snd
             .exec("tc", &["-s", "qdisc", "show", "dev", veth])
             .expect("failed to query tc qdisc");
         let s = String::from_utf8_lossy(&out.stdout);
         assert!(
-            s.contains("tbf"),
-            "TBF qdisc not found on {} — got: {}",
+            s.contains("netem") && s.contains("rate"),
+            "netem rate qdisc not found on {} — got: {}",
             veth,
             s.trim()
         );
@@ -1022,9 +1019,9 @@ fn test_three_link_bandwidth_differentiation() {
     let _ = recv_child.wait();
     let _ = collector_handle.join();
 
-    // Capture per-link TBF throughput from tc stats
-    let mut tbf_sent_bytes = [0u64; 3];
-    let mut tbf_dropped_pkts = [0u64; 3];
+    // Capture per-link netem throughput from tc stats
+    let mut netem_sent_bytes = [0u64; 3];
+    let mut netem_dropped_pkts = [0u64; 3];
     for (i, veth) in veth_names.iter().enumerate() {
         let out = ns_snd
             .exec("tc", &["-s", "qdisc", "show", "dev", veth])
@@ -1032,13 +1029,13 @@ fn test_three_link_bandwidth_differentiation() {
         let s = String::from_utf8_lossy(&out.stdout);
         eprintln!("  {}: {}", veth, s.trim());
 
-        // Parse "Sent X bytes Y pkt (dropped Z, ...)" from the TBF line
+        // Parse "Sent X bytes Y pkt (dropped Z, ...)" from the netem line
         for line in s.lines() {
             if line.trim_start().starts_with("Sent ") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 6 {
                     if let Ok(bytes) = parts[1].parse::<u64>() {
-                        tbf_sent_bytes[i] = bytes;
+                        netem_sent_bytes[i] = bytes;
                     }
                 }
                 // Find "(dropped X,"
@@ -1046,11 +1043,11 @@ fn test_three_link_bandwidth_differentiation() {
                     let rest = &line[pos + 8..];
                     if let Some(end) = rest.find(',') {
                         if let Ok(d) = rest[..end].parse::<u64>() {
-                            tbf_dropped_pkts[i] = d;
+                            netem_dropped_pkts[i] = d;
                         }
                     }
                 }
-                break; // Only parse the first "Sent" line (TBF root)
+                break;
             }
         }
     }
@@ -1090,28 +1087,28 @@ fn test_three_link_bandwidth_differentiation() {
     );
     for i in 0..3 {
         eprintln!(
-            "  Link {} ({}kbps TBF): sent={} bytes, dropped={} pkts",
-            i, bandwidths_kbit[i], tbf_sent_bytes[i], tbf_dropped_pkts[i]
+            "  Link {} ({}kbps netem): sent={} bytes, dropped={} pkts",
+            i, bandwidths_kbit[i], netem_sent_bytes[i], netem_dropped_pkts[i]
         );
     }
 
-    // === Assertion A: TBF enforces differentiated bandwidth limits ===
+    // === Assertion A: netem enforces differentiated bandwidth limits ===
     // The higher-bandwidth link must pass more bytes than the lower-bandwidth link.
     assert!(
-        tbf_sent_bytes[2] > tbf_sent_bytes[0],
-        "TBF not differentiating: {}kbps link sent {} bytes <= {}kbps link sent {} bytes",
+        netem_sent_bytes[2] > netem_sent_bytes[0],
+        "netem not differentiating: {}kbps link sent {} bytes <= {}kbps link sent {} bytes",
         bandwidths_kbit[2],
-        tbf_sent_bytes[2],
+        netem_sent_bytes[2],
         bandwidths_kbit[0],
-        tbf_sent_bytes[0]
+        netem_sent_bytes[0]
     );
     assert!(
-        tbf_sent_bytes[1] > tbf_sent_bytes[0],
-        "TBF not differentiating: {}kbps link sent {} bytes <= {}kbps link sent {} bytes",
+        netem_sent_bytes[1] > netem_sent_bytes[0],
+        "netem not differentiating: {}kbps link sent {} bytes <= {}kbps link sent {} bytes",
         bandwidths_kbit[1],
-        tbf_sent_bytes[1],
+        netem_sent_bytes[1],
         bandwidths_kbit[0],
-        tbf_sent_bytes[0]
+        netem_sent_bytes[0]
     );
 
     // === Assertion B: All 3 links alive from sender perspective ===
@@ -1122,16 +1119,16 @@ fn test_three_link_bandwidth_differentiation() {
     );
 
     // === Assertion C: Every link carries traffic ===
-    for (i, &bytes) in tbf_sent_bytes.iter().enumerate() {
-        assert!(bytes > 0, "Link {} carried zero traffic through TBF", i);
+    for (i, &bytes) in netem_sent_bytes.iter().enumerate() {
+        assert!(bytes > 0, "Link {} carried zero traffic through netem", i);
     }
 
-    // === Assertion D: TBF throughput ordering matches link bandwidth ordering ===
+    // === Assertion D: Throughput ordering matches link bandwidth ordering ===
     // link2 (17500kbps) > link1 (12000kbps) > link0 (5000kbps) in bytes sent
     assert!(
-        tbf_sent_bytes[2] >= tbf_sent_bytes[1],
-        "TBF throughput ordering violated: link2 ({}) should >= link1 ({})",
-        tbf_sent_bytes[2],
-        tbf_sent_bytes[1]
+        netem_sent_bytes[2] >= netem_sent_bytes[1],
+        "Throughput ordering violated: link2 ({}) should >= link1 ({})",
+        netem_sent_bytes[2],
+        netem_sent_bytes[1]
     );
 }

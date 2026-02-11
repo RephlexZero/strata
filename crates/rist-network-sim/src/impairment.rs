@@ -25,28 +25,29 @@ pub struct ImpairmentConfig {
     pub duplicate_percent: Option<f32>,
     pub reorder_percent: Option<f32>,
     pub corrupt_percent: Option<f32>,
-    /// When `true` and `rate_kbit` is set, a TBF (Token Bucket Filter) qdisc is
-    /// installed as root to enforce the bandwidth limit by actually dropping
-    /// excess packets, with netem chained as a child.
+    /// Override the netem queue `limit` (in packets).  When `None` and
+    /// `rate_kbit` is set, an appropriate limit is auto-calculated from the
+    /// bandwidth-delay product (~2× BDP).  This keeps the queue finite so
+    /// excess packets are dropped at the netem level — drops that are visible
+    /// to the receiver and produce RTCP NACKs, enabling AIMD convergence.
     ///
-    /// When `false` (default), `rate_kbit` is passed to netem's `rate` parameter
-    /// which only adds serialization delay without dropping packets.  This is
-    /// suitable for tests that rely on AIMD convergence via RTCP feedback, where
-    /// kernel-level drops (invisible to the application) would be counter-productive.
-    pub tbf_shaping: bool,
+    /// Set explicitly to fine-tune burst tolerance.  A larger limit absorbs
+    /// more bursts but delays congestion detection; a smaller limit is more
+    /// aggressive but may drop packets even within capacity.
+    pub netem_limit: Option<u32>,
 }
 
-/// Applies network impairment to an interface inside a namespace using `tc`.
+/// Applies network impairment to an interface inside a namespace using `tc netem`.
 ///
-/// Removes any existing root qdisc first, then configures the specified
-/// delay, loss, duplication, reorder, and corruption parameters via netem.
+/// Removes any existing root qdisc first, then installs netem with the specified
+/// delay, loss, rate, duplication, reorder, and corruption parameters.
 ///
-/// When `rate_kbit` is set, a TBF (Token Bucket Filter) qdisc is installed as
-/// the root to enforce the bandwidth limit by dropping excess packets, with
-/// netem chained as a child for delay/loss/etc.  This is the standard Linux
-/// approach for bandwidth shaping – plain `netem rate` only adds serialization
-/// delay but never drops packets until the (very large) default queue limit is
-/// reached.
+/// When `rate_kbit` is set, the netem `rate` parameter adds serialization delay
+/// and the queue `limit` is set to a finite value (auto-calculated from the
+/// bandwidth-delay product if not explicitly provided).  This finite queue causes
+/// netem to **drop excess packets** when the sender exceeds link capacity — drops
+/// that are visible to the receiver and trigger RTCP NACKs, enabling AIMD
+/// convergence.
 pub fn apply_impairment(
     ns: &Namespace,
     interface: &str,
@@ -67,110 +68,56 @@ pub fn apply_impairment(
         return Ok(());
     }
 
-    // 2. Determine whether we need TBF for bandwidth enforcement.
-    //    When tbf_shaping is true and rate_kbit is set, we use:
-    //      root -> tbf (rate enforcement) -> netem (delay/loss/etc.)
-    //    Otherwise, we use:
-    //      root -> netem (delay/loss/etc.)  [rate passed as netem param if set]
-    let has_netem_params = config.delay_ms.is_some()
-        || config.loss_percent.is_some()
-        || config.gemodel.is_some()
-        || config.duplicate_percent.is_some()
-        || config.reorder_percent.is_some()
-        || config.corrupt_percent.is_some();
+    // 2. Build netem command: tc qdisc add dev <iface> root netem [limit N] ...
+    let mut args_storage: Vec<String> = vec![
+        "qdisc".into(),
+        "add".into(),
+        "dev".into(),
+        interface.into(),
+        "root".into(),
+        "netem".into(),
+    ];
 
-    if config.tbf_shaping {
-        let rate = config
-            .rate_kbit
-            .ok_or_else(|| io::Error::other("tbf_shaping requires rate_kbit to be set"))?;
-        // Install TBF as root qdisc for bandwidth enforcement.
-        // burst = max(rate_bytes_per_sec / 10, 1540) — enough for one MTU at minimum.
-        // latency = 1s — large enough to absorb video I-frame bursts without
-        // spurious drops, while still enforcing sustained rate limits.
-        let rate_bytes_per_sec = rate * 1000 / 8;
-        let burst = std::cmp::max(rate_bytes_per_sec / 10, 1540);
-        let tbf_args: Vec<String> = vec![
-            "qdisc".into(),
-            "add".into(),
-            "dev".into(),
-            interface.into(),
-            "root".into(),
-            "handle".into(),
-            "1:".into(),
-            "tbf".into(),
-            "rate".into(),
-            format!("{}kbit", rate),
-            "burst".into(),
-            format!("{}", burst),
-            "latency".into(),
-            "1s".into(),
-        ];
-        let args: Vec<&str> = tbf_args.iter().map(|s| s.as_str()).collect();
-        let output = ns.exec("tc", &args)?;
-        if !output.status.success() {
-            return Err(io::Error::other(format!(
-                "Failed to apply TBF qdisc: {}\nCommand: tc {}",
-                String::from_utf8_lossy(&output.stderr),
-                args.join(" ")
-            )));
-        }
-
-        // Chain netem as child of TBF (if any netem params are specified).
-        if has_netem_params {
-            let mut netem_args: Vec<String> = vec![
-                "qdisc".into(),
-                "add".into(),
-                "dev".into(),
-                interface.into(),
-                "parent".into(),
-                "1:1".into(),
-                "handle".into(),
-                "10:".into(),
-                "netem".into(),
-            ];
-            append_netem_params(&config, &mut netem_args, false);
-
-            let args: Vec<&str> = netem_args.iter().map(|s| s.as_str()).collect();
-            let output = ns.exec("tc", &args)?;
-            if !output.status.success() {
-                return Err(io::Error::other(format!(
-                    "Failed to apply netem child qdisc: {}\nCommand: tc {}",
-                    String::from_utf8_lossy(&output.stderr),
-                    args.join(" ")
-                )));
-            }
-        }
+    // Determine queue limit.  When rate_kbit is set, we need a finite limit to
+    // enforce bandwidth by dropping excess packets.  Auto-calculate from BDP if
+    // not explicitly provided.
+    let limit = if let Some(explicit) = config.netem_limit {
+        Some(explicit)
+    } else if let Some(rate) = config.rate_kbit {
+        // BDP-based auto limit: 2 × (rate × rtt) / MTU, minimum 20.
+        // Uses one-way delay (half RTT) from config, doubled for full RTT.
+        let rtt_ms = config.delay_ms.unwrap_or(20) as u64 * 2;
+        let bdp_bytes = rate * 1000 / 8 * rtt_ms / 1000; // bytes in one BDP
+        let mtu = 1400u64;
+        let bdp_packets = bdp_bytes / mtu;
+        Some(std::cmp::max(bdp_packets as u32 * 2, 20))
     } else {
-        // No rate limiting — just use netem as root.
-        let mut args_storage: Vec<String> = vec![
-            "qdisc".into(),
-            "add".into(),
-            "dev".into(),
-            interface.into(),
-            "root".into(),
-            "netem".into(),
-        ];
-        append_netem_params(&config, &mut args_storage, true);
+        None
+    };
 
-        let args: Vec<&str> = args_storage.iter().map(|s| s.as_str()).collect();
-        let output = ns.exec("tc", &args)?;
-        if !output.status.success() {
-            return Err(io::Error::other(format!(
-                "Failed to apply tc netem: {}\nCommand: tc {}",
-                String::from_utf8_lossy(&output.stderr),
-                args.join(" ")
-            )));
-        }
+    if let Some(lim) = limit {
+        args_storage.push("limit".into());
+        args_storage.push(lim.to_string());
+    }
+
+    append_netem_params(&config, &mut args_storage);
+
+    let args: Vec<&str> = args_storage.iter().map(|s| s.as_str()).collect();
+    let output = ns.exec("tc", &args)?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "Failed to apply tc netem: {}\nCommand: tc {}",
+            String::from_utf8_lossy(&output.stderr),
+            args.join(" ")
+        )));
     }
 
     Ok(())
 }
 
-/// Appends the netem-specific parameters (delay, loss, duplicate, reorder,
-/// corrupt) to an arg list.  When `include_rate` is true and `rate_kbit` is
-/// set, the netem `rate` parameter is also appended (serialization delay only,
-/// no actual enforcement).
-fn append_netem_params(config: &ImpairmentConfig, args: &mut Vec<String>, include_rate: bool) {
+/// Appends the netem-specific parameters (delay, loss, rate, duplicate,
+/// reorder, corrupt) to an arg list.
+fn append_netem_params(config: &ImpairmentConfig, args: &mut Vec<String>) {
     if let Some(delay) = config.delay_ms {
         args.push("delay".into());
         args.push(format!("{}ms", delay));
@@ -212,11 +159,9 @@ fn append_netem_params(config: &ImpairmentConfig, args: &mut Vec<String>, includ
         args.push(format!("{}%", corrupt));
     }
 
-    if include_rate {
-        if let Some(rate) = config.rate_kbit {
-            args.push("rate".into());
-            args.push(format!("{}kbit", rate));
-        }
+    if let Some(rate) = config.rate_kbit {
+        args.push("rate".into());
+        args.push(format!("{}kbit", rate));
     }
 }
 
