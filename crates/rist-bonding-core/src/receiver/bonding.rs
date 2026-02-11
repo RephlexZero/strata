@@ -28,6 +28,8 @@ pub struct BondingReceiver {
     stats: Arc<Mutex<ReassemblyStats>>,
     /// Track spawned thread handles for clean shutdown
     thread_handles: Mutex<Vec<thread::JoinHandle<()>>>,
+    /// Number of links added (each `add_link` call increments this).
+    link_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl BondingReceiver {
@@ -89,6 +91,7 @@ impl BondingReceiver {
             running,
             stats,
             thread_handles: Mutex::new(vec![jitter_handle]),
+            link_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -109,10 +112,17 @@ impl BondingReceiver {
         self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// Returns the number of links that have been added to this receiver.
+    pub fn link_count(&self) -> u64 {
+        self.link_count.load(Ordering::Relaxed)
+    }
+
     pub fn add_link(&self, bind_url: &str) -> Result<()> {
         let ctx = RistReceiverContext::new(RIST_PROFILE_SIMPLE)?;
         ctx.peer_config(bind_url)?;
         ctx.start()?;
+
+        self.link_count.fetch_add(1, Ordering::Relaxed);
 
         let input_tx = self
             .input_tx

@@ -267,7 +267,7 @@ mod imp {
                                         .field("mono_time_ns", mono_time_ns)
                                         .field("wall_time_ms", wall_time_ms)
                                         .field("total_capacity", 0.0f64)
-                                        .field("alive_links", 0u64)
+                                        .field("alive_links", receiver.link_count())
                                         .field("queue_depth", stats.queue_depth as u64)
                                         .field("next_seq", stats.next_seq)
                                         .field("lost_packets", stats.lost_packets)

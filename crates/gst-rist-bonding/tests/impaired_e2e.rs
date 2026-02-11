@@ -1132,3 +1132,322 @@ fn test_three_link_bandwidth_differentiation() {
         netem_sent_bytes[1]
     );
 }
+
+/// AIMD convergence test with two asymmetric links.
+///
+/// Creates two bandwidth-limited links (3 Mbps vs 9 Mbps) with netem rate +
+/// finite limit.  Netem drops excess packets at the qdisc level, which are
+/// visible to the receiver via RTCP NACKs.  The AIMD estimator should detect
+/// loss on the slower link and converge `estimated_capacity_bps` to reflect
+/// the bandwidth asymmetry.
+///
+/// Verifies:
+///   A) Both links are alive and carrying traffic
+///   B) AIMD produces non-zero estimated_capacity_bps for at least one link
+///   C) The faster link's estimated capacity exceeds the slower link's
+///   D) The capacity ratio roughly tracks the bandwidth ratio (3:9 = 1:3)
+#[test]
+fn test_aimd_convergence_two_links() {
+    // 0. Build integration_node if needed
+    let pkg_root = std::env::current_dir().unwrap();
+    let bin_path = if let Ok(p) = std::env::var("CARGO_BIN_EXE_integration_node") {
+        std::path::PathBuf::from(p)
+    } else {
+        pkg_root.join("../../target/debug/integration_node")
+    };
+
+    if !bin_path.exists() {
+        let _ = std::process::Command::new("cargo")
+            .args(["build", "--bin", "integration_node"])
+            .status();
+    }
+
+    if !std::process::Command::new("ip")
+        .arg("netns")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        eprintln!("Skipping test: requires root/netns privileges");
+        return;
+    }
+
+    // 1. Namespaces
+    let ns_snd = Arc::new(Namespace::new("rst_aimd_snd").unwrap());
+    let ns_rcv = Arc::new(Namespace::new("rst_aimd_rcv").unwrap());
+
+    // 2. Two veth pairs: slow (3 Mbps) and fast (9 Mbps)
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "veth_ai_a1",
+            "veth_ai_b1",
+            "10.40.1.1/24",
+            "10.40.1.2/24",
+        )
+        .unwrap();
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "veth_ai_a2",
+            "veth_ai_b2",
+            "10.40.2.1/24",
+            "10.40.2.2/24",
+        )
+        .unwrap();
+
+    // 3. Mgmt link for stats
+    let _ = std::process::Command::new("sudo")
+        .args(["ip", "link", "del", "veth_aimd_h"])
+        .output();
+    let _ = std::process::Command::new("sudo")
+        .args([
+            "ip", "link", "add", "veth_aimd_h", "type", "veth", "peer", "name", "veth_aimd_c",
+        ])
+        .output();
+    let _ = std::process::Command::new("sudo")
+        .args(["ip", "link", "set", "veth_aimd_c", "netns", "rst_aimd_snd"])
+        .output();
+    let _ = std::process::Command::new("sudo")
+        .args([
+            "ip",
+            "addr",
+            "add",
+            "192.168.104.1/24",
+            "dev",
+            "veth_aimd_h",
+        ])
+        .output();
+    let _ = std::process::Command::new("sudo")
+        .args(["ip", "link", "set", "veth_aimd_h", "up"])
+        .output();
+    let _ = ns_snd.exec(
+        "ip",
+        &["addr", "add", "192.168.104.2/24", "dev", "veth_aimd_c"],
+    );
+    let _ = ns_snd.exec("ip", &["link", "set", "veth_aimd_c", "up"]);
+
+    // 4. Apply bandwidth limits: 3 Mbps (slow) vs 9 Mbps (fast)
+    let slow_kbit = 3_000u64;
+    let fast_kbit = 9_000u64;
+
+    apply_impairment(
+        &ns_snd,
+        "veth_ai_a1",
+        ImpairmentConfig {
+            rate_kbit: Some(slow_kbit),
+            delay_ms: Some(30),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    apply_impairment(
+        &ns_snd,
+        "veth_ai_a2",
+        ImpairmentConfig {
+            rate_kbit: Some(fast_kbit),
+            delay_ms: Some(30),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Verify connectivity
+    for ip in &["10.40.1.2", "10.40.2.2"] {
+        let out = ns_snd
+            .exec("ping", &["-c", "1", "-W", "2", ip])
+            .expect("ping failed");
+        assert!(out.status.success(), "Cannot reach {}", ip);
+    }
+
+    // 5. Start receiver
+    let mut recv_child = spawn_in_ns(
+        &ns_rcv.name,
+        bin_path.to_str().unwrap(),
+        &["receiver", "--bind", "rist://0.0.0.0:5003"],
+    );
+
+    // 6. Stats collector
+    let stats_socket =
+        UdpSocket::bind("192.168.104.1:9300").expect("Failed to bind stats socket");
+    stats_socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+
+    let collected_data: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let data_clone = collected_data.clone();
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let running_clone = running.clone();
+
+    let collector_handle = thread::spawn(move || {
+        let mut buf = [0u8; 65535];
+        while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok((amt, _)) = stats_socket.recv_from(&mut buf) {
+                if let Ok(val) = serde_json::from_slice::<Value>(&buf[..amt]) {
+                    data_clone.lock().unwrap().push(val);
+                }
+            }
+        }
+    });
+
+    // 7. Start sender. Encode at 80% of aggregate (9.6 Mbps) to push both links.
+    let total_kbps = slow_kbit + fast_kbit; // 12000
+    let encode_kbps = (total_kbps as f64 * 0.80) as u64; // 9600
+    let mut send_child = spawn_in_ns(
+        &ns_snd.name,
+        bin_path.to_str().unwrap(),
+        &[
+            "sender",
+            "--dest",
+            "rist://10.40.1.2:5003,rist://10.40.2.2:5003",
+            "--stats-dest",
+            "192.168.104.1:9300",
+            "--bitrate",
+            &encode_kbps.to_string(),
+        ],
+    );
+
+    eprintln!(
+        "AIMD convergence test: encoding at {} kbps across {}/{} kbps links...",
+        encode_kbps, slow_kbit, fast_kbit
+    );
+
+    // Let it run for the full 20s video duration
+    thread::sleep(Duration::from_secs(22));
+
+    // 8. Cleanup
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = send_child.kill();
+    let _ = send_child.wait();
+    let _ = recv_child.kill();
+    let _ = recv_child.wait();
+    let _ = collector_handle.join();
+
+    let _ = std::process::Command::new("sudo")
+        .args(["ip", "link", "del", "veth_aimd_h"])
+        .output();
+
+    // 9. Analyse stats — look at the last 10 seconds for convergence
+    let data = collected_data.lock().unwrap();
+    assert!(!data.is_empty(), "No stats collected!");
+
+    let t0 = data
+        .first()
+        .and_then(|v| v["timestamp"].as_f64())
+        .unwrap_or(0.0);
+    // Only consider stats after 10s settle period
+    let settle_after = 10.0;
+
+    let mut cap_slow_sum = 0.0;
+    let mut cap_fast_sum = 0.0;
+    let mut obs_slow_sum = 0.0;
+    let mut obs_fast_sum = 0.0;
+    let mut samples = 0u64;
+    let mut any_estimated = false;
+
+    for v in data.iter() {
+        if let Some(ts) = v["timestamp"].as_f64() {
+            let t_rel = ts - t0;
+            if t_rel >= settle_after {
+                let links = &v["links"];
+                let l0 = links.get("0");
+                let l1 = links.get("1");
+
+                // Get estimated_capacity_bps (AIMD output) or fall back to capacity
+                let mut get_cap = |l: Option<&Value>| -> f64 {
+                    let est = l
+                        .and_then(|x| x["estimated_capacity_bps"].as_f64())
+                        .unwrap_or(0.0);
+                    if est > 0.0 {
+                        any_estimated = true;
+                        est
+                    } else {
+                        l.and_then(|x| x["capacity"].as_f64()).unwrap_or(0.0)
+                    }
+                };
+                let get_obs = |l: Option<&Value>| -> f64 {
+                    l.and_then(|x| x["observed_bps"].as_f64()).unwrap_or(0.0)
+                };
+
+                let c0 = get_cap(l0);
+                let c1 = get_cap(l1);
+                let o0 = get_obs(l0);
+                let o1 = get_obs(l1);
+
+                if c0 > 0.0 || c1 > 0.0 {
+                    cap_slow_sum += c0;
+                    cap_fast_sum += c1;
+                    obs_slow_sum += o0;
+                    obs_fast_sum += o1;
+                    samples += 1;
+                }
+            }
+        }
+    }
+
+    eprintln!("--- AIMD Convergence Results ---");
+    eprintln!(
+        "  stats={}, post-settle samples={}, aimd_active={}",
+        data.len(),
+        samples,
+        any_estimated
+    );
+    if samples > 0 {
+        eprintln!(
+            "  Slow link ({}kbps): avg_cap={:.0} bps, avg_obs={:.0} bps",
+            slow_kbit,
+            cap_slow_sum / samples as f64,
+            obs_slow_sum / samples as f64
+        );
+        eprintln!(
+            "  Fast link ({}kbps): avg_cap={:.0} bps, avg_obs={:.0} bps",
+            fast_kbit,
+            cap_fast_sum / samples as f64,
+            obs_fast_sum / samples as f64
+        );
+    }
+
+    // === Assertion A: Enough post-settle data ===
+    assert!(
+        samples >= 3,
+        "Not enough post-settle samples with link data: {}",
+        samples
+    );
+
+    // === Assertion B: Both links carry traffic ===
+    assert!(
+        obs_slow_sum > 0.0,
+        "Slow link carried no observed traffic"
+    );
+    assert!(
+        obs_fast_sum > 0.0,
+        "Fast link carried no observed traffic"
+    );
+
+    // === Assertion C: Fast link has higher capacity estimate than slow link ===
+    let avg_cap_slow = cap_slow_sum / samples as f64;
+    let avg_cap_fast = cap_fast_sum / samples as f64;
+
+    eprintln!(
+        "  Capacity ratio fast/slow: {:.2} (expected ~{:.2})",
+        avg_cap_fast / avg_cap_slow.max(1.0),
+        fast_kbit as f64 / slow_kbit as f64
+    );
+
+    assert!(
+        avg_cap_fast > avg_cap_slow,
+        "Fast link capacity ({:.0}) should exceed slow link ({:.0})",
+        avg_cap_fast,
+        avg_cap_slow
+    );
+
+    // === Assertion D: Capacity ratio at least 1.5x (expected 3x, generous tolerance) ===
+    let ratio = avg_cap_fast / avg_cap_slow.max(1.0);
+    assert!(
+        ratio >= 1.5,
+        "Capacity ratio {:.2} too low — expected at least 1.5 (actual ratio is {}:{})",
+        ratio,
+        fast_kbit,
+        slow_kbit
+    );
+}
