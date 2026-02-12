@@ -20,6 +20,8 @@ pub struct LinkStatsSnapshot {
     pub kind: Option<String>,
     /// AIMD delay-gradient capacity estimate (0.0 if estimator disabled).
     pub estimated_capacity_bps: f64,
+    /// One-way delay estimate in milliseconds (0.0 if not available).
+    pub owd_ms: f64,
 }
 
 impl LinkStatsSnapshot {
@@ -37,6 +39,7 @@ impl LinkStatsSnapshot {
             iface: m.iface.clone(),
             kind: m.link_kind.clone(),
             estimated_capacity_bps: m.estimated_capacity_bps,
+            owd_ms: m.owd_ms,
         }
     }
 }

@@ -10,6 +10,7 @@
 pub mod bonding;
 pub mod dwrr;
 pub mod ewma;
+pub mod sbd;
 
 /// Describes the importance and characteristics of a packet for scheduling decisions.
 ///

@@ -277,6 +277,7 @@ mod tests {
                     iface: None,
                     link_kind: None,
                     estimated_capacity_bps: 0.0,
+                    owd_ms: 0.0,
                 }),
                 sent_packets: Mutex::new(Vec::new()),
             }

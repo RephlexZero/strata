@@ -22,6 +22,7 @@ pub enum PacketSendError {
 enum RuntimeMessage {
     Packet(Bytes, PacketProfile),
     ApplyConfig(Box<BondingConfig>),
+    UpdateSchedulerConfig(Box<SchedulerConfig>),
     AddLink(LinkConfig),
     RemoveLink(usize),
     Shutdown,
@@ -103,6 +104,13 @@ impl BondingRuntime {
             .map_err(|e| anyhow::anyhow!("Failed to remove link: {}", e))
     }
 
+    /// Live-update the scheduler configuration (e.g. max_capacity_bps).
+    pub fn update_scheduler_config(&self, config: SchedulerConfig) -> anyhow::Result<()> {
+        self.sender
+            .send(RuntimeMessage::UpdateSchedulerConfig(Box::new(config)))
+            .map_err(|e| anyhow::anyhow!("Failed to update scheduler config: {}", e))
+    }
+
     /// Returns a snapshot of all link metrics (thread-safe clone).
     pub fn get_metrics(&self) -> HashMap<usize, LinkMetrics> {
         self.metrics
@@ -170,6 +178,10 @@ fn runtime_worker(
                 RuntimeMessage::RemoveLink(id) => {
                     scheduler.remove_link(id);
                     current_links.remove(&id);
+                }
+                RuntimeMessage::UpdateSchedulerConfig(sched_cfg) => {
+                    ewma_alpha = sched_cfg.ewma_alpha;
+                    scheduler.update_config(*sched_cfg);
                 }
                 RuntimeMessage::ApplyConfig(config) => {
                     lifecycle_config = config.lifecycle.clone();

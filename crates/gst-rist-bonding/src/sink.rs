@@ -227,6 +227,14 @@ mod imp {
                         .blurb("Path to TOML config file (alternative to inline config property)")
                         .mutable_ready()
                         .build(),
+                    glib::ParamSpecUInt64::builder("max-bitrate")
+                        .nick("Max Bitrate")
+                        .blurb("Hard ceiling on per-link estimated capacity (bps). Set to encoder max-bitrate to derive RMAX (RFC 8698). 0 = disabled.")
+                        .minimum(0)
+                        .maximum(u64::MAX)
+                        .default_value(0)
+                        .mutable_playing()
+                        .build(),
                 ]
             })
         }
@@ -273,6 +281,17 @@ mod imp {
                         }
                     }
                 }
+                "max-bitrate" => {
+                    let bps: u64 = value.get().expect("type checked upstream");
+                    let mut sched = lock_or_recover(&self.scheduler_config);
+                    sched.max_capacity_bps = bps as f64;
+                    // Live-update the runtime if already started
+                    if let Some(rt) = lock_or_recover(&self.runtime).as_ref() {
+                        if let Err(e) = rt.update_scheduler_config(sched.clone()) {
+                            gst::warning!(gst::CAT_DEFAULT, "Failed to update max-bitrate: {}", e);
+                        }
+                    }
+                }
                 _ => {
                     gst::warning!(gst::CAT_DEFAULT, "Unknown property: {}", pspec.name());
                 }
@@ -283,6 +302,9 @@ mod imp {
             match pspec.name() {
                 "links" => lock_or_recover(&self.links_config).to_value(),
                 "config" | "config-file" => lock_or_recover(&self.config_toml).to_value(),
+                "max-bitrate" => {
+                    (lock_or_recover(&self.scheduler_config).max_capacity_bps as u64).to_value()
+                }
                 _ => {
                     gst::warning!(gst::CAT_DEFAULT, "Unknown property: {}", pspec.name());
                     "".to_value()

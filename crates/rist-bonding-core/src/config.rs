@@ -125,6 +125,44 @@ pub struct SchedulerConfigInput {
     pub max_capacity_bps: Option<f64>,
     /// Sustained loss rate threshold triggering independent MD (0.0-1.0)
     pub loss_md_threshold: Option<f64>,
+
+    // --- NADA / RFC 8698 knobs ---
+    /// Reference delay penalty for packet loss at PLRREF (ms) (RFC 8698 §4.2)
+    pub dloss_ref_ms: Option<f64>,
+    /// Reference packet loss ratio for unified signal (RFC 8698 §4.2)
+    pub plr_ref: Option<f64>,
+    /// Maximum rate increase multiplier in accelerated ramp-up (RFC 8698 §4.3)
+    pub gamma_max: Option<f64>,
+    /// Upper bound on self-inflicted queuing delay during ramp-up (ms) (RFC 8698 §4.3)
+    pub qbound_ms: Option<f64>,
+    /// Queuing delay threshold for determining underutilization (ms) (RFC 8698 §4.2)
+    pub qeps_ms: Option<f64>,
+    /// Observation window for loss/delay statistics (ms) (RFC 8698 §4.1)
+    pub nada_logwin_ms: Option<u64>,
+    /// PI-controller scaling parameter (RFC 8698 §4.3)
+    pub nada_kappa: Option<f64>,
+    /// PI-controller scaling parameter for proportional term (RFC 8698 §4.3)
+    pub nada_eta: Option<f64>,
+    /// PI-controller upper bound of RTT (ms) (RFC 8698 §4.3)
+    pub nada_tau_ms: Option<f64>,
+    /// Reference congestion level (ms) (RFC 8698 §4.3)
+    pub nada_xref_ms: Option<f64>,
+    /// Priority weight for the flow (RFC 8698 §4.1)
+    pub nada_prio: Option<f64>,
+
+    // --- SBD / RFC 8382 knobs ---
+    /// Enable shared bottleneck detection (RFC 8382)
+    pub sbd_enabled: Option<bool>,
+    /// Base measurement interval for SBD statistics (ms) (RFC 8382 §2)
+    pub sbd_interval_ms: Option<u64>,
+    /// Number of base intervals for SBD calculations (RFC 8382 §2)
+    pub sbd_n: Option<usize>,
+    /// Skewness threshold for bottleneck detection (RFC 8382 §2)
+    pub sbd_c_s: Option<f64>,
+    /// Hysteresis threshold for bottleneck detection (RFC 8382 §2)
+    pub sbd_c_h: Option<f64>,
+    /// Loss threshold for SBD supplementary signal (RFC 8382 §2)
+    pub sbd_p_l: Option<f64>,
 }
 
 /// Resolved link configuration with concrete values.
@@ -242,6 +280,44 @@ pub struct SchedulerConfig {
     pub max_capacity_bps: f64,
     /// Sustained loss rate threshold triggering independent MD.
     pub loss_md_threshold: f64,
+
+    // --- NADA / RFC 8698 ---
+    /// Reference delay penalty for loss at `plr_ref` (ms).
+    pub dloss_ref_ms: f64,
+    /// Reference packet loss ratio for unified congestion signal.
+    pub plr_ref: f64,
+    /// Maximum rate-increase multiplier in accelerated ramp-up mode.
+    pub gamma_max: f64,
+    /// Upper bound on self-inflicted queuing delay during ramp-up (ms).
+    pub qbound_ms: f64,
+    /// Queuing delay threshold below which path is underutilized (ms).
+    pub qeps_ms: f64,
+    /// Observation window for loss/delay statistics (ms).
+    pub nada_logwin_ms: u64,
+    /// PI-controller scaling parameter (overall speed).
+    pub nada_kappa: f64,
+    /// PI-controller proportional term weight.
+    pub nada_eta: f64,
+    /// PI-controller upper-bound of RTT (ms).
+    pub nada_tau_ms: f64,
+    /// Reference congestion level (ms) — equilibrium target.
+    pub nada_xref_ms: f64,
+    /// Priority weight of the flow.
+    pub nada_prio: f64,
+
+    // --- SBD / RFC 8382 ---
+    /// Enable shared bottleneck detection.
+    pub sbd_enabled: bool,
+    /// Base measurement interval for SBD statistics (ms).
+    pub sbd_interval_ms: u64,
+    /// Number of base intervals for SBD calculations.
+    pub sbd_n: usize,
+    /// Skewness threshold for bottleneck detection.
+    pub sbd_c_s: f64,
+    /// Hysteresis threshold for bottleneck detection.
+    pub sbd_c_h: f64,
+    /// Loss threshold for SBD supplementary signal.
+    pub sbd_p_l: f64,
 }
 
 impl Default for SchedulerConfig {
@@ -277,6 +353,25 @@ impl Default for SchedulerConfig {
             rtt_min_slow_window_s: 30.0,
             max_capacity_bps: 0.0,
             loss_md_threshold: 0.03,
+            // NADA defaults (RFC 8698)
+            dloss_ref_ms: 10.0,
+            plr_ref: 0.01,
+            gamma_max: 0.5,
+            qbound_ms: 50.0,
+            qeps_ms: 10.0,
+            nada_logwin_ms: 500,
+            nada_kappa: 0.5,
+            nada_eta: 2.0,
+            nada_tau_ms: 500.0,
+            nada_xref_ms: 10.0,
+            nada_prio: 1.0,
+            // SBD defaults (RFC 8382)
+            sbd_enabled: false,
+            sbd_interval_ms: 350,
+            sbd_n: 50,
+            sbd_c_s: 0.1,
+            sbd_c_h: 0.3,
+            sbd_p_l: 0.1,
         }
     }
 }
@@ -443,6 +538,52 @@ impl SchedulerConfigInput {
                 .loss_md_threshold
                 .unwrap_or(defaults.loss_md_threshold)
                 .clamp(0.0, 1.0),
+            // NADA knobs
+            dloss_ref_ms: self
+                .dloss_ref_ms
+                .unwrap_or(defaults.dloss_ref_ms)
+                .clamp(0.0, 1000.0),
+            plr_ref: self.plr_ref.unwrap_or(defaults.plr_ref).clamp(0.0001, 1.0),
+            gamma_max: self
+                .gamma_max
+                .unwrap_or(defaults.gamma_max)
+                .clamp(0.01, 2.0),
+            qbound_ms: self
+                .qbound_ms
+                .unwrap_or(defaults.qbound_ms)
+                .clamp(1.0, 500.0),
+            qeps_ms: self.qeps_ms.unwrap_or(defaults.qeps_ms).clamp(0.0, 200.0),
+            nada_logwin_ms: self
+                .nada_logwin_ms
+                .unwrap_or(defaults.nada_logwin_ms)
+                .max(50),
+            nada_kappa: self
+                .nada_kappa
+                .unwrap_or(defaults.nada_kappa)
+                .clamp(0.01, 5.0),
+            nada_eta: self.nada_eta.unwrap_or(defaults.nada_eta).clamp(0.1, 10.0),
+            nada_tau_ms: self
+                .nada_tau_ms
+                .unwrap_or(defaults.nada_tau_ms)
+                .clamp(50.0, 5000.0),
+            nada_xref_ms: self
+                .nada_xref_ms
+                .unwrap_or(defaults.nada_xref_ms)
+                .clamp(1.0, 500.0),
+            nada_prio: self
+                .nada_prio
+                .unwrap_or(defaults.nada_prio)
+                .clamp(0.1, 10.0),
+            // SBD knobs
+            sbd_enabled: self.sbd_enabled.unwrap_or(defaults.sbd_enabled),
+            sbd_interval_ms: self
+                .sbd_interval_ms
+                .unwrap_or(defaults.sbd_interval_ms)
+                .clamp(100, 2000),
+            sbd_n: self.sbd_n.unwrap_or(defaults.sbd_n).clamp(5, 200),
+            sbd_c_s: self.sbd_c_s.unwrap_or(defaults.sbd_c_s).clamp(-1.0, 1.0),
+            sbd_c_h: self.sbd_c_h.unwrap_or(defaults.sbd_c_h).clamp(-1.0, 1.0),
+            sbd_p_l: self.sbd_p_l.unwrap_or(defaults.sbd_p_l).clamp(0.0, 1.0),
         }
     }
 }

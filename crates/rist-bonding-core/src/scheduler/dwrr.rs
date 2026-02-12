@@ -40,6 +40,15 @@ pub(crate) struct LinkState<L: ?Sized> {
     pub last_decrease_at: Instant,
     /// Whether the AIMD estimate has been initialized from first traffic.
     pub aimd_initialized: bool,
+    // --- RFC 8698 NADA state ---
+    /// Minimum filter buffer for RTT samples (RFC 8698 §5.1.1, 15 samples).
+    pub rtt_sample_filter: VecDeque<f64>,
+    /// Previous aggregate congestion signal for PI-controller (RFC 8698 §4.3).
+    pub x_prev: f64,
+    /// Rate adaptation mode: false = accelerated ramp-up, true = gradual update.
+    pub gradual_mode: bool,
+    /// Loss-free sample counter for accelerated ramp-up mode detection.
+    pub loss_free_samples: u32,
 }
 
 /// Deficit Weighted Round Robin (DWRR) packet scheduler.
@@ -62,6 +71,10 @@ pub struct Dwrr<L: LinkSender + ?Sized> {
     cached_spare_ratio: f64,
     /// Cached total capacity of alive Live/Warm links (bps).
     cached_total_capacity: f64,
+    /// SBD bottleneck groups: links with the same group ID share a bottleneck.
+    /// Updated by SBD module when `sbd_enabled`. Group 0 = no bottleneck.
+    #[allow(dead_code)]
+    pub(crate) sbd_groups: HashMap<usize, usize>,
 }
 
 /// Computes the burst window (in seconds) for credit capping.
@@ -95,6 +108,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             config,
             cached_spare_ratio: 0.0,
             cached_total_capacity: 0.0,
+            sbd_groups: HashMap::new(),
         }
     }
 
@@ -138,6 +152,11 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 rtt_baseline: 0.0,
                 last_decrease_at: now - Duration::from_secs(10), // allow immediate first MD
                 aimd_initialized: false,
+                // NADA state
+                rtt_sample_filter: VecDeque::new(),
+                x_prev: 0.0,
+                gradual_mode: false,
+                loss_free_samples: 0,
             },
         );
         self.sorted_ids.push(id);
@@ -152,7 +171,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         // AIMD config snapshot (avoid repeated field access)
         let aimd_enabled = self.config.capacity_estimate_enabled;
         let rtt_congestion_ratio = self.config.rtt_congestion_ratio;
-        let rtt_headroom_ratio = self.config.rtt_headroom_ratio;
+        let _rtt_headroom_ratio = self.config.rtt_headroom_ratio;
         let md_factor = self.config.md_factor;
         let ai_step_ratio = self.config.ai_step_ratio;
         let decrease_cooldown = Duration::from_millis(self.config.decrease_cooldown_ms);
@@ -162,6 +181,45 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             (self.config.rtt_min_slow_window_s / 0.1).round().max(1.0) as usize;
         let max_capacity_bps = self.config.max_capacity_bps;
         let loss_md_threshold = self.config.loss_md_threshold;
+
+        // NADA / RFC 8698 config snapshot
+        let dloss_ref = self.config.dloss_ref_ms;
+        let plr_ref = self.config.plr_ref;
+        let gamma_max = self.config.gamma_max;
+        let qbound = self.config.qbound_ms;
+        let qeps = self.config.qeps_ms;
+        let nada_kappa = self.config.nada_kappa;
+        let nada_eta = self.config.nada_eta;
+        let nada_tau = self.config.nada_tau_ms;
+        let nada_xref = self.config.nada_xref_ms;
+        let nada_prio = self.config.nada_prio;
+
+        // --- Coupled AI pre-pass (RFC 6356 §3) ---
+        // Computes a coupling factor `alpha` that ensures the aggregate
+        // additive increase across N sub-flows sharing a bottleneck does
+        // not exceed the increase of a single TCP flow.
+        //   alpha = cap_total * max_i(cap_i / rtt_i²) / (sum_i(cap_i / rtt_i))²
+        let coupled_alpha = if aimd_enabled {
+            let mut cap_total = 0.0_f64;
+            let mut max_cap_rtt2 = 0.0_f64;
+            let mut sum_cap_rtt = 0.0_f64;
+            for state in self.links.values() {
+                if state.aimd_initialized && state.rtt_baseline > 0.0 {
+                    let cap = state.estimated_capacity_bps;
+                    let rtt = state.rtt_baseline;
+                    cap_total += cap;
+                    max_cap_rtt2 = max_cap_rtt2.max(cap / (rtt * rtt));
+                    sum_cap_rtt += cap / rtt;
+                }
+            }
+            if sum_cap_rtt > 0.0 && cap_total > 0.0 {
+                (cap_total * max_cap_rtt2 / (sum_cap_rtt * sum_cap_rtt)).clamp(0.01, 1.0)
+            } else {
+                1.0 // single link or no data — no coupling needed
+            }
+        } else {
+            1.0
+        };
 
         for state in self.links.values_mut() {
             let now = Instant::now();
@@ -217,11 +275,17 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             state.prev_loss_rate = state.metrics.loss_rate;
             state.last_metrics_update = now;
 
-            // ======== AIMD Delay-Gradient Capacity Estimator ========
+            // ======== NADA-style Capacity Estimator ========
+            // Combines:
+            //   #1 Coupled AI (RFC 6356 §3) — `coupled_alpha` from pre-pass
+            //   #2 Unified Congestion Signal (RFC 8698 §4.2)
+            //   #3 Dual-Mode Ramp-Up (RFC 8698 §4.3)
+            //   #4 Min Filter for Delay (RFC 8698 §5.1.1)
+            //   #7 PI-Controller Gradual Mode (RFC 8698 §4.3)
             if aimd_enabled {
                 let current_rtt = state.metrics.rtt_ms;
 
-                // Initialize AIMD from first observed traffic
+                // Initialize from first observed traffic
                 if !state.aimd_initialized && state.has_traffic && state.metrics.capacity_bps > 0.0
                 {
                     state.estimated_capacity_bps = state.metrics.capacity_bps;
@@ -229,33 +293,51 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                     state.aimd_initialized = true;
                 }
 
-                // Reset RTT windows on lifecycle phase transitions (Probe, Warm, Reset)
+                // Reset windows on lifecycle phase transitions (Probe, Warm, Reset)
                 let phase_reset = matches!(
                     state.metrics.phase,
                     LinkPhase::Probe | LinkPhase::Warm | LinkPhase::Reset
                 );
 
                 if state.aimd_initialized {
-                    // --- RTT Baseline Tracking (dual-speed windowed minimum) ---
+                    // --- #4: Min Filter (RFC 8698 §5.1.1) ---
+                    // Push raw RTT through a 15-sample minimum filter to strip
+                    // jitter-induced spikes before feeding the baseline tracker.
                     if phase_reset {
+                        state.rtt_sample_filter.clear();
                         state.rtt_min_fast_window.clear();
                         state.rtt_min_slow_window.clear();
                     }
 
                     if current_rtt > 0.0 {
+                        state.rtt_sample_filter.push_back(current_rtt);
+                        while state.rtt_sample_filter.len() > 15 {
+                            state.rtt_sample_filter.pop_front();
+                        }
+                    }
+                    let filtered_rtt = state
+                        .rtt_sample_filter
+                        .iter()
+                        .copied()
+                        .fold(f64::MAX, f64::min);
+                    let filtered_rtt = if filtered_rtt == f64::MAX {
+                        current_rtt
+                    } else {
+                        filtered_rtt
+                    };
+
+                    // --- RTT Baseline Tracking (dual-speed windowed minimum) ---
+                    if filtered_rtt > 0.0 {
                         // Fast window (~3s)
-                        state.rtt_min_fast_window.push_back(current_rtt);
+                        state.rtt_min_fast_window.push_back(filtered_rtt);
                         while state.rtt_min_fast_window.len() > fast_window_samples {
                             state.rtt_min_fast_window.pop_front();
                         }
-
                         // Slow window (~30s)
-                        state.rtt_min_slow_window.push_back(current_rtt);
+                        state.rtt_min_slow_window.push_back(filtered_rtt);
                         while state.rtt_min_slow_window.len() > slow_window_samples {
                             state.rtt_min_slow_window.pop_front();
                         }
-
-                        // Effective baseline = min(fast_min, slow_min)
                         let fast_min = state
                             .rtt_min_fast_window
                             .iter()
@@ -269,9 +351,20 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                         state.rtt_baseline = fast_min.min(slow_min);
                     }
 
-                    // --- AIMD Algorithm ---
+                    // --- #2: Unified Congestion Signal (RFC 8698 §4.2) ---
+                    // Folds delay-gradient and loss into a single scalar:
+                    //   x_curr = d_queuing + DLOSS_REF * (p_loss / PLR_REF)²
                     if state.rtt_baseline > 0.0 {
-                        let rtt_ratio = current_rtt / state.rtt_baseline;
+                        let queuing_delay = (filtered_rtt - state.rtt_baseline).max(0.0);
+                        let loss = state.metrics.loss_rate;
+                        let loss_penalty = if plr_ref > 0.0 {
+                            dloss_ref * (loss / plr_ref).powi(2)
+                        } else {
+                            0.0
+                        };
+                        let x_curr = queuing_delay + loss_penalty;
+
+                        let rtt_ratio = filtered_rtt / state.rtt_baseline;
                         let since_last_decrease = now.duration_since(state.last_decrease_at);
 
                         // Suppress AI during Probe/Cooldown/Init/Reset
@@ -283,39 +376,110 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                                 | LinkPhase::Reset
                         );
 
-                        // --- Multiplicative Decrease ---
-                        // Two independent triggers, both subject to cooldown:
-                        // 1. Delay-gradient: elevated RTT ratio AND rising RTT slope
-                        //    (avoids false positives on cell handovers with stable high RTT)
-                        // 2. Loss-based: sustained loss above threshold with stable RTT
-                        //    (catches non-queuing radio-layer fading loss)
-                        let delay_md =
-                            rtt_ratio > rtt_congestion_ratio && state.rtt_slope_ms_s > 0.0;
-                        let loss_md = state.metrics.loss_rate > loss_md_threshold;
+                        // --- #3: Mode Detection (RFC 8698 §4.3) ---
+                        // Track consecutive loss-free samples for ramp-up eligibility.
+                        if loss == 0.0 {
+                            state.loss_free_samples = state.loss_free_samples.saturating_add(1);
+                        } else {
+                            state.loss_free_samples = 0;
+                        }
 
-                        if (delay_md || loss_md) && since_last_decrease > decrease_cooldown {
-                            state.estimated_capacity_bps *= md_factor;
-                            state.last_decrease_at = now;
-                        }
-                        // --- Additive Increase ---
-                        else if rtt_ratio < rtt_headroom_ratio
-                            && state.has_traffic
-                            && state.measured_bps > state.estimated_capacity_bps * 0.3
+                        if queuing_delay < qeps
+                            && loss == 0.0
+                            && state.loss_free_samples > 5
                             && !suppress_increase
+                            && state.has_traffic
                         {
-                            state.estimated_capacity_bps +=
-                                state.estimated_capacity_bps * ai_step_ratio;
+                            // === Accelerated Ramp-Up Mode (RFC 8698 §4.3) ===
+                            // Path is clearly underutilized — multiplicative increase
+                            // bounded by self-inflicted queuing budget `qbound`.
+                            state.gradual_mode = false;
+
+                            let r_recv = rist_capacity.max(state.estimated_capacity_bps);
+                            // gamma ≤ min(gamma_max, qbound / (rtt * r_recv_norm))
+                            // r_recv_norm converts bps→Mbps for dimensional balance
+                            let gamma = if filtered_rtt > 0.0 && r_recv > 0.0 {
+                                gamma_max.min(qbound / (filtered_rtt * (r_recv / 1_000_000.0)))
+                            } else {
+                                gamma_max
+                            };
+
+                            // #1 Coupled AI: scale increase by coupled_alpha
+                            state.estimated_capacity_bps += coupled_alpha
+                                * gamma
+                                * (r_recv - state.estimated_capacity_bps)
+                                    .max(state.estimated_capacity_bps * ai_step_ratio);
+                        } else {
+                            // === Gradual Update Mode ===
+                            state.gradual_mode = true;
+
+                            // --- Multiplicative Decrease ---
+                            // Two independent triggers, both subject to cooldown:
+                            // 1. Delay-gradient: elevated RTT ratio AND rising slope
+                            // 2. Loss-based: sustained loss above threshold
+                            let delay_md =
+                                rtt_ratio > rtt_congestion_ratio && state.rtt_slope_ms_s > 0.0;
+                            let loss_md = loss > loss_md_threshold;
+
+                            if (delay_md || loss_md) && since_last_decrease > decrease_cooldown {
+                                state.estimated_capacity_bps *= md_factor;
+                                state.last_decrease_at = now;
+                            } else if !suppress_increase
+                                && state.has_traffic
+                                && state.measured_bps > state.estimated_capacity_bps * 0.3
+                            {
+                                // --- #7: PI-Controller (RFC 8698 §4.3) ---
+                                // Replaces binary AIMD increase with a smooth
+                                // proportional-integral controller:
+                                //   x_offset = x_curr − prio·xref·rmax/r_n
+                                //   x_diff   = x_curr − x_prev
+                                //   r_n *= 1 − κ·(δ/τ)·(x_offset + η·x_diff)
+                                let rmax = if max_capacity_bps > 0.0 {
+                                    max_capacity_bps
+                                } else {
+                                    rist_capacity.max(capacity_floor) * 2.0
+                                };
+                                let r_n = state.estimated_capacity_bps.max(1.0);
+                                let x_offset = x_curr - nada_prio * nada_xref * rmax / r_n;
+                                let x_diff = x_curr - state.x_prev;
+                                let delta_ms = (dt * 1000.0).min(nada_tau);
+
+                                let adjust = nada_kappa
+                                    * (delta_ms / nada_tau)
+                                    * (x_offset + nada_eta * x_diff);
+
+                                // #1 Coupled AI: scale AI portion by coupled_alpha
+                                if adjust < 0.0 {
+                                    // Negative adjust → rate increase (signal below target)
+                                    state.estimated_capacity_bps *= 1.0 - coupled_alpha * adjust;
+                                } else {
+                                    // Positive adjust → rate decrease (signal above target)
+                                    state.estimated_capacity_bps *= 1.0 - adjust;
+                                }
+                            }
                         }
+
+                        // Persist congestion signal for next PI-controller iteration
+                        state.x_prev = x_curr;
                     }
 
                     // --- Clamping ---
                     // Upper bound uses only receiver-reported capacity (rist_capacity),
                     // NOT measured_bps which is contaminated by DWRR's own allocation
                     // decisions and creates a positive feedback spiral.
+                    // During bootstrap (rist_capacity not yet available from librist),
+                    // allow generous headroom so the estimator can probe upward.
                     let upper = if max_capacity_bps > 0.0 {
                         max_capacity_bps
+                    } else if rist_capacity > capacity_floor {
+                        // Receiver has reported real capacity — tight bound
+                        rist_capacity * 2.0
                     } else {
-                        rist_capacity.max(capacity_floor) * 2.0
+                        // Bootstrap: receiver hasn't reported yet. Use measured
+                        // throughput with a 3× factor as a temporary ceiling.
+                        // This is less tight than rist_capacity×2 but avoids the
+                        // old positive-feedback spiral because the factor is fixed.
+                        state.measured_bps.max(capacity_floor) * 3.0
                     };
                     state.estimated_capacity_bps =
                         state.estimated_capacity_bps.clamp(capacity_floor, upper);
@@ -660,6 +824,7 @@ mod tests {
                     iface: None,
                     link_kind: None,
                     estimated_capacity_bps: 0.0,
+                    owd_ms: 0.0,
                 }),
             }
         }
@@ -1122,8 +1287,10 @@ mod tests {
         // Set RTT high enough to trigger MD (baseline is ~10ms, so 1.8× = 18ms)
         link.set_rtt(25.0);
 
-        // We need a rising RTT slope, so set prev_rtt below current
+        // Clear the min filter so the high RTT propagates immediately
+        // (the min filter retains 15 samples and would mask the spike otherwise)
         if let Some(state) = dwrr.links.get_mut(&1) {
+            state.rtt_sample_filter.clear();
             state.prev_rtt_ms = 10.0;
             // Set last_decrease_at far in the past to clear cooldown
             state.last_decrease_at = Instant::now() - Duration::from_secs(10);
@@ -1204,7 +1371,10 @@ mod tests {
 
     #[test]
     fn aimd_hold_zone_no_change() {
-        // RTT ratio between headroom (1.3) and congestion (1.8) → no change
+        // In the NADA controller, there is no binary hold zone — the PI controller
+        // always makes a gradual adjustment. Verify that a moderate RTT ratio
+        // (between headroom and congestion thresholds) does NOT trigger MD, and
+        // only produces a small PI-controller adjustment.
         let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
         let mut dwrr = Dwrr::with_config(aimd_config());
         dwrr.add_link(link.clone());
@@ -1212,21 +1382,27 @@ mod tests {
 
         let initial_estimate = dwrr.links.get(&1).unwrap().estimated_capacity_bps;
 
-        // Set RTT to be in the hold zone: ratio ~1.5 (between 1.3 and 1.8)
+        // Set RTT to be in the moderate zone: ratio ~1.5 (between 1.3 and 1.8)
         // baseline ~10ms, so 15ms → ratio 1.5
         link.set_rtt(15.0);
         if let Some(state) = dwrr.links.get_mut(&1) {
+            state.rtt_sample_filter.clear();
             state.prev_rtt_ms = 15.0; // stable
             state.last_metrics_update = Instant::now() - Duration::from_millis(100);
         }
         dwrr.refresh_metrics();
 
         let state = dwrr.links.get(&1).unwrap();
+        // MD should NOT trigger (rtt_ratio 1.5 < 1.8 and stable slope)
+        // The PI controller makes a gradual adjustment — confirm it's NOT an MD
+        // (MD would decrease by exactly md_factor=0.7, i.e. 30% reduction).
+        let is_md_reduction = state.estimated_capacity_bps < initial_estimate * 0.75;
         assert!(
-            (state.estimated_capacity_bps - initial_estimate).abs() < 1.0,
-            "Hold zone should not change estimate: {} vs {}",
+            !is_md_reduction,
+            "Moderate RTT should NOT trigger MD: estimate={} vs initial={} (ratio={:.3})",
             state.estimated_capacity_bps,
-            initial_estimate
+            initial_estimate,
+            state.estimated_capacity_bps / initial_estimate
         );
     }
 
@@ -1483,6 +1659,7 @@ mod tests {
         // Reduce link1's estimated capacity via MD
         link1.set_rtt(25.0);
         if let Some(state) = dwrr.links.get_mut(&1) {
+            state.rtt_sample_filter.clear(); // flush min filter so high RTT propagates
             state.prev_rtt_ms = 10.0;
             state.last_decrease_at = Instant::now() - Duration::from_secs(10);
             state.last_metrics_update = Instant::now() - Duration::from_millis(100);

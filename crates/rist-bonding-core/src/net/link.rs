@@ -272,6 +272,7 @@ impl LinkSender for Link {
             iface: iface_name,
             link_kind,
             estimated_capacity_bps: 0.0,
+            owd_ms: 0.0,
         }
     }
 }
