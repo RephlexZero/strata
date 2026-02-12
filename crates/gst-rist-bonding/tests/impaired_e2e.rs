@@ -1202,7 +1202,15 @@ fn test_aimd_convergence_two_links() {
         .output();
     let _ = std::process::Command::new("sudo")
         .args([
-            "ip", "link", "add", "veth_aimd_h", "type", "veth", "peer", "name", "veth_aimd_c",
+            "ip",
+            "link",
+            "add",
+            "veth_aimd_h",
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "veth_aimd_c",
         ])
         .output();
     let _ = std::process::Command::new("sudo")
@@ -1268,8 +1276,7 @@ fn test_aimd_convergence_two_links() {
     );
 
     // 6. Stats collector
-    let stats_socket =
-        UdpSocket::bind("192.168.104.1:9300").expect("Failed to bind stats socket");
+    let stats_socket = UdpSocket::bind("192.168.104.1:9300").expect("Failed to bind stats socket");
     stats_socket
         .set_read_timeout(Some(Duration::from_millis(100)))
         .unwrap();
@@ -1415,14 +1422,8 @@ fn test_aimd_convergence_two_links() {
     );
 
     // === Assertion B: Both links carry traffic ===
-    assert!(
-        obs_slow_sum > 0.0,
-        "Slow link carried no observed traffic"
-    );
-    assert!(
-        obs_fast_sum > 0.0,
-        "Fast link carried no observed traffic"
-    );
+    assert!(obs_slow_sum > 0.0, "Slow link carried no observed traffic");
+    assert!(obs_fast_sum > 0.0, "Fast link carried no observed traffic");
 
     // === Assertion C: Fast link has higher capacity estimate than slow link ===
     let avg_cap_slow = cap_slow_sum / samples as f64;

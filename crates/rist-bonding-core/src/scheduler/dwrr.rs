@@ -166,6 +166,10 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         for state in self.links.values_mut() {
             let now = Instant::now();
             state.metrics = state.link.get_metrics();
+            // Capture the receiver-reported capacity before bootstrap overwrites it.
+            // This value is an external signal free from sender-side feedback loops
+            // (see RFC 6356 §5, RFC 8698 §4.3).
+            let rist_capacity = state.metrics.capacity_bps;
             let dt_sent = now.duration_since(state.last_sent_at).as_secs_f64();
             if dt_sent > 0.0 {
                 let delta_bytes = state.sent_bytes.saturating_sub(state.last_sent_bytes);
@@ -305,10 +309,13 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                     }
 
                     // --- Clamping ---
+                    // Upper bound uses only receiver-reported capacity (rist_capacity),
+                    // NOT measured_bps which is contaminated by DWRR's own allocation
+                    // decisions and creates a positive feedback spiral.
                     let upper = if max_capacity_bps > 0.0 {
                         max_capacity_bps
                     } else {
-                        state.measured_bps.max(state.metrics.capacity_bps) * 2.0
+                        rist_capacity.max(capacity_floor) * 2.0
                     };
                     state.estimated_capacity_bps =
                         state.estimated_capacity_bps.clamp(capacity_floor, upper);
