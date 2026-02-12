@@ -108,9 +108,7 @@ impl SbdEngine {
 
     /// Register a link for SBD tracking.
     pub fn add_link(&mut self, link_id: usize) {
-        self.link_states
-            .entry(link_id)
-            .or_default();
+        self.link_states.entry(link_id).or_default();
     }
 
     /// Remove a link from SBD tracking.
