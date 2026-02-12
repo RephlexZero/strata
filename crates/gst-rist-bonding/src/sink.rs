@@ -16,21 +16,39 @@ fn parse_config(config: &str) -> Result<BondingConfig, String> {
     BondingConfig::from_toml_str(config)
 }
 
-fn compute_congestion_recommendation(
-    total_capacity_bps: f64,
-    observed_bps: f64,
-    headroom_ratio: f64,
-    trigger_ratio: f64,
-) -> Option<u64> {
-    if total_capacity_bps <= 0.0 {
+/// NADA-derived rate signals per RFC 8698 §5.2.2.
+///
+/// Given the aggregate reference rate (`r_ref` — sum of per-link NADA
+/// `estimated_capacity_bps`), derive:
+///
+/// - **`r_vin`** — target encoder bitrate:  `max(RMIN, r_ref × (1 − BETA_V))`
+/// - **`headroom`** — bandwidth ceiling:    `min(RMAX, r_ref × (1 + BETA_S))`
+///
+/// Returns `None` when `r_ref` is zero (no alive links).
+///
+/// Constants:
+///   RMIN    = 150 000 bps   (RFC 8698 default minimum)
+///   BETA_V  = 0.05          (video smoothing margin — conservative)
+///   BETA_S  = 0.05          (sending-rate margin)
+fn compute_nada_rate_signals(r_ref: f64, max_capacity_bps: f64) -> Option<(u64, u64)> {
+    if r_ref <= 0.0 {
         return None;
     }
-    let recommended = (total_capacity_bps * headroom_ratio).round() as u64;
-    if observed_bps > total_capacity_bps * trigger_ratio {
-        Some(recommended)
+
+    const RMIN: f64 = 150_000.0;
+    const BETA_V: f64 = 0.05;
+    const BETA_S: f64 = 0.05;
+
+    let r_vin = (r_ref * (1.0 - BETA_V)).max(RMIN);
+
+    let rmax = if max_capacity_bps > 0.0 {
+        max_capacity_bps
     } else {
-        None
-    }
+        f64::MAX
+    };
+    let headroom = (r_ref * (1.0 + BETA_S)).min(rmax);
+
+    Some((r_vin.round() as u64, headroom.round() as u64))
 }
 
 mod imp {
@@ -435,8 +453,7 @@ mod imp {
             let element_weak = self.obj().downgrade();
             let running = self.stats_running.clone();
             running.store(true, Ordering::Relaxed);
-            let congestion_headroom = sched_cfg.congestion_headroom_ratio;
-            let congestion_trigger = sched_cfg.congestion_trigger_ratio;
+            let max_capacity_bps = sched_cfg.max_capacity_bps;
 
             let handle = std::thread::Builder::new()
                 .name("rist-bond-stats".into())
@@ -484,6 +501,11 @@ mod imp {
                                     0.0
                                 };
 
+                                // aggregate_nada_ref_bps = total_capacity
+                                // (already sum of per-link estimated_capacity_bps
+                                //  for alive links, i.e. the NADA r_ref).
+                                let aggregate_nada_ref_bps = total_capacity;
+
                                 let snapshot = StatsSnapshot {
                                     schema_version: 3,
                                     stats_seq,
@@ -492,6 +514,7 @@ mod imp {
                                     wall_time_ms,
                                     timestamp,
                                     total_capacity,
+                                    aggregate_nada_ref_bps,
                                     alive_links,
                                     links: links_map,
                                 };
@@ -508,31 +531,32 @@ mod imp {
                                 let _ =
                                     element.post_message(gst::message::Element::new(msg_struct));
 
-                                if let Some(recommended) = compute_congestion_recommendation(
-                                    total_capacity,
-                                    total_observed_bps,
-                                    congestion_headroom,
-                                    congestion_trigger,
+                                // RFC 8698 §5.2.2: derive encoder target rate
+                                // (r_vin) and bandwidth ceiling (headroom) from
+                                // the aggregate NADA reference rate.  Always post
+                                // both messages — continuous signaling replaces
+                                // the previous threshold-gated approach.
+                                if let Some((r_vin, headroom)) = compute_nada_rate_signals(
+                                    aggregate_nada_ref_bps,
+                                    max_capacity_bps,
                                 ) {
-                                    let msg = gst::Structure::builder("congestion-control")
-                                        .field("recommended-bitrate", recommended)
+                                    let cc_msg = gst::Structure::builder("congestion-control")
+                                        .field("recommended-bitrate", r_vin)
+                                        .field("aggregate-nada-ref-bps", aggregate_nada_ref_bps)
                                         .field("total_capacity", total_capacity)
                                         .field("observed_bps", total_observed_bps)
                                         .build();
-                                    let _ = element.post_message(gst::message::Element::new(msg));
-                                } else if total_capacity > 0.0
-                                    && total_observed_bps < total_capacity * congestion_headroom
-                                {
-                                    // Utilization is well under capacity — signal
-                                    // the application that it's safe to probe higher.
-                                    let headroom_bps =
-                                        (total_capacity * congestion_headroom).round() as u64;
-                                    let msg = gst::Structure::builder("bandwidth-available")
-                                        .field("max-bitrate", headroom_bps)
+                                    let _ =
+                                        element.post_message(gst::message::Element::new(cc_msg));
+
+                                    let bw_msg = gst::Structure::builder("bandwidth-available")
+                                        .field("max-bitrate", headroom)
+                                        .field("aggregate-nada-ref-bps", aggregate_nada_ref_bps)
                                         .field("total_capacity", total_capacity)
                                         .field("observed_bps", total_observed_bps)
                                         .build();
-                                    let _ = element.post_message(gst::message::Element::new(msg));
+                                    let _ =
+                                        element.post_message(gst::message::Element::new(bw_msg));
                                 }
                             }
                             stats_seq = stats_seq.wrapping_add(1);
@@ -601,7 +625,7 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_congestion_recommendation, parse_config};
+    use super::{compute_nada_rate_signals, parse_config};
 
     #[test]
     fn parse_config_links_basic() {
@@ -668,21 +692,34 @@ mod tests {
     }
 
     #[test]
-    fn congestion_recommendation_respects_headroom() {
-        let recommended = compute_congestion_recommendation(10_000_000.0, 9_200_000.0, 0.85, 0.90);
-        assert_eq!(recommended, Some(8_500_000));
+    fn nada_rate_signals_derive_r_vin_and_headroom() {
+        // 10 Mbps aggregate NADA r_ref, no RMAX ceiling
+        let (r_vin, headroom) = compute_nada_rate_signals(10_000_000.0, 0.0).unwrap();
+        // r_vin = 10M * 0.95 = 9.5M
+        assert_eq!(r_vin, 9_500_000);
+        // headroom = 10M * 1.05 = 10.5M
+        assert_eq!(headroom, 10_500_000);
     }
 
     #[test]
-    fn congestion_recommendation_skips_below_trigger() {
-        let recommended = compute_congestion_recommendation(10_000_000.0, 8_000_000.0, 0.85, 0.90);
-        assert!(recommended.is_none());
+    fn nada_rate_signals_clamp_to_rmin() {
+        // Very low r_ref — r_vin should clamp to RMIN (150 kbps)
+        let (r_vin, _headroom) = compute_nada_rate_signals(100_000.0, 0.0).unwrap();
+        assert_eq!(r_vin, 150_000); // RMIN floor
     }
 
     #[test]
-    fn congestion_recommendation_skips_zero_capacity() {
-        let recommended = compute_congestion_recommendation(0.0, 9_000_000.0, 0.85, 0.90);
-        assert!(recommended.is_none());
+    fn nada_rate_signals_respect_rmax() {
+        // 50 Mbps r_ref with 40 Mbps RMAX ceiling
+        let (r_vin, headroom) = compute_nada_rate_signals(50_000_000.0, 40_000_000.0).unwrap();
+        assert_eq!(r_vin, 47_500_000); // 50M * 0.95
+        assert_eq!(headroom, 40_000_000); // clamped to RMAX
+    }
+
+    #[test]
+    fn nada_rate_signals_return_none_for_zero() {
+        assert!(compute_nada_rate_signals(0.0, 0.0).is_none());
+        assert!(compute_nada_rate_signals(-1.0, 0.0).is_none());
     }
 }
 

@@ -28,3 +28,4 @@ path = "src/bin/integration_node.rs"
 [dev-dependencies]
 plotters = "0.3.7"
 rist-network-sim = { path = "../rist-network-sim" }
+serde_json = { workspace = true }

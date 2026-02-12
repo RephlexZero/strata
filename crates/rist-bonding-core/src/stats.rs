@@ -54,6 +54,10 @@ pub struct StatsSnapshot {
     pub wall_time_ms: u64,
     pub timestamp: f64,
     pub total_capacity: f64,
+    /// Aggregate NADA reference rate: sum of per-link `estimated_capacity_bps`
+    /// for alive links.  This is the `r_ref` used by RFC 8698 §5.2.2 sender-
+    /// side rate derivation to compute encoder target bitrate (`r_vin`).
+    pub aggregate_nada_ref_bps: f64,
     pub alive_links: u64,
     pub links: HashMap<String, LinkStatsSnapshot>,
 }
