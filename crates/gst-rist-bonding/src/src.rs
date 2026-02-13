@@ -4,6 +4,7 @@ use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
 use rist_bonding_core::receiver::bonding::BondingReceiver;
+use rist_bonding_core::receiver::aggregator::ReassemblyConfig;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,6 +16,9 @@ mod imp {
         links: String,
         latency: u32,
         config_toml: String,
+        jitter_latency_multiplier: f64,
+        max_latency_ms: u64,
+        stats_interval_ms: u64,
     }
 
     impl Default for Settings {
@@ -23,6 +27,9 @@ mod imp {
                 links: String::new(),
                 latency: 50, // Default 50ms — matches ReceiverConfig::default().start_latency
                 config_toml: String::new(),
+                jitter_latency_multiplier: 4.0,
+                max_latency_ms: 500,
+                stats_interval_ms: 1000,
             }
         }
     }
@@ -49,6 +56,9 @@ mod imp {
                     settings.config_toml = toml_str.to_string();
                     // Apply receiver config: override latency and links if specified
                     settings.latency = cfg.receiver.start_latency.as_millis() as u32;
+                    settings.jitter_latency_multiplier = cfg.scheduler.jitter_latency_multiplier;
+                    settings.max_latency_ms = cfg.scheduler.max_latency_ms;
+                    settings.stats_interval_ms = cfg.scheduler.stats_interval_ms;
                     // If links are specified in config, override the links property
                     if !cfg.links.is_empty() {
                         settings.links = cfg
@@ -222,7 +232,13 @@ mod imp {
             }
 
             let latency_duration = Duration::from_millis(settings.latency as u64);
-            let receiver = BondingReceiver::new(latency_duration);
+            let reassembly_config = ReassemblyConfig {
+                start_latency: latency_duration,
+                jitter_latency_multiplier: settings.jitter_latency_multiplier,
+                max_latency_ms: settings.max_latency_ms,
+                ..ReassemblyConfig::default()
+            };
+            let receiver = BondingReceiver::new_with_config(reassembly_config);
 
             for link in settings.links.split(',') {
                 let link = link.trim();
@@ -243,6 +259,7 @@ mod imp {
             self.stats_running.store(true, Ordering::Relaxed);
             let running = self.stats_running.clone();
             let element_weak = self.obj().downgrade();
+            let stats_interval = Duration::from_millis(settings.stats_interval_ms);
 
             let handle = std::thread::Builder::new()
                 .name("rist-rcv-stats".into())
@@ -260,19 +277,21 @@ mod imp {
                                         .duration_since(UNIX_EPOCH)
                                         .map(|d| d.as_millis() as u64)
                                         .unwrap_or(0);
+                                    let alive_links = receiver.link_count();
                                     let msg = gst::Structure::builder("rist-bonding-stats")
-                                        .field("schema_version", 1i32)
+                                        .field("schema_version", 3i32)
                                         .field("stats_seq", stats_seq)
                                         .field("heartbeat", true)
                                         .field("mono_time_ns", mono_time_ns)
                                         .field("wall_time_ms", wall_time_ms)
-                                        .field("total_capacity", 0.0f64)
-                                        .field("alive_links", receiver.link_count())
+                                        .field("total_capacity", 0.0f64) // receiver has no capacity metric
+                                        .field("alive_links", alive_links)
                                         .field("queue_depth", stats.queue_depth as u64)
                                         .field("next_seq", stats.next_seq)
                                         .field("lost_packets", stats.lost_packets)
                                         .field("late_packets", stats.late_packets)
-                                        .field("current_latency_ms", stats.current_latency_ms) // Added
+                                        .field("duplicate_packets", stats.duplicate_packets)
+                                        .field("current_latency_ms", stats.current_latency_ms)
                                         .build();
                                     let _ = element.post_message(gst::message::Element::new(msg));
                                     stats_seq = stats_seq.wrapping_add(1);
@@ -282,7 +301,7 @@ mod imp {
                             break;
                         }
 
-                        std::thread::sleep(Duration::from_secs(1));
+                        std::thread::sleep(stats_interval);
                     }
                 })
                 .expect("failed to spawn receiver stats thread");

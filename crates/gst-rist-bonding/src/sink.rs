@@ -75,7 +75,7 @@ mod imp {
         pub(crate) config_toml: Mutex<String>,
         pub(crate) pad_map: Mutex<HashMap<String, usize>>,
         pub(crate) pending_links: Mutex<HashMap<usize, LinkConfig>>,
-        pub(crate) scheduler_config: Mutex<SchedulerConfig>,
+        pub(crate) scheduler_config: Arc<Mutex<SchedulerConfig>>,
     }
 
     impl Default for RsRistBondSink {
@@ -88,7 +88,7 @@ mod imp {
                 config_toml: Mutex::new(String::new()),
                 pad_map: Mutex::new(HashMap::new()),
                 pending_links: Mutex::new(HashMap::new()),
-                scheduler_config: Mutex::new(SchedulerConfig::default()),
+                scheduler_config: Arc::new(Mutex::new(SchedulerConfig::default())),
             }
         }
     }
@@ -453,17 +453,21 @@ mod imp {
             let element_weak = self.obj().downgrade();
             let running = self.stats_running.clone();
             running.store(true, Ordering::Relaxed);
-            let max_capacity_bps = sched_cfg.max_capacity_bps;
+            let sched_cfg_handle = Arc::clone(&self.scheduler_config);
 
             let handle = std::thread::Builder::new()
                 .name("rist-bond-stats".into())
                 .spawn(move || {
-                    let stats_interval = Duration::from_millis(sched_cfg.stats_interval_ms);
                     let mut last_stats = Instant::now();
                     let start = Instant::now();
                     let mut stats_seq: u64 = 0;
 
                     while running.load(Ordering::Relaxed) {
+                        // Re-read stats_interval each iteration so runtime
+                        // config changes take effect immediately.
+                        let stats_interval = Duration::from_millis(
+                            lock_or_recover(&sched_cfg_handle).stats_interval_ms,
+                        );
                         if last_stats.elapsed() >= stats_interval {
                             if let Some(element) = element_weak.upgrade() {
                                 let metrics = lock_or_recover(&metrics_handle).clone();
@@ -474,20 +478,24 @@ mod imp {
                                     .unwrap_or(0);
 
                                 let mut total_capacity = 0.0;
+                                let mut total_nada_ref = 0.0;
                                 let mut total_observed_bps = 0.0;
                                 let mut alive_links = 0u64;
                                 let mut links_map = std::collections::HashMap::new();
 
                                 for (id, m) in &metrics {
                                     if m.alive {
-                                        // Use estimated capacity if AIMD is active,
-                                        // else fall back to raw capacity_bps.
-                                        let effective_capacity = if m.estimated_capacity_bps > 0.0 {
-                                            m.estimated_capacity_bps
+                                        // total_capacity always sums raw link
+                                        // capacity.
+                                        total_capacity += m.capacity_bps;
+                                        // aggregate_nada_ref uses the AIMD-
+                                        // estimated rate when active, else the
+                                        // raw capacity as fallback.
+                                        if m.estimated_capacity_bps > 0.0 {
+                                            total_nada_ref += m.estimated_capacity_bps;
                                         } else {
-                                            m.capacity_bps
-                                        };
-                                        total_capacity += effective_capacity;
+                                            total_nada_ref += m.capacity_bps;
+                                        }
                                         total_observed_bps += m.observed_bps;
                                         alive_links += 1;
                                     }
@@ -501,10 +509,7 @@ mod imp {
                                     0.0
                                 };
 
-                                // aggregate_nada_ref_bps = total_capacity
-                                // (already sum of per-link estimated_capacity_bps
-                                //  for alive links, i.e. the NADA r_ref).
-                                let aggregate_nada_ref_bps = total_capacity;
+                                let aggregate_nada_ref_bps = total_nada_ref;
 
                                 let snapshot = StatsSnapshot {
                                     schema_version: 3,
@@ -516,6 +521,7 @@ mod imp {
                                     total_capacity,
                                     aggregate_nada_ref_bps,
                                     alive_links,
+                                    total_dead_drops: 0,
                                     links: links_map,
                                 };
 
@@ -531,11 +537,11 @@ mod imp {
                                 let _ =
                                     element.post_message(gst::message::Element::new(msg_struct));
 
-                                // RFC 8698 §5.2.2: derive encoder target rate
-                                // (r_vin) and bandwidth ceiling (headroom) from
-                                // the aggregate NADA reference rate.  Always post
-                                // both messages — continuous signaling replaces
-                                // the previous threshold-gated approach.
+                                // Read max_capacity_bps from the shared
+                                // scheduler config each iteration so runtime
+                                // changes via the max-bitrate property are
+                                // reflected immediately.
+                                let max_capacity_bps = lock_or_recover(&sched_cfg_handle).max_capacity_bps;
                                 if let Some((r_vin, headroom)) = compute_nada_rate_signals(
                                     aggregate_nada_ref_bps,
                                     max_capacity_bps,

@@ -1,5 +1,6 @@
 use crate::config::SchedulerConfig;
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
+use crate::scheduler::sbd::SbdEngine;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -73,8 +74,11 @@ pub struct Dwrr<L: LinkSender + ?Sized> {
     cached_total_capacity: f64,
     /// SBD bottleneck groups: links with the same group ID share a bottleneck.
     /// Updated by SBD module when `sbd_enabled`. Group 0 = no bottleneck.
-    #[allow(dead_code)]
     pub(crate) sbd_groups: HashMap<usize, usize>,
+    /// Optional SBD engine: instantiated when `sbd_enabled` is true.
+    sbd_engine: Option<SbdEngine>,
+    /// Instant of the last SBD `process_interval` call.
+    sbd_last_process: Instant,
 }
 
 /// Computes the burst window (in seconds) for credit capping.
@@ -101,6 +105,16 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
     }
 
     pub fn with_config(config: SchedulerConfig) -> Self {
+        let sbd_engine = if config.sbd_enabled {
+            Some(SbdEngine::new(
+                config.sbd_n,
+                config.sbd_c_s,
+                config.sbd_c_h,
+                config.sbd_p_l,
+            ))
+        } else {
+            None
+        };
         Self {
             links: HashMap::new(),
             sorted_ids: Vec::new(),
@@ -109,6 +123,8 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             cached_spare_ratio: 0.0,
             cached_total_capacity: 0.0,
             sbd_groups: HashMap::new(),
+            sbd_engine,
+            sbd_last_process: Instant::now(),
         }
     }
 
@@ -161,6 +177,9 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         );
         self.sorted_ids.push(id);
         self.sorted_ids.sort();
+        if let Some(sbd) = &mut self.sbd_engine {
+            sbd.add_link(id);
+        }
     }
 
     pub fn refresh_metrics(&mut self) {
@@ -171,7 +190,6 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         // AIMD config snapshot (avoid repeated field access)
         let aimd_enabled = self.config.capacity_estimate_enabled;
         let rtt_congestion_ratio = self.config.rtt_congestion_ratio;
-        let _rtt_headroom_ratio = self.config.rtt_headroom_ratio;
         let md_factor = self.config.md_factor;
         let ai_step_ratio = self.config.ai_step_ratio;
         let decrease_cooldown = Duration::from_millis(self.config.decrease_cooldown_ms);
@@ -199,29 +217,76 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         // additive increase across N sub-flows sharing a bottleneck does
         // not exceed the increase of a single TCP flow.
         //   alpha = cap_total * max_i(cap_i / rtt_i²) / (sum_i(cap_i / rtt_i))²
-        let coupled_alpha = if aimd_enabled {
-            let mut cap_total = 0.0_f64;
-            let mut max_cap_rtt2 = 0.0_f64;
-            let mut sum_cap_rtt = 0.0_f64;
-            for state in self.links.values() {
-                if state.aimd_initialized && state.rtt_baseline > 0.0 {
-                    let cap = state.estimated_capacity_bps;
-                    let rtt = state.rtt_baseline;
-                    cap_total += cap;
-                    max_cap_rtt2 = max_cap_rtt2.max(cap / (rtt * rtt));
-                    sum_cap_rtt += cap / rtt;
+        //
+        // When SBD is enabled, coupling is computed per-group so that only
+        // links sharing a bottleneck are coupled.  Links in group 0 (no
+        // shared bottleneck) get alpha = 1.0.
+        let per_link_alpha: HashMap<usize, f64> = if aimd_enabled {
+            if self.config.sbd_enabled && !self.sbd_groups.is_empty() {
+                // Build per-group accumulators.
+                let mut group_accum: HashMap<usize, (f64, f64, f64)> = HashMap::new();
+                for (&id, state) in &self.links {
+                    if state.aimd_initialized && state.rtt_baseline > 0.0 {
+                        let group = self.sbd_groups.get(&id).copied().unwrap_or(0);
+                        let cap = state.estimated_capacity_bps;
+                        let rtt = state.rtt_baseline;
+                        let entry = group_accum.entry(group).or_insert((0.0, 0.0, 0.0));
+                        entry.0 += cap;                           // cap_total
+                        entry.1 = entry.1.max(cap / (rtt * rtt)); // max_cap_rtt2
+                        entry.2 += cap / rtt;                      // sum_cap_rtt
+                    }
                 }
-            }
-            if sum_cap_rtt > 0.0 && cap_total > 0.0 {
-                (cap_total * max_cap_rtt2 / (sum_cap_rtt * sum_cap_rtt)).clamp(0.01, 1.0)
+                // Compute per-link alpha from group membership.
+                self.links
+                    .keys()
+                    .map(|&id| {
+                        let group = self.sbd_groups.get(&id).copied().unwrap_or(0);
+                        if group == 0 {
+                            // Not in a shared bottleneck — no coupling.
+                            (id, 1.0)
+                        } else if let Some(&(cap_total, max_cap_rtt2, sum_cap_rtt)) =
+                            group_accum.get(&group)
+                        {
+                            if sum_cap_rtt > 0.0 && cap_total > 0.0 {
+                                let alpha = (cap_total * max_cap_rtt2
+                                    / (sum_cap_rtt * sum_cap_rtt))
+                                    .clamp(0.01, 1.0);
+                                (id, alpha)
+                            } else {
+                                (id, 1.0)
+                            }
+                        } else {
+                            (id, 1.0)
+                        }
+                    })
+                    .collect()
             } else {
-                1.0 // single link or no data — no coupling needed
+                // SBD disabled — global coupling across all initialized links.
+                let mut cap_total = 0.0_f64;
+                let mut max_cap_rtt2 = 0.0_f64;
+                let mut sum_cap_rtt = 0.0_f64;
+                for state in self.links.values() {
+                    if state.aimd_initialized && state.rtt_baseline > 0.0 {
+                        let cap = state.estimated_capacity_bps;
+                        let rtt = state.rtt_baseline;
+                        cap_total += cap;
+                        max_cap_rtt2 = max_cap_rtt2.max(cap / (rtt * rtt));
+                        sum_cap_rtt += cap / rtt;
+                    }
+                }
+                let global_alpha = if sum_cap_rtt > 0.0 && cap_total > 0.0 {
+                    (cap_total * max_cap_rtt2 / (sum_cap_rtt * sum_cap_rtt)).clamp(0.01, 1.0)
+                } else {
+                    1.0
+                };
+                self.links.keys().map(|&id| (id, global_alpha)).collect()
             }
         } else {
-            1.0
+            self.links.keys().map(|&id| (id, 1.0)).collect()
         };
 
-        for state in self.links.values_mut() {
+        for (&link_id, state) in self.links.iter_mut() {
+            let coupled_alpha = per_link_alpha.get(&link_id).copied().unwrap_or(1.0);
             let now = Instant::now();
             state.metrics = state.link.get_metrics();
             // Capture the receiver-reported capacity before bootstrap overwrites it.
@@ -307,6 +372,13 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                         state.rtt_sample_filter.clear();
                         state.rtt_min_fast_window.clear();
                         state.rtt_min_slow_window.clear();
+                        // Reset estimated capacity to the floor so the link
+                        // doesn't retain a depressed pre-death value that
+                        // causes a slow ramp-up after revival.
+                        state.estimated_capacity_bps = capacity_floor;
+                        state.x_prev = 0.0;
+                        state.gradual_mode = false;
+                        state.loss_free_samples = 0;
                     }
 
                     if current_rtt > 0.0 {
@@ -526,6 +598,33 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         } else {
             0.0
         };
+
+        // --- SBD: feed delay/loss samples and process intervals (RFC 8382) ---
+        if let Some(sbd) = &mut self.sbd_engine {
+            // Feed per-link OWD and loss data collected during the refresh above.
+            for (&id, state) in &self.links {
+                if state.metrics.owd_ms > 0.0 {
+                    sbd.record_delay(id, state.metrics.owd_ms);
+                }
+                if state.metrics.loss_rate > 0.0 {
+                    // Approximate discrete loss events from the continuous loss rate.
+                    // Each refresh cycle represents ~1 observation; fractional losses
+                    // are rounded so that rates ≥ 0.5% register at least one event.
+                    let loss_events = (state.metrics.loss_rate * 10.0).ceil() as u32;
+                    for _ in 0..loss_events {
+                        sbd.record_loss(id);
+                    }
+                }
+            }
+
+            // Process the SBD base interval on the configured cadence.
+            let sbd_interval = Duration::from_millis(self.config.sbd_interval_ms);
+            if self.sbd_last_process.elapsed() >= sbd_interval {
+                sbd.process_interval();
+                self.sbd_groups = sbd.compute_groups();
+                self.sbd_last_process = Instant::now();
+            }
+        }
     }
 
     pub fn remove_link(&mut self, id: usize) {
@@ -537,6 +636,10 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         if self.current_rr_idx >= self.sorted_ids.len() {
             self.current_rr_idx = 0;
         }
+        if let Some(sbd) = &mut self.sbd_engine {
+            sbd.remove_link(id);
+        }
+        self.sbd_groups.remove(&id);
     }
 
     pub fn get_active_links(&self) -> Vec<(usize, crate::net::interface::LinkMetrics)> {
@@ -1235,7 +1338,6 @@ mod tests {
         SchedulerConfig {
             capacity_estimate_enabled: true,
             rtt_congestion_ratio: 1.8,
-            rtt_headroom_ratio: 1.3,
             md_factor: 0.7,
             ai_step_ratio: 0.08,
             decrease_cooldown_ms: 500,

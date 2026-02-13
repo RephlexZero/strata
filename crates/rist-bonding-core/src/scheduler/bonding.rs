@@ -4,7 +4,6 @@ use crate::scheduler::dwrr::Dwrr;
 use anyhow::Result;
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, warn};
@@ -21,14 +20,16 @@ use tracing::{error, warn};
 pub struct BondingScheduler<L: LinkSender + ?Sized> {
     scheduler: Dwrr<L>,
     next_seq: u64,
+    /// Monotonic start time for bonding header timestamps.
+    start_time: Instant,
     // Fast-failover state
     failover_until: Option<Instant>,
     prev_phases: HashMap<usize, crate::net::interface::LinkPhase>,
     prev_rtts: HashMap<usize, f64>,
     /// Counter for consecutive all-links-dead failures (for escalation)
     consecutive_dead_count: u64,
-    /// Total packets dropped due to all links being dead
-    pub total_dead_drops: Arc<AtomicU64>,
+    /// Total packets dropped due to all links being dead (used for log messages)
+    total_dead_drops: u64,
 }
 
 impl<L: LinkSender + ?Sized> BondingScheduler<L> {
@@ -42,11 +43,12 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         Self {
             scheduler: Dwrr::with_config(config),
             next_seq: 0,
+            start_time: Instant::now(),
             failover_until: None,
             prev_phases: HashMap::new(),
             prev_rtts: HashMap::new(),
             consecutive_dead_count: 0,
-            total_dead_drops: Arc::new(AtomicU64::new(0)),
+            total_dead_drops: 0,
         }
     }
 
@@ -129,6 +131,12 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         }
     }
 
+    /// Creates a bonding header with a monotonic send timestamp for OWD measurement.
+    fn make_header(&self, seq: u64) -> crate::protocol::header::BondingHeader {
+        let send_time_us = self.start_time.elapsed().as_micros() as u64;
+        crate::protocol::header::BondingHeader::with_timestamp(seq, send_time_us)
+    }
+
     /// Returns a snapshot of metrics for all registered links.
     pub fn get_all_metrics(&self) -> HashMap<usize, crate::net::interface::LinkMetrics> {
         self.scheduler.get_active_links().into_iter().collect()
@@ -157,7 +165,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             let seq = self.next_seq;
             self.next_seq += 1;
 
-            let header = crate::protocol::header::BondingHeader::new(seq);
+            let header = self.make_header(seq);
             let wrapped = header.wrap(payload);
 
             for link in links {
@@ -186,7 +194,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
                     let seq = self.next_seq;
                     self.next_seq += 1;
 
-                    let header = crate::protocol::header::BondingHeader::new(seq);
+                    let header = self.make_header(seq);
                     let wrapped = header.wrap(payload);
 
                     for link in links {
@@ -205,7 +213,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             let seq = self.next_seq;
             self.next_seq += 1;
 
-            let header = crate::protocol::header::BondingHeader::new(seq);
+            let header = self.make_header(seq);
             let wrapped = header.wrap(payload);
 
             link.send(&wrapped)?;
@@ -216,7 +224,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
 
         // All links dead — escalate logging based on consecutive failures.
         self.consecutive_dead_count += 1;
-        self.total_dead_drops.fetch_add(1, Ordering::Relaxed);
+        self.total_dead_drops += 1;
 
         // Log at escalating severity: first occurrence is a warning,
         // sustained failures (100+ consecutive) escalate to error.
@@ -226,13 +234,13 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             error!(
                 "All links dead for {} consecutive packets — total drops: {}",
                 self.consecutive_dead_count,
-                self.total_dead_drops.load(Ordering::Relaxed)
+                self.total_dead_drops
             );
         } else if self.consecutive_dead_count.is_multiple_of(1000) {
             error!(
                 "All links still dead after {} consecutive drops (total: {})",
                 self.consecutive_dead_count,
-                self.total_dead_drops.load(Ordering::Relaxed)
+                self.total_dead_drops
             );
         }
 

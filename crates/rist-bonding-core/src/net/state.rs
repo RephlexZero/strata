@@ -60,10 +60,6 @@ pub struct LinkStats {
     pub os_up_i32: AtomicI32, // -1 unknown, 0 down, 1 up
     pub mtu_i32: AtomicI32,   // -1 unknown
     pub os_last_poll_ms: AtomicU64,
-    /// Previous bytes_written snapshot for observed rate computation.
-    pub observed_prev_bytes: AtomicU64,
-    /// Timestamp (ms since epoch) of the previous bytes_written snapshot.
-    pub observed_prev_ts_ms: AtomicU64,
     pub ewma_state: Mutex<EwmaStats>,
     pub lifecycle: Mutex<LinkLifecycle>,
 }
@@ -88,8 +84,6 @@ impl LinkStats {
             os_up_i32: AtomicI32::new(-1),
             mtu_i32: AtomicI32::new(-1),
             os_last_poll_ms: AtomicU64::new(0),
-            observed_prev_bytes: AtomicU64::new(0),
-            observed_prev_ts_ms: AtomicU64::new(0),
             ewma_state: Mutex::new(EwmaStats::with_alpha(ewma_alpha)),
             lifecycle: Mutex::new(LinkLifecycle::new(lifecycle_config)),
         }
@@ -157,6 +151,7 @@ impl LinkLifecycle {
 
         let stats_stale = stats_age > std::time::Duration::from_millis(self.config.stats_stale_ms);
 
+        let old_phase = self.phase;
         self.phase = match self.phase {
             LinkPhase::Init => {
                 if fresh {
@@ -219,10 +214,23 @@ impl LinkLifecycle {
             }
         };
 
+        // Record last_transition for all phases that carry traffic or
+        // transition outward.  Cooldown and Reset use last_transition as
+        // their entry timestamp (timer start), so we must NOT overwrite it
+        // while *staying* in those phases, but we DO set it on the tick
+        // that first enters them.
+        let entered_cooldown_or_reset = (self.phase == LinkPhase::Cooldown
+            || self.phase == LinkPhase::Reset)
+            && old_phase != self.phase;
+
         if self.phase != LinkPhase::Cooldown
             && self.phase != LinkPhase::Reset
             && self.phase != LinkPhase::Init
         {
+            self.last_transition = now;
+        } else if entered_cooldown_or_reset {
+            // First tick entering Cooldown/Reset — record entry time so the
+            // cooldown timer measures from the correct instant.
             self.last_transition = now;
         }
 

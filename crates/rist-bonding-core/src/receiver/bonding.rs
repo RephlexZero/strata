@@ -58,9 +58,17 @@ impl BondingReceiver {
                 let tick_interval = Duration::from_millis(10);
 
                 while running_clone.load(Ordering::Relaxed) {
+                    // Drain all available packets before ticking.
+                    // The initial recv_timeout provides the 10ms cadence;
+                    // subsequent try_recv() calls ensure the channel doesn't
+                    // back up under high throughput.
                     match input_rx.recv_timeout(tick_interval) {
                         Ok(packet) => {
                             buffer.push(packet.seq_id, packet.payload, packet.arrival_time);
+                            // Drain remaining buffered packets without blocking
+                            while let Ok(pkt) = input_rx.try_recv() {
+                                buffer.push(pkt.seq_id, pkt.payload, pkt.arrival_time);
+                            }
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                             // No packet; still tick below

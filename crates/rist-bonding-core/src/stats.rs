@@ -59,5 +59,7 @@ pub struct StatsSnapshot {
     /// side rate derivation to compute encoder target bitrate (`r_vin`).
     pub aggregate_nada_ref_bps: f64,
     pub alive_links: u64,
+    /// Total packets dropped because all links were dead.
+    pub total_dead_drops: u64,
     pub links: HashMap<String, LinkStatsSnapshot>,
 }
