@@ -158,11 +158,11 @@ Added `total_dead_drops` field to `StatsSnapshot` for future observability.
 
 ### 21. Receiver Stats Interval Not Live-Updatable
 
-**Severity**: Low | **Status**: Acknowledged
+**Severity**: Low | **Status**: Fixed
 
-Minor asymmetry: sender re-reads `stats_interval_ms` each tick (Issue #14),
-but receiver captures it once at start. Receiver has no shared config handle.
-Acceptable given receiver stats are typically stable.
+Refactored `RsRistBondSrc.settings` from `Mutex<Settings>` to `Arc<Mutex<Settings>>`.
+Stats thread now holds an `Arc::clone` of the settings handle and re-reads
+`stats_interval_ms` each tick, matching the sender pattern (Issue #14).
 
 ---
 
@@ -190,6 +190,6 @@ Acceptable given receiver stats are typically stable.
 | 18 | Cooldown timer off-by-one | Low | **Fixed** |
 | 19 | SBD groups unused by coupled alpha | Medium | **Fixed** |
 | 20 | `total_dead_drops` dead observable | Low | **Fixed** |
-| 21 | Receiver stats interval not live | Low | **Acknowledged** |
+| 21 | Receiver stats interval not live | Low | **Fixed** |
 
-All 179 tests pass (164 core lib + 4 network-sim + 11 GStreamer plugin).
+All 21 issues resolved. 179 tests pass (164 core lib + 4 network-sim + 11 GStreamer plugin).

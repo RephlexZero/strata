@@ -3,8 +3,8 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
-use rist_bonding_core::receiver::bonding::BondingReceiver;
 use rist_bonding_core::receiver::aggregator::ReassemblyConfig;
+use rist_bonding_core::receiver::bonding::BondingReceiver;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,15 +34,26 @@ mod imp {
         }
     }
 
-    #[derive(Default)]
     pub struct RsRistBondSrc {
-        settings: Mutex<Settings>,
+        settings: Arc<Mutex<Settings>>,
         receiver: Mutex<Option<BondingReceiver>>,
         stats_running: Arc<AtomicBool>,
         stats_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
         /// Set by `unlock()` to interrupt the blocking `create()` call;
         /// cleared by `unlock_stop()` so normal operation can resume.
         flushing: AtomicBool,
+    }
+
+    impl Default for RsRistBondSrc {
+        fn default() -> Self {
+            Self {
+                settings: Arc::new(Mutex::new(Settings::default())),
+                receiver: Mutex::new(None),
+                stats_running: Arc::new(AtomicBool::new(false)),
+                stats_thread: Mutex::new(None),
+                flushing: AtomicBool::new(false),
+            }
+        }
     }
 
     impl RsRistBondSrc {
@@ -259,7 +270,7 @@ mod imp {
             self.stats_running.store(true, Ordering::Relaxed);
             let running = self.stats_running.clone();
             let element_weak = self.obj().downgrade();
-            let stats_interval = Duration::from_millis(settings.stats_interval_ms);
+            let settings_handle = Arc::clone(&self.settings);
 
             let handle = std::thread::Builder::new()
                 .name("rist-rcv-stats".into())
@@ -301,7 +312,10 @@ mod imp {
                             break;
                         }
 
-                        std::thread::sleep(stats_interval);
+                        let interval = Duration::from_millis(
+                            lock_or_recover(&settings_handle).stats_interval_ms,
+                        );
+                        std::thread::sleep(interval);
                     }
                 })
                 .expect("failed to spawn receiver stats thread");
