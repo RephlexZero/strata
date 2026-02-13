@@ -301,11 +301,14 @@ mod imp {
                 }
                 "max-bitrate" => {
                     let bps: u64 = value.get().expect("type checked upstream");
-                    let mut sched = lock_or_recover(&self.scheduler_config);
-                    sched.max_capacity_bps = bps as f64;
+                    let sched_clone = {
+                        let mut sched = lock_or_recover(&self.scheduler_config);
+                        sched.max_capacity_bps = bps as f64;
+                        sched.clone()
+                    };
                     // Live-update the runtime if already started
                     if let Some(rt) = lock_or_recover(&self.runtime).as_ref() {
-                        if let Err(e) = rt.update_scheduler_config(sched.clone()) {
+                        if let Err(e) = rt.update_scheduler_config(sched_clone) {
                             gst::warning!(gst::CAT_DEFAULT, "Failed to update max-bitrate: {}", e);
                         }
                     }
@@ -541,7 +544,8 @@ mod imp {
                                 // scheduler config each iteration so runtime
                                 // changes via the max-bitrate property are
                                 // reflected immediately.
-                                let max_capacity_bps = lock_or_recover(&sched_cfg_handle).max_capacity_bps;
+                                let max_capacity_bps =
+                                    lock_or_recover(&sched_cfg_handle).max_capacity_bps;
                                 if let Some((r_vin, headroom)) = compute_nada_rate_signals(
                                     aggregate_nada_ref_bps,
                                     max_capacity_bps,
@@ -571,7 +575,12 @@ mod imp {
                         std::thread::sleep(Duration::from_millis(50));
                     }
                 })
-                .expect("failed to spawn stats thread");
+                .map_err(|e| {
+                    gst::error_msg!(
+                        gst::ResourceError::Failed,
+                        ["Failed to spawn sender stats thread: {}", e]
+                    )
+                })?;
 
             *lock_or_recover(&self.stats_thread) = Some(handle);
             Ok(())

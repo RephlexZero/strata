@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// An incoming packet with its bonding sequence ID and arrival timestamp.
@@ -34,6 +34,9 @@ pub struct ReassemblyBuffer {
     avg_iat: f64,
     jitter_smoothed: f64,
     jitter_samples: VecDeque<f64>,
+
+    // O(log n) index of buffered seq_ids → arrival times for fast gap scanning.
+    buffered_seqs: BTreeMap<u64, Instant>,
 }
 
 /// Configuration for the reassembly jitter buffer.
@@ -115,6 +118,7 @@ impl ReassemblyBuffer {
             avg_iat: 0.0,
             jitter_smoothed: 0.0,
             jitter_samples: VecDeque::with_capacity(128),
+            buffered_seqs: BTreeMap::new(),
         }
     }
 
@@ -165,9 +169,30 @@ impl ReassemblyBuffer {
         self.last_arrival = Some(now);
 
         if seq_id < self.next_seq {
-            // Late packet, drop
-            self.late_packets += 1;
-            return;
+            // Detect sender restart: if next_seq is far ahead (>capacity) and
+            // we receive a very low seq_id, the sender likely restarted.
+            // Reset state to avoid prolonged blackout.
+            if self.next_seq > self.capacity as u64
+                && seq_id < self.capacity as u64
+            {
+                tracing::warn!(
+                    "Sender seq reset detected (got {} while expecting {}), resetting receiver state",
+                    seq_id,
+                    self.next_seq
+                );
+                // Clear the entire buffer
+                for slot in self.buffer.iter_mut() {
+                    *slot = None;
+                }
+                self.buffered = 0;
+                self.buffered_seqs.clear();
+                self.next_seq = seq_id;
+                // Fall through to normal push logic below
+            } else {
+                // Late packet, drop
+                self.late_packets += 1;
+                return;
+            }
         }
 
         let capacity = self.capacity as u64;
@@ -189,11 +214,13 @@ impl ReassemblyBuffer {
             } else if existing.seq_id >= self.next_seq {
                 // Different packet in this slot, was lost
                 self.lost_packets += 1;
+                self.buffered_seqs.remove(&existing.seq_id);
             }
         } else {
             self.buffered += 1;
         }
 
+        self.buffered_seqs.insert(seq_id, now);
         self.buffer[idx] = Some(Packet {
             seq_id,
             payload,
@@ -219,6 +246,7 @@ impl ReassemblyBuffer {
                     if now.duration_since(packet.arrival_time) >= release_after {
                         let p = self.buffer[idx].take().unwrap();
                         self.buffered = self.buffered.saturating_sub(1);
+                        self.buffered_seqs.remove(&p.seq_id);
                         released.push(p.payload);
                         self.next_seq += 1;
                         continue;
@@ -258,6 +286,7 @@ impl ReassemblyBuffer {
             let idx = self.buffer_index(seq);
             if let Some(packet) = &self.buffer[idx] {
                 if packet.seq_id == seq {
+                    self.buffered_seqs.remove(&seq);
                     self.buffer[idx] = None;
                     self.buffered = self.buffered.saturating_sub(1);
                 }
@@ -267,19 +296,11 @@ impl ReassemblyBuffer {
     }
 
     fn find_next_available(&self) -> Option<(u64, Instant)> {
-        let mut best: Option<(u64, Instant)> = None;
-        for slot in self.buffer.iter().flatten() {
-            if slot.seq_id <= self.next_seq {
-                continue;
-            }
-            match best {
-                Some((best_seq, _)) if slot.seq_id >= best_seq => {}
-                _ => {
-                    best = Some((slot.seq_id, slot.arrival_time));
-                }
-            }
-        }
-        best
+        // O(log n) lookup using the BTreeMap index — find the first seq > next_seq.
+        self.buffered_seqs
+            .range((self.next_seq + 1)..)
+            .next()
+            .map(|(&seq, &arrival)| (seq, arrival))
     }
 }
 

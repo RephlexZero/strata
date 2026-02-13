@@ -19,6 +19,8 @@ mod imp {
         jitter_latency_multiplier: f64,
         max_latency_ms: u64,
         stats_interval_ms: u64,
+        buffer_capacity: usize,
+        skip_after_ms: Option<u64>,
     }
 
     impl Default for Settings {
@@ -30,6 +32,8 @@ mod imp {
                 jitter_latency_multiplier: 4.0,
                 max_latency_ms: 500,
                 stats_interval_ms: 1000,
+                buffer_capacity: 2048,
+                skip_after_ms: None,
             }
         }
     }
@@ -70,6 +74,8 @@ mod imp {
                     settings.jitter_latency_multiplier = cfg.scheduler.jitter_latency_multiplier;
                     settings.max_latency_ms = cfg.scheduler.max_latency_ms;
                     settings.stats_interval_ms = cfg.scheduler.stats_interval_ms;
+                    settings.buffer_capacity = cfg.receiver.buffer_capacity;
+                    settings.skip_after_ms = cfg.receiver.skip_after.map(|d| d.as_millis() as u64);
                     // If links are specified in config, override the links property
                     if !cfg.links.is_empty() {
                         settings.links = cfg
@@ -108,11 +114,13 @@ mod imp {
                     glib::ParamSpecString::builder("links")
                         .nick("Links")
                         .blurb("Comma-separated list of RIST URLs to bind to (e.g. 'rist://@0.0.0.0:5000')")
+                        .mutable_ready()
                         .build(),
                     glib::ParamSpecUInt::builder("latency")
                         .nick("Latency")
                         .blurb("Reassembly buffer latency in milliseconds")
                         .default_value(50)
+                        .mutable_ready()
                         .build(),
                     glib::ParamSpecString::builder("config")
                         .nick("Config (TOML)")
@@ -247,7 +255,8 @@ mod imp {
                 start_latency: latency_duration,
                 jitter_latency_multiplier: settings.jitter_latency_multiplier,
                 max_latency_ms: settings.max_latency_ms,
-                ..ReassemblyConfig::default()
+                buffer_capacity: settings.buffer_capacity,
+                skip_after: settings.skip_after_ms.map(Duration::from_millis),
             };
             let receiver = BondingReceiver::new_with_config(reassembly_config);
 
@@ -318,7 +327,12 @@ mod imp {
                         std::thread::sleep(interval);
                     }
                 })
-                .expect("failed to spawn receiver stats thread");
+                .map_err(|e| {
+                    gst::error_msg!(
+                        gst::ResourceError::Failed,
+                        ["Failed to spawn receiver stats thread: {}", e]
+                    )
+                })?;
             *lock_or_recover(&self.stats_thread) = Some(handle);
 
             Ok(())

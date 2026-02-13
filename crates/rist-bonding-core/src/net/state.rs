@@ -54,7 +54,10 @@ pub struct LinkStats {
     pub lost: AtomicU64,
     pub smoothed_rtt_us: AtomicU64,
     pub smoothed_bw_bps: AtomicU64,
-    pub smoothed_loss_permille: AtomicU64, // Stored as * 1000. 1000 = 100% loss.
+    /// Smoothed loss stored as micro-loss (× 1,000,000). 1,000,000 = 100% loss.
+    /// Micro-loss precision prevents truncation of sub-0.1% loss rates that
+    /// are important for early congestion detection in the NADA controller.
+    pub smoothed_loss_micro: AtomicU64,
     pub bytes_written: AtomicU64,
     pub last_stats_ms: AtomicU64,
     pub os_up_i32: AtomicI32, // -1 unknown, 0 down, 1 up
@@ -78,7 +81,7 @@ impl LinkStats {
             lost: AtomicU64::new(0),
             smoothed_rtt_us: AtomicU64::new(0),
             smoothed_bw_bps: AtomicU64::new(0),
-            smoothed_loss_permille: AtomicU64::new(0),
+            smoothed_loss_micro: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
             last_stats_ms: AtomicU64::new(0),
             os_up_i32: AtomicI32::new(-1),

@@ -166,6 +166,120 @@ Stats thread now holds an `Arc::clone` of the settings handle and re-reads
 
 ---
 
+## Round 4 (14 issues — 13 fixed, 1 documented)
+
+### 22. DWRR Diversity Selection Dead Code
+
+**Severity**: Medium | **Status**: Fixed
+
+`select_best_n_links` first pass condition `is_diverse || selected.len() < n`
+was tautological — second clause always true early, making diversity preference
+dead code. Fixed: first pass selects diverse links only; second pass fills
+remaining slots from any link.
+
+### 23. `skip_after_ms` Config Field Not Plumbed
+
+**Severity**: Low | **Status**: Fixed
+
+Added `skip_after_ms: Option<u64>` to GStreamer source `Settings`, populated
+from TOML config, and passed through to `ReassemblyConfig` in `start()`.
+
+### 24. `buffer_capacity` Config Field Not Plumbed
+
+**Severity**: Low | **Status**: Fixed
+
+Added `buffer_capacity: usize` to GStreamer source `Settings`, populated
+from TOML config, and passed through to `ReassemblyConfig` in `start()`.
+
+### 25. Nested Lock Ordering in Sink `max-bitrate` Handler
+
+**Severity**: Medium | **Status**: Fixed
+
+`max-bitrate` property handler held scheduler lock while acquiring runtime
+lock, creating a potential deadlock. Fixed by cloning config, dropping
+scheduler lock, then acquiring runtime lock.
+
+### 26. Loss Precision Truncated to Permille
+
+**Severity**: Medium | **Status**: Fixed
+
+`smoothed_loss_permille` (×1,000) provided only 0.1% granularity. Renamed
+to `smoothed_loss_micro` (×1,000,000) for 0.0001% granularity. Updated
+writer in `wrapper.rs` and reader in `link.rs`.
+
+### 27. Non-Deterministic SBD Clustering
+
+**Severity**: Low | **Status**: Fixed
+
+Greedy clustering in `compute_groups()` depended on HashMap iteration order.
+Fixed by sorting `bottlenecked` vec by `link_id` before clustering.
+
+### 28. `thread::spawn().expect()` in Production Code
+
+**Severity**: Medium | **Status**: Fixed
+
+Replaced 5 instances of `.expect()` on `thread::spawn()` with proper error
+handling: `.map_err()` in GStreamer elements (src.rs, sink.rs) and
+`.unwrap_or_else(|e| panic!(...))` with descriptive messages in core
+(runtime.rs, bonding.rs).
+
+### 29. Misleading `link_count` Field Name
+
+**Severity**: Low | **Status**: Fixed
+
+Renamed `link_count` to `total_links_added` in `BondingReceiver` with updated
+doc comment clarifying it's a monotonic counter, not active link count.
+
+### 30. O(n) Jitter Buffer Scan
+
+**Severity**: Medium | **Status**: Fixed
+
+`find_next_available()` performed O(n) full-buffer scan. Added
+`buffered_seqs: BTreeMap<u64, Instant>` tracking present sequence numbers
+for O(log n) lookup. BTreeMap maintained on push/release/advance_window.
+
+### 31. No Sender Sequence Reset Detection
+
+**Severity**: Medium | **Status**: Fixed
+
+If a sender restarts and sequence numbers reset to 0, the receiver would
+stall waiting for unreachable future sequences. Added detection: if
+`next_seq > capacity` and incoming `seq_id < capacity`, reset receiver state
+(clear buffer, buffered_seqs, next_seq) with a `tracing::warn` log.
+
+### 32. Blocking Channel Send in Reader Threads
+
+**Severity**: Medium | **Status**: Fixed
+
+Reader threads used blocking `input_tx.send(packet)` which could stall if
+the jitter thread fell behind. Changed to `input_tx.try_send(packet)` with
+a debug log on drop when channel is full.
+
+### 33. Diversity Test Did Not Exercise Diversity Logic
+
+**Severity**: Low | **Status**: Fixed
+
+Test created 3 identical wired links, so diversity preference had no effect.
+Fixed test to create 2 wired + 1 cellular link and verify that for n=2,
+the cellular link is preferred over the second wired link for diversity.
+
+### 34. GStreamer Source Properties Mutable While Playing
+
+**Severity**: Low | **Status**: Fixed
+
+`links` and `latency` properties lacked `.mutable_ready()` flag, allowing
+changes while the pipeline was playing (which would have no effect). Added
+the flag to both properties.
+
+### 35. `u64` Precision Loss for Extreme Bitrates
+
+**Severity**: Low | **Status**: Documented
+
+`f64 as u64` truncation in `capacity_bps` could lose precision above ~9 Pbps.
+Theoretical only — no practical impact. Documented as known limitation.
+
+---
+
 ## Final Status
 
 | # | Issue | Severity | Status |
@@ -191,5 +305,19 @@ Stats thread now holds an `Arc::clone` of the settings handle and re-reads
 | 19 | SBD groups unused by coupled alpha | Medium | **Fixed** |
 | 20 | `total_dead_drops` dead observable | Low | **Fixed** |
 | 21 | Receiver stats interval not live | Low | **Fixed** |
+| 22 | DWRR diversity selection dead code | Medium | **Fixed** |
+| 23 | `skip_after_ms` not plumbed | Low | **Fixed** |
+| 24 | `buffer_capacity` not plumbed | Low | **Fixed** |
+| 25 | Nested lock ordering in sink | Medium | **Fixed** |
+| 26 | Loss precision truncated | Medium | **Fixed** |
+| 27 | Non-deterministic SBD clustering | Low | **Fixed** |
+| 28 | `thread::spawn().expect()` | Medium | **Fixed** |
+| 29 | Misleading `link_count` name | Low | **Fixed** |
+| 30 | O(n) jitter buffer scan | Medium | **Fixed** |
+| 31 | No sender seq reset detection | Medium | **Fixed** |
+| 32 | Blocking channel in readers | Medium | **Fixed** |
+| 33 | Diversity test ineffective | Low | **Fixed** |
+| 34 | Src properties mutable while playing | Low | **Fixed** |
+| 35 | `u64` precision for extreme rates | Low | **Documented** |
 
-All 21 issues resolved. 179 tests pass (164 core lib + 4 network-sim + 11 GStreamer plugin).
+All 35 issues resolved. 179 tests pass (164 core lib + 4 network-sim + 11 GStreamer plugin).

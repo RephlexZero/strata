@@ -233,14 +233,12 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         } else if self.consecutive_dead_count == 100 {
             error!(
                 "All links dead for {} consecutive packets — total drops: {}",
-                self.consecutive_dead_count,
-                self.total_dead_drops
+                self.consecutive_dead_count, self.total_dead_drops
             );
         } else if self.consecutive_dead_count.is_multiple_of(1000) {
             error!(
                 "All links still dead after {} consecutive drops (total: {})",
-                self.consecutive_dead_count,
-                self.total_dead_drops
+                self.consecutive_dead_count, self.total_dead_drops
             );
         }
 

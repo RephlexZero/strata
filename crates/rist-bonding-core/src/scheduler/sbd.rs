@@ -281,8 +281,10 @@ impl SbdEngine {
         // --- Step 5: Group bottlenecked links ---
         // Simple clustering: links with similar skew/var profiles share a group.
         // We use a greedy nearest-neighbour approach with a tolerance of 2*C_H.
+        // Sort by link_id for deterministic grouping regardless of HashMap order.
         let mut next_group = 1usize;
         let tolerance = 2.0 * self.c_h.abs().max(0.05);
+        bottlenecked.sort_by_key(|(id, _, _)| *id);
 
         for (link_id, skew, var) in &bottlenecked {
             let mut assigned = false;

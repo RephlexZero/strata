@@ -58,7 +58,7 @@ impl BondingRuntime {
         let handle = thread::Builder::new()
             .name("rist-bond-worker".into())
             .spawn(move || runtime_worker(rx, metrics_clone, scheduler_config))
-            .expect("failed to spawn bonding runtime worker");
+            .unwrap_or_else(|e| panic!("failed to spawn bonding runtime worker: {}", e));
 
         Self {
             sender: tx,

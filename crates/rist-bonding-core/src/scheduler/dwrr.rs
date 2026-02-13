@@ -231,9 +231,9 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                         let cap = state.estimated_capacity_bps;
                         let rtt = state.rtt_baseline;
                         let entry = group_accum.entry(group).or_insert((0.0, 0.0, 0.0));
-                        entry.0 += cap;                           // cap_total
+                        entry.0 += cap; // cap_total
                         entry.1 = entry.1.max(cap / (rtt * rtt)); // max_cap_rtt2
-                        entry.2 += cap / rtt;                      // sum_cap_rtt
+                        entry.2 += cap / rtt; // sum_cap_rtt
                     }
                 }
                 // Compute per-link alpha from group membership.
@@ -734,20 +734,18 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         // Sort by quality score descending
         scored_links.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Select up to N links, preferring diversity
+        // First pass: select diverse links (different link_kind) in quality order
         for (id, _score, link_kind) in &scored_links {
             if selected.len() >= n {
                 break;
             }
 
-            // Diversity preference: prefer new link_kind if we have multiple links
             let is_diverse = match link_kind {
                 None => true, // Unknown kind is always considered diverse
                 Some(kind) => !used_kinds.contains(kind.as_str()),
             };
 
-            // Always select if we haven't reached N, but prefer diverse links first
-            if is_diverse || selected.len() < n {
+            if is_diverse {
                 if let Some(state) = self.links.get_mut(id) {
                     state.credits -= packet_cost;
                     selected.push(state.link.clone());
@@ -758,7 +756,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             }
         }
 
-        // If we couldn't get N diverse links, fill with remaining best quality links
+        // Second pass: fill remaining slots with best quality links regardless of diversity
         if selected.len() < n {
             for (id, _score, _) in &scored_links {
                 if selected.len() >= n {
@@ -1151,37 +1149,42 @@ mod tests {
 
     #[test]
     fn test_diversity_aware_link_selection() {
-        // Create links with different kinds
-        let wifi_link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
-        let cellular_link = Arc::new(MockLink::new(2, 8_000_000.0, LinkPhase::Live));
-        let wired_link = Arc::new(MockLink::new(3, 12_000_000.0, LinkPhase::Live));
+        // Two high-capacity wired links and one lower-capacity cellular link.
+        // With diversity preference, the cellular link should be chosen over
+        // the second wired link despite lower capacity.
+        let wired1 = Arc::new(MockLink::new(1, 12_000_000.0, LinkPhase::Live));
+        let wired2 = Arc::new(MockLink::new(2, 11_000_000.0, LinkPhase::Live));
+        let cellular = Arc::new(MockLink::new(3, 8_000_000.0, LinkPhase::Live));
 
-        // Set link_kind for diversity
-        if let Ok(mut m) = wifi_link.metrics.lock() {
-            m.link_kind = Some("wifi".to_string());
-        }
-        if let Ok(mut m) = cellular_link.metrics.lock() {
-            m.link_kind = Some("cellular".to_string());
-        }
-        if let Ok(mut m) = wired_link.metrics.lock() {
+        if let Ok(mut m) = wired1.metrics.lock() {
             m.link_kind = Some("wired".to_string());
+        }
+        if let Ok(mut m) = wired2.metrics.lock() {
+            m.link_kind = Some("wired".to_string());
+        }
+        if let Ok(mut m) = cellular.metrics.lock() {
+            m.link_kind = Some("cellular".to_string());
         }
 
         let mut dwrr = Dwrr::new();
-        dwrr.add_link(wifi_link.clone());
-        dwrr.add_link(cellular_link.clone());
-        dwrr.add_link(wired_link.clone());
+        dwrr.add_link(wired1.clone());
+        dwrr.add_link(wired2.clone());
+        dwrr.add_link(cellular.clone());
 
         dwrr.refresh_metrics();
 
-        // Select best 2 links - should prefer diverse kinds
+        // Select best 2 links — diversity should prefer wired + cellular
+        // over wired + wired, even though wired2 has higher capacity than cellular.
         let selected = dwrr.select_best_n_links(1000, 2);
         assert_eq!(selected.len(), 2);
 
-        // Should get wired (highest capacity) and wifi (second highest)
         let ids: Vec<usize> = selected.iter().map(|l| l.id()).collect();
-        assert!(ids.contains(&3)); // Wired should be selected
-        assert!(ids.len() == 2); // Got 2 links
+        assert!(ids.contains(&1), "Highest capacity wired link should be selected");
+        assert!(
+            ids.contains(&3),
+            "Cellular link should be preferred over second wired link for diversity: got {:?}",
+            ids
+        );
     }
 
     #[test]

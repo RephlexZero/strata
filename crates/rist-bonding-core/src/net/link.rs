@@ -153,7 +153,7 @@ impl LinkSender for Link {
         let raw_rtt_ms = self.stats.rtt.load(Ordering::Relaxed) as f64;
         let raw_bw = self.stats.bandwidth.load(Ordering::Relaxed) as f64;
         let bw = self.stats.smoothed_bw_bps.load(Ordering::Relaxed) as f64;
-        let loss_pm = self.stats.smoothed_loss_permille.load(Ordering::Relaxed);
+        let loss_micro = self.stats.smoothed_loss_micro.load(Ordering::Relaxed);
 
         let rtt_ms = if rtt_us > 0 {
             rtt_us as f64 / 1000.0
@@ -163,7 +163,7 @@ impl LinkSender for Link {
 
         let bw = if bw > 0.0 { bw } else { raw_bw };
 
-        let loss_rate = loss_pm as f64 / 1000.0;
+        let loss_rate = loss_micro as f64 / 1_000_000.0;
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)

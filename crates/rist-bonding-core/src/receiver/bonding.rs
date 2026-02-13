@@ -28,8 +28,8 @@ pub struct BondingReceiver {
     stats: Arc<Mutex<ReassemblyStats>>,
     /// Track spawned thread handles for clean shutdown
     thread_handles: Mutex<Vec<thread::JoinHandle<()>>>,
-    /// Number of links added (each `add_link` call increments this).
-    link_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Total number of links added (historical; not decremented on thread exit).
+    total_links_added: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl BondingReceiver {
@@ -90,7 +90,7 @@ impl BondingReceiver {
                     }
                 }
             })
-            .expect("failed to spawn jitter buffer thread");
+            .unwrap_or_else(|e| panic!("failed to spawn jitter buffer thread: {}", e));
 
         Self {
             input_tx: Some(input_tx),
@@ -99,7 +99,7 @@ impl BondingReceiver {
             running,
             stats,
             thread_handles: Mutex::new(vec![jitter_handle]),
-            link_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            total_links_added: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -120,9 +120,10 @@ impl BondingReceiver {
         self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Returns the number of links that have been added to this receiver.
+    /// Returns the total number of links that have been added to this receiver.
+    /// Note: this is a cumulative count and does not decrease if reader threads exit.
     pub fn link_count(&self) -> u64 {
-        self.link_count.load(Ordering::Relaxed)
+        self.total_links_added.load(Ordering::Relaxed)
     }
 
     pub fn add_link(&self, bind_url: &str) -> Result<()> {
@@ -130,7 +131,7 @@ impl BondingReceiver {
         ctx.peer_config(bind_url)?;
         ctx.start()?;
 
-        self.link_count.fetch_add(1, Ordering::Relaxed);
+        self.total_links_added.fetch_add(1, Ordering::Relaxed);
 
         let input_tx = self
             .input_tx
@@ -155,10 +156,10 @@ impl BondingReceiver {
                                     payload: original_payload,
                                     arrival_time: Instant::now(),
                                 };
-                                if let Err(e) = input_tx.send(packet) {
+                                if input_tx.try_send(packet).is_err() {
                                     debug!(
-                                        "BondingReceiver: input channel full/closed on {}: {}",
-                                        link_url, e
+                                        "BondingReceiver: input channel full, dropping packet on {}",
+                                        link_url
                                     );
                                 }
                             } else {
