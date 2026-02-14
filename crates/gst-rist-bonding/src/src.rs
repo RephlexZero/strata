@@ -370,15 +370,6 @@ mod imp {
             &self,
             _buf: Option<&mut gst::BufferRef>,
         ) -> Result<gst_base::subclass::base_src::CreateSuccess, gst::FlowError> {
-            let receiver_guard = lock_or_recover(&self.receiver);
-
-            let rx = if let Some(receiver) = &*receiver_guard {
-                receiver.output_rx.clone()
-            } else {
-                return Err(gst::FlowError::Eos);
-            };
-            drop(receiver_guard);
-
             // Use recv_timeout in a loop so we can check the flushing flag
             // periodically. This allows unlock() to interrupt us without
             // destroying the receiver.
@@ -387,20 +378,24 @@ mod imp {
                     return Err(gst::FlowError::Flushing);
                 }
 
-                match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(bytes) => {
-                        let buffer = gst::Buffer::from_slice(bytes);
-                        return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(
-                            buffer,
-                        ));
+                let mut receiver_guard = lock_or_recover(&self.receiver);
+                if let Some(receiver) = receiver_guard.as_mut() {
+                    match receiver.recv_timeout(Duration::from_millis(100)) {
+                        Some(bytes) => {
+                            drop(receiver_guard);
+                            let buffer = gst::Buffer::from_slice(bytes);
+                            return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(
+                                buffer,
+                            ));
+                        }
+                        None => {
+                            drop(receiver_guard);
+                            // Loop back to check flushing flag
+                            continue;
+                        }
                     }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        // Loop back to check flushing flag
-                        continue;
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                        return Err(gst::FlowError::Eos);
-                    }
+                } else {
+                    return Err(gst::FlowError::Eos);
                 }
             }
         }

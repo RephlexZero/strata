@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// An incoming packet with its bonding sequence ID and arrival timestamp.
@@ -7,6 +7,74 @@ pub struct Packet {
     pub seq_id: u64,
     pub payload: Bytes,
     pub arrival_time: Instant,
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Bitfield gap tracker — O(1) amortised insert / find-next-available
+// replaces the previous BTreeMap<u64, Instant> index.
+// ──────────────────────────────────────────────────────────────────
+
+/// Tracks which slots within the circular buffer are occupied using a
+/// compact bitfield.  This gives O(1) insert / remove and O(capacity/64)
+/// `find_next` in the worst case (typically a single word scan).
+struct SlotBitmap {
+    /// One bit per buffer slot.  `bits[slot / 64] & (1 << (slot % 64))`.
+    bits: Vec<u64>,
+    /// Parallel array storing the arrival `Instant` per slot so we can
+    /// check the gap-skip timeout without touching the packet data.
+    arrivals: Vec<Option<Instant>>,
+}
+
+impl SlotBitmap {
+    fn new(capacity: usize) -> Self {
+        let words = capacity.div_ceil(64);
+        Self {
+            bits: vec![0u64; words],
+            arrivals: vec![None; capacity],
+        }
+    }
+
+    #[inline]
+    fn set(&mut self, slot: usize, arrival: Instant) {
+        self.bits[slot / 64] |= 1u64 << (slot % 64);
+        self.arrivals[slot] = Some(arrival);
+    }
+
+    #[inline]
+    fn clear(&mut self, slot: usize) {
+        self.bits[slot / 64] &= !(1u64 << (slot % 64));
+        self.arrivals[slot] = None;
+    }
+
+    #[inline]
+    fn is_set(&self, slot: usize) -> bool {
+        self.bits[slot / 64] & (1u64 << (slot % 64)) != 0
+    }
+
+    /// Find the earliest occupied seq_id **after** `base_seq` within
+    /// `capacity` slots of the circular buffer.
+    fn find_next(&self, base_seq: u64, capacity: usize) -> Option<(u64, Instant)> {
+        for offset in 1..capacity as u64 {
+            let seq = base_seq + offset;
+            let slot = (seq % capacity as u64) as usize;
+            if self.is_set(slot) {
+                if let Some(arrival) = self.arrivals[slot] {
+                    return Some((seq, arrival));
+                }
+            }
+        }
+        None
+    }
+
+    /// Clear all bits and arrivals.
+    fn clear_all(&mut self) {
+        for w in self.bits.iter_mut() {
+            *w = 0;
+        }
+        for a in self.arrivals.iter_mut() {
+            *a = None;
+        }
+    }
 }
 
 /// Jitter buffer that reorders and releases packets in sequence order.
@@ -35,8 +103,14 @@ pub struct ReassemblyBuffer {
     jitter_smoothed: f64,
     jitter_samples: VecDeque<f64>,
 
-    // O(log n) index of buffered seq_ids → arrival times for fast gap scanning.
-    buffered_seqs: BTreeMap<u64, Instant>,
+    // ── Performance scratch buffers ──
+    /// Re-usable scratch for `percentile()` to avoid per-call allocation (#3).
+    percentile_scratch: Vec<f64>,
+    /// Re-usable scratch for `tick()` output to avoid per-call allocation (#2).
+    tick_scratch: Vec<Bytes>,
+
+    // O(1) bitfield index of occupied slots + arrival times (#4).
+    slot_bitmap: SlotBitmap,
 }
 
 /// Configuration for the reassembly jitter buffer.
@@ -74,18 +148,19 @@ pub struct ReassemblyStats {
     pub current_latency_ms: u64,
 }
 
-fn percentile(samples: &VecDeque<f64>, pct: f64) -> f64 {
+fn percentile(samples: &VecDeque<f64>, pct: f64, scratch: &mut Vec<f64>) -> f64 {
     if samples.is_empty() {
         return 0.0;
     }
-    let mut v: Vec<f64> = samples.iter().copied().collect();
-    let idx = ((v.len() - 1) as f64 * pct).round() as usize;
-    let idx = idx.min(v.len() - 1);
+    scratch.clear();
+    scratch.extend(samples.iter().copied());
+    let idx = ((scratch.len() - 1) as f64 * pct).round() as usize;
+    let idx = idx.min(scratch.len() - 1);
     // Use select_nth_unstable for O(n) partial sort instead of full O(n log n) sort.
-    v.select_nth_unstable_by(idx, |a, b| {
+    scratch.select_nth_unstable_by(idx, |a, b| {
         a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
     });
-    v[idx]
+    scratch[idx]
 }
 
 impl ReassemblyBuffer {
@@ -118,7 +193,9 @@ impl ReassemblyBuffer {
             avg_iat: 0.0,
             jitter_smoothed: 0.0,
             jitter_samples: VecDeque::with_capacity(128),
-            buffered_seqs: BTreeMap::new(),
+            percentile_scratch: Vec::with_capacity(128),
+            tick_scratch: Vec::with_capacity(64),
+            slot_bitmap: SlotBitmap::new(capacity),
         }
     }
 
@@ -156,7 +233,7 @@ impl ReassemblyBuffer {
 
             // Update target latency: Start Latency + multiplier * p95(Jitter)
             let jitter_est = if self.jitter_samples.len() >= 5 {
-                percentile(&self.jitter_samples, 0.95)
+                percentile(&self.jitter_samples, 0.95, &mut self.percentile_scratch)
             } else {
                 self.jitter_smoothed
             };
@@ -183,7 +260,7 @@ impl ReassemblyBuffer {
                     *slot = None;
                 }
                 self.buffered = 0;
-                self.buffered_seqs.clear();
+                self.slot_bitmap.clear_all();
                 self.next_seq = seq_id;
                 // Fall through to normal push logic below
             } else {
@@ -212,13 +289,13 @@ impl ReassemblyBuffer {
             } else if existing.seq_id >= self.next_seq {
                 // Different packet in this slot, was lost
                 self.lost_packets += 1;
-                self.buffered_seqs.remove(&existing.seq_id);
+                self.slot_bitmap.clear(idx);
             }
         } else {
             self.buffered += 1;
         }
 
-        self.buffered_seqs.insert(seq_id, now);
+        self.slot_bitmap.set(idx, now);
         self.buffer[idx] = Some(Packet {
             seq_id,
             payload,
@@ -227,7 +304,8 @@ impl ReassemblyBuffer {
     }
 
     pub fn tick(&mut self, now: Instant) -> Vec<Bytes> {
-        let mut released = Vec::new();
+        // Re-use the pre-allocated scratch vec (#2).
+        self.tick_scratch.clear();
         let skip_after = self.skip_after.unwrap_or(self.latency);
         let release_after = self
             .skip_after
@@ -244,8 +322,8 @@ impl ReassemblyBuffer {
                     if now.duration_since(packet.arrival_time) >= release_after {
                         let p = self.buffer[idx].take().unwrap();
                         self.buffered = self.buffered.saturating_sub(1);
-                        self.buffered_seqs.remove(&p.seq_id);
-                        released.push(p.payload);
+                        self.slot_bitmap.clear(idx);
+                        self.tick_scratch.push(p.payload);
                         self.next_seq += 1;
                         continue;
                     }
@@ -268,7 +346,8 @@ impl ReassemblyBuffer {
             break;
         }
 
-        released
+        // Return ownership of the scratch vec's contents.
+        std::mem::take(&mut self.tick_scratch)
     }
 
     fn buffer_index(&self, seq_id: u64) -> usize {
@@ -284,7 +363,7 @@ impl ReassemblyBuffer {
             let idx = self.buffer_index(seq);
             if let Some(packet) = &self.buffer[idx] {
                 if packet.seq_id == seq {
-                    self.buffered_seqs.remove(&seq);
+                    self.slot_bitmap.clear(idx);
                     self.buffer[idx] = None;
                     self.buffered = self.buffered.saturating_sub(1);
                 }
@@ -294,11 +373,8 @@ impl ReassemblyBuffer {
     }
 
     fn find_next_available(&self) -> Option<(u64, Instant)> {
-        // O(log n) lookup using the BTreeMap index — find the first seq > next_seq.
-        self.buffered_seqs
-            .range((self.next_seq + 1)..)
-            .next()
-            .map(|(&seq, &arrival)| (seq, arrival))
+        // O(capacity/64) bitfield scan — replaces the O(log n) BTreeMap range().
+        self.slot_bitmap.find_next(self.next_seq, self.capacity)
     }
 }
 
@@ -416,8 +492,9 @@ mod tests {
         samples.push_back(3.0);
         samples.push_back(100.0);
 
-        let p50 = percentile(&samples, 0.5);
-        let p95 = percentile(&samples, 0.95);
+        let mut scratch = Vec::new();
+        let p50 = percentile(&samples, 0.5, &mut scratch);
+        let p95 = percentile(&samples, 0.95, &mut scratch);
 
         assert_eq!(p50, 3.0);
         assert_eq!(p95, 100.0);
@@ -600,14 +677,16 @@ mod tests {
     fn test_percentile_single_sample() {
         let mut samples = VecDeque::new();
         samples.push_back(5.0);
-        assert_eq!(percentile(&samples, 0.5), 5.0);
-        assert_eq!(percentile(&samples, 0.95), 5.0);
+        let mut scratch = Vec::new();
+        assert_eq!(percentile(&samples, 0.5, &mut scratch), 5.0);
+        assert_eq!(percentile(&samples, 0.95, &mut scratch), 5.0);
     }
 
     #[test]
     fn test_percentile_empty() {
         let samples = VecDeque::new();
-        assert_eq!(percentile(&samples, 0.5), 0.0);
+        let mut scratch = Vec::new();
+        assert_eq!(percentile(&samples, 0.5, &mut scratch), 0.0);
     }
 
     #[test]
@@ -935,5 +1014,127 @@ mod tests {
             counter.load(Ordering::Relaxed) > 0,
             "Concurrent buffers should produce output"
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // SlotBitmap tests (#4)
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn slot_bitmap_set_and_check() {
+        let now = Instant::now();
+        let mut bm = SlotBitmap::new(128);
+        assert!(!bm.is_set(0));
+        bm.set(0, now);
+        assert!(bm.is_set(0));
+        bm.clear(0);
+        assert!(!bm.is_set(0));
+    }
+
+    #[test]
+    fn slot_bitmap_find_next_basic() {
+        let now = Instant::now();
+        let mut bm = SlotBitmap::new(64);
+        // No bits set
+        assert!(bm.find_next(0, 64).is_none());
+
+        // Set slot for seq 5 (slot = 5 % 64 = 5)
+        bm.set(5, now);
+        let found = bm.find_next(0, 64);
+        assert!(found.is_some());
+        let (seq, _arrival) = found.unwrap();
+        // find_next(0, 64) checks offsets 1..64, so first match is offset 5 → seq 5
+        assert_eq!(seq, 5);
+    }
+
+    #[test]
+    fn slot_bitmap_find_next_wraparound() {
+        let now = Instant::now();
+        let mut bm = SlotBitmap::new(16);
+        // Set slot 2
+        bm.set(2, now);
+        // base_seq=14, capacity=16 → offsets 1..16 → seqs 15..30
+        // slot for seq 18 = 18 % 16 = 2 ← that's where we set the bit
+        let found = bm.find_next(14, 16);
+        assert!(found.is_some());
+        let (seq, _) = found.unwrap();
+        assert_eq!(seq % 16, 2); // Matches the slot
+    }
+
+    #[test]
+    fn slot_bitmap_clear_all() {
+        let now = Instant::now();
+        let mut bm = SlotBitmap::new(256);
+        for i in 0..256 {
+            bm.set(i, now);
+        }
+        bm.clear_all();
+        for i in 0..256 {
+            assert!(!bm.is_set(i), "Slot {} should be clear after clear_all", i);
+        }
+    }
+
+    #[test]
+    fn slot_bitmap_word_boundary() {
+        // Test slots at word boundaries (64-bit)
+        let now = Instant::now();
+        let mut bm = SlotBitmap::new(256);
+        for slot in [0, 63, 64, 127, 128, 191, 192, 255] {
+            bm.set(slot, now);
+            assert!(bm.is_set(slot), "Slot {} should be set", slot);
+            bm.clear(slot);
+            assert!(!bm.is_set(slot), "Slot {} should be clear", slot);
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Percentile scratch buffer reuse test (#3)
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn percentile_scratch_reused_across_calls() {
+        let mut samples = VecDeque::new();
+        for i in 0..50 {
+            samples.push_back(i as f64);
+        }
+        let mut scratch = Vec::new();
+        let _ = percentile(&samples, 0.5, &mut scratch);
+        let cap_after_first = scratch.capacity();
+        // Second call should reuse the same allocation
+        let _ = percentile(&samples, 0.95, &mut scratch);
+        assert_eq!(
+            scratch.capacity(),
+            cap_after_first,
+            "Scratch buffer should not reallocate on second call with same-sized input"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // tick() scratch reuse test (#2)
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tick_returns_owned_vec() {
+        let mut buf = ReassemblyBuffer::with_config(
+            0,
+            ReassemblyConfig {
+                start_latency: Duration::from_millis(1),
+                buffer_capacity: 64,
+                ..ReassemblyConfig::default()
+            },
+        );
+        let now = Instant::now();
+        for i in 0..10u64 {
+            buf.push(i, Bytes::from(vec![i as u8; 50]), now);
+        }
+        let out = buf.tick(now + Duration::from_millis(1));
+        assert_eq!(out.len(), 10);
+
+        // Second tick with new data
+        for i in 10..20u64 {
+            buf.push(i, Bytes::from(vec![i as u8; 50]), now);
+        }
+        let out2 = buf.tick(now + Duration::from_millis(2));
+        assert_eq!(out2.len(), 10);
     }
 }

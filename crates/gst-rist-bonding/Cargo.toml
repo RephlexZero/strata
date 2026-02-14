@@ -12,6 +12,7 @@ tracing = { workspace = true }
 once_cell = { workspace = true }
 bytes.workspace = true
 crossbeam-channel = { workspace = true }
+arc-swap.workspace = true
 ctrlc = "3.5.1"
 serde.workspace = true
 serde_json.workspace = true

@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 ///
 /// Holds the link's credit balance, throughput measurements, trend slopes,
 /// and penalty factors used to compute effective capacity during link selection.
+///
+/// Cache-line aligned (64 bytes) to prevent false sharing when multiple
+/// links are iterated in tight scheduler loops (#8).
+#[repr(align(64))]
 pub(crate) struct LinkState<L: ?Sized> {
     pub link: Arc<L>,
     pub credits: f64,
@@ -705,7 +709,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
     pub fn select_best_n_links(&mut self, packet_len: usize, n: usize) -> Vec<Arc<L>> {
         let packet_cost = packet_len as f64;
         let mut selected = Vec::new();
-        let mut used_kinds: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut used_kinds: std::collections::HashSet<compact_str::CompactString> = std::collections::HashSet::new();
 
         // Score all alive links
         let mut scored_links: Vec<_> = self
@@ -962,7 +966,7 @@ mod tests {
 
         fn set_link_kind(&self, kind: &str) {
             if let Ok(mut m) = self.metrics.lock() {
-                m.link_kind = Some(kind.to_string());
+                m.link_kind = Some(compact_str::CompactString::from(kind));
             }
         }
     }
@@ -1169,13 +1173,13 @@ mod tests {
         let cellular = Arc::new(MockLink::new(3, 8_000_000.0, LinkPhase::Live));
 
         if let Ok(mut m) = wired1.metrics.lock() {
-            m.link_kind = Some("wired".to_string());
+            m.link_kind = Some(compact_str::CompactString::from("wired"));
         }
         if let Ok(mut m) = wired2.metrics.lock() {
-            m.link_kind = Some("wired".to_string());
+            m.link_kind = Some(compact_str::CompactString::from("wired"));
         }
         if let Ok(mut m) = cellular.metrics.lock() {
-            m.link_kind = Some("cellular".to_string());
+            m.link_kind = Some(compact_str::CompactString::from("cellular"));
         }
 
         let mut dwrr = Dwrr::new();

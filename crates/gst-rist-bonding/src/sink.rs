@@ -478,7 +478,7 @@ mod imp {
                         );
                         if last_stats.elapsed() >= stats_interval {
                             if let Some(element) = element_weak.upgrade() {
-                                let metrics = lock_or_recover(&metrics_handle).clone();
+                                let metrics = (**metrics_handle.load()).clone();
                                 let mono_time_ns = start.elapsed().as_nanos() as u64;
                                 let wall_time_ms = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)

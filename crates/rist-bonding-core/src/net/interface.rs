@@ -1,4 +1,5 @@
 use anyhow::Result;
+use compact_str::CompactString;
 
 /// Lifecycle phase of a network link.
 ///
@@ -43,6 +44,10 @@ impl LinkPhase {
 /// Populated by [`LinkSender::get_metrics()`] from smoothed EWMA values
 /// and OS-level interface state (operstate, MTU). The scheduler uses these
 /// to compute effective capacity and credit accrual rates.
+///
+/// `iface` and `link_kind` use [`CompactString`] (inline up to 24 bytes)
+/// to eliminate heap allocation when cloning — these short strings ("eth0",
+/// "wired", etc.) never exceed the inline threshold.
 #[derive(Default, Debug, Clone)]
 pub struct LinkMetrics {
     pub rtt_ms: f64,
@@ -56,8 +61,8 @@ pub struct LinkMetrics {
     pub phase: LinkPhase,
     pub os_up: Option<bool>,
     pub mtu: Option<u32>,
-    pub iface: Option<String>,
-    pub link_kind: Option<String>,
+    pub iface: Option<CompactString>,
+    pub link_kind: Option<CompactString>,
     /// AIMD delay-gradient capacity estimate (0.0 if estimator disabled).
     pub estimated_capacity_bps: f64,
     /// One-way delay estimate in milliseconds (0.0 if not available).
@@ -103,8 +108,8 @@ mod tests {
         assert_eq!(m.phase, LinkPhase::Init);
         assert_eq!(m.os_up, None);
         assert_eq!(m.mtu, None);
-        assert_eq!(m.iface, None);
-        assert_eq!(m.link_kind, None);
+        assert!(m.iface.is_none());
+        assert!(m.link_kind.is_none());
         assert!((m.estimated_capacity_bps - 0.0).abs() < f64::EPSILON);
         assert!((m.owd_ms - 0.0).abs() < f64::EPSILON);
     }

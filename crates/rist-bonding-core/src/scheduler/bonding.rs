@@ -223,26 +223,34 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         }
 
         // All links dead — escalate logging based on consecutive failures.
+        self.log_dead_links();
         self.consecutive_dead_count += 1;
         self.total_dead_drops += 1;
 
-        // Log at escalating severity: first occurrence is a warning,
-        // sustained failures (100+ consecutive) escalate to error.
-        if self.consecutive_dead_count == 1 {
+        Err(anyhow::anyhow!("Link selection failed (all links dead)"))
+    }
+
+    /// Cold helper for dead-link logging — separated so the compiler can
+    /// inline the hot path of `send()` without bloating it with log
+    /// formatting code (#9).
+    #[cold]
+    #[inline(never)]
+    fn log_dead_links(&self) {
+        // Escalating severity: first occurrence is a warning,
+        // sustained failures (100+) escalate to error.
+        if self.consecutive_dead_count == 0 {
             warn!("All links dead: dropped packet (seq={})", self.next_seq);
-        } else if self.consecutive_dead_count == 100 {
+        } else if self.consecutive_dead_count == 99 {
             error!(
                 "All links dead for {} consecutive packets — total drops: {}",
-                self.consecutive_dead_count, self.total_dead_drops
+                self.consecutive_dead_count + 1, self.total_dead_drops + 1
             );
-        } else if self.consecutive_dead_count.is_multiple_of(1000) {
+        } else if (self.consecutive_dead_count + 1).is_multiple_of(1000) {
             error!(
                 "All links still dead after {} consecutive drops (total: {})",
-                self.consecutive_dead_count, self.total_dead_drops
+                self.consecutive_dead_count + 1, self.total_dead_drops + 1
             );
         }
-
-        Err(anyhow::anyhow!("Link selection failed (all links dead)"))
     }
 }
 

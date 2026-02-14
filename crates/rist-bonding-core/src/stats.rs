@@ -36,8 +36,8 @@ impl LinkStatsSnapshot {
             observed_bytes: m.observed_bytes,
             os_up: m.os_up,
             mtu: m.mtu,
-            iface: m.iface.clone(),
-            kind: m.link_kind.clone(),
+            iface: m.iface.as_ref().map(|s| s.to_string()),
+            kind: m.link_kind.as_ref().map(|s| s.to_string()),
             estimated_capacity_bps: m.estimated_capacity_bps,
             owd_ms: m.owd_ms,
         }
@@ -198,5 +198,41 @@ mod tests {
         assert_eq!(back.schema_version, snap.schema_version);
         assert_eq!(back.stats_seq, snap.stats_seq);
         assert!((back.aggregate_nada_ref_bps - snap.aggregate_nada_ref_bps).abs() < 1e-6);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // CompactString → String serialization tests (#6)
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn compact_string_iface_serializes_to_json_string() {
+        let m = sample_metrics();
+        let s = LinkStatsSnapshot::from_metrics(&m);
+        let json = serde_json::to_string(&s).unwrap();
+        // Verify the JSON contains "iface":"eth0" and "kind":"wired"
+        assert!(json.contains(r#""iface":"eth0""#), "json = {}", json);
+        assert!(json.contains(r#""kind":"wired""#), "json = {}", json);
+    }
+
+    #[test]
+    fn compact_string_none_omitted_from_json() {
+        let m = LinkMetrics {
+            iface: None,
+            link_kind: None,
+            ..LinkMetrics::default()
+        };
+        let s = LinkStatsSnapshot::from_metrics(&m);
+        let json = serde_json::to_string(&s).unwrap();
+        // With skip_serializing_if = "Option::is_none", these should be absent
+        assert!(
+            !json.contains("iface"),
+            "json should omit null iface: {}",
+            json
+        );
+        assert!(
+            !json.contains("kind"),
+            "json should omit null kind: {}",
+            json
+        );
     }
 }

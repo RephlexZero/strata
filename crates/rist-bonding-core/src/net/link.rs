@@ -3,6 +3,7 @@ use crate::net::state::LinkStats;
 use crate::net::util::bind_url_to_iface;
 use crate::net::wrapper::{RecoveryConfig, RistContext};
 use anyhow::Result;
+use compact_str::CompactString;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -248,8 +249,8 @@ impl LinkSender for Link {
             phase,
             os_up,
             mtu,
-            iface: iface_name,
-            link_kind,
+            iface: iface_name.map(CompactString::from),
+            link_kind: link_kind.map(CompactString::from),
             estimated_capacity_bps: 0.0,
             // Use RTT/2 as a proxy for one-way delay when true OWD
             // is unavailable.  This feeds the SBD engine (RFC 8382)

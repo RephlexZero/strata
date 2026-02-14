@@ -1,4 +1,37 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::cell::RefCell;
+
+/// Thread-local pool of `BytesMut` buffers to avoid per-packet heap
+/// allocation on the send hot path.  Each buffer is MTU-sized (1500 B)
+/// by default; `wrap()` will grow it transparently when the payload is
+/// larger.
+const POOL_CAPACITY: usize = 256;
+const DEFAULT_BUF_SIZE: usize = 1500;
+
+thread_local! {
+    static BUF_POOL: RefCell<Vec<BytesMut>> = RefCell::new(Vec::with_capacity(POOL_CAPACITY));
+}
+
+/// Take a `BytesMut` from the thread-local pool, or allocate a new one.
+#[inline]
+fn pool_take() -> BytesMut {
+    BUF_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_else(|| BytesMut::with_capacity(DEFAULT_BUF_SIZE))
+}
+
+/// Return a `BytesMut` to the thread-local pool for reuse.
+#[inline]
+pub fn pool_return(mut buf: BytesMut) {
+    buf.clear();
+    BUF_POOL.with(|pool| {
+        let mut p = pool.borrow_mut();
+        if p.len() < POOL_CAPACITY {
+            p.push(buf);
+        }
+        // else: pool full, let the buffer drop normally
+    });
+}
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct BondingHeader {
@@ -27,10 +60,13 @@ impl BondingHeader {
         }
     }
 
-    /// Wraps a payload with the bonding header.
+    /// Wraps a payload with the bonding header, using a pooled buffer
+    /// to avoid per-packet heap allocation.
     /// Returns a new Bytes object containing [Header + Payload]
     pub fn wrap(&self, payload: Bytes) -> Bytes {
-        let mut buf = BytesMut::with_capacity(Self::SIZE + payload.len());
+        let needed = Self::SIZE + payload.len();
+        let mut buf = pool_take();
+        buf.reserve(needed);
         buf.put_u64(self.seq_id);
         buf.put_u64(self.send_time_us);
         buf.put(payload);
@@ -205,5 +241,90 @@ mod tests {
             receiver_hasher.finish(),
             "Sender and receiver hashes must match through header wrap/unwrap"
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // BytesMut pool tests (#1)
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pool_take_returns_buffer() {
+        let buf = pool_take();
+        assert!(buf.capacity() >= DEFAULT_BUF_SIZE);
+    }
+
+    #[test]
+    fn pool_return_and_reuse() {
+        // Return a buffer, then take — should get the same capacity back.
+        let buf = BytesMut::with_capacity(2048);
+        pool_return(buf);
+        let reused = pool_take();
+        // The reused buffer should have been cleared but retain capacity.
+        assert!(reused.is_empty());
+        assert!(reused.capacity() >= 2048);
+    }
+
+    #[test]
+    fn pool_does_not_exceed_capacity() {
+        // Fill pool to capacity and then try to return one more.
+        for _ in 0..POOL_CAPACITY + 10 {
+            pool_return(BytesMut::with_capacity(128));
+        }
+        // Pool should be capped.
+        let count = BUF_POOL.with(|pool| pool.borrow().len());
+        assert!(count <= POOL_CAPACITY);
+    }
+
+    #[test]
+    fn pool_survives_concurrent_threads() {
+        use std::thread;
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                thread::spawn(|| {
+                    for _ in 0..100 {
+                        let buf = pool_take();
+                        pool_return(buf);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn wrap_uses_pooled_buffer() {
+        // Warm up the pool
+        for _ in 0..5 {
+            pool_return(BytesMut::with_capacity(DEFAULT_BUF_SIZE));
+        }
+        let pool_size_before = BUF_POOL.with(|p| p.borrow().len());
+        assert!(pool_size_before > 0);
+
+        let header = BondingHeader::new(1);
+        let _wrapped = header.wrap(Bytes::from_static(b"test"));
+
+        let pool_size_after = BUF_POOL.with(|p| p.borrow().len());
+        // Pool should have decreased by 1 (buffer taken for wrap)
+        assert!(
+            pool_size_after < pool_size_before,
+            "Pool should shrink when wrap() takes a buffer: before={}, after={}",
+            pool_size_before,
+            pool_size_after
+        );
+    }
+
+    #[test]
+    fn wrap_large_payload_grows_buffer() {
+        // Even with a default-sized pool buffer, large payloads work.
+        let large = Bytes::from(vec![0xAAu8; 9000]); // jumbo frame
+        let header = BondingHeader::new(42);
+        let wrapped = header.wrap(large.clone());
+        let (decoded, payload) = BondingHeader::unwrap(wrapped).unwrap();
+        assert_eq!(decoded.seq_id, 42);
+        assert_eq!(payload.len(), 9000);
     }
 }

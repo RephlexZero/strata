@@ -20,6 +20,19 @@
 
 use std::collections::{HashMap, VecDeque};
 
+// Thread-local scratch buffers for SBD `process_interval()` to avoid
+// per-call heap allocations (#10).  These Vecs are reused across
+// invocations and cleared — never freed — so the allocator overhead
+// amortises to near zero after the first interval.
+thread_local! {
+    static SBD_SCRATCH_SAMPLES: std::cell::RefCell<Vec<f64>> =
+        std::cell::RefCell::new(Vec::with_capacity(64));
+    static SBD_SCRATCH_SORTED: std::cell::RefCell<Vec<f64>> =
+        std::cell::RefCell::new(Vec::with_capacity(64));
+    static SBD_SCRATCH_ABS_DEVS: std::cell::RefCell<Vec<f64>> =
+        std::cell::RefCell::new(Vec::with_capacity(64));
+}
+
 /// Per-link statistics tracker for SBD.
 #[derive(Debug, Clone)]
 pub struct LinkSbdState {
@@ -137,6 +150,13 @@ impl SbdEngine {
     /// base interval, then appends to the M-interval history.
     pub fn process_interval(&mut self) {
         let n = self.n;
+        SBD_SCRATCH_SAMPLES.with(|samples_cell| {
+        SBD_SCRATCH_SORTED.with(|sorted_cell| {
+        SBD_SCRATCH_ABS_DEVS.with(|abs_devs_cell| {
+            let mut samples = samples_cell.borrow_mut();
+            let mut sorted = sorted_cell.borrow_mut();
+            let mut abs_devs = abs_devs_cell.borrow_mut();
+
         for state in self.link_states.values_mut() {
             // Only process if we have enough samples
             if state.delay_samples.len() < 2 {
@@ -161,14 +181,16 @@ impl SbdEngine {
                 state.delay_samples.pop_front();
             }
 
-            let samples: Vec<f64> = state.delay_samples.iter().copied().collect();
+            samples.clear();
+            samples.extend(state.delay_samples.iter().copied());
             let count = samples.len() as f64;
 
             // --- Step 2a: Compute mean ---
             let mean = samples.iter().sum::<f64>() / count;
 
             // --- Step 2b: skew_est (skewness via mean vs median comparison) ---
-            let mut sorted = samples.clone();
+            sorted.clear();
+            sorted.extend(samples.iter().copied());
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let median = if sorted.len().is_multiple_of(2) {
                 (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
@@ -178,7 +200,8 @@ impl SbdEngine {
             let skew_est = mean - median;
 
             // --- Step 2c: var_est (MAD — Median Absolute Deviation) ---
-            let mut abs_devs: Vec<f64> = samples.iter().map(|x| (x - median).abs()).collect();
+            abs_devs.clear();
+            abs_devs.extend(samples.iter().map(|x| (x - median).abs()));
             abs_devs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let var_est = if abs_devs.len().is_multiple_of(2) {
                 (abs_devs[abs_devs.len() / 2 - 1] + abs_devs[abs_devs.len() / 2]) / 2.0
@@ -190,7 +213,7 @@ impl SbdEngine {
             // Count sign changes in the deviation from mean
             let mut sign_changes = 0u32;
             let mut prev_sign = 0i32;
-            for &s in &samples {
+            for &s in samples.iter() {
                 let sign = if s > mean {
                     1
                 } else if s < mean {
@@ -238,6 +261,9 @@ impl SbdEngine {
             state.pkt_count = 0;
             state.pkt_lost = 0;
         }
+        }); // abs_devs
+        }); // sorted
+        }); // samples
     }
 
     /// Run the 5-step grouping algorithm (RFC 8382 §3).

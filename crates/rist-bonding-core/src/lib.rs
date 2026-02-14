@@ -31,9 +31,8 @@ pub use net::wrapper::{RecoveryConfig, RistContext, RistReceiverContext};
 /// is already set. Safe to call multiple times — subsequent calls are no-ops.
 /// Controlled by `RUST_LOG` env var (e.g., `RUST_LOG=rist_bonding_core=debug`).
 pub fn init() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
+    use std::sync::LazyLock;
+    static INIT: LazyLock<()> = LazyLock::new(|| {
         // Only install if no subscriber is already set (e.g., by the host application).
         if tracing::dispatcher::has_been_set() {
             tracing::info!("Rist Bonding Core: tracing subscriber already set");
@@ -52,4 +51,6 @@ pub fn init() {
             tracing::info!("Rist Bonding Core initialized");
         }
     });
+    // Force evaluation; the closure runs at most once.
+    let _ = &*INIT;
 }
