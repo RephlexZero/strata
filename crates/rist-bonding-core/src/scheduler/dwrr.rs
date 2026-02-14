@@ -54,6 +54,11 @@ pub(crate) struct LinkState<L: ?Sized> {
     pub gradual_mode: bool,
     /// Loss-free sample counter for accelerated ramp-up mode detection.
     pub loss_free_samples: u32,
+    // --- wVegas Coupled CC state ---
+    /// Congestion window (bytes) maintained by the wVegas algorithm.
+    pub wvegas_cwnd: f64,
+    /// Minimum RTT observed on this link (base RTT for Vegas diff).
+    pub wvegas_base_rtt_ms: f64,
 }
 
 /// Deficit Weighted Round Robin (DWRR) packet scheduler.
@@ -177,6 +182,8 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 x_prev: 0.0,
                 gradual_mode: false,
                 loss_free_samples: 0,
+                wvegas_cwnd: self.config.wvegas_init_cwnd,
+                wvegas_base_rtt_ms: f64::MAX,
             },
         );
         self.sorted_ids.push(id);
@@ -565,8 +572,94 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 }
             }
 
-            // Calculate spare capacity using estimated_capacity when AIMD is active
-            let effective_capacity = if aimd_enabled && state.aimd_initialized {
+            // ======== wVegas Coupled CC ========
+            // Vegas-style delay-based congestion window that modulates
+            // the send rate independently from AIMD.  When enabled,
+            // `estimated_capacity_bps` is clamped to the window-implied
+            // rate: `cwnd / base_rtt`.
+            if self.config.wvegas_enabled && state.metrics.rtt_ms > 0.0 {
+                let rtt = state.metrics.rtt_ms;
+
+                // Track base RTT (minimum ever observed).
+                if rtt < state.wvegas_base_rtt_ms {
+                    state.wvegas_base_rtt_ms = rtt;
+                }
+                let base_rtt = state.wvegas_base_rtt_ms;
+                let cwnd = state.wvegas_cwnd;
+
+                // Vegas diff = expected − actual (in MTU-equivalents).
+                //   expected = cwnd / base_rtt
+                //   actual   = cwnd / rtt
+                //   diff     = cwnd * (1/base_rtt − 1/rtt) / 1500
+                let diff = if base_rtt > 0.0 {
+                    cwnd * (1.0 / base_rtt - 1.0 / rtt) / 1500.0
+                } else {
+                    0.0
+                };
+
+                let wv_alpha = self.config.wvegas_alpha;
+                let wv_beta = self.config.wvegas_beta;
+                let wv_gamma = self.config.wvegas_gamma;
+                let wv_min = self.config.wvegas_min_cwnd;
+
+                // Coupled alpha: scale increase by the SBD coupling factor.
+                let ca = coupled_alpha;
+
+                if diff < wv_alpha {
+                    // Under-utilizing: increase window (additive increase)
+                    let inc = (wv_gamma * ca * 1500.0).min(cwnd * 0.25);
+                    state.wvegas_cwnd = cwnd + inc;
+                } else if diff > wv_beta {
+                    // Congested: decrease window (multiplicative decrease)
+                    let dec = 1500.0;
+                    state.wvegas_cwnd = (cwnd - dec).max(wv_min);
+                }
+                // else: in the [alpha, beta] sweet-spot — hold steady.
+
+                // Modulate estimated capacity: cwnd-implied rate.
+                let cwnd_bps = state.wvegas_cwnd * 8.0 / (base_rtt / 1000.0);
+                let cap_ceiling = if state.estimated_capacity_bps > 0.0 {
+                    state.estimated_capacity_bps
+                } else {
+                    state.metrics.capacity_bps
+                };
+                if cwnd_bps < cap_ceiling {
+                    state.estimated_capacity_bps = cwnd_bps;
+                    state.metrics.estimated_capacity_bps = cwnd_bps;
+                }
+            }
+
+            // ======== Signal Watermark ========
+            // Read wireless signal strength and apply capacity penalty
+            // when below the configured threshold.
+            if self.config.signal_watermark_enabled {
+                if let Some(ref iface) = state.metrics.iface {
+                    if let Some(dbm) = crate::net::signal::read_signal_dbm(iface) {
+                        state.metrics.signal_dbm = Some(dbm);
+                        if crate::net::signal::is_below_watermark(
+                            Some(dbm),
+                            self.config.signal_watermark_threshold_dbm,
+                        ) {
+                            // Bootstrap from raw capacity when no estimator
+                            // (AIMD / wVegas) has set a value yet.
+                            if state.estimated_capacity_bps <= 0.0 {
+                                state.estimated_capacity_bps = state.metrics.capacity_bps;
+                            }
+                            // Apply capacity penalty: reduce effective capacity.
+                            let penalty = self.config.signal_watermark_penalty;
+                            state.estimated_capacity_bps *= penalty;
+                            state.metrics.estimated_capacity_bps = state.estimated_capacity_bps;
+                        }
+                    }
+                }
+            }
+
+            // Calculate spare capacity using estimated_capacity when an
+            // estimator (AIMD / wVegas / signal-watermark) has set it.
+            let effective_capacity = if (aimd_enabled && state.aimd_initialized)
+                || ((self.config.wvegas_enabled || self.config.signal_watermark_enabled)
+                    && state.estimated_capacity_bps > 0.0)
+            {
                 state.estimated_capacity_bps
             } else {
                 state.metrics.capacity_bps
@@ -685,6 +778,34 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
     /// Use this on the hot packet path instead of calling `get_active_links()`.
     pub fn cached_spare_ratio(&self) -> f64 {
         self.cached_spare_ratio
+    }
+
+    /// Returns the minimum OWD across all alive links (ms).
+    /// Used by the discard primitive to decide whether a packet would
+    /// arrive after its deadline.  Returns `0.0` when no alive
+    /// link has a positive OWD measurement yet (conservatively assumes
+    /// no delay, so the discard primitive will not fire).
+    pub fn min_alive_owd_ms(&self) -> f64 {
+        let mut min = f64::MAX;
+        for state in self.links.values() {
+            if state.metrics.alive && state.metrics.owd_ms > 0.0 && state.metrics.owd_ms < min {
+                min = state.metrics.owd_ms;
+            }
+        }
+        if min == f64::MAX {
+            0.0
+        } else {
+            min
+        }
+    }
+
+    /// Returns the wVegas congestion window (bytes) for the given link.
+    /// Returns `None` if the link doesn't exist or wVegas is disabled.
+    pub fn wvegas_cwnd(&self, link_id: usize) -> Option<f64> {
+        if !self.config.wvegas_enabled {
+            return None;
+        }
+        self.links.get(&link_id).map(|s| s.wvegas_cwnd)
     }
 
     /// Returns all alive links and deducts the cost from their credits.
@@ -931,6 +1052,7 @@ mod tests {
                     link_kind: None,
                     estimated_capacity_bps: 0.0,
                     owd_ms: 0.0,
+                    signal_dbm: None,
                 }),
             }
         }
@@ -2031,6 +2153,163 @@ mod tests {
             (est_after - 1_000_000.0).abs() < 1.0,
             "estimated_capacity should reset to floor on phase reset, got {}",
             est_after
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // wVegas Coupled CC tests
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn wvegas_disabled_by_default() {
+        let dwrr: Dwrr<MockLink> = Dwrr::new();
+        assert!(!dwrr.config().wvegas_enabled);
+        assert!(dwrr.wvegas_cwnd(1).is_none());
+    }
+
+    #[test]
+    fn wvegas_init_cwnd_set_on_add_link() {
+        let config = SchedulerConfig {
+            wvegas_enabled: true,
+            wvegas_init_cwnd: 32768.0,
+            ..SchedulerConfig::default()
+        };
+        let mut dwrr = Dwrr::with_config(config);
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        dwrr.add_link(link);
+
+        let cwnd = dwrr
+            .wvegas_cwnd(1)
+            .expect("wVegas enabled, should return cwnd");
+        assert!(
+            (cwnd - 32768.0).abs() < 1e-6,
+            "Initial cwnd should be 32768, got {}",
+            cwnd
+        );
+    }
+
+    #[test]
+    fn wvegas_increases_window_when_underutilized() {
+        let config = SchedulerConfig {
+            wvegas_enabled: true,
+            wvegas_alpha: 2.0,
+            wvegas_beta: 4.0,
+            wvegas_gamma: 2.0,
+            wvegas_init_cwnd: 65536.0,
+            wvegas_min_cwnd: 4096.0,
+            capacity_estimate_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut dwrr = Dwrr::with_config(config);
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        // RTT is exactly equal to base_rtt → diff = 0 < alpha → increase
+        link.set_rtt(10.0);
+        dwrr.add_link(link.clone());
+
+        let cwnd_before = dwrr.wvegas_cwnd(1).unwrap();
+        dwrr.refresh_metrics();
+        let cwnd_after = dwrr.wvegas_cwnd(1).unwrap();
+
+        assert!(
+            cwnd_after > cwnd_before,
+            "wVegas should increase window when diff < alpha: before={}, after={}",
+            cwnd_before,
+            cwnd_after
+        );
+    }
+
+    #[test]
+    fn wvegas_decreases_window_when_congested() {
+        let config = SchedulerConfig {
+            wvegas_enabled: true,
+            wvegas_alpha: 2.0,
+            wvegas_beta: 4.0,
+            wvegas_gamma: 2.0,
+            wvegas_init_cwnd: 65536.0,
+            wvegas_min_cwnd: 4096.0,
+            capacity_estimate_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut dwrr = Dwrr::with_config(config);
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        link.set_rtt(5.0);
+
+        // First refresh to establish base_rtt = 5ms
+        dwrr.add_link(link.clone());
+        dwrr.refresh_metrics();
+
+        // Spike RTT dramatically (5ms → 50ms) to create large diff > beta
+        link.set_rtt(50.0);
+        let cwnd_before = dwrr.wvegas_cwnd(1).unwrap();
+        dwrr.refresh_metrics();
+        let cwnd_after = dwrr.wvegas_cwnd(1).unwrap();
+
+        assert!(
+            cwnd_after < cwnd_before,
+            "wVegas should decrease window when diff > beta: before={}, after={}",
+            cwnd_before,
+            cwnd_after
+        );
+    }
+
+    #[test]
+    fn wvegas_respects_minimum_cwnd() {
+        let config = SchedulerConfig {
+            wvegas_enabled: true,
+            wvegas_alpha: 2.0,
+            wvegas_beta: 4.0,
+            wvegas_gamma: 2.0,
+            wvegas_init_cwnd: 5000.0, // Start near minimum
+            wvegas_min_cwnd: 4096.0,
+            capacity_estimate_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut dwrr = Dwrr::with_config(config);
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        link.set_rtt(5.0);
+
+        dwrr.add_link(link.clone());
+        dwrr.refresh_metrics(); // Sets base_rtt
+
+        // Huge RTT spike → aggressive decrease
+        link.set_rtt(500.0);
+        for _ in 0..20 {
+            dwrr.refresh_metrics();
+        }
+
+        let cwnd = dwrr.wvegas_cwnd(1).unwrap();
+        assert!(
+            cwnd >= 4096.0,
+            "wVegas cwnd should not drop below min_cwnd (4096), got {}",
+            cwnd
+        );
+    }
+
+    #[test]
+    fn wvegas_modulates_estimated_capacity() {
+        let config = SchedulerConfig {
+            wvegas_enabled: true,
+            wvegas_alpha: 2.0,
+            wvegas_beta: 4.0,
+            wvegas_init_cwnd: 10_000.0,
+            wvegas_min_cwnd: 4096.0,
+            capacity_estimate_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut dwrr = Dwrr::with_config(config);
+        let link = Arc::new(MockLink::new(1, 100_000_000.0, LinkPhase::Live));
+        link.set_rtt(10.0);
+        dwrr.add_link(link.clone());
+        dwrr.refresh_metrics();
+
+        // cwnd=10000 bytes, base_rtt=10ms → cwnd_bps = 10000*8/(10/1000) = 8_000_000
+        // That's less than the link's 100 Mbps capacity, so it should clamp.
+        let metrics = dwrr.get_active_links();
+        let (_, m) = metrics.into_iter().find(|(id, _)| *id == 1).unwrap();
+        assert!(
+            m.estimated_capacity_bps < 100_000_000.0,
+            "wVegas should modulate capacity below link reported value, got {}",
+            m.estimated_capacity_bps
         );
     }
 }

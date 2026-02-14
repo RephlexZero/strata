@@ -7,6 +7,11 @@ pub struct Packet {
     pub seq_id: u64,
     pub payload: Bytes,
     pub arrival_time: Instant,
+    /// Sender-side timestamp in microseconds (from `BondingHeader::send_time_us`).
+    /// Used for relative-delay jitter estimation that is resilient to
+    /// clock drift between sender and receiver.  `0` means not available
+    /// (falls back to classic IAT jitter).
+    pub send_time_us: u64,
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -103,6 +108,16 @@ pub struct ReassemblyBuffer {
     jitter_smoothed: f64,
     jitter_samples: VecDeque<f64>,
 
+    // ── Relative delay jitter (clock-drift resistant) ──
+    /// Monotonic reference base for computing receiver-side timestamps
+    /// in microseconds.  Set to the arrival time of the first packet.
+    recv_base: Option<Instant>,
+    /// Sliding minimum of one-way delay samples (µs).
+    /// Kept as a windowed min-tracker (last 256 samples).
+    min_delay_us: f64,
+    /// Ring of recent OWD samples for sliding-min tracking.
+    delay_ring: VecDeque<f64>,
+
     // ── Performance scratch buffers ──
     /// Re-usable scratch for `percentile()` to avoid per-call allocation (#3).
     percentile_scratch: Vec<f64>,
@@ -193,6 +208,9 @@ impl ReassemblyBuffer {
             avg_iat: 0.0,
             jitter_smoothed: 0.0,
             jitter_samples: VecDeque::with_capacity(128),
+            recv_base: None,
+            min_delay_us: f64::MAX,
+            delay_ring: VecDeque::with_capacity(256),
             percentile_scratch: Vec::with_capacity(128),
             tick_scratch: Vec::with_capacity(64),
             slot_bitmap: SlotBitmap::new(capacity),
@@ -211,8 +229,66 @@ impl ReassemblyBuffer {
     }
 
     pub fn push(&mut self, seq_id: u64, payload: Bytes, now: Instant) {
-        // Calculate Jitter
-        if let Some(last) = self.last_arrival {
+        self.push_with_send_time(seq_id, payload, now, 0);
+    }
+
+    /// Push a packet with an optional sender timestamp for relative-delay
+    /// jitter estimation.  When `send_time_us > 0`, the jitter buffer
+    /// computes `relative_delay = owd - min(owd)` which is resilient to
+    /// clock drift between sender and receiver (important when bonding
+    /// cellular + wired paths with independent clock sources).
+    ///
+    /// Falls back to classic inter-arrival-time (IAT) jitter when
+    /// `send_time_us == 0`.
+    pub fn push_with_send_time(
+        &mut self,
+        seq_id: u64,
+        payload: Bytes,
+        now: Instant,
+        send_time_us: u64,
+    ) {
+        // ── Jitter estimation ──
+        if send_time_us > 0 {
+            // -- Relative delay mode (clock-drift resistant) --
+            let recv_base = *self.recv_base.get_or_insert(now);
+            let recv_us = now.duration_since(recv_base).as_micros() as f64;
+            let owd_us = recv_us - send_time_us as f64;
+
+            // Sliding-min tracker (256-sample window)
+            self.delay_ring.push_back(owd_us);
+            if self.delay_ring.len() > 256 {
+                self.delay_ring.pop_front();
+            }
+            // Recompute min if the evicted sample was the old minimum
+            if owd_us < self.min_delay_us {
+                self.min_delay_us = owd_us;
+            } else if self.delay_ring.len() < 256 || self.min_delay_us == f64::MAX {
+                // Need to rescan — the old minimum may have been evicted
+                self.min_delay_us = self.delay_ring.iter().copied().fold(f64::MAX, f64::min);
+            }
+            // Relative delay: how much above the minimum OWD this packet is
+            let relative_delay_ms = (owd_us - self.min_delay_us) / 1000.0;
+
+            // Feed into the same jitter EWMA / p95 pipeline
+            let alpha = 0.1;
+            self.jitter_smoothed =
+                (1.0 - alpha) * self.jitter_smoothed + alpha * (relative_delay_ms / 1000.0);
+            self.jitter_samples.push_back(relative_delay_ms / 1000.0);
+            if self.jitter_samples.len() > 128 {
+                self.jitter_samples.pop_front();
+            }
+
+            let jitter_est = if self.jitter_samples.len() >= 5 {
+                percentile(&self.jitter_samples, 0.95, &mut self.percentile_scratch)
+            } else {
+                self.jitter_smoothed
+            };
+            let jitter_ms = jitter_est * 1000.0;
+            let additional_latency =
+                Duration::from_millis((self.jitter_latency_multiplier * jitter_ms) as u64);
+            self.latency = (self.start_latency + additional_latency).min(self.max_latency);
+        } else if let Some(last) = self.last_arrival {
+            // -- Classic IAT mode (fallback) --
             let iat = now.duration_since(last).as_secs_f64();
 
             // EWMA alpha
@@ -300,6 +376,7 @@ impl ReassemblyBuffer {
             seq_id,
             payload,
             arrival_time: now,
+            send_time_us,
         });
     }
 
@@ -1136,5 +1213,124 @@ mod tests {
         }
         let out2 = buf.tick(now + Duration::from_millis(2));
         assert_eq!(out2.len(), 10);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Relative delay jitter tests (#2)
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn relative_delay_mode_activates_with_send_time() {
+        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(10));
+        let start = Instant::now();
+
+        // Push with send timestamps — relative delay should kick in
+        buf.push_with_send_time(0, Bytes::from_static(b"P0"), start, 1_000);
+        buf.push_with_send_time(
+            1,
+            Bytes::from_static(b"P1"),
+            start + Duration::from_millis(20),
+            21_000,
+        );
+
+        // delay_ring should have 2 entries
+        assert_eq!(buf.delay_ring.len(), 2);
+        assert!(buf.min_delay_us < f64::MAX, "min_delay should be set");
+    }
+
+    #[test]
+    fn relative_delay_with_constant_owd_yields_zero_jitter() {
+        // If all packets have the same OWD, relative delay = 0 → no jitter → latency stays minimal.
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(10),
+            buffer_capacity: 64,
+            jitter_latency_multiplier: 4.0,
+            max_latency_ms: 500,
+            skip_after: None,
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        for i in 0..50u64 {
+            // OWD is always exactly 1000µs (1ms)
+            let arrival = start + Duration::from_micros(i * 1000 + 1000);
+            let send_time_us = i * 1000;
+            buf.push_with_send_time(i, Bytes::from(vec![0u8; 100]), arrival, send_time_us);
+        }
+
+        // Latency should remain at start_latency since jitter ≈ 0
+        assert!(
+            buf.latency <= Duration::from_millis(15),
+            "Constant OWD should produce zero jitter, latency should stay near start: {:?}",
+            buf.latency
+        );
+    }
+
+    #[test]
+    fn relative_delay_increases_latency_on_variable_owd() {
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(10),
+            buffer_capacity: 64,
+            jitter_latency_multiplier: 4.0,
+            max_latency_ms: 500,
+            skip_after: None,
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        // Inject variable OWD: alternating 1ms and 20ms
+        for i in 0..20u64 {
+            let owd_us = if i % 2 == 0 { 1000 } else { 20000 };
+            let arrival = start + Duration::from_micros(i * 10_000 + owd_us);
+            let send_time_us = i * 10_000;
+            buf.push_with_send_time(i, Bytes::from(vec![0u8; 100]), arrival, send_time_us);
+        }
+
+        assert!(
+            buf.latency > Duration::from_millis(10),
+            "Variable OWD should increase latency beyond start: {:?}",
+            buf.latency
+        );
+    }
+
+    #[test]
+    fn relative_delay_falls_back_to_iat_when_no_send_time() {
+        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(10));
+        let start = Instant::now();
+
+        // Push without send timestamps (send_time_us = 0) → classic IAT mode
+        buf.push_with_send_time(0, Bytes::from_static(b"P0"), start, 0);
+        buf.push_with_send_time(
+            1,
+            Bytes::from_static(b"P1"),
+            start + Duration::from_millis(20),
+            0,
+        );
+
+        // delay_ring should be empty (relative delay not activated)
+        assert!(
+            buf.delay_ring.is_empty(),
+            "No send timestamps → should not use relative delay"
+        );
+    }
+
+    #[test]
+    fn relative_delay_sliding_min_window() {
+        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(10));
+        let start = Instant::now();
+
+        // Push 300 packets to exceed the 256-sample sliding window
+        for i in 0..300u64 {
+            let owd_us = 5000 + (i % 10) * 100; // 5ms to 5.9ms OWD
+            let arrival = start + Duration::from_micros(i * 1000 + owd_us);
+            buf.push_with_send_time(i, Bytes::from(vec![0u8; 10]), arrival, i * 1000);
+        }
+
+        assert_eq!(
+            buf.delay_ring.len(),
+            256,
+            "Sliding window should cap at 256"
+        );
+        assert!(buf.min_delay_us < f64::MAX, "Min delay should be tracked");
     }
 }

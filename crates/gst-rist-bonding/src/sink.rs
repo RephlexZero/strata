@@ -619,6 +619,7 @@ mod imp {
                 is_critical,
                 can_drop,
                 size_bytes: data.len(),
+                ..Default::default()
             };
 
             if let Some(rt) = lock_or_recover(&self.runtime).as_ref() {

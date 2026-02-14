@@ -68,6 +68,9 @@ pub struct LinkMetrics {
     /// One-way delay estimate in milliseconds (0.0 if not available).
     /// Computed from `BondingHeader::send_time_us` when OWD timestamps are present.
     pub owd_ms: f64,
+    /// Wireless signal strength in dBm (`None` for wired links).
+    /// Read from sysfs/netlink for Wi-Fi or cellular interfaces.
+    pub signal_dbm: Option<f64>,
 }
 
 /// Abstraction for a network link capable of sending packets and reporting metrics.

@@ -256,6 +256,9 @@ impl LinkSender for Link {
             // is unavailable.  This feeds the SBD engine (RFC 8382)
             // with a reasonable delay signal.
             owd_ms: rtt_ms / 2.0,
+            // Signal strength is populated by the signal-watermark
+            // subsystem when available (Wi-Fi / cellular interfaces).
+            signal_dbm: None,
         }
     }
 }

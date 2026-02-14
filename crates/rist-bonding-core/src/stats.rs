@@ -87,6 +87,7 @@ mod tests {
             link_kind: Some("wired".into()),
             estimated_capacity_bps: 8_000_000.0,
             owd_ms: 6.25,
+            signal_dbm: Some(-65.0),
         }
     }
 

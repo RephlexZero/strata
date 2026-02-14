@@ -62,9 +62,19 @@ impl BondingReceiver {
                 while running_clone.load(Ordering::Relaxed) {
                     match input_rx.recv_timeout(tick_interval) {
                         Ok(packet) => {
-                            buffer.push(packet.seq_id, packet.payload, packet.arrival_time);
+                            buffer.push_with_send_time(
+                                packet.seq_id,
+                                packet.payload,
+                                packet.arrival_time,
+                                packet.send_time_us,
+                            );
                             while let Ok(pkt) = input_rx.try_recv() {
-                                buffer.push(pkt.seq_id, pkt.payload, pkt.arrival_time);
+                                buffer.push_with_send_time(
+                                    pkt.seq_id,
+                                    pkt.payload,
+                                    pkt.arrival_time,
+                                    pkt.send_time_us,
+                                );
                             }
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -183,6 +193,7 @@ impl BondingReceiver {
                                     seq_id: header.seq_id,
                                     payload: original_payload,
                                     arrival_time: Instant::now(),
+                                    send_time_us: header.send_time_us,
                                 };
                                 if input_tx.try_send(packet).is_err() {
                                     debug!(

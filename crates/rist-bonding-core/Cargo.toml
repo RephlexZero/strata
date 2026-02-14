@@ -17,5 +17,6 @@ libc = "0.2.181"
 arc-swap = { workspace = true }
 compact_str = { workspace = true }
 rtrb = { workspace = true }
+raptorq = { workspace = true }
 
 [dev-dependencies]

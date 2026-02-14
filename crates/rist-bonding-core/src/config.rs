@@ -142,6 +142,43 @@ pub struct SchedulerConfigInput {
     /// Priority weight for the flow (RFC 8698 §4.1)
     pub nada_prio: Option<f64>,
 
+    // --- Discard primitive ---
+    /// Latency budget in ms; packets whose estimated OWD exceeds this
+    /// are discarded at the sender (0 = disabled).
+    pub discard_deadline_ms: Option<u64>,
+
+    // --- STORM Dual-Queue ---
+    /// Enable STORM dual-queue scheduling (reliable vs unreliable)
+    pub storm_enabled: Option<bool>,
+    /// Weight of the reliable queue (0.0-1.0); unreliable gets 1-weight
+    pub storm_reliable_weight: Option<f64>,
+    /// Max age in ms for unreliable queue entries before discard
+    pub storm_unreliable_max_age_ms: Option<u64>,
+    /// Max internal queue depth per class (packets)
+    pub storm_queue_capacity: Option<usize>,
+
+    // --- wVegas Coupled CC ---
+    /// Enable wVegas delay-based congestion control
+    pub wvegas_enabled: Option<bool>,
+    /// Alpha threshold (packets): below this diff → increase window
+    pub wvegas_alpha: Option<f64>,
+    /// Beta threshold (packets): above this diff → decrease window
+    pub wvegas_beta: Option<f64>,
+    /// Maximum window increase per RTT (bytes)
+    pub wvegas_gamma: Option<f64>,
+    /// Initial congestion window (bytes)
+    pub wvegas_init_cwnd: Option<f64>,
+    /// Minimum congestion window (bytes)
+    pub wvegas_min_cwnd: Option<f64>,
+
+    // --- Signal Watermark ---
+    /// Enable signal-strength watermark for wireless links
+    pub signal_watermark_enabled: Option<bool>,
+    /// Signal threshold in dBm below which the link is unreliable
+    pub signal_watermark_threshold_dbm: Option<f64>,
+    /// Capacity penalty factor when below watermark (0.0-1.0)
+    pub signal_watermark_penalty: Option<f64>,
+
     // --- SBD / RFC 8382 knobs ---
     /// Enable shared bottleneck detection (RFC 8382)
     pub sbd_enabled: Option<bool>,
@@ -291,6 +328,43 @@ pub struct SchedulerConfig {
     /// Priority weight of the flow.
     pub nada_prio: f64,
 
+    // --- Discard primitive ---
+    /// Latency budget in ms; droppable packets whose estimated OWD
+    /// exceeds this are silently discarded at the sender (0 = disabled).
+    pub discard_deadline_ms: u64,
+
+    // --- STORM Dual-Queue ---
+    /// Enable STORM dual-queue scheduling (reliable vs unreliable).
+    pub storm_enabled: bool,
+    /// Weight of the reliable queue (0.0-1.0); unreliable gets `1 - weight`.
+    pub storm_reliable_weight: f64,
+    /// Max age in ms for unreliable queue entries before age-discard.
+    pub storm_unreliable_max_age_ms: u64,
+    /// Max internal queue depth per class (packets).
+    pub storm_queue_capacity: usize,
+
+    // --- wVegas Coupled CC ---
+    /// Enable wVegas delay-based congestion control.
+    pub wvegas_enabled: bool,
+    /// Alpha threshold (packets): below diff → window increase.
+    pub wvegas_alpha: f64,
+    /// Beta threshold (packets): above diff → window decrease.
+    pub wvegas_beta: f64,
+    /// Maximum window increase per RTT (bytes).
+    pub wvegas_gamma: f64,
+    /// Initial congestion window (bytes).
+    pub wvegas_init_cwnd: f64,
+    /// Minimum congestion window (bytes).
+    pub wvegas_min_cwnd: f64,
+
+    // --- Signal Watermark ---
+    /// Enable signal-strength watermark for wireless link classification.
+    pub signal_watermark_enabled: bool,
+    /// Signal threshold in dBm: below this → link classified unreliable.
+    pub signal_watermark_threshold_dbm: f64,
+    /// Capacity penalty when signal is below watermark (0.0−1.0).
+    pub signal_watermark_penalty: f64,
+
     // --- SBD / RFC 8382 ---
     /// Enable shared bottleneck detection.
     pub sbd_enabled: bool,
@@ -354,6 +428,24 @@ impl Default for SchedulerConfig {
             sbd_c_s: 0.1,
             sbd_c_h: 0.3,
             sbd_p_l: 0.1,
+            // Discard primitive
+            discard_deadline_ms: 200,
+            // STORM dual-queue
+            storm_enabled: true,
+            storm_reliable_weight: 0.7,
+            storm_unreliable_max_age_ms: 200,
+            storm_queue_capacity: 256,
+            // wVegas coupled CC
+            wvegas_enabled: false,
+            wvegas_alpha: 2.0,
+            wvegas_beta: 4.0,
+            wvegas_gamma: 2.0,
+            wvegas_init_cwnd: 65536.0,
+            wvegas_min_cwnd: 4096.0,
+            // Signal watermark
+            signal_watermark_enabled: true,
+            signal_watermark_threshold_dbm: -80.0,
+            signal_watermark_penalty: 0.5,
         }
     }
 }
@@ -550,6 +642,58 @@ impl SchedulerConfigInput {
             sbd_c_s: self.sbd_c_s.unwrap_or(defaults.sbd_c_s).clamp(-1.0, 1.0),
             sbd_c_h: self.sbd_c_h.unwrap_or(defaults.sbd_c_h).clamp(-1.0, 1.0),
             sbd_p_l: self.sbd_p_l.unwrap_or(defaults.sbd_p_l).clamp(0.0, 1.0),
+            // Discard primitive
+            discard_deadline_ms: self
+                .discard_deadline_ms
+                .unwrap_or(defaults.discard_deadline_ms),
+            // STORM dual-queue
+            storm_enabled: self.storm_enabled.unwrap_or(defaults.storm_enabled),
+            storm_reliable_weight: self
+                .storm_reliable_weight
+                .unwrap_or(defaults.storm_reliable_weight)
+                .clamp(0.1, 0.95),
+            storm_unreliable_max_age_ms: self
+                .storm_unreliable_max_age_ms
+                .unwrap_or(defaults.storm_unreliable_max_age_ms)
+                .max(10),
+            storm_queue_capacity: self
+                .storm_queue_capacity
+                .unwrap_or(defaults.storm_queue_capacity)
+                .clamp(16, 4096),
+            // wVegas coupled CC
+            wvegas_enabled: self.wvegas_enabled.unwrap_or(defaults.wvegas_enabled),
+            wvegas_alpha: self
+                .wvegas_alpha
+                .unwrap_or(defaults.wvegas_alpha)
+                .clamp(0.1, 20.0),
+            wvegas_beta: self
+                .wvegas_beta
+                .unwrap_or(defaults.wvegas_beta)
+                .clamp(0.1, 50.0),
+            wvegas_gamma: self
+                .wvegas_gamma
+                .unwrap_or(defaults.wvegas_gamma)
+                .clamp(0.1, 100.0),
+            wvegas_init_cwnd: self
+                .wvegas_init_cwnd
+                .unwrap_or(defaults.wvegas_init_cwnd)
+                .clamp(1024.0, 10_000_000.0),
+            wvegas_min_cwnd: self
+                .wvegas_min_cwnd
+                .unwrap_or(defaults.wvegas_min_cwnd)
+                .clamp(512.0, 1_000_000.0),
+            // Signal watermark
+            signal_watermark_enabled: self
+                .signal_watermark_enabled
+                .unwrap_or(defaults.signal_watermark_enabled),
+            signal_watermark_threshold_dbm: self
+                .signal_watermark_threshold_dbm
+                .unwrap_or(defaults.signal_watermark_threshold_dbm)
+                .clamp(-140.0, 0.0),
+            signal_watermark_penalty: self
+                .signal_watermark_penalty
+                .unwrap_or(defaults.signal_watermark_penalty)
+                .clamp(0.0, 1.0),
         }
     }
 }
