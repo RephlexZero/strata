@@ -16,6 +16,7 @@
 | 05 | [Receiver Workers](05-receiver-workers.md) | Receiver worker lifecycle, forwarding pipeline variants (RTMP, SRT, HLS, record), resource management, health checks, multi-host scaling. |
 | 06 | [Technology Choices](06-technology-choices.md) | Trade-off analysis: language, deployment model, database, auth, real-time updates, monitoring. Rationale for each decision. |
 | 07 | [Hardware Evaluation](07-hardware-evaluation.md) | SBC comparison (ROCK 5B+, Orange Pi 5 Plus, ROCK 5 ITX, RPi 5). HDMI input approaches (native vs USB capture). Bill of materials. Thermal and VPU considerations. |
+| 08 | [Local Dev Environment](08-local-dev-environment.md) | Docker Compose simulation of the full stack (sender + cloud + dashboard) inside the devcontainer. Simulated hardware, seed data, developer workflow. |
 
 ---
 
@@ -23,15 +24,17 @@
 
 | Decision | Choice | Doc |
 |---|---|---|
-| Deployment model | Process-per-stream (not Docker, not k8s) | [01](01-architecture-overview.md#5-deployment-model-decision) |
+| Deployment model | Docker Compose + process-per-stream inside | [01](01-architecture-overview.md#5-deployment-model-decision), [06](06-technology-choices.md#2-deployment-docker-compose--process-per-stream-inside) |
 | Repo structure | Monorepo with new workspace crates | [01](01-architecture-overview.md#4-repo-structure-decision) |
 | Video encryption | RIST PSK (AES-256) via librist | [03](03-security-model.md#2-video-encryption) |
 | Backend framework | Rust + axum | [06](06-technology-choices.md#1-language) |
-| Database | SQLite v1 → PostgreSQL later | [06](06-technology-choices.md#3-database) |
+| Frontend framework | Leptos (Rust/WASM) — web page, no native apps | [06](06-technology-choices.md#1-language) |
+| Database | PostgreSQL from day one | [06](06-technology-choices.md#3-database) |
 | Agent ↔ Cloud | WebSocket (WSS), outbound from agent | [02](02-control-protocol.md#1-transport) |
 | Sender hardware | Radxa ROCK 5B+ (primary), OPi5+ (alt) | [07](07-hardware-evaluation.md#4-recommendation-matrix) |
 | HDMI input | USB capture card (v1), native HDMI RX (future) | [07](07-hardware-evaluation.md#2-hdmi-input-native-vs-usb-capture) |
 | First-time setup | AP Wi-Fi captive portal on device | [04 §9](04-sender-agent.md#9-ap-wi-fi-onboarding-first-time-setup) |
+| Local dev testing | Docker Compose full-stack simulation | [08](08-local-dev-environment.md) |
 
 ---
 

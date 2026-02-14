@@ -146,15 +146,18 @@ strata/
 │   ├── gst-rist-bonding/         # GStreamer plugin (existing)
 │   ├── rist-network-sim/         # Test infra (existing)
 │   ├── strata-agent/             # Sender agent daemon (NEW)
-│   ├── strata-control/           # Control plane API server (NEW)
+│   ├── strata-control/           # Control plane + Leptos dashboard (NEW)
 │   └── strata-common/            # Shared types, auth, protocol (NEW)
-├── web/                          # Dashboard SPA (NEW)
-├── deploy/                       # Docker, k8s, systemd configs (NEW)
+├── dev/                          # Docker Compose for local simulation (NEW)
+├── deploy/                       # Production docker-compose.yml (NEW)
 ├── examples/                     # TOML configs (existing)
 ├── docs/
 │   └── platform/                 # These architecture docs
 └── wiki/                         # User-facing wiki (existing)
 ```
+
+The `strata-control` crate includes the Leptos dashboard — it's compiled into
+the same binary. No separate `web/` directory or JavaScript build step.
 
 ### Why Not Separate Repos?
 
@@ -168,81 +171,49 @@ strata/
 
 ## 5. Deployment Model Decision
 
-This is the hardest architectural call. Three options analysed:
+### Chosen: Docker Compose + Process-per-Stream Inside
 
-### Option A: Process-per-Stream (Recommended for v1)
-
-```
-┌─────────────────────────────────────────┐
-│               VPS (single host)          │
-│                                          │
-│  systemd service: strata-control         │
-│    └─ API server (Rust, axum/actix)      │
-│    └─ spawns/manages child processes     │
-│                                          │
-│  For each active stream:                 │
-│    └─ strata-receiver (child process)    │
-│       └─ rsristbondsrc → pipeline → RTMP │
-│                                          │
-└──────────────────────────────────────────┘
-```
-
-**Pros:**
-- Simplest to implement and debug
-- Process isolation — one bad stream can't crash others
-- Each process: ~50–100 MB RAM for a 1080p30 stream
-- A single 8-core VPS can handle 20–40 concurrent streams
-- No container orchestration overhead
-- Matches GStreamer's threading model perfectly
-
-**Cons:**
-- Single-host ceiling (~40 streams on a beefy VPS)
-- Manual scaling (add more VPSes, load-balance at DNS/IP level)
-
-### Option B: Containerised (Docker Compose)
+The platform ships as a Docker Compose stack. Docker handles deployment
+(reproducible, portable, one-command). Process-per-stream handles the runtime
+(fast startup, zero overhead, direct UDP).
 
 ```
-┌─────────────────────────────────────────────┐
-│  docker-compose                              │
-│                                              │
-│  strata-control (1 container)                │
-│  strata-receiver-1 (1 container per stream)  │
-│  strata-receiver-2                           │
-│  ...                                         │
-│  postgres (1 container)                      │
-│  nginx (1 container, TLS termination)        │
-└─────────────────────────────────────────────┘
+docker compose up
+  ├── strata-control (1 container)
+  │     ├── axum API server
+  │     ├── Leptos dashboard (served on :443)
+  │     ├── spawns child processes:
+  │     │     ├── strata-receiver --stream-id str_001
+  │     │     ├── strata-receiver --stream-id str_002
+  │     │     └── ...
+  │     └── connects to postgres
+  │
+  └── postgres (1 container)
+        └── PostgreSQL 16 (data in named volume)
 ```
 
-**Pros:**
-- Clean isolation, easily reproducible
-- Can use Docker health checks for auto-restart
-- Portable across VPS providers
+**Why this hybrid:**
+- Docker Compose: one-command deploy on any VPS, reproducible, easy TLS via
+  Caddy/Traefik sidecar, easy PostgreSQL provisioning.
+- Process-per-stream: <100ms startup, zero memory overhead per worker, direct
+  UDP binding, matches GStreamer's process-bound threading model.
+- NOT container-per-stream: adds 10–30 MB overhead per stream, complicates UDP
+  port mapping, no benefit for this workload.
+- NOT Kubernetes: way too heavy for this topology. Revisit only if >100
+  concurrent streams across >3 hosts.
 
-**Cons:**
-- Docker overhead per container adds up at scale
-- NAT/port mapping complexity for UDP RIST traffic
-- More moving parts for marginal benefit over process-per-stream
+### Regional Deployment
 
-### Option C: Kubernetes
+The same Docker Compose stack deploys identically to each regional VPS:
 
-**Pros:**
-- Auto-scaling, rolling deploys, service mesh
-- Multi-node scaling built in
+```
+Europe VPS      →  docker compose up
+US-East VPS     →  docker compose up
+Asia-Pacific    →  docker compose up
+```
 
-**Cons:**
-- Enormous operational complexity for a small team
-- k8s is terrible for UDP workloads without specialised CNI plugins
-- Minimum 3-node cluster overhead
-- Premature at this stage
-
-### Verdict
-
-**Start with Option A (process-per-stream).** It handles the realistic initial
-scale (5–40 concurrent streams) with minimal complexity. If demand exceeds a
-single host, add a lightweight load-balancer (HAProxy/nginx for control plane,
-DNS-based for UDP receiver ports). Containerise later when there's operational
-pain, not before.
+Each region is independent (own database, own users, own streams). Regional DNS
+routes users to the nearest VPS. No cross-region sync needed for v1.
 
 ---
 
@@ -278,16 +249,15 @@ reduces density. Avoid transcoding on the receiver unless absolutely necessary.
 
 ---
 
-## 8. Open Questions
+## 8. Resolved Questions
 
-These should be resolved before implementation begins:
+All major architectural questions have been decided. See [06 §8](06-technology-choices.md#8-resolved-questions)
+for the full resolution table.
 
-1. **Auth provider** — Roll own JWT auth, or use an external provider (Auth0, Keycloak, Supabase Auth)?
-2. **Database** — SQLite (simplest, single-host) vs PostgreSQL (multi-host ready)?
-3. **Dashboard framework** — Rust (Leptos/Yew) for full-stack Rust, or React/Vue for faster UI dev?
-4. **RIST encryption** — librist supports PSK (pre-shared key) and DTLS. Which to use? PSK is simpler; DTLS is more flexible.
-5. **Sender auto-provisioning** — How does a new Orange Pi get registered? QR code? Enrollment token? Manual?
-6. **Multi-region** — Do receivers need to be geographically close to senders for latency? (Probably not — RIST handles jitter, and the receiver-to-platform leg is TCP.)
+Remaining open:
+1. **TLS certificates** — Let's Encrypt via Caddy/Traefik in compose, or self-managed?
+2. **Billing** — Stripe? Per-stream pricing? Monthly plans? (Not v1.)
+3. **CDN for dashboard** — Serve directly from axum. CDN later if needed.
 
 ---
 
@@ -296,4 +266,4 @@ These should be resolved before implementation begins:
 - [03-security-model.md](03-security-model.md) — Authentication, encryption, and trust model
 - [04-sender-agent.md](04-sender-agent.md) — Sender agent daemon design
 - [05-receiver-workers.md](05-receiver-workers.md) — Receiver worker lifecycle and forwarding
-- [06-api-reference.md](06-api-reference.md) — REST + WebSocket API specification
+- [08-local-dev-environment.md](08-local-dev-environment.md) — Local development simulation with Docker Compose

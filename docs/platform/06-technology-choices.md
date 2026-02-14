@@ -6,83 +6,137 @@
 
 ## 1. Language
 
-### Recommendation: Rust for backend, TypeScript/React for dashboard
+### Decision: Full-stack Rust — axum backend, Leptos dashboard
 
 **Backend (control plane, sender agent, receiver worker):**
 Rust is the obvious choice — the entire transport engine is Rust, the GStreamer
-bindings are Rust, and the team already has the toolchain. Using a different
+bindings are Rust, and the toolchain is already established. Using a different
 language for the platform layer would create a pointless context-switch tax.
 
-Potential framework: **axum** (tokio-based, async, tower middleware ecosystem).
+Framework: **axum** (tokio-based, async, tower middleware ecosystem).
 
 **Dashboard:**
-The dashboard is a standard CRUD SPA with real-time WebSocket updates. React or
-Vue with TypeScript is the pragmatic choice — fastest to iterate on, largest
-ecosystem for UI components, easy to hire for.
+**Leptos** — a Rust WASM framework with fine-grained reactivity and SSR support.
+The dashboard is a web page (not a native app — nothing for users to install),
+so it must work well in a browser, but it doesn't need the full SPA ecosystem.
 
-Rust-native web frameworks (Leptos, Yew) are interesting but add compilation
-time and reduce the pool of potential contributors. Not worth it for a dashboard.
+Why Leptos over React/Svelte:
+- **Full-stack Rust**: One language, one toolchain, one CI pipeline. The control
+  plane can serve the dashboard directly from the same axum binary — no separate
+  Node.js build step, no npm, no JavaScript ecosystem churn.
+- **AI-assisted development**: With Claude Code as the primary development tool,
+  the "harder to hire for" argument is irrelevant. The AI writes Rust and Leptos
+  as fluently as React.
+- **SSR + hydration**: Leptos can server-render the initial page load (fast TTFB)
+  and hydrate for interactivity. Good for the dashboard's real-time stats views.
+- **Type safety end-to-end**: Shared types between backend API and frontend views
+  with zero serialization glue.
+- **Binary embedding**: The compiled WASM + assets can be embedded in the server
+  binary via `include_dir!` or served from a static directory. Single binary
+  deployment.
+
+Alternatives considered:
+- **React/Vue + TypeScript**: Largest ecosystem, but adds a Node.js dependency,
+  a separate build pipeline, and a language context switch. Unnecessary complexity
+  for a solo developer.
+- **Svelte**: Clean and lightweight, but still JavaScript/TypeScript and a
+  separate build step.
+- **Yew**: Rust/WASM like Leptos, but uses a virtual DOM (React-like). Leptos's
+  fine-grained signals are more efficient and ergonomic.
 
 ---
 
-## 2. Deployment: Why Process-per-Stream over Docker/K8s
+## 2. Deployment: Docker Compose + Process-per-Stream Inside
 
-### Process-per-Stream (Chosen)
+### Architecture
 
-Each receiver worker is a child process managed by the control plane:
+The platform ships as a **Docker Compose stack**. The control plane, database,
+and receiver workers all run inside containers — but receiver workers are still
+child processes, not individual containers.
 
 ```
-strata-control (pid 1000)
-  └── strata-receiver --stream-id str_001 (pid 1001)
-  └── strata-receiver --stream-id str_002 (pid 1002)
-  └── strata-receiver --stream-id str_003 (pid 1003)
+docker compose up
+  ├── strata-control (container)
+  │     ├── axum API server (serves dashboard + REST + WSS)
+  │     ├── spawns child processes:
+  │     │     ├── strata-receiver --stream-id str_001 (pid inside container)
+  │     │     ├── strata-receiver --stream-id str_002
+  │     │     └── ...
+  │     └── serves Leptos dashboard on :443
+  │
+  └── postgres (container)
+        └── PostgreSQL 16 (data in named volume)
 ```
 
-**Why this wins for v1:**
+### Why This Hybrid Approach
 
-| Factor | Process | Docker Container | Kubernetes Pod |
+Docker Compose handles the **deployment** problem (reproducible, portable, one
+command to spin up the whole platform on any VPS). Process-per-stream handles
+the **runtime** problem (fast startup, zero overhead, direct UDP binding).
+
+| Factor | Process-in-Container | Container-per-Stream | Kubernetes Pod |
 |---|---|---|---|
 | Startup time | <100ms | 1–5s | 5–30s |
-| Memory overhead | ~0 | ~10–30 MB per container | ~50–100 MB per pod |
-| UDP port binding | Direct | Requires `--network host` or port mapping | Requires hostNetwork or NodePort |
-| Operational complexity | Low (systemd) | Medium (docker daemon) | High (cluster, etcd, DNS) |
-| Debugging | `strace -p <pid>`, gdb | Docker exec, log drivers | kubectl exec, log aggregation |
+| Memory overhead | ~0 per worker | ~10–30 MB per container | ~50–100 MB per pod |
+| UDP port binding | `--network host` on the control container | Port mapping per stream | hostNetwork or NodePort |
+| Deploy complexity | `docker compose up` | Same but more containers | Cluster + etcd + DNS |
+| Debugging | `docker exec` + `strace` | Docker exec per container | kubectl exec |
 | Maximum density | ~40 streams/host | ~30 streams/host | ~20 streams/host |
-| Team knowledge needed | Linux basics | Docker + networking | k8s ecosystem |
 
-GStreamer pipelines are inherently process-bound (GMainLoop, bus watches). Docker
-adds overhead and networking complexity (especially for UDP) without meaningful
-benefit for this workload. Kubernetes is even worse — it's designed for stateless
-HTTP microservices, not latency-sensitive UDP media workers.
+GStreamer pipelines are inherently process-bound (GMainLoop, bus watches).
+Wrapping each in a separate container adds overhead and networking complexity
+for no benefit. But wrapping the whole platform in Docker Compose makes deployment
+a one-liner and works identically on every VPS provider.
+
+### Regional Deployment
+
+The same Docker Compose stack deploys to each regional VPS:
+
+```
+Europe VPS      →  docker compose up  (strata-control + postgres)
+US-East VPS     →  docker compose up  (strata-control + postgres)
+Asia-Pacific    →  docker compose up  (strata-control + postgres)
+```
+
+Each region is **independent** — its own database, its own users, its own streams.
+No cross-region coordination needed for v1. Regional DNS (Cloudflare, Route 53)
+routes users to the nearest VPS.
+
+Future: If cross-region features are needed (e.g., a user in Europe viewing a
+stream received in Asia), add a federation layer. But that's far out.
 
 ### When to Reconsider
 
-- **Docker**: When deploying to customer-managed infrastructure where isolation
-  matters (security compliance), or when the deploy target varies between
-  Linux distributions.
+- **Container-per-stream**: If process isolation within the container becomes a
+  compliance requirement (multi-tenant security audits).
 - **Kubernetes**: When running >100 concurrent streams across >3 hosts with
-  auto-scaling requirements. Even then, consider Nomad or a simpler scheduler
-  before k8s.
+  auto-scaling. Even then, consider Nomad first.
 
 ---
 
 ## 3. Database
 
-### Recommendation: SQLite for v1, PostgreSQL when multi-host
+### Decision: PostgreSQL from Day One
 
-| Factor | SQLite | PostgreSQL |
-|---|---|---|
-| Deployment | Zero-config, single file | Separate service to manage |
-| Performance | 50k+ reads/s, ~1k writes/s | Much higher write throughput |
-| Multi-host | Single-host only | Shared across hosts |
-| Backups | `cp database.db backup.db` | pg_dump, WAL archiving |
-| Migrations | rusqlite + manual | sqlx + inline migrations |
+PostgreSQL runs as a container in the Docker Compose stack. No SQLite phase.
 
-For v1 (single host, <100 users, <50 senders), SQLite with WAL mode is more than
-sufficient and removes an entire deployment dependency.
+**Why skip SQLite:**
+- The platform will deploy to **regional VPSes worldwide** from early on.
+  PostgreSQL is the correct choice for any multi-region deployment.
+- Docker Compose makes PostgreSQL zero-effort to deploy — it's just another
+  service in the compose file, not a separate ops burden.
+- `sqlx` with compile-time checked queries provides excellent Rust integration.
+- Avoiding a SQLite→PostgreSQL migration eliminates throwaway work.
+- Backups: `pg_dump` via a cron container or managed backup service.
 
-When the platform goes multi-host, migrate to PostgreSQL. The data model is simple
-enough that migration is a few hours of work.
+**Rust integration:** `sqlx` with the `postgres` feature. Compile-time query
+checking, async, connection pooling, inline migrations.
+
+```toml
+# Cargo.toml
+[dependencies]
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "migrate"] }
+```
 
 ### Data Model (Sketch)
 
@@ -197,12 +251,45 @@ trivial with the `metrics` + `metrics-exporter-prometheus` Rust crates.
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Backend language | Rust (axum) | Same as transport engine, team expertise |
-| Frontend | React + TypeScript | Fastest iteration, largest ecosystem |
-| Deployment | Process-per-stream | Simplest, best performance for UDP media |
-| Database | SQLite (v1) → PostgreSQL (multi-host) | Zero-config start, easy migration |
+| Backend language | Rust (axum) | Same as transport engine, single toolchain |
+| Frontend | Leptos (Rust/WASM) | Full-stack Rust, SSR, embedded in server binary |
+| Deployment | Docker Compose + process-per-stream inside | One-command deploy, zero per-worker overhead |
+| Database | PostgreSQL | Multi-region from day one, sqlx compile-time checks |
 | Auth | Custom JWT (Argon2id + Ed25519) | Minimal dependencies, device auth needs |
 | Real-time | WebSocket | Bidirectional, browser-native, well-understood |
 | Video encryption | RIST PSK (AES-256) | Built into librist, zero implementation cost |
 | Monitoring | Prometheus + structured logs | Industry standard, low overhead |
 | Repo structure | Monorepo | Transport + platform share crates |
+| Client apps | None — web page only | No installs, works on any device with a browser |
+
+---
+
+## 8. Resolved Questions
+
+Previously open, now decided:
+
+| Question | Decision | Rationale |
+|---|---|---|
+| Auth provider | Roll own JWT (Argon2id + Ed25519) | <100 users initially, devices use key pairs not passwords |
+| Database | PostgreSQL from day one | Multi-region VPS deployment, Docker Compose makes it free |
+| Dashboard framework | Leptos (Rust/WASM) | Full-stack Rust, AI-assisted dev, no JS build step |
+| RIST encryption | PSK (pre-shared key) | Simpler, sufficient, already works in librist [03](03-security-model.md) |
+| Sender provisioning | AP Wi-Fi captive portal + enrollment token | Documented in [04 §9](04-sender-agent.md#9-ap-wi-fi-onboarding-first-time-setup) |
+| Multi-region | Independent regional VPSes, no cross-region sync | Each VPS is self-contained. RIST handles jitter; receiver→platform is TCP |
+| Client apps | None — web page only | Dashboard is a Leptos web page served by axum. No native apps to install |
+| Deployment packaging | Docker Compose | Whole stack in one compose file. Process-per-stream for workers inside |
+
+### Remaining Open Questions
+
+1. **TLS certificates** — Let's Encrypt via Caddy/Traefik reverse proxy in the compose stack, or self-managed?
+2. **Billing** — Stripe integration? Per-stream pricing? Monthly plans? (Not needed for v1.)
+3. **CDN for dashboard** — Serve Leptos assets from a CDN, or directly from axum? (Directly is fine for v1.)
+
+---
+
+*Next documents in this directory:*
+- [02-control-protocol.md](02-control-protocol.md) — WebSocket control protocol between sender agent and control plane
+- [03-security-model.md](03-security-model.md) — Authentication, encryption, and trust model
+- [04-sender-agent.md](04-sender-agent.md) — Sender agent daemon design
+- [05-receiver-workers.md](05-receiver-workers.md) — Receiver worker lifecycle and forwarding
+- [08-local-dev-environment.md](08-local-dev-environment.md) — Local development simulation with Docker Compose
