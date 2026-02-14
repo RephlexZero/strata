@@ -32,7 +32,8 @@
         "source=/lib/modules,target=/lib/modules,type=bind,readonly"
     ],
     "features": {
-        "ghcr.io/devcontainers/features/rust:1": {}
+        "ghcr.io/devcontainers/features/rust:1": {},
+        "ghcr.io/devcontainers/features/docker-in-docker:2": {}
     },
     "postCreateCommand": ".devcontainer/post-create.sh"
 }

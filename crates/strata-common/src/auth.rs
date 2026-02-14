@@ -43,12 +43,9 @@ pub fn hash_password(password: &str) -> Result<String, AuthError> {
 
 /// Verify a password against an Argon2id hash.
 pub fn verify_password(password: &str, hash: &str) -> Result<bool, AuthError> {
-    use argon2::{
-        password_hash::PasswordHash, Argon2, PasswordVerifier,
-    };
+    use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
 
-    let parsed_hash =
-        PasswordHash::new(hash).map_err(|e| AuthError::HashError(e.to_string()))?;
+    let parsed_hash = PasswordHash::new(hash).map_err(|e| AuthError::HashError(e.to_string()))?;
     Ok(Argon2::default()
         .verify_password(password.as_bytes(), &parsed_hash)
         .is_ok())
@@ -83,9 +80,7 @@ pub struct JwtContext {
 impl JwtContext {
     /// Create a JWT context from an Ed25519 private key (32 bytes, base64-encoded).
     pub fn from_ed25519_seed(seed_b64: &str) -> Result<Self, AuthError> {
-        let seed_bytes = BASE64
-            .decode(seed_b64)
-            .map_err(|_| AuthError::InvalidKey)?;
+        let seed_bytes = BASE64.decode(seed_b64).map_err(|_| AuthError::InvalidKey)?;
         if seed_bytes.len() != 32 {
             return Err(AuthError::InvalidKey);
         }
@@ -121,8 +116,7 @@ impl JwtContext {
         let encoding_key = jsonwebtoken::EncodingKey::from_ed_der(&pkcs8_der);
 
         // For the public key, jsonwebtoken expects raw 32-byte Ed25519 public key
-        let decoding_key =
-            jsonwebtoken::DecodingKey::from_ed_der(verifying_key.as_bytes());
+        let decoding_key = jsonwebtoken::DecodingKey::from_ed_der(verifying_key.as_bytes());
 
         Ok(Self {
             encoding_key,
@@ -135,8 +129,8 @@ impl JwtContext {
     pub fn generate() -> (Self, String) {
         let signing_key = SigningKey::generate(&mut OsRng);
         let seed_b64 = BASE64.encode(signing_key.to_bytes());
-        let ctx = Self::from_ed25519_seed(&seed_b64)
-            .expect("freshly generated key should be valid");
+        let ctx =
+            Self::from_ed25519_seed(&seed_b64).expect("freshly generated key should be valid");
         (ctx, seed_b64)
     }
 
@@ -153,8 +147,7 @@ impl JwtContext {
         validation.set_issuer(&["strata-control"]);
         validation.validate_exp = true;
 
-        let token_data =
-            jsonwebtoken::decode::<Claims>(token, &self.decoding_key, &validation)?;
+        let token_data = jsonwebtoken::decode::<Claims>(token, &self.decoding_key, &validation)?;
         Ok(token_data.claims)
     }
 }
