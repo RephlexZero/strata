@@ -1,0 +1,49 @@
+# Receiver configuration for cellular bonding
+#
+# Use case: Cloud or studio server receiving a bonded RIST stream from a
+# field sender using multiple cellular modems.
+#
+# Usage:
+#   integration_node receiver --bind rist://@0.0.0.0:5000 \
+#     --output recording.ts --config examples/receiver-cellular.toml
+#
+# Or with gst-launch-1.0:
+#   gst-launch-1.0 \
+#     rsristbondsrc config-file=examples/receiver-cellular.toml ! \
+#     tsdemux ! h264parse ! avdec_h264 ! autovideosink
+
+version = 1
+
+# --- Links ---
+# Bind addresses for incoming RIST streams.  One port per sender link.
+# Use 0.0.0.0 to listen on all interfaces (typical for a cloud server).
+
+[[links]]
+id = 0
+uri = "rist://@0.0.0.0:5000"
+
+[[links]]
+id = 1
+uri = "rist://@0.0.0.0:5002"
+
+# Uncomment if the sender uses a third modem:
+# [[links]]
+# id = 2
+# uri = "rist://@0.0.0.0:5004"
+
+# --- Receiver Buffer ---
+[receiver]
+# Initial reassembly latency before adaptive algorithm kicks in.
+# 100 ms accommodates typical cellular jitter.
+start_latency_ms = 100
+
+# Max reorder buffer depth (packets).
+buffer_capacity = 2048
+
+# --- Scheduler (receiver-side) ---
+[scheduler]
+# Adaptive reassembly: buffer = p95_jitter * multiplier
+jitter_latency_multiplier = 4.0
+
+# Hard ceiling on reassembly latency (ms)
+max_latency_ms = 500

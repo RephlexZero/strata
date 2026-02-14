@@ -1,0 +1,75 @@
+# Sender configuration for cellular bonding
+#
+# Use case: Live HDMI capture from an Orange Pi 5 Plus with 2–3 USB cellular
+# modems, bonded for reliability over lossy/variable mobile networks.
+#
+# Usage:
+#   integration_node sender --source v4l2 --device /dev/video0 \
+#     --dest rist://server:5000,rist://server:5002 \
+#     --bitrate 5000 --config examples/sender-cellular.toml
+#
+# Or with gst-launch-1.0:
+#   gst-launch-1.0 v4l2src device=/dev/video0 ! videoconvert ! videoscale ! \
+#     video/x-raw,width=1920,height=1080 ! \
+#     x264enc tune=zerolatency bitrate=5000 vbv-buf-capacity=5000 ! \
+#     mpegtsmux alignment=7 ! \
+#     rsristbondsink config-file=examples/sender-cellular.toml
+
+version = 1
+
+# --- Links ---
+# Each link maps to one cellular modem interface.
+# The `interface` field uses SO_BINDTODEVICE to pin traffic to that modem.
+# Requires policy routing — see wiki/Cellular-Modem-Setup.md
+
+[[links]]
+id = 0
+uri = "rist://receiver.example.com:5000"
+interface = "wwan0"                # First cellular modem
+recovery_maxbitrate = 20000        # Cap ARQ retransmit to 20 Mbps
+recovery_rtt_max = 800             # Cellular RTTs can be high; allow 800 ms
+
+[[links]]
+id = 1
+uri = "rist://receiver.example.com:5002"
+interface = "wwan1"                # Second cellular modem
+recovery_maxbitrate = 20000
+recovery_rtt_max = 800
+
+# Uncomment for a third modem:
+# [[links]]
+# id = 2
+# uri = "rist://receiver.example.com:5004"
+# interface = "wwan2"
+# recovery_maxbitrate = 20000
+# recovery_rtt_max = 800
+
+# --- Scheduler ---
+[scheduler]
+# STORM dual-queue: prioritises keyframes/audio over droppable B-frames
+storm_enabled = true
+storm_reliable_weight = 0.7
+
+# Discard stale packets that would arrive after 200 ms — don't waste
+# bandwidth sending frames the decoder can't use
+discard_deadline_ms = 200
+
+# Adaptive redundancy: duplicate packets across modems when spare capacity exists
+redundancy_enabled = true
+redundancy_spare_ratio = 0.5
+
+# Broadcast keyframes and audio to ALL modems for maximum reliability
+critical_broadcast = true
+
+# Fast failover: if one modem's RTT spikes, temporarily broadcast everything
+failover_enabled = true
+failover_duration_ms = 3000
+failover_rtt_spike_factor = 3.0
+
+# Signal watermark: automatically reduce scheduling weight when cellular
+# signal drops below -80 dBm (reads /proc/net/wireless)
+signal_watermark_enabled = true
+signal_watermark_threshold_dbm = -80.0
+
+# Stats emission interval (ms) — 1 second is fine for dashboards
+stats_interval_ms = 1000

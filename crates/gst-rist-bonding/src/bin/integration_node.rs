@@ -3,6 +3,59 @@ use gst::MessageView;
 use std::env;
 use std::sync::{Arc, Mutex};
 
+const SENDER_HELP: &str = r#"
+USAGE: integration_node sender [OPTIONS] --dest <URL[,URL...]>
+
+OPTIONS:
+  --dest <urls>       Comma-separated RIST destination URLs (required)
+                      e.g. rist://192.168.1.100:5000,rist://10.0.0.100:5000
+  --source <mode>     Video source mode (default: test)
+                        test   - SMPTE colour bars (videotestsrc)
+                        v4l2   - Camera / HDMI capture card (v4l2src)
+                        uri    - File or network stream (uridecodebin)
+  --device <path>     V4L2 device path (default: /dev/video0, used with --source v4l2)
+  --uri <uri>         Media URI for uridecodebin (used with --source uri)
+                      e.g. file:///home/user/video.mp4
+  --bitrate <kbps>    Target encoder bitrate in kbps (default: 3000)
+  --config <path>     Path to TOML config file (see Configuration Reference)
+  --stats-dest <addr> UDP address to relay stats JSON (e.g. 192.168.1.50:9000)
+  --help              Show this help
+
+EXAMPLES:
+  # Test pattern over two cellular links
+  integration_node sender --dest rist://server:5000,rist://server:5002 \
+    --config sender.toml
+
+  # HDMI capture card to cloud receiver
+  integration_node sender --source v4l2 --device /dev/video0 \
+    --dest rist://cloud.example.com:5000,rist://cloud.example.com:5002 \
+    --bitrate 5000 --config sender.toml
+
+  # Pre-recorded file (for testing without hardware)
+  integration_node sender --source uri --uri file:///tmp/test.mp4 \
+    --dest rist://192.168.1.100:5000
+"#;
+
+const RECEIVER_HELP: &str = r#"
+USAGE: integration_node receiver [OPTIONS] --bind <URL>
+
+OPTIONS:
+  --bind <url>        RIST bind URL (required), e.g. rist://@0.0.0.0:5000
+  --output <path>     Record to file (.ts = raw MPEG-TS, .mp4 = remuxed)
+  --config <path>     Path to TOML config file (see Configuration Reference)
+  --help              Show this help
+
+EXAMPLES:
+  # Receive and monitor (no file output)
+  integration_node receiver --bind rist://@0.0.0.0:5000
+
+  # Receive and record to MPEG-TS file
+  integration_node receiver --bind rist://@0.0.0.0:5000 --output capture.ts
+
+  # Receive with config
+  integration_node receiver --bind rist://@0.0.0.0:5000 --config receiver.toml
+"#;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize structured logging for production use.
     // Controlled by RUST_LOG env var (e.g., RUST_LOG=info,librist=warn).
@@ -12,7 +65,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <sender|receiver> [args]", args[0]);
+        eprintln!("Usage: {} <sender|receiver> [--help]", args[0]);
+        eprintln!("Run with --help after the mode for detailed usage.");
         std::process::exit(1);
     }
 
@@ -21,6 +75,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match mode.as_str() {
         "sender" => run_sender(&args[2..]),
         "receiver" => run_receiver(&args[2..]),
+        "--help" | "-h" | "help" => {
+            eprintln!("Usage: {} <sender|receiver> [args]\n", args[0]);
+            eprintln!("Modes:");
+            eprintln!("  sender    Encode and transmit video over bonded RIST links");
+            eprintln!("  receiver  Receive and reassemble bonded RIST stream\n");
+            eprintln!(
+                "Run `{} sender --help` or `{} receiver --help` for mode-specific options.",
+                args[0], args[0]
+            );
+            Ok(())
+        }
         _ => {
             eprintln!("Unknown mode: {}", mode);
             std::process::exit(1);
@@ -37,41 +102,108 @@ fn register_plugins() -> Result<(), gst::glib::BoolError> {
 fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut dest_str = "";
     let mut stats_dest = "";
-    let mut bitrate_kbps = 3000; // Default 3000kbps (3Mbps)
+    let mut bitrate_kbps = 3000u32;
     let mut config_path = "";
+    let mut source_mode = "test";
+    let mut device_path = "/dev/video0";
+    let mut source_uri = "";
 
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--dest" && i + 1 < args.len() {
-            dest_str = &args[i + 1];
-            i += 1;
-        } else if args[i] == "--stats-dest" && i + 1 < args.len() {
-            stats_dest = &args[i + 1];
-            i += 1;
-        } else if args[i] == "--bitrate" && i + 1 < args.len() {
-            bitrate_kbps = args[i + 1].parse().unwrap_or(3000);
-            i += 1;
-        } else if args[i] == "--config" && i + 1 < args.len() {
-            config_path = &args[i + 1];
-            i += 1;
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                eprint!("{SENDER_HELP}");
+                return Ok(());
+            }
+            "--dest" if i + 1 < args.len() => {
+                dest_str = &args[i + 1];
+                i += 1;
+            }
+            "--stats-dest" if i + 1 < args.len() => {
+                stats_dest = &args[i + 1];
+                i += 1;
+            }
+            "--bitrate" if i + 1 < args.len() => {
+                bitrate_kbps = args[i + 1].parse().unwrap_or(3000);
+                i += 1;
+            }
+            "--config" if i + 1 < args.len() => {
+                config_path = &args[i + 1];
+                i += 1;
+            }
+            "--source" if i + 1 < args.len() => {
+                source_mode = &args[i + 1];
+                i += 1;
+            }
+            "--device" if i + 1 < args.len() => {
+                device_path = &args[i + 1];
+                i += 1;
+            }
+            "--uri" if i + 1 < args.len() => {
+                source_uri = &args[i + 1];
+                i += 1;
+            }
+            other => {
+                eprintln!("Unknown argument: {other}");
+                eprint!("{SENDER_HELP}");
+                std::process::exit(1);
+            }
         }
         i += 1;
     }
 
     if dest_str.is_empty() {
         eprintln!("Missing --dest <url>");
+        eprint!("{SENDER_HELP}");
         std::process::exit(1);
     }
 
     register_plugins()?;
 
-    // Pipeline: videotestsrc ! x264enc ! mpegtsmux ! rsristbondsink (request pads)
-    // We send 1200 buffers (20s at 60fps) to ensure continuous flow beyond test duration.
-    // VBV buffer = bitrate (1-second buffer) constrains the peak rate to ~2× target,
+    // Build the source portion of the pipeline based on the selected mode.
+    // All modes produce encoded H.264 MPEG-TS output for rsristbondsink.
+    //
+    // VBV buffer = bitrate (1-second buffer) constrains the peak rate,
     // preventing unconstrained VBR overshoot with tune=zerolatency.
+    let source_fragment = match source_mode {
+        "test" => {
+            // Indefinite SMPTE test pattern — runs until Ctrl+C.
+            format!(
+                "videotestsrc is-live=true pattern=smpte ! video/x-raw,width=1920,height=1080,framerate=30/1 ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps}",
+                bps = bitrate_kbps
+            )
+        }
+        "v4l2" => {
+            // V4L2 camera or HDMI capture card.
+            // Most capture cards output raw video or MJPEG; we re-encode to H.264.
+            // For cards that output H.264 natively, use --source uri with a custom pipeline.
+            format!(
+                "v4l2src device={dev} ! videoconvert ! videoscale ! video/x-raw,width=1920,height=1080 ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps}",
+                dev = device_path,
+                bps = bitrate_kbps
+            )
+        }
+        "uri" => {
+            // File or network stream via uridecodebin.  Useful for testing with
+            // pre-recorded content without camera hardware.
+            if source_uri.is_empty() {
+                eprintln!("--source uri requires --uri <media-uri>");
+                std::process::exit(1);
+            }
+            format!(
+                "uridecodebin uri={uri} ! videoconvert ! videoscale ! video/x-raw,width=1920,height=1080 ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps}",
+                uri = source_uri,
+                bps = bitrate_kbps
+            )
+        }
+        other => {
+            eprintln!("Unknown source mode: {other}  (valid: test, v4l2, uri)");
+            std::process::exit(1);
+        }
+    };
+
     let pipeline_str = format!(
-        "videotestsrc num-buffers=1200 is-live=true pattern=smpte ! video/x-raw,width=1920,height=1080,framerate=60/1 ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps} ! mpegtsmux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink name=rsink",
-        bps = bitrate_kbps
+        "{source_fragment} ! mpegtsmux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink name=rsink"
     );
     eprintln!("Sender Pipeline: {}", pipeline_str);
 
@@ -110,20 +242,30 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         stats_socket = Some(sock);
     }
 
-    // Additive-increase step: ramp bitrate back up by this amount (kbps)
-    // each stats interval when bandwidth-available signals headroom.
-    let _ramp_step_kbps: u32 = (bitrate_kbps / 10).max(100);
-
     // Track the current NADA-derived ceiling (updated continuously via
     // bandwidth-available messages).
     let nada_ceiling_kbps = Arc::new(Mutex::new(bitrate_kbps));
 
+    // Graceful shutdown: send EOS on Ctrl+C so the pipeline flushes cleanly.
+    let pipeline_weak = pipeline.downgrade();
+    ctrlc::set_handler(move || {
+        eprintln!("\nReceived shutdown signal. Sending EOS to pipeline...");
+        if let Some(pipeline) = pipeline_weak.upgrade() {
+            let _ = pipeline.send_event(gst::event::Eos::new());
+        }
+    })
+    .expect("Error setting signal handler");
+
     pipeline.set_state(gst::State::Playing)?;
+    eprintln!("Sender running (source={source_mode})... Press Ctrl+C to stop.");
 
     let bus = pipeline.bus().unwrap();
     for msg in bus.iter_timed(gst::ClockTime::NONE) {
         match msg.view() {
-            MessageView::Eos(..) => break,
+            MessageView::Eos(..) => {
+                eprintln!("Got EOS. Pipeline finished.");
+                break;
+            }
             MessageView::Error(err) => {
                 eprintln!("Error: {}", err.error());
                 pipeline.set_state(gst::State::Null)?;
@@ -179,21 +321,35 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut config_path = "";
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--bind" && i + 1 < args.len() {
-            bind_str = &args[i + 1];
-            i += 1;
-        } else if args[i] == "--output" && i + 1 < args.len() {
-            output_file = &args[i + 1];
-            i += 1;
-        } else if args[i] == "--config" && i + 1 < args.len() {
-            config_path = &args[i + 1];
-            i += 1;
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                eprint!("{RECEIVER_HELP}");
+                return Ok(());
+            }
+            "--bind" if i + 1 < args.len() => {
+                bind_str = &args[i + 1];
+                i += 1;
+            }
+            "--output" if i + 1 < args.len() => {
+                output_file = &args[i + 1];
+                i += 1;
+            }
+            "--config" if i + 1 < args.len() => {
+                config_path = &args[i + 1];
+                i += 1;
+            }
+            other => {
+                eprintln!("Unknown argument: {other}");
+                eprint!("{RECEIVER_HELP}");
+                std::process::exit(1);
+            }
         }
         i += 1;
     }
 
     if bind_str.is_empty() {
         eprintln!("Missing --bind <url>");
+        eprint!("{RECEIVER_HELP}");
         std::process::exit(1);
     }
 

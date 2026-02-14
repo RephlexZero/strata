@@ -1,0 +1,19 @@
+# Minimal sender configuration
+#
+# Bare-minimum config with sensible defaults.  Good for local testing or
+# ethernet-to-ethernet setups where you don't need interface binding.
+#
+# Usage:
+#   gst-launch-1.0 videotestsrc is-live=true ! \
+#     x264enc tune=zerolatency bitrate=3000 ! mpegtsmux ! \
+#     rsristbondsink config-file=examples/sender-minimal.toml
+
+version = 1
+
+[[links]]
+id = 0
+uri = "rist://192.168.1.100:5000"
+
+[[links]]
+id = 1
+uri = "rist://192.168.1.100:5002"
