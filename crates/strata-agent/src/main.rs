@@ -127,7 +127,13 @@ async fn main() -> anyhow::Result<()> {
     let portal_enrollment_token = cli.enrollment_token.clone();
     let portal_control_url = cli.control_url.clone();
     let portal_handle = tokio::spawn(async move {
-        run_portal(portal_state, portal_addr, portal_enrollment_token, portal_control_url).await
+        run_portal(
+            portal_state,
+            portal_addr,
+            portal_enrollment_token,
+            portal_control_url,
+        )
+        .await
     });
 
     // ── Shutdown handling ───────────────────────────────────────

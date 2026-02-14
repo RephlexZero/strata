@@ -49,7 +49,10 @@ impl PipelineManager {
     /// Start a sender pipeline.
     pub fn start(&mut self, payload: StreamStartPayload) -> anyhow::Result<()> {
         if self.is_running() {
-            anyhow::bail!("pipeline already running (stream {})", self.stream_id.as_deref().unwrap_or("?"));
+            anyhow::bail!(
+                "pipeline already running (stream {})",
+                self.stream_id.as_deref().unwrap_or("?")
+            );
         }
 
         tracing::info!(
@@ -80,10 +83,7 @@ impl PipelineManager {
 
     /// Stop the current pipeline.
     pub fn stop(&mut self) -> PipelineStopStats {
-        let duration_s = self
-            .started_at
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
+        let duration_s = self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
 
         if let Some(mut child) = self.child.take() {
             // Send SIGINT for graceful EOS shutdown
@@ -125,9 +125,7 @@ impl PipelineManager {
 
     /// Get elapsed seconds since pipeline started, if running.
     pub fn elapsed_s(&self) -> u64 {
-        self.started_at
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0)
+        self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0)
     }
 }
 

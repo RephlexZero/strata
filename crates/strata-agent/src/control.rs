@@ -16,8 +16,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use strata_common::models::StreamState;
 use strata_common::protocol::{
-    AgentMessage, AuthLoginPayload, ControlMessage,
-    DeviceStatusPayload, Envelope, StreamEndReason, StreamEndedPayload,
+    AgentMessage, AuthLoginPayload, ControlMessage, DeviceStatusPayload, Envelope, StreamEndReason,
+    StreamEndedPayload,
 };
 
 use crate::AgentState;
@@ -217,7 +217,9 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
 
     match envelope.msg_type.as_str() {
         "stream.start" => {
-            if let Ok(ControlMessage::StreamStart(payload)) = envelope.parse_payload::<ControlMessage>() {
+            if let Ok(ControlMessage::StreamStart(payload)) =
+                envelope.parse_payload::<ControlMessage>()
+            {
                 tracing::info!(stream_id = %payload.stream_id, "received stream.start");
                 let mut pipeline = state.pipeline.lock().await;
                 if let Err(e) = pipeline.start(payload.clone()) {
@@ -236,7 +238,9 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
             }
         }
         "stream.stop" => {
-            if let Ok(ControlMessage::StreamStop(payload)) = envelope.parse_payload::<ControlMessage>() {
+            if let Ok(ControlMessage::StreamStop(payload)) =
+                envelope.parse_payload::<ControlMessage>()
+            {
                 tracing::info!(stream_id = %payload.stream_id, "received stream.stop");
                 let mut pipeline = state.pipeline.lock().await;
                 let stats = pipeline.stop();

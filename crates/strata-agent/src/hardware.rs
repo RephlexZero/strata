@@ -77,10 +77,7 @@ impl HardwareScanner {
             device: "/dev/video0".into(),
             input_type: MediaInputType::Test,
             label: "Simulated HDMI Capture".into(),
-            capabilities: vec![
-                "1920x1080@30".into(),
-                "1280x720@60".into(),
-            ],
+            capabilities: vec!["1920x1080@30".into(), "1280x720@60".into()],
             status: MediaInputStatus::Available,
         }];
 
@@ -154,7 +151,7 @@ fn scan_network_interfaces() -> Vec<NetworkInterface> {
             name,
             iface_type,
             state,
-            ip: None,    // TODO: read from `ip addr`
+            ip: None,      // TODO: read from `ip addr`
             carrier: None, // TODO: read from ModemManager
             signal_dbm: None,
             technology: None,
