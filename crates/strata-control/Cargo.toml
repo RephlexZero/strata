@@ -1,0 +1,51 @@
+[package]
+name = "strata-control"
+version = "0.1.0"
+edition = "2021"
+description = "Strata control plane — REST API, agent WebSocket, dashboard, receiver spawner"
+publish = false
+
+[[bin]]
+name = "strata-control"
+path = "src/main.rs"
+
+[dependencies]
+strata-common = { path = "../strata-common" }
+
+# Web framework
+axum = { version = "0.8", features = ["ws", "macros"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tokio = { version = "1", features = ["full"] }
+hyper = "1"
+
+# Database
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "chrono",
+    "uuid",
+    "migrate",
+] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.11", features = ["v7"] }
+
+# Auth
+jsonwebtoken = "9"
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = "2"
+
+# Misc
+dashmap = "6"
+futures = "0.3"
+tokio-stream = "0.1"
