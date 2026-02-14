@@ -4,7 +4,6 @@ use crate::scheduler::dwrr::Dwrr;
 use anyhow::Result;
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, warn};
@@ -21,14 +20,16 @@ use tracing::{error, warn};
 pub struct BondingScheduler<L: LinkSender + ?Sized> {
     scheduler: Dwrr<L>,
     next_seq: u64,
+    /// Monotonic start time for bonding header timestamps.
+    start_time: Instant,
     // Fast-failover state
     failover_until: Option<Instant>,
     prev_phases: HashMap<usize, crate::net::interface::LinkPhase>,
     prev_rtts: HashMap<usize, f64>,
     /// Counter for consecutive all-links-dead failures (for escalation)
     consecutive_dead_count: u64,
-    /// Total packets dropped due to all links being dead
-    pub total_dead_drops: Arc<AtomicU64>,
+    /// Total packets dropped due to all links being dead (used for log messages)
+    total_dead_drops: u64,
 }
 
 impl<L: LinkSender + ?Sized> BondingScheduler<L> {
@@ -42,11 +43,12 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         Self {
             scheduler: Dwrr::with_config(config),
             next_seq: 0,
+            start_time: Instant::now(),
             failover_until: None,
             prev_phases: HashMap::new(),
             prev_rtts: HashMap::new(),
             consecutive_dead_count: 0,
-            total_dead_drops: Arc::new(AtomicU64::new(0)),
+            total_dead_drops: 0,
         }
     }
 
@@ -129,6 +131,12 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         }
     }
 
+    /// Creates a bonding header with a monotonic send timestamp for OWD measurement.
+    fn make_header(&self, seq: u64) -> crate::protocol::header::BondingHeader {
+        let send_time_us = self.start_time.elapsed().as_micros() as u64;
+        crate::protocol::header::BondingHeader::with_timestamp(seq, send_time_us)
+    }
+
     /// Returns a snapshot of metrics for all registered links.
     pub fn get_all_metrics(&self) -> HashMap<usize, crate::net::interface::LinkMetrics> {
         self.scheduler.get_active_links().into_iter().collect()
@@ -157,7 +165,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             let seq = self.next_seq;
             self.next_seq += 1;
 
-            let header = crate::protocol::header::BondingHeader::new(seq);
+            let header = self.make_header(seq);
             let wrapped = header.wrap(payload);
 
             for link in links {
@@ -186,7 +194,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
                     let seq = self.next_seq;
                     self.next_seq += 1;
 
-                    let header = crate::protocol::header::BondingHeader::new(seq);
+                    let header = self.make_header(seq);
                     let wrapped = header.wrap(payload);
 
                     for link in links {
@@ -205,7 +213,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             let seq = self.next_seq;
             self.next_seq += 1;
 
-            let header = crate::protocol::header::BondingHeader::new(seq);
+            let header = self.make_header(seq);
             let wrapped = header.wrap(payload);
 
             link.send(&wrapped)?;
@@ -216,7 +224,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
 
         // All links dead — escalate logging based on consecutive failures.
         self.consecutive_dead_count += 1;
-        self.total_dead_drops.fetch_add(1, Ordering::Relaxed);
+        self.total_dead_drops += 1;
 
         // Log at escalating severity: first occurrence is a warning,
         // sustained failures (100+ consecutive) escalate to error.
@@ -225,14 +233,12 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         } else if self.consecutive_dead_count == 100 {
             error!(
                 "All links dead for {} consecutive packets — total drops: {}",
-                self.consecutive_dead_count,
-                self.total_dead_drops.load(Ordering::Relaxed)
+                self.consecutive_dead_count, self.total_dead_drops
             );
         } else if self.consecutive_dead_count.is_multiple_of(1000) {
             error!(
                 "All links still dead after {} consecutive drops (total: {})",
-                self.consecutive_dead_count,
-                self.total_dead_drops.load(Ordering::Relaxed)
+                self.consecutive_dead_count, self.total_dead_drops
             );
         }
 
@@ -640,5 +646,162 @@ mod tests {
 
         // Should be sent to single link, not broadcast
         assert_eq!(l1_count + l2_count, 1);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Header timestamp & sequence wiring tests
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn send_wraps_with_non_zero_timestamp() {
+        use crate::protocol::header::BondingHeader;
+
+        let config = SchedulerConfig {
+            critical_broadcast: false,
+            redundancy_enabled: false,
+            failover_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut sched = BondingScheduler::with_config(config);
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        sched.add_link(link.clone());
+        sched.refresh_metrics();
+
+        // Small sleep so timestamp is non-zero
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        let payload = Bytes::from_static(b"test-payload");
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: false,
+            can_drop: false,
+            size_bytes: payload.len(),
+        };
+        sched.send(payload, profile).unwrap();
+
+        let packets = link.sent_packets.lock().unwrap();
+        assert_eq!(packets.len(), 1);
+
+        let raw = Bytes::from(packets[0].clone());
+        let (header, body) = BondingHeader::unwrap(raw).expect("Should have a valid header");
+
+        assert_eq!(header.seq_id, 0, "First packet should be seq 0");
+        assert!(
+            header.send_time_us > 0,
+            "send_time_us should be non-zero for OWD measurement, got {}",
+            header.send_time_us
+        );
+        assert_eq!(body, Bytes::from_static(b"test-payload"));
+    }
+
+    #[test]
+    fn seq_increments_monotonically() {
+        use crate::protocol::header::BondingHeader;
+
+        let config = SchedulerConfig {
+            critical_broadcast: false,
+            redundancy_enabled: false,
+            failover_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut sched = BondingScheduler::with_config(config);
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        sched.add_link(link.clone());
+        sched.refresh_metrics();
+
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: false,
+            can_drop: false,
+            size_bytes: 100,
+        };
+        for _ in 0..10 {
+            sched.send(Bytes::from_static(b"data"), profile).unwrap();
+        }
+
+        let packets = link.sent_packets.lock().unwrap();
+        assert_eq!(packets.len(), 10);
+
+        for (i, pkt) in packets.iter().enumerate() {
+            let raw = Bytes::from(pkt.clone());
+            let (hdr, _) = BondingHeader::unwrap(raw).unwrap();
+            assert_eq!(
+                hdr.seq_id, i as u64,
+                "Seq should be monotonically increasing"
+            );
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Error path & wrapper-level API tests
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn send_all_links_dead_returns_error() {
+        let config = SchedulerConfig {
+            critical_broadcast: false,
+            redundancy_enabled: false,
+            failover_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut sched = BondingScheduler::with_config(config);
+        // Add a link but set it to dead phase
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        link.set_phase(LinkPhase::Init);
+        // Make metrics show not alive
+        link.metrics.lock().unwrap().alive = false;
+        sched.add_link(link);
+        sched.refresh_metrics();
+
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: false,
+            can_drop: false,
+            size_bytes: 100,
+        };
+        let result = sched.send(Bytes::from_static(b"data"), profile);
+        assert!(result.is_err(), "Send should fail when all links are dead");
+    }
+
+    #[test]
+    fn remove_link_on_bonding_scheduler() {
+        let mut sched = BondingScheduler::new();
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 5_000_000.0, 10.0));
+        sched.add_link(l1);
+        sched.add_link(l2);
+        sched.refresh_metrics();
+
+        let metrics = sched.get_all_metrics();
+        assert!(metrics.contains_key(&1));
+        assert!(metrics.contains_key(&2));
+
+        sched.remove_link(1);
+        sched.refresh_metrics();
+
+        let metrics = sched.get_all_metrics();
+        assert!(
+            !metrics.contains_key(&1),
+            "Link 1 should be gone after remove"
+        );
+        assert!(metrics.contains_key(&2), "Link 2 should remain");
+    }
+
+    #[test]
+    fn get_all_metrics_reflects_links() {
+        let mut sched = BondingScheduler::new();
+        assert!(
+            sched.get_all_metrics().is_empty(),
+            "No links → empty metrics"
+        );
+
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        sched.add_link(l1);
+        sched.refresh_metrics();
+
+        let metrics = sched.get_all_metrics();
+        assert_eq!(metrics.len(), 1);
+        assert!(metrics.contains_key(&1));
+        assert!(
+            (metrics[&1].capacity_bps - 10_000_000.0).abs() < 1e-6,
+            "Capacity should reflect link's reported value"
+        );
     }
 }

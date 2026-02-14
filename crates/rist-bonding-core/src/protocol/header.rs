@@ -173,4 +173,37 @@ mod tests {
         assert_eq!(h1, h2);
         assert_ne!(h1, h3);
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Data integrity end-to-end through header wrap/unwrap
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn data_integrity_through_wrap_unwrap() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let num_packets = 200;
+        let mut sender_hasher = DefaultHasher::new();
+        let mut receiver_hasher = DefaultHasher::new();
+
+        let mut wrapped = Vec::new();
+        for i in 0..num_packets {
+            let payload: Vec<u8> = (0..100).map(|j| ((i * 7 + j * 3) % 256) as u8).collect();
+            payload.hash(&mut sender_hasher);
+            let header = BondingHeader::with_timestamp(i as u64, i as u64 * 1000);
+            wrapped.push(header.wrap(Bytes::from(payload)));
+        }
+
+        for w in wrapped {
+            let (_hdr, body) = BondingHeader::unwrap(w).unwrap();
+            body.to_vec().hash(&mut receiver_hasher);
+        }
+
+        assert_eq!(
+            sender_hasher.finish(),
+            receiver_hasher.finish(),
+            "Sender and receiver hashes must match through header wrap/unwrap"
+        );
+    }
 }

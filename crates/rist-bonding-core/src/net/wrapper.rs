@@ -189,11 +189,11 @@ unsafe extern "C" fn stats_cb(
                 let bw = ewma.bandwidth.value() as u64;
                 link_stats.smoothed_bw_bps.store(bw, Ordering::Relaxed);
 
-                // Loss in permille (0-1000)
-                let loss_pm = (ewma.loss.value() * 1000.0) as u64;
+                // Loss in micro-loss (0-1_000_000). 1_000_000 = 100% loss.
+                let loss_micro = (ewma.loss.value() * 1_000_000.0) as u64;
                 link_stats
-                    .smoothed_loss_permille
-                    .store(loss_pm, Ordering::Relaxed);
+                    .smoothed_loss_micro
+                    .store(loss_micro, Ordering::Relaxed);
             }
         }
     }));

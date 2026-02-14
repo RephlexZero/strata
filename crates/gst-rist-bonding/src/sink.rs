@@ -16,21 +16,39 @@ fn parse_config(config: &str) -> Result<BondingConfig, String> {
     BondingConfig::from_toml_str(config)
 }
 
-fn compute_congestion_recommendation(
-    total_capacity_bps: f64,
-    observed_bps: f64,
-    headroom_ratio: f64,
-    trigger_ratio: f64,
-) -> Option<u64> {
-    if total_capacity_bps <= 0.0 {
+/// NADA-derived rate signals per RFC 8698 §5.2.2.
+///
+/// Given the aggregate reference rate (`r_ref` — sum of per-link NADA
+/// `estimated_capacity_bps`), derive:
+///
+/// - **`r_vin`** — target encoder bitrate:  `max(RMIN, r_ref × (1 − BETA_V))`
+/// - **`headroom`** — bandwidth ceiling:    `min(RMAX, r_ref × (1 + BETA_S))`
+///
+/// Returns `None` when `r_ref` is zero (no alive links).
+///
+/// Constants:
+///   RMIN    = 150 000 bps   (RFC 8698 default minimum)
+///   BETA_V  = 0.05          (video smoothing margin — conservative)
+///   BETA_S  = 0.05          (sending-rate margin)
+fn compute_nada_rate_signals(r_ref: f64, max_capacity_bps: f64) -> Option<(u64, u64)> {
+    if r_ref <= 0.0 {
         return None;
     }
-    let recommended = (total_capacity_bps * headroom_ratio).round() as u64;
-    if observed_bps > total_capacity_bps * trigger_ratio {
-        Some(recommended)
+
+    const RMIN: f64 = 150_000.0;
+    const BETA_V: f64 = 0.05;
+    const BETA_S: f64 = 0.05;
+
+    let r_vin = (r_ref * (1.0 - BETA_V)).max(RMIN);
+
+    let rmax = if max_capacity_bps > 0.0 {
+        max_capacity_bps
     } else {
-        None
-    }
+        f64::MAX
+    };
+    let headroom = (r_ref * (1.0 + BETA_S)).min(rmax);
+
+    Some((r_vin.round() as u64, headroom.round() as u64))
 }
 
 mod imp {
@@ -57,7 +75,7 @@ mod imp {
         pub(crate) config_toml: Mutex<String>,
         pub(crate) pad_map: Mutex<HashMap<String, usize>>,
         pub(crate) pending_links: Mutex<HashMap<usize, LinkConfig>>,
-        pub(crate) scheduler_config: Mutex<SchedulerConfig>,
+        pub(crate) scheduler_config: Arc<Mutex<SchedulerConfig>>,
     }
 
     impl Default for RsRistBondSink {
@@ -70,7 +88,7 @@ mod imp {
                 config_toml: Mutex::new(String::new()),
                 pad_map: Mutex::new(HashMap::new()),
                 pending_links: Mutex::new(HashMap::new()),
-                scheduler_config: Mutex::new(SchedulerConfig::default()),
+                scheduler_config: Arc::new(Mutex::new(SchedulerConfig::default())),
             }
         }
     }
@@ -283,11 +301,14 @@ mod imp {
                 }
                 "max-bitrate" => {
                     let bps: u64 = value.get().expect("type checked upstream");
-                    let mut sched = lock_or_recover(&self.scheduler_config);
-                    sched.max_capacity_bps = bps as f64;
+                    let sched_clone = {
+                        let mut sched = lock_or_recover(&self.scheduler_config);
+                        sched.max_capacity_bps = bps as f64;
+                        sched.clone()
+                    };
                     // Live-update the runtime if already started
                     if let Some(rt) = lock_or_recover(&self.runtime).as_ref() {
-                        if let Err(e) = rt.update_scheduler_config(sched.clone()) {
+                        if let Err(e) = rt.update_scheduler_config(sched_clone) {
                             gst::warning!(gst::CAT_DEFAULT, "Failed to update max-bitrate: {}", e);
                         }
                     }
@@ -375,6 +396,11 @@ mod imp {
                     }
                 };
 
+                // Reserve the name in pad_map immediately so that
+                // subsequent auto-naming requests (with name=None)
+                // will skip this name even before a URI is set.
+                self.get_id_for_pad(&name);
+
                 let pad = glib::Object::builder::<RsRistBondSinkPad>()
                     .property("name", &name)
                     .property("direction", gst::PadDirection::Src)
@@ -435,18 +461,21 @@ mod imp {
             let element_weak = self.obj().downgrade();
             let running = self.stats_running.clone();
             running.store(true, Ordering::Relaxed);
-            let congestion_headroom = sched_cfg.congestion_headroom_ratio;
-            let congestion_trigger = sched_cfg.congestion_trigger_ratio;
+            let sched_cfg_handle = Arc::clone(&self.scheduler_config);
 
             let handle = std::thread::Builder::new()
                 .name("rist-bond-stats".into())
                 .spawn(move || {
-                    let stats_interval = Duration::from_millis(sched_cfg.stats_interval_ms);
                     let mut last_stats = Instant::now();
                     let start = Instant::now();
                     let mut stats_seq: u64 = 0;
 
                     while running.load(Ordering::Relaxed) {
+                        // Re-read stats_interval each iteration so runtime
+                        // config changes take effect immediately.
+                        let stats_interval = Duration::from_millis(
+                            lock_or_recover(&sched_cfg_handle).stats_interval_ms,
+                        );
                         if last_stats.elapsed() >= stats_interval {
                             if let Some(element) = element_weak.upgrade() {
                                 let metrics = lock_or_recover(&metrics_handle).clone();
@@ -457,20 +486,24 @@ mod imp {
                                     .unwrap_or(0);
 
                                 let mut total_capacity = 0.0;
+                                let mut total_nada_ref = 0.0;
                                 let mut total_observed_bps = 0.0;
                                 let mut alive_links = 0u64;
                                 let mut links_map = std::collections::HashMap::new();
 
                                 for (id, m) in &metrics {
                                     if m.alive {
-                                        // Use estimated capacity if AIMD is active,
-                                        // else fall back to raw capacity_bps.
-                                        let effective_capacity = if m.estimated_capacity_bps > 0.0 {
-                                            m.estimated_capacity_bps
+                                        // total_capacity always sums raw link
+                                        // capacity.
+                                        total_capacity += m.capacity_bps;
+                                        // aggregate_nada_ref uses the AIMD-
+                                        // estimated rate when active, else the
+                                        // raw capacity as fallback.
+                                        if m.estimated_capacity_bps > 0.0 {
+                                            total_nada_ref += m.estimated_capacity_bps;
                                         } else {
-                                            m.capacity_bps
-                                        };
-                                        total_capacity += effective_capacity;
+                                            total_nada_ref += m.capacity_bps;
+                                        }
                                         total_observed_bps += m.observed_bps;
                                         alive_links += 1;
                                     }
@@ -484,6 +517,8 @@ mod imp {
                                     0.0
                                 };
 
+                                let aggregate_nada_ref_bps = total_nada_ref;
+
                                 let snapshot = StatsSnapshot {
                                     schema_version: 3,
                                     stats_seq,
@@ -492,7 +527,9 @@ mod imp {
                                     wall_time_ms,
                                     timestamp,
                                     total_capacity,
+                                    aggregate_nada_ref_bps,
                                     alive_links,
+                                    total_dead_drops: 0,
                                     links: links_map,
                                 };
 
@@ -508,31 +545,33 @@ mod imp {
                                 let _ =
                                     element.post_message(gst::message::Element::new(msg_struct));
 
-                                if let Some(recommended) = compute_congestion_recommendation(
-                                    total_capacity,
-                                    total_observed_bps,
-                                    congestion_headroom,
-                                    congestion_trigger,
+                                // Read max_capacity_bps from the shared
+                                // scheduler config each iteration so runtime
+                                // changes via the max-bitrate property are
+                                // reflected immediately.
+                                let max_capacity_bps =
+                                    lock_or_recover(&sched_cfg_handle).max_capacity_bps;
+                                if let Some((r_vin, headroom)) = compute_nada_rate_signals(
+                                    aggregate_nada_ref_bps,
+                                    max_capacity_bps,
                                 ) {
-                                    let msg = gst::Structure::builder("congestion-control")
-                                        .field("recommended-bitrate", recommended)
+                                    let cc_msg = gst::Structure::builder("congestion-control")
+                                        .field("recommended-bitrate", r_vin)
+                                        .field("aggregate-nada-ref-bps", aggregate_nada_ref_bps)
                                         .field("total_capacity", total_capacity)
                                         .field("observed_bps", total_observed_bps)
                                         .build();
-                                    let _ = element.post_message(gst::message::Element::new(msg));
-                                } else if total_capacity > 0.0
-                                    && total_observed_bps < total_capacity * congestion_headroom
-                                {
-                                    // Utilization is well under capacity — signal
-                                    // the application that it's safe to probe higher.
-                                    let headroom_bps =
-                                        (total_capacity * congestion_headroom).round() as u64;
-                                    let msg = gst::Structure::builder("bandwidth-available")
-                                        .field("max-bitrate", headroom_bps)
+                                    let _ =
+                                        element.post_message(gst::message::Element::new(cc_msg));
+
+                                    let bw_msg = gst::Structure::builder("bandwidth-available")
+                                        .field("max-bitrate", headroom)
+                                        .field("aggregate-nada-ref-bps", aggregate_nada_ref_bps)
                                         .field("total_capacity", total_capacity)
                                         .field("observed_bps", total_observed_bps)
                                         .build();
-                                    let _ = element.post_message(gst::message::Element::new(msg));
+                                    let _ =
+                                        element.post_message(gst::message::Element::new(bw_msg));
                                 }
                             }
                             stats_seq = stats_seq.wrapping_add(1);
@@ -541,7 +580,12 @@ mod imp {
                         std::thread::sleep(Duration::from_millis(50));
                     }
                 })
-                .expect("failed to spawn stats thread");
+                .map_err(|e| {
+                    gst::error_msg!(
+                        gst::ResourceError::Failed,
+                        ["Failed to spawn sender stats thread: {}", e]
+                    )
+                })?;
 
             *lock_or_recover(&self.stats_thread) = Some(handle);
             Ok(())
@@ -601,7 +645,7 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_congestion_recommendation, parse_config};
+    use super::{compute_nada_rate_signals, parse_config};
 
     #[test]
     fn parse_config_links_basic() {
@@ -668,21 +712,59 @@ mod tests {
     }
 
     #[test]
-    fn congestion_recommendation_respects_headroom() {
-        let recommended = compute_congestion_recommendation(10_000_000.0, 9_200_000.0, 0.85, 0.90);
-        assert_eq!(recommended, Some(8_500_000));
+    fn nada_rate_signals_derive_r_vin_and_headroom() {
+        // 10 Mbps aggregate NADA r_ref, no RMAX ceiling
+        let (r_vin, headroom) = compute_nada_rate_signals(10_000_000.0, 0.0).unwrap();
+        // r_vin = 10M * 0.95 = 9.5M
+        assert_eq!(r_vin, 9_500_000);
+        // headroom = 10M * 1.05 = 10.5M
+        assert_eq!(headroom, 10_500_000);
     }
 
     #[test]
-    fn congestion_recommendation_skips_below_trigger() {
-        let recommended = compute_congestion_recommendation(10_000_000.0, 8_000_000.0, 0.85, 0.90);
-        assert!(recommended.is_none());
+    fn nada_rate_signals_clamp_to_rmin() {
+        // Very low r_ref — r_vin should clamp to RMIN (150 kbps)
+        let (r_vin, _headroom) = compute_nada_rate_signals(100_000.0, 0.0).unwrap();
+        assert_eq!(r_vin, 150_000); // RMIN floor
     }
 
     #[test]
-    fn congestion_recommendation_skips_zero_capacity() {
-        let recommended = compute_congestion_recommendation(0.0, 9_000_000.0, 0.85, 0.90);
-        assert!(recommended.is_none());
+    fn nada_rate_signals_respect_rmax() {
+        // 50 Mbps r_ref with 40 Mbps RMAX ceiling
+        let (r_vin, headroom) = compute_nada_rate_signals(50_000_000.0, 40_000_000.0).unwrap();
+        assert_eq!(r_vin, 47_500_000); // 50M * 0.95
+        assert_eq!(headroom, 40_000_000); // clamped to RMAX
+    }
+
+    #[test]
+    fn nada_rate_signals_return_none_for_zero() {
+        assert!(compute_nada_rate_signals(0.0, 0.0).is_none());
+        assert!(compute_nada_rate_signals(-1.0, 0.0).is_none());
+    }
+
+    /// Verify that r_vin clamps exactly at RMIN boundary.
+    /// RMIN = 150_000.  r_vin = r_ref * 0.95.
+    /// When r_ref = RMIN / 0.95 ≈ 157_894.74, r_vin rounds to exactly 150_000.
+    #[test]
+    fn nada_rate_signals_at_exact_rmin_boundary() {
+        const RMIN: f64 = 150_000.0;
+        // r_ref just below the threshold: r_vin should clamp to RMIN
+        let r_ref_below = RMIN / 0.95 - 1.0; // ~157_893.7
+        let (r_vin, _) = compute_nada_rate_signals(r_ref_below, 0.0).unwrap();
+        assert_eq!(r_vin, RMIN as u64, "r_vin should clamp to RMIN");
+
+        // r_ref at exactly RMIN / 0.95: r_vin = RMIN exactly (before rounding)
+        let r_ref_exact = RMIN / 0.95;
+        let (r_vin, _) = compute_nada_rate_signals(r_ref_exact, 0.0).unwrap();
+        assert_eq!(r_vin, RMIN as u64, "r_vin at breakpoint should equal RMIN");
+
+        // r_ref above threshold: r_vin should exceed RMIN
+        let r_ref_above = RMIN / 0.95 + 100.0;
+        let (r_vin, _) = compute_nada_rate_signals(r_ref_above, 0.0).unwrap();
+        assert!(
+            r_vin > RMIN as u64,
+            "r_vin should exceed RMIN above the breakpoint"
+        );
     }
 }
 

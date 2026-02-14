@@ -28,8 +28,8 @@ pub struct BondingReceiver {
     stats: Arc<Mutex<ReassemblyStats>>,
     /// Track spawned thread handles for clean shutdown
     thread_handles: Mutex<Vec<thread::JoinHandle<()>>>,
-    /// Number of links added (each `add_link` call increments this).
-    link_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Total number of links added (historical; not decremented on thread exit).
+    total_links_added: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl BondingReceiver {
@@ -58,9 +58,17 @@ impl BondingReceiver {
                 let tick_interval = Duration::from_millis(10);
 
                 while running_clone.load(Ordering::Relaxed) {
+                    // Drain all available packets before ticking.
+                    // The initial recv_timeout provides the 10ms cadence;
+                    // subsequent try_recv() calls ensure the channel doesn't
+                    // back up under high throughput.
                     match input_rx.recv_timeout(tick_interval) {
                         Ok(packet) => {
                             buffer.push(packet.seq_id, packet.payload, packet.arrival_time);
+                            // Drain remaining buffered packets without blocking
+                            while let Ok(pkt) = input_rx.try_recv() {
+                                buffer.push(pkt.seq_id, pkt.payload, pkt.arrival_time);
+                            }
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                             // No packet; still tick below
@@ -82,7 +90,7 @@ impl BondingReceiver {
                     }
                 }
             })
-            .expect("failed to spawn jitter buffer thread");
+            .unwrap_or_else(|e| panic!("failed to spawn jitter buffer thread: {}", e));
 
         Self {
             input_tx: Some(input_tx),
@@ -91,7 +99,7 @@ impl BondingReceiver {
             running,
             stats,
             thread_handles: Mutex::new(vec![jitter_handle]),
-            link_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            total_links_added: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -112,9 +120,10 @@ impl BondingReceiver {
         self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Returns the number of links that have been added to this receiver.
+    /// Returns the total number of links that have been added to this receiver.
+    /// Note: this is a cumulative count and does not decrease if reader threads exit.
     pub fn link_count(&self) -> u64 {
-        self.link_count.load(Ordering::Relaxed)
+        self.total_links_added.load(Ordering::Relaxed)
     }
 
     pub fn add_link(&self, bind_url: &str) -> Result<()> {
@@ -122,7 +131,7 @@ impl BondingReceiver {
         ctx.peer_config(bind_url)?;
         ctx.start()?;
 
-        self.link_count.fetch_add(1, Ordering::Relaxed);
+        self.total_links_added.fetch_add(1, Ordering::Relaxed);
 
         let input_tx = self
             .input_tx
@@ -147,10 +156,10 @@ impl BondingReceiver {
                                     payload: original_payload,
                                     arrival_time: Instant::now(),
                                 };
-                                if let Err(e) = input_tx.send(packet) {
+                                if input_tx.try_send(packet).is_err() {
                                     debug!(
-                                        "BondingReceiver: input channel full/closed on {}: {}",
-                                        link_url, e
+                                        "BondingReceiver: input channel full, dropping packet on {}",
+                                        link_url
                                     );
                                 }
                             } else {
@@ -239,5 +248,63 @@ mod tests {
         let rcv = BondingReceiver::new(Duration::from_millis(50));
         // output_rx should be available and empty (no data sent)
         assert!(rcv.output_rx.try_recv().is_err());
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Concurrency & channel backpressure tests
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bounded_channel_backpressure_drops_not_blocks() {
+        use crossbeam_channel::bounded;
+
+        // Simulate the reader→jitter channel with a small capacity
+        let (tx, rx) = bounded::<Bytes>(4);
+
+        // Fill the channel
+        for i in 0..4 {
+            tx.send(Bytes::from(vec![i; 10])).unwrap();
+        }
+
+        // try_send on full channel should fail, not block
+        let result = tx.try_send(Bytes::from_static(b"overflow"));
+        assert!(
+            result.is_err(),
+            "try_send on full channel should return error"
+        );
+
+        // Drain one and verify it works again
+        let _ = rx.recv().unwrap();
+        let result = tx.try_send(Bytes::from_static(b"after-drain"));
+        assert!(result.is_ok(), "try_send should succeed after draining");
+    }
+
+    #[test]
+    fn receiver_output_poll_from_another_thread() {
+        let rcv = BondingReceiver::new(Duration::from_millis(50));
+        let rx = rcv.output_rx.clone();
+
+        let handle = std::thread::spawn(move || {
+            let result = rx.recv_timeout(Duration::from_millis(50));
+            assert!(result.is_err(), "Should timeout with no data");
+        });
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn new_with_config_applies_settings() {
+        use crate::receiver::aggregator::ReassemblyConfig;
+
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(100),
+            buffer_capacity: 512,
+            skip_after: Some(Duration::from_millis(25)),
+            ..ReassemblyConfig::default()
+        };
+        let rcv = BondingReceiver::new_with_config(config);
+        assert_eq!(rcv.link_count(), 0);
+        let stats = rcv.get_stats();
+        assert_eq!(stats.queue_depth, 0);
     }
 }

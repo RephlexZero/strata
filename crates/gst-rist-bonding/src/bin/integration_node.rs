@@ -111,8 +111,12 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Additive-increase step: ramp bitrate back up by this amount (kbps)
-    // each stats interval when bandwidth-available is signalled.
-    let ramp_step_kbps: u32 = (bitrate_kbps / 10).max(100);
+    // each stats interval when bandwidth-available signals headroom.
+    let _ramp_step_kbps: u32 = (bitrate_kbps / 10).max(100);
+
+    // Track the current NADA-derived ceiling (updated continuously via
+    // bandwidth-available messages).
+    let nada_ceiling_kbps = Arc::new(Mutex::new(bitrate_kbps));
 
     pipeline.set_state(gst::State::Playing)?;
 
@@ -129,35 +133,27 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(s) = element.structure() {
                     if s.name() == "congestion-control" {
                         if let Ok(recommended) = s.get::<u64>("recommended-bitrate") {
-                            // Update encoder: only reduce bitrate (congestion relief),
-                            // never increase beyond the configured value.
+                            // RFC 8698 §5.2.2: Set encoder bitrate to r_vin
+                            // (NADA-derived target).  Clamp to [500, configured_max].
                             if let Some(enc) = pipeline.by_name("enc") {
-                                // x264enc bitrate is in kbit/sec
                                 let recommended_kbps = (recommended / 1000) as u32;
+                                let target = recommended_kbps.clamp(500, bitrate_kbps);
                                 let current: u32 = enc.property("bitrate");
-                                let target = std::cmp::max(recommended_kbps, 500);
-                                if target < current {
+                                if target != current {
                                     eprintln!(
-                                        "Congestion Control: Reducing Bitrate from {} to {} kbps",
-                                        current, target
+                                        "NADA Rate Signal: Setting bitrate {} -> {} kbps (r_vin={})",
+                                        current, target, recommended
                                     );
                                     enc.set_property("bitrate", target);
                                 }
                             }
                         }
                     } else if s.name() == "bandwidth-available" {
-                        // AIMD additive increase: ramp bitrate back up
-                        // towards the configured ceiling.
-                        if let Some(enc) = pipeline.by_name("enc") {
-                            let current: u32 = enc.property("bitrate");
-                            if current < bitrate_kbps {
-                                let target = std::cmp::min(current + ramp_step_kbps, bitrate_kbps);
-                                eprintln!(
-                                    "Bandwidth Available: Increasing Bitrate from {} to {} kbps",
-                                    current, target
-                                );
-                                enc.set_property("bitrate", target);
-                            }
+                        // Update NADA ceiling — the maximum safe rate
+                        // according to the aggregate estimate.
+                        if let Ok(max_bps) = s.get::<u64>("max-bitrate") {
+                            let ceiling = ((max_bps / 1000) as u32).min(bitrate_kbps);
+                            *nada_ceiling_kbps.lock().unwrap() = ceiling;
                         }
                     } else if s.name() == "rist-bonding-stats" {
                         // Relay to UDP if configured

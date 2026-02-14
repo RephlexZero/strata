@@ -77,3 +77,35 @@ pub trait LinkSender: Send + Sync {
     /// Returns a snapshot of the link's current metrics.
     fn get_metrics(&self) -> LinkMetrics;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_phase_as_str_all_variants() {
+        assert_eq!(LinkPhase::Init.as_str(), "init");
+        assert_eq!(LinkPhase::Probe.as_str(), "probe");
+        assert_eq!(LinkPhase::Warm.as_str(), "warm");
+        assert_eq!(LinkPhase::Live.as_str(), "live");
+        assert_eq!(LinkPhase::Degrade.as_str(), "degrade");
+        assert_eq!(LinkPhase::Cooldown.as_str(), "cooldown");
+        assert_eq!(LinkPhase::Reset.as_str(), "reset");
+    }
+
+    #[test]
+    fn link_metrics_default_values() {
+        let m = LinkMetrics::default();
+        assert!((m.rtt_ms - 0.0).abs() < f64::EPSILON);
+        assert!((m.capacity_bps - 0.0).abs() < f64::EPSILON);
+        assert!((m.loss_rate - 0.0).abs() < f64::EPSILON);
+        assert!(!m.alive);
+        assert_eq!(m.phase, LinkPhase::Init);
+        assert_eq!(m.os_up, None);
+        assert_eq!(m.mtu, None);
+        assert_eq!(m.iface, None);
+        assert_eq!(m.link_kind, None);
+        assert!((m.estimated_capacity_bps - 0.0).abs() < f64::EPSILON);
+        assert!((m.owd_ms - 0.0).abs() < f64::EPSILON);
+    }
+}

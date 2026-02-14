@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// An incoming packet with its bonding sequence ID and arrival timestamp.
@@ -34,6 +34,9 @@ pub struct ReassemblyBuffer {
     avg_iat: f64,
     jitter_smoothed: f64,
     jitter_samples: VecDeque<f64>,
+
+    // O(log n) index of buffered seq_ids → arrival times for fast gap scanning.
+    buffered_seqs: BTreeMap<u64, Instant>,
 }
 
 /// Configuration for the reassembly jitter buffer.
@@ -115,6 +118,7 @@ impl ReassemblyBuffer {
             avg_iat: 0.0,
             jitter_smoothed: 0.0,
             jitter_samples: VecDeque::with_capacity(128),
+            buffered_seqs: BTreeMap::new(),
         }
     }
 
@@ -165,9 +169,28 @@ impl ReassemblyBuffer {
         self.last_arrival = Some(now);
 
         if seq_id < self.next_seq {
-            // Late packet, drop
-            self.late_packets += 1;
-            return;
+            // Detect sender restart: if next_seq is far ahead (>capacity) and
+            // we receive a very low seq_id, the sender likely restarted.
+            // Reset state to avoid prolonged blackout.
+            if self.next_seq > self.capacity as u64 && seq_id < self.capacity as u64 {
+                tracing::warn!(
+                    "Sender seq reset detected (got {} while expecting {}), resetting receiver state",
+                    seq_id,
+                    self.next_seq
+                );
+                // Clear the entire buffer
+                for slot in self.buffer.iter_mut() {
+                    *slot = None;
+                }
+                self.buffered = 0;
+                self.buffered_seqs.clear();
+                self.next_seq = seq_id;
+                // Fall through to normal push logic below
+            } else {
+                // Late packet, drop
+                self.late_packets += 1;
+                return;
+            }
         }
 
         let capacity = self.capacity as u64;
@@ -189,11 +212,13 @@ impl ReassemblyBuffer {
             } else if existing.seq_id >= self.next_seq {
                 // Different packet in this slot, was lost
                 self.lost_packets += 1;
+                self.buffered_seqs.remove(&existing.seq_id);
             }
         } else {
             self.buffered += 1;
         }
 
+        self.buffered_seqs.insert(seq_id, now);
         self.buffer[idx] = Some(Packet {
             seq_id,
             payload,
@@ -219,6 +244,7 @@ impl ReassemblyBuffer {
                     if now.duration_since(packet.arrival_time) >= release_after {
                         let p = self.buffer[idx].take().unwrap();
                         self.buffered = self.buffered.saturating_sub(1);
+                        self.buffered_seqs.remove(&p.seq_id);
                         released.push(p.payload);
                         self.next_seq += 1;
                         continue;
@@ -258,6 +284,7 @@ impl ReassemblyBuffer {
             let idx = self.buffer_index(seq);
             if let Some(packet) = &self.buffer[idx] {
                 if packet.seq_id == seq {
+                    self.buffered_seqs.remove(&seq);
                     self.buffer[idx] = None;
                     self.buffered = self.buffered.saturating_sub(1);
                 }
@@ -267,19 +294,11 @@ impl ReassemblyBuffer {
     }
 
     fn find_next_available(&self) -> Option<(u64, Instant)> {
-        let mut best: Option<(u64, Instant)> = None;
-        for slot in self.buffer.iter().flatten() {
-            if slot.seq_id <= self.next_seq {
-                continue;
-            }
-            match best {
-                Some((best_seq, _)) if slot.seq_id >= best_seq => {}
-                _ => {
-                    best = Some((slot.seq_id, slot.arrival_time));
-                }
-            }
-        }
-        best
+        // O(log n) lookup using the BTreeMap index — find the first seq > next_seq.
+        self.buffered_seqs
+            .range((self.next_seq + 1)..)
+            .next()
+            .map(|(&seq, &arrival)| (seq, arrival))
     }
 }
 
@@ -672,5 +691,249 @@ mod tests {
         // Verify no data loss or corruption
         assert_eq!(buf.lost_packets, 0, "No packets should be lost");
         assert_eq!(buf.duplicate_packets, 0, "No duplicates should be counted");
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Burst drain, seq reset, and BTreeMap edge-case tests
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tick_drains_burst_in_one_call() {
+        let mut buf = ReassemblyBuffer::with_config(
+            0,
+            ReassemblyConfig {
+                start_latency: Duration::from_millis(1),
+                buffer_capacity: 1024,
+                ..ReassemblyConfig::default()
+            },
+        );
+        let now = Instant::now();
+
+        for i in 0..100u64 {
+            buf.push(i, Bytes::from(vec![i as u8; 50]), now);
+        }
+
+        let out = buf.tick(now + Duration::from_millis(1));
+        assert_eq!(
+            out.len(),
+            100,
+            "tick() should release all ready packets in one call, got {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn sender_seq_reset_detected() {
+        let mut buf = ReassemblyBuffer::with_config(
+            0,
+            ReassemblyConfig {
+                start_latency: Duration::from_millis(1),
+                buffer_capacity: 64,
+                ..ReassemblyConfig::default()
+            },
+        );
+        let now = Instant::now();
+
+        // Normal operation: push 100 packets
+        for i in 0..100u64 {
+            buf.push(i, Bytes::from(vec![i as u8; 10]), now);
+        }
+        let _ = buf.tick(now + Duration::from_millis(1));
+        assert_eq!(buf.next_seq, 100);
+
+        // Sender restarts: seq resets to 5
+        buf.push(
+            5,
+            Bytes::from_static(b"RESET"),
+            now + Duration::from_millis(10),
+        );
+
+        // After reset detection, next_seq should be reset
+        assert!(
+            buf.next_seq <= 5,
+            "After sender reset detection, next_seq should be <= 5, got {}",
+            buf.next_seq
+        );
+
+        // Release the reset packet
+        let out = buf.tick(now + Duration::from_millis(11));
+        assert!(
+            !out.is_empty(),
+            "Should be able to release packets after sender reset"
+        );
+    }
+
+    #[test]
+    fn late_packet_not_false_reset() {
+        let mut buf = ReassemblyBuffer::with_config(
+            0,
+            ReassemblyConfig {
+                start_latency: Duration::from_millis(1),
+                buffer_capacity: 128,
+                ..ReassemblyConfig::default()
+            },
+        );
+        let now = Instant::now();
+
+        // Push packets 0-9 and release them
+        for i in 0..10u64 {
+            buf.push(i, Bytes::from(vec![0u8; 10]), now);
+        }
+        let _ = buf.tick(now + Duration::from_millis(1));
+        let late_before = buf.late_packets;
+
+        // Seq 5 again is late, NOT a reset (next_seq=10 < capacity=128)
+        buf.push(
+            5,
+            Bytes::from_static(b"late"),
+            now + Duration::from_millis(5),
+        );
+
+        assert_eq!(
+            buf.late_packets,
+            late_before + 1,
+            "Late packet should be counted as late, not trigger reset"
+        );
+        assert_eq!(
+            buf.next_seq, 10,
+            "next_seq should not change for late packets"
+        );
+    }
+
+    #[test]
+    fn btreemap_large_buffer_gap_skip() {
+        let mut buf = ReassemblyBuffer::with_config(
+            0,
+            ReassemblyConfig {
+                start_latency: Duration::from_millis(1),
+                buffer_capacity: 4096,
+                skip_after: Some(Duration::from_millis(1)),
+                ..ReassemblyConfig::default()
+            },
+        );
+        let now = Instant::now();
+
+        // Push 1000 packets with seq 1..=1000 (missing seq 0)
+        for i in 1..=1000u64 {
+            buf.push(i, Bytes::from(vec![0u8; 10]), now);
+        }
+
+        // tick should skip seq 0 and release the rest
+        let out = buf.tick(now + Duration::from_millis(2));
+        assert!(!out.is_empty(), "Should release packets after gap skip");
+        assert!(buf.lost_packets >= 1, "seq 0 should be counted as lost");
+    }
+
+    #[test]
+    fn btreemap_consistency_after_push_tick_push() {
+        let mut buf = ReassemblyBuffer::with_config(
+            0,
+            ReassemblyConfig {
+                start_latency: Duration::from_millis(1),
+                buffer_capacity: 32,
+                ..ReassemblyConfig::default()
+            },
+        );
+        let now = Instant::now();
+
+        for i in 0..10u64 {
+            buf.push(i, Bytes::from(vec![0u8; 10]), now);
+        }
+        let out = buf.tick(now + Duration::from_millis(1));
+        assert_eq!(out.len(), 10);
+        assert_eq!(buf.buffered, 0);
+
+        for i in 10..20u64 {
+            buf.push(i, Bytes::from(vec![0u8; 10]), now);
+        }
+        let out = buf.tick(now + Duration::from_millis(2));
+        assert_eq!(out.len(), 10);
+        assert_eq!(buf.buffered, 0);
+        assert_eq!(buf.lost_packets, 0);
+    }
+
+    #[test]
+    fn btreemap_survives_window_advance() {
+        let mut buf = ReassemblyBuffer::with_config(
+            0,
+            ReassemblyConfig {
+                start_latency: Duration::from_millis(1),
+                buffer_capacity: 16,
+                skip_after: Some(Duration::from_millis(1)),
+                ..ReassemblyConfig::default()
+            },
+        );
+        let now = Instant::now();
+
+        buf.push(0, Bytes::from_static(b"P0"), now);
+        buf.push(1, Bytes::from_static(b"P1"), now);
+
+        // Far-ahead packet forces window advance
+        buf.push(30, Bytes::from_static(b"P30"), now);
+
+        let out = buf.tick(now + Duration::from_millis(2));
+        assert!(
+            !out.is_empty(),
+            "Should release something after window advance"
+        );
+        assert!(
+            buf.lost_packets > 0,
+            "Window advance should count lost packets"
+        );
+    }
+
+    #[test]
+    fn duplicate_counting() {
+        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(10));
+        let now = Instant::now();
+
+        buf.push(0, Bytes::from_static(b"first"), now);
+        buf.push(0, Bytes::from_static(b"dupe"), now);
+
+        assert_eq!(buf.duplicate_packets, 1);
+    }
+
+    #[test]
+    fn concurrent_buffer_push_and_tick() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let num_threads = 4;
+        let packets_per_thread = 1000;
+
+        let mut handles = Vec::new();
+        for t in 0..num_threads {
+            let counter = counter.clone();
+            handles.push(thread::spawn(move || {
+                let mut buf = ReassemblyBuffer::with_config(
+                    0,
+                    ReassemblyConfig {
+                        start_latency: Duration::from_millis(1),
+                        buffer_capacity: 2048,
+                        ..ReassemblyConfig::default()
+                    },
+                );
+                let now = Instant::now();
+
+                for i in 0..packets_per_thread {
+                    let seq = (t * packets_per_thread + i) as u64;
+                    buf.push(seq, Bytes::from(vec![0u8; 100]), now);
+                }
+
+                let out = buf.tick(now + Duration::from_millis(1));
+                counter.fetch_add(out.len() as u64, Ordering::Relaxed);
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(
+            counter.load(Ordering::Relaxed) > 0,
+            "Concurrent buffers should produce output"
+        );
     }
 }

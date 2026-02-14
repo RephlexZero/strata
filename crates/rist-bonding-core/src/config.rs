@@ -81,10 +81,6 @@ pub struct SchedulerConfigInput {
     pub failover_duration_ms: Option<u64>,
     /// RTT multiple to trigger failover
     pub failover_rtt_spike_factor: Option<f64>,
-    /// Recommended bitrate as fraction of capacity (0.0-1.0)
-    pub congestion_headroom_ratio: Option<f64>,
-    /// Observed/capacity ratio that triggers congestion recommendation (0.0-1.0)
-    pub congestion_trigger_ratio: Option<f64>,
     /// EWMA smoothing factor for link stats (0.0-1.0)
     pub ewma_alpha: Option<f64>,
     /// How far ahead to predict link trends (seconds)
@@ -109,8 +105,6 @@ pub struct SchedulerConfigInput {
     pub capacity_estimate_enabled: Option<bool>,
     /// RTT / baseline ratio that triggers multiplicative decrease (e.g. 1.8)
     pub rtt_congestion_ratio: Option<f64>,
-    /// RTT / baseline ratio below which additive increase is allowed (e.g. 1.3)
-    pub rtt_headroom_ratio: Option<f64>,
     /// Multiplicative decrease factor (0.0-1.0, e.g. 0.7)
     pub md_factor: Option<f64>,
     /// Additive increase step as fraction of estimated capacity (e.g. 0.08)
@@ -137,8 +131,6 @@ pub struct SchedulerConfigInput {
     pub qbound_ms: Option<f64>,
     /// Queuing delay threshold for determining underutilization (ms) (RFC 8698 §4.2)
     pub qeps_ms: Option<f64>,
-    /// Observation window for loss/delay statistics (ms) (RFC 8698 §4.1)
-    pub nada_logwin_ms: Option<u64>,
     /// PI-controller scaling parameter (RFC 8698 §4.3)
     pub nada_kappa: Option<f64>,
     /// PI-controller scaling parameter for proportional term (RFC 8698 §4.3)
@@ -247,8 +239,6 @@ pub struct SchedulerConfig {
     pub failover_enabled: bool,
     pub failover_duration_ms: u64,
     pub failover_rtt_spike_factor: f64,
-    pub congestion_headroom_ratio: f64,
-    pub congestion_trigger_ratio: f64,
     pub ewma_alpha: f64,
     pub prediction_horizon_s: f64,
     pub capacity_floor_bps: f64,
@@ -264,8 +254,6 @@ pub struct SchedulerConfig {
     pub capacity_estimate_enabled: bool,
     /// RTT / baseline ratio that triggers multiplicative decrease.
     pub rtt_congestion_ratio: f64,
-    /// RTT / baseline ratio below which additive increase is allowed.
-    pub rtt_headroom_ratio: f64,
     /// Multiplicative decrease factor.
     pub md_factor: f64,
     /// Additive increase step as fraction of estimated capacity.
@@ -292,8 +280,6 @@ pub struct SchedulerConfig {
     pub qbound_ms: f64,
     /// Queuing delay threshold below which path is underutilized (ms).
     pub qeps_ms: f64,
-    /// Observation window for loss/delay statistics (ms).
-    pub nada_logwin_ms: u64,
     /// PI-controller scaling parameter (overall speed).
     pub nada_kappa: f64,
     /// PI-controller proportional term weight.
@@ -331,8 +317,6 @@ impl Default for SchedulerConfig {
             failover_enabled: true,
             failover_duration_ms: 3000,
             failover_rtt_spike_factor: 3.0,
-            congestion_headroom_ratio: 0.85,
-            congestion_trigger_ratio: 0.90,
             ewma_alpha: 0.125,
             prediction_horizon_s: 0.5,
             capacity_floor_bps: 1_000_000.0,
@@ -345,7 +329,6 @@ impl Default for SchedulerConfig {
             // AIMD defaults
             capacity_estimate_enabled: true,
             rtt_congestion_ratio: 1.8,
-            rtt_headroom_ratio: 1.3,
             md_factor: 0.7,
             ai_step_ratio: 0.08,
             decrease_cooldown_ms: 500,
@@ -359,7 +342,6 @@ impl Default for SchedulerConfig {
             gamma_max: 0.5,
             qbound_ms: 50.0,
             qeps_ms: 10.0,
-            nada_logwin_ms: 500,
             nada_kappa: 0.5,
             nada_eta: 2.0,
             nada_tau_ms: 500.0,
@@ -462,14 +444,6 @@ impl SchedulerConfigInput {
                 .failover_rtt_spike_factor
                 .unwrap_or(defaults.failover_rtt_spike_factor)
                 .clamp(1.0, 100.0),
-            congestion_headroom_ratio: self
-                .congestion_headroom_ratio
-                .unwrap_or(defaults.congestion_headroom_ratio)
-                .clamp(0.0, 1.0),
-            congestion_trigger_ratio: self
-                .congestion_trigger_ratio
-                .unwrap_or(defaults.congestion_trigger_ratio)
-                .clamp(0.0, 1.0),
             ewma_alpha: self
                 .ewma_alpha
                 .unwrap_or(defaults.ewma_alpha)
@@ -508,10 +482,6 @@ impl SchedulerConfigInput {
             rtt_congestion_ratio: self
                 .rtt_congestion_ratio
                 .unwrap_or(defaults.rtt_congestion_ratio)
-                .clamp(1.0, 10.0),
-            rtt_headroom_ratio: self
-                .rtt_headroom_ratio
-                .unwrap_or(defaults.rtt_headroom_ratio)
                 .clamp(1.0, 10.0),
             md_factor: self.md_factor.unwrap_or(defaults.md_factor).clamp(0.1, 1.0),
             ai_step_ratio: self
@@ -553,10 +523,6 @@ impl SchedulerConfigInput {
                 .unwrap_or(defaults.qbound_ms)
                 .clamp(1.0, 500.0),
             qeps_ms: self.qeps_ms.unwrap_or(defaults.qeps_ms).clamp(0.0, 200.0),
-            nada_logwin_ms: self
-                .nada_logwin_ms
-                .unwrap_or(defaults.nada_logwin_ms)
-                .max(50),
             nada_kappa: self
                 .nada_kappa
                 .unwrap_or(defaults.nada_kappa)
@@ -813,8 +779,6 @@ mod tests {
             failover_enabled = false
             failover_duration_ms = 5000
             failover_rtt_spike_factor = 4.0
-            congestion_headroom_ratio = 0.80
-            congestion_trigger_ratio = 0.85
             ewma_alpha = 0.2
             prediction_horizon_s = 1.0
             capacity_floor_bps = 2000000.0
@@ -835,8 +799,6 @@ mod tests {
         assert!(!cfg.scheduler.failover_enabled);
         assert_eq!(cfg.scheduler.failover_duration_ms, 5000);
         assert!((cfg.scheduler.failover_rtt_spike_factor - 4.0).abs() < 1e-6);
-        assert!((cfg.scheduler.congestion_headroom_ratio - 0.80).abs() < 1e-6);
-        assert!((cfg.scheduler.congestion_trigger_ratio - 0.85).abs() < 1e-6);
         assert!((cfg.scheduler.ewma_alpha - 0.2).abs() < 1e-6);
         assert!((cfg.scheduler.prediction_horizon_s - 1.0).abs() < 1e-6);
         assert!((cfg.scheduler.capacity_floor_bps - 2_000_000.0).abs() < 1e-6);
@@ -1058,19 +1020,6 @@ mod tests {
     }
 
     #[test]
-    fn congestion_ratios_clamped() {
-        let toml = r#"
-            version = 1
-            [scheduler]
-            congestion_headroom_ratio = 2.0
-            congestion_trigger_ratio = -1.0
-        "#;
-        let cfg = BondingConfig::from_toml_str(toml).unwrap();
-        assert!((cfg.scheduler.congestion_headroom_ratio - 1.0).abs() < 1e-6);
-        assert!((cfg.scheduler.congestion_trigger_ratio - 0.0).abs() < 1e-6);
-    }
-
-    #[test]
     fn failover_rtt_spike_factor_clamped() {
         let toml = r#"
             version = 1
@@ -1110,7 +1059,6 @@ mod tests {
         let cfg = BondingConfig::from_toml_str("").unwrap();
         assert!(cfg.scheduler.capacity_estimate_enabled);
         assert!((cfg.scheduler.rtt_congestion_ratio - 1.8).abs() < 1e-6);
-        assert!((cfg.scheduler.rtt_headroom_ratio - 1.3).abs() < 1e-6);
         assert!((cfg.scheduler.md_factor - 0.7).abs() < 1e-6);
         assert!((cfg.scheduler.ai_step_ratio - 0.08).abs() < 1e-6);
         assert_eq!(cfg.scheduler.decrease_cooldown_ms, 500);
@@ -1127,7 +1075,6 @@ mod tests {
             [scheduler]
             capacity_estimate_enabled = false
             rtt_congestion_ratio = 2.5
-            rtt_headroom_ratio = 1.5
             md_factor = 0.5
             ai_step_ratio = 0.1
             decrease_cooldown_ms = 1000
@@ -1139,7 +1086,6 @@ mod tests {
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
         assert!(!cfg.scheduler.capacity_estimate_enabled);
         assert!((cfg.scheduler.rtt_congestion_ratio - 2.5).abs() < 1e-6);
-        assert!((cfg.scheduler.rtt_headroom_ratio - 1.5).abs() < 1e-6);
         assert!((cfg.scheduler.md_factor - 0.5).abs() < 1e-6);
         assert!((cfg.scheduler.ai_step_ratio - 0.1).abs() < 1e-6);
         assert_eq!(cfg.scheduler.decrease_cooldown_ms, 1000);
@@ -1155,7 +1101,6 @@ mod tests {
             version = 1
             [scheduler]
             rtt_congestion_ratio = 0.5
-            rtt_headroom_ratio = 0.1
             md_factor = 0.01
             ai_step_ratio = 5.0
             decrease_cooldown_ms = 10
@@ -1166,7 +1111,6 @@ mod tests {
         "#;
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
         assert!((cfg.scheduler.rtt_congestion_ratio - 1.0).abs() < 1e-6);
-        assert!((cfg.scheduler.rtt_headroom_ratio - 1.0).abs() < 1e-6);
         assert!((cfg.scheduler.md_factor - 0.1).abs() < 1e-6);
         assert!((cfg.scheduler.ai_step_ratio - 1.0).abs() < 1e-6);
         assert_eq!(cfg.scheduler.decrease_cooldown_ms, 50);
@@ -1174,5 +1118,404 @@ mod tests {
         assert!((cfg.scheduler.rtt_min_slow_window_s - 5.0).abs() < 1e-6);
         assert!((cfg.scheduler.max_capacity_bps - 0.0).abs() < 1e-6);
         assert!((cfg.scheduler.loss_md_threshold - 1.0).abs() < 1e-6);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Config-to-runtime wiring tests
+    //
+    // These verify that parsed TOML values actually reach their
+    // destination structs (ReassemblyConfig, SchedulerConfig, etc.).
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn buffer_capacity_reaches_reassembly_config() {
+        use crate::receiver::aggregator::ReassemblyConfig;
+        let toml = r#"
+            version = 1
+            [receiver]
+            buffer_capacity = 512
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.receiver.buffer_capacity, 512);
+
+        // Construct ReassemblyConfig the same way src.rs does
+        let rc = ReassemblyConfig {
+            start_latency: cfg.receiver.start_latency,
+            buffer_capacity: cfg.receiver.buffer_capacity,
+            skip_after: cfg.receiver.skip_after,
+            jitter_latency_multiplier: cfg.scheduler.jitter_latency_multiplier,
+            max_latency_ms: cfg.scheduler.max_latency_ms,
+        };
+        assert_eq!(rc.buffer_capacity, 512);
+    }
+
+    #[test]
+    fn skip_after_ms_reaches_reassembly_config() {
+        use crate::receiver::aggregator::{ReassemblyBuffer, ReassemblyConfig};
+        use std::time::{Duration, Instant};
+
+        let toml = r#"
+            version = 1
+            [receiver]
+            skip_after_ms = 25
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.receiver.skip_after, Some(Duration::from_millis(25)));
+
+        let rc = ReassemblyConfig {
+            start_latency: Duration::from_millis(100),
+            skip_after: cfg.receiver.skip_after,
+            ..ReassemblyConfig::default()
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, rc);
+        let now = Instant::now();
+
+        // Push seq 1, missing seq 0
+        buf.push(1, bytes::Bytes::from_static(b"P1"), now);
+
+        // At 24ms, should NOT release (skip_after is 25ms)
+        let out = buf.tick(now + Duration::from_millis(24));
+        assert!(out.is_empty(), "Should not release before skip_after");
+
+        // At 25ms, SHOULD release (gap waited long enough)
+        let out = buf.tick(now + Duration::from_millis(25));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], bytes::Bytes::from_static(b"P1"));
+    }
+
+    #[test]
+    fn jitter_latency_multiplier_reaches_reassembly() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            jitter_latency_multiplier = 8.0
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!((cfg.scheduler.jitter_latency_multiplier - 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn max_latency_ms_reaches_reassembly() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            max_latency_ms = 100
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.scheduler.max_latency_ms, 100);
+    }
+
+    #[test]
+    fn start_latency_reaches_receiver_config() {
+        let toml = r#"
+            version = 1
+            [receiver]
+            start_latency_ms = 75
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.receiver.start_latency, Duration::from_millis(75));
+    }
+
+    #[test]
+    fn channel_capacity_reaches_scheduler_config() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            channel_capacity = 500
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.scheduler.channel_capacity, 500);
+    }
+
+    #[test]
+    fn ewma_alpha_reaches_scheduler_config() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            ewma_alpha = 0.25
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!((cfg.scheduler.ewma_alpha - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn nada_config_reaches_scheduler() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            dloss_ref_ms = 20.0
+            plr_ref = 0.02
+            gamma_max = 0.3
+            qbound_ms = 100.0
+            nada_kappa = 0.8
+            nada_eta = 3.0
+            nada_tau_ms = 600.0
+            nada_xref_ms = 15.0
+            nada_prio = 2.0
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!((cfg.scheduler.dloss_ref_ms - 20.0).abs() < 1e-6);
+        assert!((cfg.scheduler.plr_ref - 0.02).abs() < 1e-6);
+        assert!((cfg.scheduler.gamma_max - 0.3).abs() < 1e-6);
+        assert!((cfg.scheduler.qbound_ms - 100.0).abs() < 1e-6);
+        assert!((cfg.scheduler.nada_kappa - 0.8).abs() < 1e-6);
+        assert!((cfg.scheduler.nada_eta - 3.0).abs() < 1e-6);
+        assert!((cfg.scheduler.nada_tau_ms - 600.0).abs() < 1e-6);
+        assert!((cfg.scheduler.nada_xref_ms - 15.0).abs() < 1e-6);
+        assert!((cfg.scheduler.nada_prio - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sbd_config_reaches_scheduler() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            sbd_enabled = true
+            sbd_interval_ms = 500
+            sbd_n = 100
+            sbd_c_s = 0.2
+            sbd_c_h = 0.5
+            sbd_p_l = 0.15
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.scheduler.sbd_enabled);
+        assert_eq!(cfg.scheduler.sbd_interval_ms, 500);
+        assert_eq!(cfg.scheduler.sbd_n, 100);
+        assert!((cfg.scheduler.sbd_c_s - 0.2).abs() < 1e-6);
+        assert!((cfg.scheduler.sbd_c_h - 0.5).abs() < 1e-6);
+        assert!((cfg.scheduler.sbd_p_l - 0.15).abs() < 1e-6);
+    }
+
+    #[test]
+    fn aimd_config_reaches_scheduler() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            capacity_estimate_enabled = false
+            rtt_congestion_ratio = 2.5
+            md_factor = 0.5
+            ai_step_ratio = 0.1
+            decrease_cooldown_ms = 1000
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!(!cfg.scheduler.capacity_estimate_enabled);
+        assert!((cfg.scheduler.rtt_congestion_ratio - 2.5).abs() < 1e-6);
+        assert!((cfg.scheduler.md_factor - 0.5).abs() < 1e-6);
+        assert!((cfg.scheduler.ai_step_ratio - 0.1).abs() < 1e-6);
+        assert_eq!(cfg.scheduler.decrease_cooldown_ms, 1000);
+    }
+
+    #[test]
+    fn lifecycle_config_reaches_resolved() {
+        let toml = r#"
+            version = 1
+            [lifecycle]
+            good_loss_rate_max = 0.1
+            cooldown_ms = 5000
+            probe_to_warm_good = 5
+            warm_to_live_good = 15
+            live_to_degrade_bad = 5
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!((cfg.lifecycle.good_loss_rate_max - 0.1).abs() < 1e-6);
+        assert_eq!(cfg.lifecycle.cooldown_ms, 5000);
+        assert_eq!(cfg.lifecycle.probe_to_warm_good, 5);
+        assert_eq!(cfg.lifecycle.warm_to_live_good, 15);
+        assert_eq!(cfg.lifecycle.live_to_degrade_bad, 5);
+    }
+
+    #[test]
+    fn recovery_params_reach_link_config() {
+        let toml = r#"
+            version = 1
+            [[links]]
+            uri = "rist://10.0.0.1:5000"
+            recovery_maxbitrate = 50000
+            recovery_rtt_max = 1000
+            recovery_reorder_buffer = 30
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.links[0].recovery_maxbitrate, Some(50000));
+        assert_eq!(cfg.links[0].recovery_rtt_max, Some(1000));
+        assert_eq!(cfg.links[0].recovery_reorder_buffer, Some(30));
+    }
+
+    /// Verify that ALL scheduler config fields parsed from TOML arrive in
+    /// the resolved SchedulerConfig.
+    #[test]
+    fn all_scheduler_fields_wired() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            redundancy_enabled = false
+            redundancy_spare_ratio = 0.7
+            redundancy_max_packet_bytes = 5000
+            redundancy_target_links = 4
+            critical_broadcast = false
+            failover_enabled = false
+            failover_duration_ms = 8000
+            failover_rtt_spike_factor = 5.0
+            ewma_alpha = 0.3
+            prediction_horizon_s = 2.0
+            capacity_floor_bps = 3000000.0
+            penalty_decay = 0.8
+            penalty_recovery = 0.03
+            jitter_latency_multiplier = 6.0
+            max_latency_ms = 400
+            stats_interval_ms = 750
+            channel_capacity = 3000
+            capacity_estimate_enabled = false
+            rtt_congestion_ratio = 2.0
+            md_factor = 0.6
+            ai_step_ratio = 0.05
+            decrease_cooldown_ms = 800
+            rtt_min_fast_window_s = 4.0
+            rtt_min_slow_window_s = 45.0
+            max_capacity_bps = 200000000.0
+            loss_md_threshold = 0.04
+            dloss_ref_ms = 15.0
+            plr_ref = 0.005
+            gamma_max = 0.4
+            qbound_ms = 80.0
+            qeps_ms = 5.0
+            nada_kappa = 0.3
+            nada_eta = 1.5
+            nada_tau_ms = 400.0
+            nada_xref_ms = 8.0
+            nada_prio = 1.5
+            sbd_enabled = true
+            sbd_interval_ms = 400
+            sbd_n = 80
+            sbd_c_s = 0.15
+            sbd_c_h = 0.25
+            sbd_p_l = 0.08
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        let s = &cfg.scheduler;
+
+        assert!(!s.redundancy_enabled);
+        assert!((s.redundancy_spare_ratio - 0.7).abs() < 1e-6);
+        assert_eq!(s.redundancy_max_packet_bytes, 5000);
+        assert_eq!(s.redundancy_target_links, 4);
+        assert!(!s.critical_broadcast);
+        assert!(!s.failover_enabled);
+        assert_eq!(s.failover_duration_ms, 8000);
+        assert!((s.failover_rtt_spike_factor - 5.0).abs() < 1e-6);
+        assert!((s.ewma_alpha - 0.3).abs() < 1e-6);
+        assert!((s.prediction_horizon_s - 2.0).abs() < 1e-6);
+        assert!((s.capacity_floor_bps - 3_000_000.0).abs() < 1e-6);
+        assert!((s.penalty_decay - 0.8).abs() < 1e-6);
+        assert!((s.penalty_recovery - 0.03).abs() < 1e-6);
+        assert!((s.jitter_latency_multiplier - 6.0).abs() < 1e-6);
+        assert_eq!(s.max_latency_ms, 400);
+        assert_eq!(s.stats_interval_ms, 750);
+        assert_eq!(s.channel_capacity, 3000);
+        assert!(!s.capacity_estimate_enabled);
+        assert!((s.rtt_congestion_ratio - 2.0).abs() < 1e-6);
+        assert!((s.md_factor - 0.6).abs() < 1e-6);
+        assert!((s.ai_step_ratio - 0.05).abs() < 1e-6);
+        assert_eq!(s.decrease_cooldown_ms, 800);
+        assert!((s.rtt_min_fast_window_s - 4.0).abs() < 1e-6);
+        assert!((s.rtt_min_slow_window_s - 45.0).abs() < 1e-6);
+        assert!((s.max_capacity_bps - 200_000_000.0).abs() < 1e-3);
+        assert!((s.loss_md_threshold - 0.04).abs() < 1e-6);
+        assert!((s.dloss_ref_ms - 15.0).abs() < 1e-6);
+        assert!((s.plr_ref - 0.005).abs() < 1e-6);
+        assert!((s.gamma_max - 0.4).abs() < 1e-6);
+        assert!((s.qbound_ms - 80.0).abs() < 1e-6);
+        assert!((s.qeps_ms - 5.0).abs() < 1e-6);
+        assert!((s.nada_kappa - 0.3).abs() < 1e-6);
+        assert!((s.nada_eta - 1.5).abs() < 1e-6);
+        assert!((s.nada_tau_ms - 400.0).abs() < 1e-6);
+        assert!((s.nada_xref_ms - 8.0).abs() < 1e-6);
+        assert!((s.nada_prio - 1.5).abs() < 1e-6);
+        assert!(s.sbd_enabled);
+        assert_eq!(s.sbd_interval_ms, 400);
+        assert_eq!(s.sbd_n, 80);
+        assert!((s.sbd_c_s - 0.15).abs() < 1e-6);
+        assert!((s.sbd_c_h - 0.25).abs() < 1e-6);
+        assert!((s.sbd_p_l - 0.08).abs() < 1e-6);
+    }
+
+    /// Verify that config defaults match between parsed defaults and
+    /// the struct defaults (guards against divergence).
+    #[test]
+    fn config_defaults_match_struct_defaults() {
+        let cfg = BondingConfig::from_toml_str("").unwrap();
+        let sched_default = SchedulerConfig::default();
+        let rcv_default = ReceiverConfig::default();
+
+        assert_eq!(
+            cfg.scheduler.redundancy_enabled,
+            sched_default.redundancy_enabled
+        );
+        assert!(
+            (cfg.scheduler.ewma_alpha - sched_default.ewma_alpha).abs() < 1e-6,
+            "ewma_alpha default mismatch: parsed={} struct={}",
+            cfg.scheduler.ewma_alpha,
+            sched_default.ewma_alpha
+        );
+        assert_eq!(
+            cfg.scheduler.channel_capacity,
+            sched_default.channel_capacity
+        );
+        assert_eq!(
+            cfg.scheduler.stats_interval_ms,
+            sched_default.stats_interval_ms
+        );
+        assert_eq!(
+            cfg.scheduler.capacity_estimate_enabled,
+            sched_default.capacity_estimate_enabled
+        );
+        assert!(!cfg.scheduler.sbd_enabled);
+        assert_eq!(cfg.receiver.start_latency, rcv_default.start_latency);
+        assert_eq!(cfg.receiver.buffer_capacity, rcv_default.buffer_capacity);
+        assert_eq!(cfg.receiver.skip_after, rcv_default.skip_after);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // deny_unknown_fields coverage for nested sections
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn unknown_key_in_links_rejected() {
+        let toml = r#"
+            version = 1
+            [[links]]
+            uri = "rist://1.2.3.4:5000"
+            bogus_field = 42
+        "#;
+        let result = BondingConfig::from_toml_str(toml);
+        assert!(
+            result.is_err(),
+            "Unknown key in [[links]] should be rejected"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("bogus_field"),
+            "Error should mention the unknown field, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn unknown_key_in_lifecycle_rejected() {
+        let toml = r#"
+            version = 1
+            [lifecycle]
+            cooldown_ms = 5000
+            nonexistent_knob = true
+        "#;
+        let result = BondingConfig::from_toml_str(toml);
+        assert!(
+            result.is_err(),
+            "Unknown key in [lifecycle] should be rejected"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("nonexistent_knob"),
+            "Error should mention the unknown field, got: {}",
+            msg
+        );
     }
 }

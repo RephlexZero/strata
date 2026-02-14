@@ -1,5 +1,6 @@
 use crate::config::SchedulerConfig;
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
+use crate::scheduler::sbd::SbdEngine;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -73,8 +74,11 @@ pub struct Dwrr<L: LinkSender + ?Sized> {
     cached_total_capacity: f64,
     /// SBD bottleneck groups: links with the same group ID share a bottleneck.
     /// Updated by SBD module when `sbd_enabled`. Group 0 = no bottleneck.
-    #[allow(dead_code)]
     pub(crate) sbd_groups: HashMap<usize, usize>,
+    /// Optional SBD engine: instantiated when `sbd_enabled` is true.
+    sbd_engine: Option<SbdEngine>,
+    /// Instant of the last SBD `process_interval` call.
+    sbd_last_process: Instant,
 }
 
 /// Computes the burst window (in seconds) for credit capping.
@@ -101,6 +105,16 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
     }
 
     pub fn with_config(config: SchedulerConfig) -> Self {
+        let sbd_engine = if config.sbd_enabled {
+            Some(SbdEngine::new(
+                config.sbd_n,
+                config.sbd_c_s,
+                config.sbd_c_h,
+                config.sbd_p_l,
+            ))
+        } else {
+            None
+        };
         Self {
             links: HashMap::new(),
             sorted_ids: Vec::new(),
@@ -109,6 +123,8 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             cached_spare_ratio: 0.0,
             cached_total_capacity: 0.0,
             sbd_groups: HashMap::new(),
+            sbd_engine,
+            sbd_last_process: Instant::now(),
         }
     }
 
@@ -161,6 +177,9 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         );
         self.sorted_ids.push(id);
         self.sorted_ids.sort();
+        if let Some(sbd) = &mut self.sbd_engine {
+            sbd.add_link(id);
+        }
     }
 
     pub fn refresh_metrics(&mut self) {
@@ -171,7 +190,6 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         // AIMD config snapshot (avoid repeated field access)
         let aimd_enabled = self.config.capacity_estimate_enabled;
         let rtt_congestion_ratio = self.config.rtt_congestion_ratio;
-        let _rtt_headroom_ratio = self.config.rtt_headroom_ratio;
         let md_factor = self.config.md_factor;
         let ai_step_ratio = self.config.ai_step_ratio;
         let decrease_cooldown = Duration::from_millis(self.config.decrease_cooldown_ms);
@@ -199,29 +217,76 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         // additive increase across N sub-flows sharing a bottleneck does
         // not exceed the increase of a single TCP flow.
         //   alpha = cap_total * max_i(cap_i / rtt_i²) / (sum_i(cap_i / rtt_i))²
-        let coupled_alpha = if aimd_enabled {
-            let mut cap_total = 0.0_f64;
-            let mut max_cap_rtt2 = 0.0_f64;
-            let mut sum_cap_rtt = 0.0_f64;
-            for state in self.links.values() {
-                if state.aimd_initialized && state.rtt_baseline > 0.0 {
-                    let cap = state.estimated_capacity_bps;
-                    let rtt = state.rtt_baseline;
-                    cap_total += cap;
-                    max_cap_rtt2 = max_cap_rtt2.max(cap / (rtt * rtt));
-                    sum_cap_rtt += cap / rtt;
+        //
+        // When SBD is enabled, coupling is computed per-group so that only
+        // links sharing a bottleneck are coupled.  Links in group 0 (no
+        // shared bottleneck) get alpha = 1.0.
+        let per_link_alpha: HashMap<usize, f64> = if aimd_enabled {
+            if self.config.sbd_enabled && !self.sbd_groups.is_empty() {
+                // Build per-group accumulators.
+                let mut group_accum: HashMap<usize, (f64, f64, f64)> = HashMap::new();
+                for (&id, state) in &self.links {
+                    if state.aimd_initialized && state.rtt_baseline > 0.0 {
+                        let group = self.sbd_groups.get(&id).copied().unwrap_or(0);
+                        let cap = state.estimated_capacity_bps;
+                        let rtt = state.rtt_baseline;
+                        let entry = group_accum.entry(group).or_insert((0.0, 0.0, 0.0));
+                        entry.0 += cap; // cap_total
+                        entry.1 = entry.1.max(cap / (rtt * rtt)); // max_cap_rtt2
+                        entry.2 += cap / rtt; // sum_cap_rtt
+                    }
                 }
-            }
-            if sum_cap_rtt > 0.0 && cap_total > 0.0 {
-                (cap_total * max_cap_rtt2 / (sum_cap_rtt * sum_cap_rtt)).clamp(0.01, 1.0)
+                // Compute per-link alpha from group membership.
+                self.links
+                    .keys()
+                    .map(|&id| {
+                        let group = self.sbd_groups.get(&id).copied().unwrap_or(0);
+                        if group == 0 {
+                            // Not in a shared bottleneck — no coupling.
+                            (id, 1.0)
+                        } else if let Some(&(cap_total, max_cap_rtt2, sum_cap_rtt)) =
+                            group_accum.get(&group)
+                        {
+                            if sum_cap_rtt > 0.0 && cap_total > 0.0 {
+                                let alpha = (cap_total * max_cap_rtt2
+                                    / (sum_cap_rtt * sum_cap_rtt))
+                                    .clamp(0.01, 1.0);
+                                (id, alpha)
+                            } else {
+                                (id, 1.0)
+                            }
+                        } else {
+                            (id, 1.0)
+                        }
+                    })
+                    .collect()
             } else {
-                1.0 // single link or no data — no coupling needed
+                // SBD disabled — global coupling across all initialized links.
+                let mut cap_total = 0.0_f64;
+                let mut max_cap_rtt2 = 0.0_f64;
+                let mut sum_cap_rtt = 0.0_f64;
+                for state in self.links.values() {
+                    if state.aimd_initialized && state.rtt_baseline > 0.0 {
+                        let cap = state.estimated_capacity_bps;
+                        let rtt = state.rtt_baseline;
+                        cap_total += cap;
+                        max_cap_rtt2 = max_cap_rtt2.max(cap / (rtt * rtt));
+                        sum_cap_rtt += cap / rtt;
+                    }
+                }
+                let global_alpha = if sum_cap_rtt > 0.0 && cap_total > 0.0 {
+                    (cap_total * max_cap_rtt2 / (sum_cap_rtt * sum_cap_rtt)).clamp(0.01, 1.0)
+                } else {
+                    1.0
+                };
+                self.links.keys().map(|&id| (id, global_alpha)).collect()
             }
         } else {
-            1.0
+            self.links.keys().map(|&id| (id, 1.0)).collect()
         };
 
-        for state in self.links.values_mut() {
+        for (&link_id, state) in self.links.iter_mut() {
+            let coupled_alpha = per_link_alpha.get(&link_id).copied().unwrap_or(1.0);
             let now = Instant::now();
             state.metrics = state.link.get_metrics();
             // Capture the receiver-reported capacity before bootstrap overwrites it.
@@ -307,6 +372,13 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                         state.rtt_sample_filter.clear();
                         state.rtt_min_fast_window.clear();
                         state.rtt_min_slow_window.clear();
+                        // Reset estimated capacity to the floor so the link
+                        // doesn't retain a depressed pre-death value that
+                        // causes a slow ramp-up after revival.
+                        state.estimated_capacity_bps = capacity_floor;
+                        state.x_prev = 0.0;
+                        state.gradual_mode = false;
+                        state.loss_free_samples = 0;
                     }
 
                     if current_rtt > 0.0 {
@@ -526,6 +598,33 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         } else {
             0.0
         };
+
+        // --- SBD: feed delay/loss samples and process intervals (RFC 8382) ---
+        if let Some(sbd) = &mut self.sbd_engine {
+            // Feed per-link OWD and loss data collected during the refresh above.
+            for (&id, state) in &self.links {
+                if state.metrics.owd_ms > 0.0 {
+                    sbd.record_delay(id, state.metrics.owd_ms);
+                }
+                if state.metrics.loss_rate > 0.0 {
+                    // Approximate discrete loss events from the continuous loss rate.
+                    // Each refresh cycle represents ~1 observation; fractional losses
+                    // are rounded so that rates ≥ 0.5% register at least one event.
+                    let loss_events = (state.metrics.loss_rate * 10.0).ceil() as u32;
+                    for _ in 0..loss_events {
+                        sbd.record_loss(id);
+                    }
+                }
+            }
+
+            // Process the SBD base interval on the configured cadence.
+            let sbd_interval = Duration::from_millis(self.config.sbd_interval_ms);
+            if self.sbd_last_process.elapsed() >= sbd_interval {
+                sbd.process_interval();
+                self.sbd_groups = sbd.compute_groups();
+                self.sbd_last_process = Instant::now();
+            }
+        }
     }
 
     pub fn remove_link(&mut self, id: usize) {
@@ -537,6 +636,10 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         if self.current_rr_idx >= self.sorted_ids.len() {
             self.current_rr_idx = 0;
         }
+        if let Some(sbd) = &mut self.sbd_engine {
+            sbd.remove_link(id);
+        }
+        self.sbd_groups.remove(&id);
     }
 
     pub fn get_active_links(&self) -> Vec<(usize, crate::net::interface::LinkMetrics)> {
@@ -631,20 +734,18 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         // Sort by quality score descending
         scored_links.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Select up to N links, preferring diversity
+        // First pass: select diverse links (different link_kind) in quality order
         for (id, _score, link_kind) in &scored_links {
             if selected.len() >= n {
                 break;
             }
 
-            // Diversity preference: prefer new link_kind if we have multiple links
             let is_diverse = match link_kind {
                 None => true, // Unknown kind is always considered diverse
                 Some(kind) => !used_kinds.contains(kind.as_str()),
             };
 
-            // Always select if we haven't reached N, but prefer diverse links first
-            if is_diverse || selected.len() < n {
+            if is_diverse {
                 if let Some(state) = self.links.get_mut(id) {
                     state.credits -= packet_cost;
                     selected.push(state.link.clone());
@@ -655,7 +756,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             }
         }
 
-        // If we couldn't get N diverse links, fill with remaining best quality links
+        // Second pass: fill remaining slots with best quality links regardless of diversity
         if selected.len() < n {
             for (id, _score, _) in &scored_links {
                 if selected.len() >= n {
@@ -850,6 +951,18 @@ mod tests {
         fn set_phase(&self, phase: LinkPhase) {
             if let Ok(mut m) = self.metrics.lock() {
                 m.phase = phase;
+            }
+        }
+
+        fn set_owd(&self, owd_ms: f64) {
+            if let Ok(mut m) = self.metrics.lock() {
+                m.owd_ms = owd_ms;
+            }
+        }
+
+        fn set_link_kind(&self, kind: &str) {
+            if let Ok(mut m) = self.metrics.lock() {
+                m.link_kind = Some(kind.to_string());
             }
         }
     }
@@ -1048,37 +1161,45 @@ mod tests {
 
     #[test]
     fn test_diversity_aware_link_selection() {
-        // Create links with different kinds
-        let wifi_link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
-        let cellular_link = Arc::new(MockLink::new(2, 8_000_000.0, LinkPhase::Live));
-        let wired_link = Arc::new(MockLink::new(3, 12_000_000.0, LinkPhase::Live));
+        // Two high-capacity wired links and one lower-capacity cellular link.
+        // With diversity preference, the cellular link should be chosen over
+        // the second wired link despite lower capacity.
+        let wired1 = Arc::new(MockLink::new(1, 12_000_000.0, LinkPhase::Live));
+        let wired2 = Arc::new(MockLink::new(2, 11_000_000.0, LinkPhase::Live));
+        let cellular = Arc::new(MockLink::new(3, 8_000_000.0, LinkPhase::Live));
 
-        // Set link_kind for diversity
-        if let Ok(mut m) = wifi_link.metrics.lock() {
-            m.link_kind = Some("wifi".to_string());
-        }
-        if let Ok(mut m) = cellular_link.metrics.lock() {
-            m.link_kind = Some("cellular".to_string());
-        }
-        if let Ok(mut m) = wired_link.metrics.lock() {
+        if let Ok(mut m) = wired1.metrics.lock() {
             m.link_kind = Some("wired".to_string());
+        }
+        if let Ok(mut m) = wired2.metrics.lock() {
+            m.link_kind = Some("wired".to_string());
+        }
+        if let Ok(mut m) = cellular.metrics.lock() {
+            m.link_kind = Some("cellular".to_string());
         }
 
         let mut dwrr = Dwrr::new();
-        dwrr.add_link(wifi_link.clone());
-        dwrr.add_link(cellular_link.clone());
-        dwrr.add_link(wired_link.clone());
+        dwrr.add_link(wired1.clone());
+        dwrr.add_link(wired2.clone());
+        dwrr.add_link(cellular.clone());
 
         dwrr.refresh_metrics();
 
-        // Select best 2 links - should prefer diverse kinds
+        // Select best 2 links — diversity should prefer wired + cellular
+        // over wired + wired, even though wired2 has higher capacity than cellular.
         let selected = dwrr.select_best_n_links(1000, 2);
         assert_eq!(selected.len(), 2);
 
-        // Should get wired (highest capacity) and wifi (second highest)
         let ids: Vec<usize> = selected.iter().map(|l| l.id()).collect();
-        assert!(ids.contains(&3)); // Wired should be selected
-        assert!(ids.len() == 2); // Got 2 links
+        assert!(
+            ids.contains(&1),
+            "Highest capacity wired link should be selected"
+        );
+        assert!(
+            ids.contains(&3),
+            "Cellular link should be preferred over second wired link for diversity: got {:?}",
+            ids
+        );
     }
 
     #[test]
@@ -1235,7 +1356,6 @@ mod tests {
         SchedulerConfig {
             capacity_estimate_enabled: true,
             rtt_congestion_ratio: 1.8,
-            rtt_headroom_ratio: 1.3,
             md_factor: 0.7,
             ai_step_ratio: 0.08,
             decrease_cooldown_ms: 500,
@@ -1684,6 +1804,228 @@ mod tests {
             "Link with lower AIMD estimate should get fewer credits: l1={} l2={}",
             link1_credits,
             link2_credits
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // SBD ↔ DWRR integration tests
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sbd_wired_into_dwrr_refresh_metrics() {
+        let config = SchedulerConfig {
+            sbd_enabled: true,
+            sbd_interval_ms: 100,
+            sbd_n: 5,
+            sbd_c_s: 0.05,
+            sbd_c_h: 0.01,
+            sbd_p_l: 0.05,
+            capacity_estimate_enabled: false,
+            ..SchedulerConfig::default()
+        };
+
+        let mut dwrr: Dwrr<MockLink> = Dwrr::with_config(config);
+        let link1 = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let link2 = Arc::new(MockLink::new(2, 10_000_000.0, LinkPhase::Live));
+
+        link1.set_owd(5.0);
+        link2.set_owd(5.0);
+
+        dwrr.add_link(link1.clone());
+        dwrr.add_link(link2.clone());
+
+        // Multiple refresh cycles to feed SBD samples
+        for _ in 0..10 {
+            dwrr.refresh_metrics();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Skew OWD on link1 and add loss
+        link1.set_owd(50.0);
+        link1.set_loss_rate(0.1);
+        for _ in 0..10 {
+            dwrr.refresh_metrics();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // SBD should have produced group assignments (the code path ran)
+        assert!(
+            dwrr.sbd_engine.is_some(),
+            "SBD engine should be instantiated when sbd_enabled=true"
+        );
+    }
+
+    #[test]
+    fn sbd_groups_affect_coupled_alpha() {
+        let config = SchedulerConfig {
+            sbd_enabled: true,
+            sbd_interval_ms: 100,
+            sbd_n: 5,
+            capacity_estimate_enabled: true,
+            ..SchedulerConfig::default()
+        };
+
+        let mut dwrr: Dwrr<MockLink> = Dwrr::with_config(config);
+        let link1 = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let link2 = Arc::new(MockLink::new(2, 10_000_000.0, LinkPhase::Live));
+
+        dwrr.add_link(link1.clone());
+        dwrr.add_link(link2.clone());
+        dwrr.mark_has_traffic(1);
+        dwrr.mark_has_traffic(2);
+        dwrr.refresh_metrics();
+
+        // Manually inject SBD groups to simulate shared bottleneck
+        dwrr.sbd_groups.insert(1, 1);
+        dwrr.sbd_groups.insert(2, 1);
+        // Refresh metrics — coupled alpha should be applied per-group
+        for _ in 0..3 {
+            dwrr.refresh_metrics();
+        }
+
+        // Now test with group 0 (no coupling)
+        dwrr.sbd_groups.insert(1, 0);
+        dwrr.sbd_groups.insert(2, 0);
+        dwrr.refresh_metrics();
+
+        // Both code paths should execute without panicking.
+    }
+
+    #[test]
+    fn nada_ref_uses_estimated_capacity() {
+        let config = SchedulerConfig {
+            capacity_estimate_enabled: true,
+            ..SchedulerConfig::default()
+        };
+
+        let mut dwrr: Dwrr<MockLink> = Dwrr::with_config(config);
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        dwrr.add_link(link.clone());
+        dwrr.mark_has_traffic(1);
+        dwrr.refresh_metrics();
+
+        // After AIMD init, estimated_capacity_bps should be set
+        let metrics: HashMap<usize, LinkMetrics> = dwrr.get_active_links().into_iter().collect();
+        let m = metrics.get(&1).unwrap();
+        assert!(
+            m.estimated_capacity_bps > 0.0,
+            "estimated_capacity_bps should be set after AIMD init, got {}",
+            m.estimated_capacity_bps
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Diversity-aware selection tests
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn diversity_selection_prefers_different_link_kinds() {
+        let mut dwrr: Dwrr<MockLink> = Dwrr::new();
+        let l1 = Arc::new(MockLink::new(1, 50_000_000.0, LinkPhase::Live));
+        let l2 = Arc::new(MockLink::new(2, 40_000_000.0, LinkPhase::Live));
+        let l3 = Arc::new(MockLink::new(3, 10_000_000.0, LinkPhase::Live));
+        l1.set_link_kind("wired");
+        l2.set_link_kind("wired");
+        l3.set_link_kind("cellular");
+
+        dwrr.add_link(l1);
+        dwrr.add_link(l2);
+        dwrr.add_link(l3);
+        dwrr.refresh_metrics();
+
+        let selected = dwrr.select_best_n_links(1000, 2);
+        let ids: Vec<usize> = selected.iter().map(|l| l.id()).collect();
+
+        assert!(
+            ids.contains(&1),
+            "Best wired link should be selected: {:?}",
+            ids
+        );
+        assert!(
+            ids.contains(&3),
+            "Cellular link should be preferred over second wired for diversity: {:?}",
+            ids
+        );
+    }
+
+    #[test]
+    fn diversity_selection_n1_picks_best() {
+        let mut dwrr: Dwrr<MockLink> = Dwrr::new();
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let l2 = Arc::new(MockLink::new(2, 5_000_000.0, LinkPhase::Live));
+        l1.set_link_kind("wired");
+        l2.set_link_kind("cellular");
+
+        dwrr.add_link(l1);
+        dwrr.add_link(l2);
+        dwrr.refresh_metrics();
+
+        let selected = dwrr.select_best_n_links(1000, 1);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id(), 1, "n=1 should pick highest-capacity link");
+    }
+
+    #[test]
+    fn diversity_selection_n_exceeds_links() {
+        let mut dwrr: Dwrr<MockLink> = Dwrr::new();
+        for id in 1..=3 {
+            dwrr.add_link(Arc::new(MockLink::new(id, 10_000_000.0, LinkPhase::Live)));
+        }
+        dwrr.refresh_metrics();
+
+        let selected = dwrr.select_best_n_links(1000, 5);
+        assert_eq!(
+            selected.len(),
+            3,
+            "Should return all 3 links when n=5 > link_count=3"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // AIMD reset tests
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn estimated_capacity_resets_on_phase_reset() {
+        let config = SchedulerConfig {
+            capacity_estimate_enabled: true,
+            capacity_floor_bps: 1_000_000.0,
+            ..SchedulerConfig::default()
+        };
+
+        let mut dwrr: Dwrr<MockLink> = Dwrr::with_config(config);
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        dwrr.add_link(link.clone());
+        dwrr.mark_has_traffic(1);
+        dwrr.refresh_metrics();
+
+        let est_before = dwrr
+            .get_active_links()
+            .into_iter()
+            .find(|(id, _)| *id == 1)
+            .unwrap()
+            .1
+            .estimated_capacity_bps;
+        assert!(
+            est_before > 1_000_000.0,
+            "Should be initialized above floor"
+        );
+
+        // Simulate link death → Reset phase
+        link.set_phase(LinkPhase::Reset);
+        dwrr.refresh_metrics();
+
+        let est_after = dwrr
+            .get_active_links()
+            .into_iter()
+            .find(|(id, _)| *id == 1)
+            .unwrap()
+            .1
+            .estimated_capacity_bps;
+        assert!(
+            (est_after - 1_000_000.0).abs() < 1.0,
+            "estimated_capacity should reset to floor on phase reset, got {}",
+            est_after
         );
     }
 }

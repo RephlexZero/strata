@@ -184,4 +184,90 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn zero_duration_produces_single_frame() {
+        let cfg = ScenarioConfig {
+            seed: 99,
+            duration: Duration::from_secs(0),
+            step: Duration::from_secs(1),
+            links: vec![LinkScenarioConfig {
+                min_rate_kbit: 500,
+                max_rate_kbit: 1500,
+                rate_step_kbit: 100,
+                base_delay_ms: 20,
+                delay_jitter_ms: 10,
+                delay_step_ms: 5,
+                max_loss_percent: 5.0,
+                loss_step_percent: 1.0,
+            }],
+        };
+        let mut scenario = Scenario::new(cfg);
+        let frames = scenario.frames();
+        // duration=0 with step=1s → ceil(0/1)=0 → 0..=0 → 1 frame
+        assert_eq!(
+            frames.len(),
+            1,
+            "Zero duration should produce exactly 1 frame"
+        );
+        assert_eq!(frames[0].t, Duration::from_secs(0));
+        assert_eq!(frames[0].configs.len(), 1);
+    }
+
+    #[test]
+    fn values_stay_within_bounds() {
+        let cfg = ScenarioConfig {
+            seed: 123,
+            duration: Duration::from_secs(100),
+            step: Duration::from_secs(1),
+            links: vec![LinkScenarioConfig {
+                min_rate_kbit: 1000,
+                max_rate_kbit: 5000,
+                rate_step_kbit: 500,
+                base_delay_ms: 10,
+                delay_jitter_ms: 20,
+                delay_step_ms: 5,
+                max_loss_percent: 10.0,
+                loss_step_percent: 3.0,
+            }],
+        };
+        let mut scenario = Scenario::new(cfg.clone());
+        let frames = scenario.frames();
+        assert!(frames.len() > 50);
+
+        for frame in &frames {
+            for (i, c) in frame.configs.iter().enumerate() {
+                let link = &cfg.links[i];
+                if let Some(rate) = c.rate_kbit {
+                    assert!(
+                        rate >= link.min_rate_kbit && rate <= link.max_rate_kbit,
+                        "Rate {} out of bounds [{}, {}] at t={:?}",
+                        rate,
+                        link.min_rate_kbit,
+                        link.max_rate_kbit,
+                        frame.t
+                    );
+                }
+                if let Some(loss) = c.loss_percent {
+                    assert!(
+                        loss >= 0.0 && loss <= link.max_loss_percent,
+                        "Loss {}% out of bounds [0, {}] at t={:?}",
+                        loss,
+                        link.max_loss_percent,
+                        frame.t
+                    );
+                }
+                if let Some(delay) = c.delay_ms {
+                    let max_delay = link.base_delay_ms + link.delay_jitter_ms;
+                    assert!(
+                        delay >= 1 && delay <= max_delay,
+                        "Delay {}ms out of bounds [1, {}] at t={:?}",
+                        delay,
+                        max_delay,
+                        frame.t
+                    );
+                }
+            }
+        }
+    }
 }

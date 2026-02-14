@@ -153,7 +153,7 @@ impl LinkSender for Link {
         let raw_rtt_ms = self.stats.rtt.load(Ordering::Relaxed) as f64;
         let raw_bw = self.stats.bandwidth.load(Ordering::Relaxed) as f64;
         let bw = self.stats.smoothed_bw_bps.load(Ordering::Relaxed) as f64;
-        let loss_pm = self.stats.smoothed_loss_permille.load(Ordering::Relaxed);
+        let loss_micro = self.stats.smoothed_loss_micro.load(Ordering::Relaxed);
 
         let rtt_ms = if rtt_us > 0 {
             rtt_us as f64 / 1000.0
@@ -163,7 +163,7 @@ impl LinkSender for Link {
 
         let bw = if bw > 0.0 { bw } else { raw_bw };
 
-        let loss_rate = loss_pm as f64 / 1000.0;
+        let loss_rate = loss_micro as f64 / 1_000_000.0;
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -227,43 +227,22 @@ impl LinkSender for Link {
             (None, None, None, None)
         };
 
-        // Compute observed_bps from application-level bytes_written rate,
-        // independent of librist's bandwidth metric used for capacity_bps.
         let current_bytes = self.stats.bytes_written.load(Ordering::Relaxed);
-        let prev_bytes = self.stats.observed_prev_bytes.load(Ordering::Relaxed);
-        let prev_ts = self.stats.observed_prev_ts_ms.load(Ordering::Relaxed);
-        let dt_ms = now_ms.saturating_sub(prev_ts);
-        let observed_bps = if dt_ms >= 50 {
-            let delta_bytes = current_bytes.saturating_sub(prev_bytes);
-            let rate = (delta_bytes as f64 * 8.0 * 1000.0) / dt_ms as f64;
-            self.stats
-                .observed_prev_bytes
-                .store(current_bytes, Ordering::Relaxed);
-            self.stats
-                .observed_prev_ts_ms
-                .store(now_ms, Ordering::Relaxed);
-            rate
-        } else if prev_ts == 0 {
-            // First call: initialize tracking, no rate yet
-            self.stats
-                .observed_prev_bytes
-                .store(current_bytes, Ordering::Relaxed);
-            self.stats
-                .observed_prev_ts_ms
-                .store(now_ms, Ordering::Relaxed);
-            0.0
-        } else {
-            // Too short interval, reuse last capacity as fallback
-            0.0
-        };
 
         LinkMetrics {
             rtt_ms,
             capacity_bps: bw,
             loss_rate,
-            observed_bps,
+            // observed_bps is filled in by DWRR::refresh_metrics() from its
+            // own sent_bytes accounting, avoiding redundant per-link tracking.
+            observed_bps: 0.0,
             observed_bytes: current_bytes,
-            queue_depth: 0, // Need to implement if possible via stats or wrapper tracking
+            // TODO(queue-depth): librist does not expose per-peer send-queue
+            // depth.  Implementing this would require either extending the
+            // librist C API or tracking pending retransmissions via stats
+            // callbacks.  Until then these are placeholder values and
+            // consumers should NOT use them for congestion signaling.
+            queue_depth: 0,
             max_queue: 1000,
             alive,
             phase,
@@ -272,7 +251,10 @@ impl LinkSender for Link {
             iface: iface_name,
             link_kind,
             estimated_capacity_bps: 0.0,
-            owd_ms: 0.0,
+            // Use RTT/2 as a proxy for one-way delay when true OWD
+            // is unavailable.  This feeds the SBD engine (RFC 8382)
+            // with a reasonable delay signal.
+            owd_ms: rtt_ms / 2.0,
         }
     }
 }
@@ -324,5 +306,20 @@ mod tests {
         assert!(!should_poll_os(1000, 900));
         assert!(should_poll_os(1500, 900));
         assert!(should_poll_os(2000, 1499));
+    }
+
+    #[test]
+    fn infer_kind_case_insensitive() {
+        assert_eq!(infer_kind_from_iface_name("WLAN0"), Some("wifi"));
+        assert_eq!(infer_kind_from_iface_name("Eth0"), Some("wired"));
+        assert_eq!(infer_kind_from_iface_name("WWAN0"), Some("cellular"));
+        assert_eq!(infer_kind_from_iface_name("WiFi0"), Some("wifi"));
+        assert_eq!(infer_kind_from_iface_name("LO"), Some("loopback"));
+    }
+
+    #[test]
+    fn infer_kind_cdc_cellular() {
+        assert_eq!(infer_kind_from_iface_name("cdc-wdm0"), Some("cellular"));
+        assert_eq!(infer_kind_from_iface_name("cdc0"), Some("cellular"));
     }
 }
