@@ -647,4 +647,86 @@ mod tests {
         // Should be sent to single link, not broadcast
         assert_eq!(l1_count + l2_count, 1);
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Header timestamp & sequence wiring tests
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn send_wraps_with_non_zero_timestamp() {
+        use crate::protocol::header::BondingHeader;
+
+        let config = SchedulerConfig {
+            critical_broadcast: false,
+            redundancy_enabled: false,
+            failover_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut sched = BondingScheduler::with_config(config);
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        sched.add_link(link.clone());
+        sched.refresh_metrics();
+
+        // Small sleep so timestamp is non-zero
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        let payload = Bytes::from_static(b"test-payload");
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: false,
+            can_drop: false,
+            size_bytes: payload.len(),
+        };
+        sched.send(payload, profile).unwrap();
+
+        let packets = link.sent_packets.lock().unwrap();
+        assert_eq!(packets.len(), 1);
+
+        let raw = Bytes::from(packets[0].clone());
+        let (header, body) = BondingHeader::unwrap(raw).expect("Should have a valid header");
+
+        assert_eq!(header.seq_id, 0, "First packet should be seq 0");
+        assert!(
+            header.send_time_us > 0,
+            "send_time_us should be non-zero for OWD measurement, got {}",
+            header.send_time_us
+        );
+        assert_eq!(body, Bytes::from_static(b"test-payload"));
+    }
+
+    #[test]
+    fn seq_increments_monotonically() {
+        use crate::protocol::header::BondingHeader;
+
+        let config = SchedulerConfig {
+            critical_broadcast: false,
+            redundancy_enabled: false,
+            failover_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut sched = BondingScheduler::with_config(config);
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        sched.add_link(link.clone());
+        sched.refresh_metrics();
+
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: false,
+            can_drop: false,
+            size_bytes: 100,
+        };
+        for _ in 0..10 {
+            sched.send(Bytes::from_static(b"data"), profile).unwrap();
+        }
+
+        let packets = link.sent_packets.lock().unwrap();
+        assert_eq!(packets.len(), 10);
+
+        for (i, pkt) in packets.iter().enumerate() {
+            let raw = Bytes::from(pkt.clone());
+            let (hdr, _) = BondingHeader::unwrap(raw).unwrap();
+            assert_eq!(
+                hdr.seq_id, i as u64,
+                "Seq should be monotonically increasing"
+            );
+        }
+    }
 }

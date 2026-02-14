@@ -463,4 +463,43 @@ mod tests {
         assert_eq!(d[0], 15.0);
         assert_eq!(d[4], 19.0);
     }
+
+    /// Verify deterministic SBD clustering regardless of HashMap iteration order.
+    #[test]
+    fn clustering_deterministic_across_runs() {
+        let mut all_results = Vec::new();
+
+        for _ in 0..20 {
+            let mut engine = SbdEngine::new(10, 0.05, 0.01, 0.05);
+            for id in 1..=5 {
+                engine.add_link(id);
+            }
+
+            for _ in 0..5 {
+                for id in 1..=5 {
+                    for _ in 0..7 {
+                        engine.record_delay(id, 5.0 + id as f64 * 0.1);
+                    }
+                    for _ in 0..3 {
+                        engine.record_delay(id, 50.0 + id as f64 * 0.1);
+                    }
+                    engine.record_loss(id);
+                }
+                engine.process_interval();
+            }
+
+            let groups = engine.compute_groups();
+            let mut sorted: Vec<(usize, usize)> = groups.into_iter().collect();
+            sorted.sort_by_key(|(id, _)| *id);
+            all_results.push(sorted);
+        }
+
+        for i in 1..all_results.len() {
+            assert_eq!(
+                all_results[0], all_results[i],
+                "SBD clustering should be deterministic: run 0 = {:?}, run {} = {:?}",
+                all_results[0], i, all_results[i]
+            );
+        }
+    }
 }

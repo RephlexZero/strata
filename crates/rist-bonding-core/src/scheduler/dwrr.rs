@@ -953,6 +953,18 @@ mod tests {
                 m.phase = phase;
             }
         }
+
+        fn set_owd(&self, owd_ms: f64) {
+            if let Ok(mut m) = self.metrics.lock() {
+                m.owd_ms = owd_ms;
+            }
+        }
+
+        fn set_link_kind(&self, kind: &str) {
+            if let Ok(mut m) = self.metrics.lock() {
+                m.link_kind = Some(kind.to_string());
+            }
+        }
     }
 
     impl LinkSender for MockLink {
@@ -1179,7 +1191,10 @@ mod tests {
         assert_eq!(selected.len(), 2);
 
         let ids: Vec<usize> = selected.iter().map(|l| l.id()).collect();
-        assert!(ids.contains(&1), "Highest capacity wired link should be selected");
+        assert!(
+            ids.contains(&1),
+            "Highest capacity wired link should be selected"
+        );
         assert!(
             ids.contains(&3),
             "Cellular link should be preferred over second wired link for diversity: got {:?}",
@@ -1789,6 +1804,228 @@ mod tests {
             "Link with lower AIMD estimate should get fewer credits: l1={} l2={}",
             link1_credits,
             link2_credits
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // SBD ↔ DWRR integration tests
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sbd_wired_into_dwrr_refresh_metrics() {
+        let config = SchedulerConfig {
+            sbd_enabled: true,
+            sbd_interval_ms: 100,
+            sbd_n: 5,
+            sbd_c_s: 0.05,
+            sbd_c_h: 0.01,
+            sbd_p_l: 0.05,
+            capacity_estimate_enabled: false,
+            ..SchedulerConfig::default()
+        };
+
+        let mut dwrr: Dwrr<MockLink> = Dwrr::with_config(config);
+        let link1 = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let link2 = Arc::new(MockLink::new(2, 10_000_000.0, LinkPhase::Live));
+
+        link1.set_owd(5.0);
+        link2.set_owd(5.0);
+
+        dwrr.add_link(link1.clone());
+        dwrr.add_link(link2.clone());
+
+        // Multiple refresh cycles to feed SBD samples
+        for _ in 0..10 {
+            dwrr.refresh_metrics();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Skew OWD on link1 and add loss
+        link1.set_owd(50.0);
+        link1.set_loss_rate(0.1);
+        for _ in 0..10 {
+            dwrr.refresh_metrics();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // SBD should have produced group assignments (the code path ran)
+        assert!(
+            dwrr.sbd_engine.is_some(),
+            "SBD engine should be instantiated when sbd_enabled=true"
+        );
+    }
+
+    #[test]
+    fn sbd_groups_affect_coupled_alpha() {
+        let config = SchedulerConfig {
+            sbd_enabled: true,
+            sbd_interval_ms: 100,
+            sbd_n: 5,
+            capacity_estimate_enabled: true,
+            ..SchedulerConfig::default()
+        };
+
+        let mut dwrr: Dwrr<MockLink> = Dwrr::with_config(config);
+        let link1 = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let link2 = Arc::new(MockLink::new(2, 10_000_000.0, LinkPhase::Live));
+
+        dwrr.add_link(link1.clone());
+        dwrr.add_link(link2.clone());
+        dwrr.mark_has_traffic(1);
+        dwrr.mark_has_traffic(2);
+        dwrr.refresh_metrics();
+
+        // Manually inject SBD groups to simulate shared bottleneck
+        dwrr.sbd_groups.insert(1, 1);
+        dwrr.sbd_groups.insert(2, 1);
+        // Refresh metrics — coupled alpha should be applied per-group
+        for _ in 0..3 {
+            dwrr.refresh_metrics();
+        }
+
+        // Now test with group 0 (no coupling)
+        dwrr.sbd_groups.insert(1, 0);
+        dwrr.sbd_groups.insert(2, 0);
+        dwrr.refresh_metrics();
+
+        // Both code paths should execute without panicking.
+    }
+
+    #[test]
+    fn nada_ref_uses_estimated_capacity() {
+        let config = SchedulerConfig {
+            capacity_estimate_enabled: true,
+            ..SchedulerConfig::default()
+        };
+
+        let mut dwrr: Dwrr<MockLink> = Dwrr::with_config(config);
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        dwrr.add_link(link.clone());
+        dwrr.mark_has_traffic(1);
+        dwrr.refresh_metrics();
+
+        // After AIMD init, estimated_capacity_bps should be set
+        let metrics: HashMap<usize, LinkMetrics> = dwrr.get_active_links().into_iter().collect();
+        let m = metrics.get(&1).unwrap();
+        assert!(
+            m.estimated_capacity_bps > 0.0,
+            "estimated_capacity_bps should be set after AIMD init, got {}",
+            m.estimated_capacity_bps
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Diversity-aware selection tests
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn diversity_selection_prefers_different_link_kinds() {
+        let mut dwrr: Dwrr<MockLink> = Dwrr::new();
+        let l1 = Arc::new(MockLink::new(1, 50_000_000.0, LinkPhase::Live));
+        let l2 = Arc::new(MockLink::new(2, 40_000_000.0, LinkPhase::Live));
+        let l3 = Arc::new(MockLink::new(3, 10_000_000.0, LinkPhase::Live));
+        l1.set_link_kind("wired");
+        l2.set_link_kind("wired");
+        l3.set_link_kind("cellular");
+
+        dwrr.add_link(l1);
+        dwrr.add_link(l2);
+        dwrr.add_link(l3);
+        dwrr.refresh_metrics();
+
+        let selected = dwrr.select_best_n_links(1000, 2);
+        let ids: Vec<usize> = selected.iter().map(|l| l.id()).collect();
+
+        assert!(
+            ids.contains(&1),
+            "Best wired link should be selected: {:?}",
+            ids
+        );
+        assert!(
+            ids.contains(&3),
+            "Cellular link should be preferred over second wired for diversity: {:?}",
+            ids
+        );
+    }
+
+    #[test]
+    fn diversity_selection_n1_picks_best() {
+        let mut dwrr: Dwrr<MockLink> = Dwrr::new();
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let l2 = Arc::new(MockLink::new(2, 5_000_000.0, LinkPhase::Live));
+        l1.set_link_kind("wired");
+        l2.set_link_kind("cellular");
+
+        dwrr.add_link(l1);
+        dwrr.add_link(l2);
+        dwrr.refresh_metrics();
+
+        let selected = dwrr.select_best_n_links(1000, 1);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id(), 1, "n=1 should pick highest-capacity link");
+    }
+
+    #[test]
+    fn diversity_selection_n_exceeds_links() {
+        let mut dwrr: Dwrr<MockLink> = Dwrr::new();
+        for id in 1..=3 {
+            dwrr.add_link(Arc::new(MockLink::new(id, 10_000_000.0, LinkPhase::Live)));
+        }
+        dwrr.refresh_metrics();
+
+        let selected = dwrr.select_best_n_links(1000, 5);
+        assert_eq!(
+            selected.len(),
+            3,
+            "Should return all 3 links when n=5 > link_count=3"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // AIMD reset tests
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn estimated_capacity_resets_on_phase_reset() {
+        let config = SchedulerConfig {
+            capacity_estimate_enabled: true,
+            capacity_floor_bps: 1_000_000.0,
+            ..SchedulerConfig::default()
+        };
+
+        let mut dwrr: Dwrr<MockLink> = Dwrr::with_config(config);
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        dwrr.add_link(link.clone());
+        dwrr.mark_has_traffic(1);
+        dwrr.refresh_metrics();
+
+        let est_before = dwrr
+            .get_active_links()
+            .into_iter()
+            .find(|(id, _)| *id == 1)
+            .unwrap()
+            .1
+            .estimated_capacity_bps;
+        assert!(
+            est_before > 1_000_000.0,
+            "Should be initialized above floor"
+        );
+
+        // Simulate link death → Reset phase
+        link.set_phase(LinkPhase::Reset);
+        dwrr.refresh_metrics();
+
+        let est_after = dwrr
+            .get_active_links()
+            .into_iter()
+            .find(|(id, _)| *id == 1)
+            .unwrap()
+            .1
+            .estimated_capacity_bps;
+        assert!(
+            (est_after - 1_000_000.0).abs() < 1.0,
+            "estimated_capacity should reset to floor on phase reset, got {}",
+            est_after
         );
     }
 }

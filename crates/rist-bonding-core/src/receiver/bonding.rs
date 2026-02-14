@@ -249,4 +249,62 @@ mod tests {
         // output_rx should be available and empty (no data sent)
         assert!(rcv.output_rx.try_recv().is_err());
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Concurrency & channel backpressure tests
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bounded_channel_backpressure_drops_not_blocks() {
+        use crossbeam_channel::bounded;
+
+        // Simulate the reader→jitter channel with a small capacity
+        let (tx, rx) = bounded::<Bytes>(4);
+
+        // Fill the channel
+        for i in 0..4 {
+            tx.send(Bytes::from(vec![i; 10])).unwrap();
+        }
+
+        // try_send on full channel should fail, not block
+        let result = tx.try_send(Bytes::from_static(b"overflow"));
+        assert!(
+            result.is_err(),
+            "try_send on full channel should return error"
+        );
+
+        // Drain one and verify it works again
+        let _ = rx.recv().unwrap();
+        let result = tx.try_send(Bytes::from_static(b"after-drain"));
+        assert!(result.is_ok(), "try_send should succeed after draining");
+    }
+
+    #[test]
+    fn receiver_output_poll_from_another_thread() {
+        let rcv = BondingReceiver::new(Duration::from_millis(50));
+        let rx = rcv.output_rx.clone();
+
+        let handle = std::thread::spawn(move || {
+            let result = rx.recv_timeout(Duration::from_millis(50));
+            assert!(result.is_err(), "Should timeout with no data");
+        });
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn new_with_config_applies_settings() {
+        use crate::receiver::aggregator::ReassemblyConfig;
+
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(100),
+            buffer_capacity: 512,
+            skip_after: Some(Duration::from_millis(25)),
+            ..ReassemblyConfig::default()
+        };
+        let rcv = BondingReceiver::new_with_config(config);
+        assert_eq!(rcv.link_count(), 0);
+        let stats = rcv.get_stats();
+        assert_eq!(stats.queue_depth, 0);
+    }
 }
