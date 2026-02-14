@@ -1,6 +1,6 @@
 # Strata Cloud Platform — Design Documents
 
-> **Status:** Architecture spec for future work. The transport layer is complete and proven.
+> **Status:** Architecture spec — **Phase 1 implementation in progress**. The transport layer is complete and proven.
 > These documents spec the managed platform that will wrap it into a multi-tenant streaming service.
 
 ---
@@ -16,7 +16,7 @@
 | 05 | [Receiver Workers](05-receiver-workers.md) | Receiver worker lifecycle, forwarding pipeline variants (RTMP, SRT, HLS, record), resource management, health checks, multi-host scaling. |
 | 06 | [Technology Choices](06-technology-choices.md) | Trade-off analysis: language, deployment model, database, auth, real-time updates, monitoring. Rationale for each decision. |
 | 07 | [Hardware Evaluation](07-hardware-evaluation.md) | SBC comparison (ROCK 5B+, Orange Pi 5 Plus, ROCK 5 ITX, RPi 5). HDMI input approaches (native vs USB capture). Bill of materials. Thermal and VPU considerations. |
-| 08 | [Local Dev Environment](08-local-dev-environment.md) | Docker Compose simulation of the full stack (sender + cloud + dashboard) inside the devcontainer. Simulated hardware, seed data, developer workflow. |
+| 08 | [Local Dev Environment](08-local-dev-environment.md) | Dev mode (process-based, `cargo run`) for daily iteration. Deploy mode (Docker Compose via DinD) for pre-release validation. Build order and implementation steps. |
 
 ---
 
@@ -34,7 +34,7 @@
 | Sender hardware | Radxa ROCK 5B+ (primary), OPi5+ (alt) | [07](07-hardware-evaluation.md#4-recommendation-matrix) |
 | HDMI input | USB capture card (v1), native HDMI RX (future) | [07](07-hardware-evaluation.md#2-hdmi-input-native-vs-usb-capture) |
 | First-time setup | AP Wi-Fi captive portal on device | [04 §9](04-sender-agent.md#9-ap-wi-fi-onboarding-first-time-setup) |
-| Local dev testing | Docker Compose full-stack simulation | [08](08-local-dev-environment.md) |
+| Local dev testing | Process-based (`cargo run`) + DinD for deploy testing | [08](08-local-dev-environment.md) |
 
 ---
 
@@ -46,12 +46,13 @@ See [01 §8](01-architecture-overview.md#8-open-questions) for the full list.
 
 ## Build Phases
 
-| Phase | Scope | Depends On |
+| Phase | Scope | Status |
 |---|---|---|
-| 0 | Transport engine + GStreamer plugin | ✅ Done |
-| 1 | Sender agent daemon | Transport engine |
-| 2 | Control plane API + receiver workers | — |
-| 3 | Web dashboard MVP | Control plane API |
-| 4 | Auth + multi-tenancy | Control plane |
-| 5 | Production hardening | All above |
-| 6 | Multi-host scaling | When single host is saturated |
+| 0 | Transport engine + GStreamer plugin | ✅ Done (336 tests) |
+| 1a | `strata-common` — shared types, auth, protocol, DB models | 🔄 In progress |
+| 1b | `strata-control` — axum API, sqlx, WSS, receiver spawner | Next |
+| 1c | `strata-agent` — daemon, WSS client, hardware sim, pipeline | Next |
+| 2 | Leptos dashboard — login, sender list, live stats | After 1b |
+| 3 | Docker Compose dev stack + deploy-mode validation | After 1c |
+| 4 | Production hardening, monitoring, TLS | After 3 |
+| 5 | Multi-region VPS deployment | When ready to sell |

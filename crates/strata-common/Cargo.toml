@@ -1,0 +1,20 @@
+[package]
+name = "strata-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared types, protocol messages, auth, and database models for the Strata platform"
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.11", features = ["v7", "serde"] }
+thiserror = "2"
+
+# Auth
+argon2 = "0.5"
+jsonwebtoken = "9"
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = "0.22"

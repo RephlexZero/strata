@@ -5,6 +5,7 @@ members = [
     "crates/rist-bonding-core",
     "crates/gst-rist-bonding",
     "crates/rist-network-sim",
+    "crates/strata-common",
 ]
 
 [workspace.dependencies]
