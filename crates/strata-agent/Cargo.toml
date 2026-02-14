@@ -1,0 +1,42 @@
+[package]
+name = "strata-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Strata sender agent — field device daemon with WSS control, hardware scanning, pipeline management"
+publish = false
+
+[[bin]]
+name = "strata-agent"
+path = "src/main.rs"
+
+[dependencies]
+strata-common = { path = "../strata-common" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+futures = "0.3"
+
+# Web (onboarding portal)
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# System info
+sysinfo = "0.35"
+rand = "0.9"
+libc = "0.2"
