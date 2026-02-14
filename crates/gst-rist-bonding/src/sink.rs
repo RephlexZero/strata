@@ -396,6 +396,11 @@ mod imp {
                     }
                 };
 
+                // Reserve the name in pad_map immediately so that
+                // subsequent auto-naming requests (with name=None)
+                // will skip this name even before a URI is set.
+                self.get_id_for_pad(&name);
+
                 let pad = glib::Object::builder::<RsRistBondSinkPad>()
                     .property("name", &name)
                     .property("direction", gst::PadDirection::Src)
@@ -735,6 +740,28 @@ mod tests {
     fn nada_rate_signals_return_none_for_zero() {
         assert!(compute_nada_rate_signals(0.0, 0.0).is_none());
         assert!(compute_nada_rate_signals(-1.0, 0.0).is_none());
+    }
+
+    /// Verify that r_vin clamps exactly at RMIN boundary.
+    /// RMIN = 150_000.  r_vin = r_ref * 0.95.
+    /// When r_ref = RMIN / 0.95 ≈ 157_894.74, r_vin rounds to exactly 150_000.
+    #[test]
+    fn nada_rate_signals_at_exact_rmin_boundary() {
+        const RMIN: f64 = 150_000.0;
+        // r_ref just below the threshold: r_vin should clamp to RMIN
+        let r_ref_below = RMIN / 0.95 - 1.0; // ~157_893.7
+        let (r_vin, _) = compute_nada_rate_signals(r_ref_below, 0.0).unwrap();
+        assert_eq!(r_vin, RMIN as u64, "r_vin should clamp to RMIN");
+
+        // r_ref at exactly RMIN / 0.95: r_vin = RMIN exactly (before rounding)
+        let r_ref_exact = RMIN / 0.95;
+        let (r_vin, _) = compute_nada_rate_signals(r_ref_exact, 0.0).unwrap();
+        assert_eq!(r_vin, RMIN as u64, "r_vin at breakpoint should equal RMIN");
+
+        // r_ref above threshold: r_vin should exceed RMIN
+        let r_ref_above = RMIN / 0.95 + 100.0;
+        let (r_vin, _) = compute_nada_rate_signals(r_ref_above, 0.0).unwrap();
+        assert!(r_vin > RMIN as u64, "r_vin should exceed RMIN above the breakpoint");
     }
 }
 

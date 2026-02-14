@@ -127,3 +127,59 @@ adaptation but has no direct test (only tested indirectly via `apply_config`).
 ---
 
 **Total: 22 new tests across 8 modules**
+
+---
+
+## Phase 2: GStreamer Element Tests (25 new tests)
+
+Element-level coverage for the `gst-rist-bonding` crate that sits between the
+existing pure-function unit tests (7 in sink.rs) and the heavyweight network
+integration tests (17 in tests/). Covers properties, config wiring, pad
+lifecycle, buffer flags, metadata, and error paths that previously had zero
+coverage.
+
+### Tier 2 — Pure Rust (no GStreamer init)
+
+| Module | Test | What it catches |
+|--------|------|----------------|
+| `util.rs` | `lock_or_recover_normal` | Happy-path mutex lock works |
+| `util.rs` | `lock_or_recover_poisoned` | Poisoned mutex is recovered (not panic) |
+| `sink.rs` | `nada_rate_signals_at_exact_rmin_boundary` | r_vin clamps exactly at RMIN floor (150 kbps) |
+
+### Tier 1 — Element factory (gst::init, no pipeline, no network)
+
+| Module | Test | What it catches |
+|--------|------|----------------|
+| `lib.rs` | `test_sink_property_roundtrip` | links, config, max-bitrate get/set fidelity + defaults |
+| `lib.rs` | `test_src_property_roundtrip` | links, latency, config get/set fidelity + defaults |
+| `lib.rs` | `test_sink_config_toml_applies` | Config TOML stored after set_property |
+| `lib.rs` | `test_src_config_toml_applies_latency` | apply_config_toml wires receiver start_latency through |
+| `lib.rs` | `test_sink_config_file_rejects_traversal` | `..` path guard rejects path traversal |
+| `lib.rs` | `test_src_config_file_rejects_traversal` | Same guard on source element |
+| `lib.rs` | `test_sink_config_file_nonexistent` | Missing file doesn't panic |
+| `lib.rs` | `test_src_config_file_nonexistent` | Same on source element |
+| `lib.rs` | `test_sink_invalid_config_no_panic` | Garbage TOML doesn't panic |
+| `lib.rs` | `test_src_invalid_config_no_panic` | Same on source; invalid TOML not stored |
+| `lib.rs` | `test_sink_element_metadata` | long-name, klass, description correctness |
+| `lib.rs` | `test_src_element_metadata` | Same for source element |
+| `lib.rs` | `test_sink_pad_templates` | 2 templates: sink (Always) + link_%u (Request) |
+| `lib.rs` | `test_src_pad_templates` | 1 template: src (Always) |
+| `lib.rs` | `test_request_pad_lifecycle_multiple` | 3 pads create/release, pad count returns to 1 |
+| `lib.rs` | `test_request_pad_auto_naming` | Auto-naming assigns unique link_N names |
+| `lib.rs` | `test_sink_empty_links_no_crash` | Empty and comma-only links strings don't crash |
+| `lib.rs` | `test_sink_pad_uri_property` | Pad URI default, set, update round-trip |
+| `lib.rs` | `test_sink_max_bitrate_default_and_live_update` | max-bitrate default 0, set/read/reset |
+
+### Tier 3 — Minimal pipeline (appsrc/fakesrc, no network)
+
+| Module | Test | What it catches |
+|--------|------|----------------|
+| `lib.rs` | `test_buffer_flags_to_profile` | All 6 flag combos flow through render() without error |
+| `lib.rs` | `test_sink_stop_without_start` | NULL→READY→NULL with no start() call |
+| `lib.rs` | `test_src_stop_without_start` | Same for source element |
+
+### Bug fix discovered during testing
+
+| Fix | Description |
+|-----|-------------|
+| `request_new_pad` auto-naming | Pad names were not reserved in `pad_map` during creation, causing duplicate `link_0` when requesting multiple pads with `name=None`. Fixed by calling `get_id_for_pad()` immediately after name generation. |
