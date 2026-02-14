@@ -1,0 +1,50 @@
+# Strata Cloud Platform — Design Documents
+
+> **Status:** Architecture spec for future work. The transport layer is complete and proven.
+> These documents spec the managed platform that will wrap it into a multi-tenant streaming service.
+
+---
+
+## Documents
+
+| # | Document | Summary |
+|---|---|---|
+| 01 | [Architecture Overview](01-architecture-overview.md) | High-level system design: sender agents, control plane, receiver workers, web dashboard. Deployment model comparison (process vs Docker vs k8s). Scaling estimates and phased build plan. |
+| 02 | [Control Protocol](02-control-protocol.md) | WebSocket protocol between sender agent and control plane. REST API for the dashboard. Message types, authentication flow, port allocation, error handling. |
+| 03 | [Security Model](03-security-model.md) | Threat model, video encryption (RIST PSK / DTLS), control channel security (TLS + JWT), device identity, secrets management, firewall rules. |
+| 04 | [Sender Agent](04-sender-agent.md) | Design of the `strata-agent` daemon: hardware discovery, pipeline management, systemd integration, state machine, self-update. |
+| 05 | [Receiver Workers](05-receiver-workers.md) | Receiver worker lifecycle, forwarding pipeline variants (RTMP, SRT, HLS, record), resource management, health checks, multi-host scaling. |
+| 06 | [Technology Choices](06-technology-choices.md) | Trade-off analysis: language, deployment model, database, auth, real-time updates, monitoring. Rationale for each decision. |
+
+---
+
+## Key Architectural Decisions
+
+| Decision | Choice | Doc |
+|---|---|---|
+| Deployment model | Process-per-stream (not Docker, not k8s) | [01](01-architecture-overview.md#5-deployment-model-decision) |
+| Repo structure | Monorepo with new workspace crates | [01](01-architecture-overview.md#4-repo-structure-decision) |
+| Video encryption | RIST PSK (AES-256) via librist | [03](03-security-model.md#2-video-encryption) |
+| Backend framework | Rust + axum | [06](06-technology-choices.md#1-language) |
+| Database | SQLite v1 → PostgreSQL later | [06](06-technology-choices.md#3-database) |
+| Agent ↔ Cloud | WebSocket (WSS), outbound from agent | [02](02-control-protocol.md#1-transport) |
+
+---
+
+## Open Questions
+
+See [01 §8](01-architecture-overview.md#8-open-questions) for the full list.
+
+---
+
+## Build Phases
+
+| Phase | Scope | Depends On |
+|---|---|---|
+| 0 | Transport engine + GStreamer plugin | ✅ Done |
+| 1 | Sender agent daemon | Transport engine |
+| 2 | Control plane API + receiver workers | — |
+| 3 | Web dashboard MVP | Control plane API |
+| 4 | Auth + multi-tenancy | Control plane |
+| 5 | Production hardening | All above |
+| 6 | Multi-host scaling | When single host is saturated |

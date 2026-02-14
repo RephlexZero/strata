@@ -25,14 +25,14 @@ version = 1
 [[links]]
 id = 0
 uri = "rist://receiver.example.com:5000"
-interface = "wwan0"                # First cellular modem
-recovery_maxbitrate = 20000        # Cap ARQ retransmit to 20 Mbps
-recovery_rtt_max = 800             # Cellular RTTs can be high; allow 800 ms
+interface = "wwan0"                      # First cellular modem
+recovery_maxbitrate = 20000              # Cap ARQ retransmit to 20 Mbps
+recovery_rtt_max = 800                   # Cellular RTTs can be high; allow 800 ms
 
 [[links]]
 id = 1
 uri = "rist://receiver.example.com:5002"
-interface = "wwan1"                # Second cellular modem
+interface = "wwan1"                      # Second cellular modem
 recovery_maxbitrate = 20000
 recovery_rtt_max = 800
 
