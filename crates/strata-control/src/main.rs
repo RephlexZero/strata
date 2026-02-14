@@ -16,6 +16,7 @@ use std::net::SocketAddr;
 
 use axum::Router;
 use tower_http::cors::CorsLayer;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -55,10 +56,19 @@ async fn main() -> anyhow::Result<()> {
     let state = state::AppState::new(pool, jwt);
 
     // ── Router ──────────────────────────────────────────────────
+    // Dashboard: serve the trunk-built WASM SPA from a directory.
+    // DASHBOARD_DIR defaults to ../strata-dashboard/dist (dev) or /app/dashboard (Docker).
+    let dashboard_dir = std::env::var("DASHBOARD_DIR")
+        .unwrap_or_else(|_| "../strata-dashboard/dist".into());
+
+    let spa_fallback = ServeFile::new(format!("{dashboard_dir}/index.html"));
+    let dashboard_service = ServeDir::new(&dashboard_dir).not_found_service(spa_fallback);
+
     let app = Router::new()
         .nest("/api", api::router())
         .route("/agent/ws", axum::routing::get(ws_agent::handler))
         .route("/ws", axum::routing::get(ws_dashboard::handler))
+        .fallback_service(dashboard_service)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state);

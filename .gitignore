@@ -46,3 +46,6 @@ docs/archive/
 
 # Video test output directory (reviewable locally, never committed)
 test_output/
+
+# WASM build output (trunk)
+crates/strata-dashboard/dist/

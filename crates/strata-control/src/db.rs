@@ -38,15 +38,13 @@ pub async fn seed_dev_data(pool: &PgPool) -> anyhow::Result<()> {
     // Hash "admin" with argon2id
     let password_hash = strata_common::auth::hash_password("admin")?;
 
-    sqlx::query(
-        "INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, $3, $4)"
-    )
-    .bind("usr_00000000-0000-0000-0000-000000000001")
-    .bind("admin@strata.local")
-    .bind(&password_hash)
-    .bind("admin")
-    .execute(pool)
-    .await?;
+    sqlx::query("INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, $3, $4)")
+        .bind("usr_00000000-0000-0000-0000-000000000001")
+        .bind("admin@strata.local")
+        .bind(&password_hash)
+        .bind("admin")
+        .execute(pool)
+        .await?;
 
     sqlx::query(
         "INSERT INTO senders (id, owner_id, name, hostname, enrollment_token, enrolled) VALUES ($1, $2, $3, $4, $5, $6)"
@@ -61,7 +59,7 @@ pub async fn seed_dev_data(pool: &PgPool) -> anyhow::Result<()> {
     .await?;
 
     sqlx::query(
-        "INSERT INTO destinations (id, owner_id, platform, name, url) VALUES ($1, $2, $3, $4, $5)"
+        "INSERT INTO destinations (id, owner_id, platform, name, url) VALUES ($1, $2, $3, $4, $5)",
     )
     .bind("dst_00000000-0000-0000-0000-000000000001")
     .bind("usr_00000000-0000-0000-0000-000000000001")

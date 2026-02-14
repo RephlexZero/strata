@@ -1,4 +1,4 @@
-.PHONY: up down logs clean build ps
+.PHONY: up down logs clean build ps dashboard
 
 # Build images and start all services
 up: build
@@ -7,6 +7,10 @@ up: build
 # Build images only
 build:
 	docker compose build
+
+# Build the dashboard WASM bundle
+dashboard:
+	cd ../crates/strata-dashboard && trunk build --release
 
 # Stop services (preserves data volume)
 down:

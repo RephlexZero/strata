@@ -8,6 +8,7 @@ members = [
     "crates/strata-common",
     "crates/strata-control",
     "crates/strata-agent",
+    "crates/strata-dashboard",
 ]
 
 [workspace.dependencies]
