@@ -266,7 +266,134 @@ Docker cross-compile infrastructure.
 
 ---
 
-## 9. Future Extensions
+## 9. AP Wi-Fi Onboarding (First-Time Setup)
+
+A brand-new sender device has no internet connectivity and no cloud credentials.
+The user needs a way to:
+
+1. Connect to the device locally
+2. Configure cellular modems (APN, etc.)
+3. Link the device to their cloud account
+4. Verify connectivity
+
+The solution is a **captive-portal Wi-Fi access point** that the device broadcasts
+on first boot (and whenever it has no cloud connection).
+
+### Flow
+
+```
+┌─────────────┐              ┌──────────────────────┐
+│ User's Phone│              │  Sender Device       │
+│ or Laptop   │              │  (ROCK 5B+ / OPi5+)  │
+│             │              │                      │
+│  1. Connect to             │  AP: "Strata-XXXX"   │
+│     Wi-Fi AP ──────────►   │  (hostapd, open or   │
+│                            │   WPA2 w/ label PSK) │
+│  2. Browser opens          │                      │
+│     captive portal ◄────── │  dnsmasq + HTTP      │
+│                            │  (redirect all DNS   │
+│  3. See setup wizard:      │   to 10.42.0.1)      │
+│     - Enter enrollment     │                      │
+│       token (from cloud    │                      │
+│       dashboard)           │                      │
+│     - Configure APNs       │                      │
+│     - See detected modems  │                      │
+│       + signal strength    │                      │
+│     - See HDMI input       │                      │
+│     - Test connectivity    │                      │
+│                            │                      │
+│  4. Submit → device        │                      │
+│     connects to cloud  ────┼──► WSS to platform   │
+│                            │                      │
+│  5. Success screen →       │  AP shuts down       │
+│     "Device online in      │  (or stays up as     │
+│      your dashboard"       │   management iface)  │
+└─────────────┘              └──────────────────────┘
+```
+
+### Implementation
+
+The onboarding portal is a **built-in HTTP server** in the agent (not a separate
+service). It serves a small set of static HTML/JS pages and a REST API:
+
+```
+GET  /               → Setup wizard SPA (embedded in binary)
+GET  /api/status     → { modems: [...], inputs: [...], connectivity: bool }
+POST /api/enroll     → { enrollment_token: "enr_..." }  → triggers cloud enrollment
+POST /api/modem/:id  → { apn: "...", pin: "..." }       → configure modem
+POST /api/wifi       → { ssid: "...", password: "..." } → connect to external Wi-Fi
+GET  /api/test       → { cloud_reachable: bool, latency_ms: 42 }
+```
+
+### AP Mode Management
+
+The agent manages `hostapd` and `dnsmasq` via systemd or direct process control:
+
+```rust
+struct ApManager {
+    hostapd_running: bool,
+    interface: String,    // e.g. "wlan0"
+}
+
+impl ApManager {
+    fn start_ap(&mut self) {
+        // 1. Write /tmp/hostapd-strata.conf:
+        //    interface=wlan0
+        //    ssid=Strata-{last4_of_mac}
+        //    channel=6
+        //    wpa=2
+        //    wpa_passphrase={printed_on_device_label}
+        // 2. Assign static IP: ip addr add 10.42.0.1/24 dev wlan0
+        // 3. Start hostapd
+        // 4. Start dnsmasq (DHCP 10.42.0.10-50, DNS redirect to 10.42.0.1)
+        // 5. Start captive portal HTTP server on 10.42.0.1:80
+    }
+
+    fn stop_ap(&mut self) {
+        // Kill hostapd + dnsmasq, release IP
+    }
+}
+```
+
+### When AP Mode is Active
+
+| Condition | AP State |
+|---|---|
+| First boot (no `/etc/strata/device.key`) | **ON** — waiting for enrollment |
+| Enrolled but no internet connectivity | **ON** — fallback management access |
+| Enrolled + cloud connected | **OFF** (default) or ON if `ap_always_on = true` in config |
+| Cloud connection lost for >5 minutes | **ON** — allow local troubleshooting |
+
+The AP SSID is derived from the device's MAC address: `Strata-A1B2` (last 4 hex
+digits). The WPA2 passphrase is printed on a label on the device.
+
+### Captive Portal Detection
+
+iOS, Android, Windows, and macOS all detect captive portals by probing specific
+URLs. The agent's DNS (dnsmasq) redirects ALL DNS queries to 10.42.0.1, and the
+HTTP server responds to known captive portal probe URLs:
+
+```
+# Apple:   GET /hotspot-detect.html → 302 to http://10.42.0.1/
+# Android: GET /generate_204        → 302 to http://10.42.0.1/
+# Windows: GET /connecttest.txt     → 302 to http://10.42.0.1/
+```
+
+This causes the phone/laptop to automatically pop up the captive portal browser,
+showing the setup wizard without the user needing to know the device's IP.
+
+### Security
+
+- The AP uses WPA2 with a device-specific passphrase (printed on label)
+- The onboarding HTTP server only binds to the AP interface (10.42.0.1), never to
+  cellular or ethernet interfaces
+- Enrollment tokens are one-time-use, generated in the cloud dashboard
+- After enrollment, the onboarding endpoint requires local auth (device passphrase)
+  to prevent drive-by configuration changes
+
+---
+
+## 10. Future Extensions
 
 | Feature | Description | Priority |
 |---|---|---|

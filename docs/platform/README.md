@@ -15,6 +15,7 @@
 | 04 | [Sender Agent](04-sender-agent.md) | Design of the `strata-agent` daemon: hardware discovery, pipeline management, systemd integration, state machine, self-update. |
 | 05 | [Receiver Workers](05-receiver-workers.md) | Receiver worker lifecycle, forwarding pipeline variants (RTMP, SRT, HLS, record), resource management, health checks, multi-host scaling. |
 | 06 | [Technology Choices](06-technology-choices.md) | Trade-off analysis: language, deployment model, database, auth, real-time updates, monitoring. Rationale for each decision. |
+| 07 | [Hardware Evaluation](07-hardware-evaluation.md) | SBC comparison (ROCK 5B+, Orange Pi 5 Plus, ROCK 5 ITX, RPi 5). HDMI input approaches (native vs USB capture). Bill of materials. Thermal and VPU considerations. |
 
 ---
 
@@ -28,6 +29,9 @@
 | Backend framework | Rust + axum | [06](06-technology-choices.md#1-language) |
 | Database | SQLite v1 → PostgreSQL later | [06](06-technology-choices.md#3-database) |
 | Agent ↔ Cloud | WebSocket (WSS), outbound from agent | [02](02-control-protocol.md#1-transport) |
+| Sender hardware | Radxa ROCK 5B+ (primary), OPi5+ (alt) | [07](07-hardware-evaluation.md#4-recommendation-matrix) |
+| HDMI input | USB capture card (v1), native HDMI RX (future) | [07](07-hardware-evaluation.md#2-hdmi-input-native-vs-usb-capture) |
+| First-time setup | AP Wi-Fi captive portal on device | [04 §9](04-sender-agent.md#9-ap-wi-fi-onboarding-first-time-setup) |
 
 ---
 
