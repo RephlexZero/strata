@@ -307,4 +307,19 @@ mod tests {
         assert!(should_poll_os(1500, 900));
         assert!(should_poll_os(2000, 1499));
     }
+
+    #[test]
+    fn infer_kind_case_insensitive() {
+        assert_eq!(infer_kind_from_iface_name("WLAN0"), Some("wifi"));
+        assert_eq!(infer_kind_from_iface_name("Eth0"), Some("wired"));
+        assert_eq!(infer_kind_from_iface_name("WWAN0"), Some("cellular"));
+        assert_eq!(infer_kind_from_iface_name("WiFi0"), Some("wifi"));
+        assert_eq!(infer_kind_from_iface_name("LO"), Some("loopback"));
+    }
+
+    #[test]
+    fn infer_kind_cdc_cellular() {
+        assert_eq!(infer_kind_from_iface_name("cdc-wdm0"), Some("cellular"));
+        assert_eq!(infer_kind_from_iface_name("cdc0"), Some("cellular"));
+    }
 }

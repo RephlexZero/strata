@@ -503,4 +503,24 @@ mod tests {
         assert_eq!(rc.recovery_maxbitrate, None);
         assert_eq!(rc.recovery_rtt_max, Some(200));
     }
+
+    #[test]
+    fn update_scheduler_config_reaches_worker() {
+        let rt = BondingRuntime::new();
+        let new_config = SchedulerConfig {
+            ewma_alpha: 0.5,
+            channel_capacity: 64,
+            ..SchedulerConfig::default()
+        };
+        let result = rt.update_scheduler_config(new_config);
+        assert!(
+            result.is_ok(),
+            "update_scheduler_config should succeed: {:?}",
+            result.err()
+        );
+        // Give the worker time to process the message
+        thread::sleep(Duration::from_millis(200));
+        // If the worker panicked processing the message, metrics would be poisoned
+        let _metrics = rt.get_metrics();
+    }
 }

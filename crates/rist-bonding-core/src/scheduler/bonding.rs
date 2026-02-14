@@ -729,4 +729,79 @@ mod tests {
             );
         }
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Error path & wrapper-level API tests
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn send_all_links_dead_returns_error() {
+        let config = SchedulerConfig {
+            critical_broadcast: false,
+            redundancy_enabled: false,
+            failover_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let mut sched = BondingScheduler::with_config(config);
+        // Add a link but set it to dead phase
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        link.set_phase(LinkPhase::Init);
+        // Make metrics show not alive
+        link.metrics.lock().unwrap().alive = false;
+        sched.add_link(link);
+        sched.refresh_metrics();
+
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: false,
+            can_drop: false,
+            size_bytes: 100,
+        };
+        let result = sched.send(Bytes::from_static(b"data"), profile);
+        assert!(result.is_err(), "Send should fail when all links are dead");
+    }
+
+    #[test]
+    fn remove_link_on_bonding_scheduler() {
+        let mut sched = BondingScheduler::new();
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 5_000_000.0, 10.0));
+        sched.add_link(l1);
+        sched.add_link(l2);
+        sched.refresh_metrics();
+
+        let metrics = sched.get_all_metrics();
+        assert!(metrics.contains_key(&1));
+        assert!(metrics.contains_key(&2));
+
+        sched.remove_link(1);
+        sched.refresh_metrics();
+
+        let metrics = sched.get_all_metrics();
+        assert!(
+            !metrics.contains_key(&1),
+            "Link 1 should be gone after remove"
+        );
+        assert!(metrics.contains_key(&2), "Link 2 should remain");
+    }
+
+    #[test]
+    fn get_all_metrics_reflects_links() {
+        let mut sched = BondingScheduler::new();
+        assert!(
+            sched.get_all_metrics().is_empty(),
+            "No links → empty metrics"
+        );
+
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        sched.add_link(l1);
+        sched.refresh_metrics();
+
+        let metrics = sched.get_all_metrics();
+        assert_eq!(metrics.len(), 1);
+        assert!(metrics.contains_key(&1));
+        assert!(
+            (metrics[&1].capacity_bps - 10_000_000.0).abs() < 1e-6,
+            "Capacity should reflect link's reported value"
+        );
+    }
 }

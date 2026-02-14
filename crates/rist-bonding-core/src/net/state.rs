@@ -574,7 +574,10 @@ mod tests {
 
         // With old permille (×1000), this would have been truncated to 0
         let permille = (loss_rate * 1_000.0) as u64;
-        assert_eq!(permille, 0, "Old permille precision would truncate 0.001% to 0");
+        assert_eq!(
+            permille, 0,
+            "Old permille precision would truncate 0.001% to 0"
+        );
     }
 
     #[test]
@@ -584,6 +587,10 @@ mod tests {
 
         let now = Instant::now();
         let phase = lc.update(now, 10.0, 0.001, 5_000_000.0, Duration::from_millis(100));
-        assert_eq!(phase, LinkPhase::Probe, "First good update should move Init → Probe");
+        assert_eq!(
+            phase,
+            LinkPhase::Probe,
+            "First good update should move Init → Probe"
+        );
     }
 }

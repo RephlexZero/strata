@@ -742,7 +742,11 @@ mod tests {
         assert_eq!(buf.next_seq, 100);
 
         // Sender restarts: seq resets to 5
-        buf.push(5, Bytes::from_static(b"RESET"), now + Duration::from_millis(10));
+        buf.push(
+            5,
+            Bytes::from_static(b"RESET"),
+            now + Duration::from_millis(10),
+        );
 
         // After reset detection, next_seq should be reset
         assert!(
@@ -779,14 +783,21 @@ mod tests {
         let late_before = buf.late_packets;
 
         // Seq 5 again is late, NOT a reset (next_seq=10 < capacity=128)
-        buf.push(5, Bytes::from_static(b"late"), now + Duration::from_millis(5));
+        buf.push(
+            5,
+            Bytes::from_static(b"late"),
+            now + Duration::from_millis(5),
+        );
 
         assert_eq!(
             buf.late_packets,
             late_before + 1,
             "Late packet should be counted as late, not trigger reset"
         );
-        assert_eq!(buf.next_seq, 10, "next_seq should not change for late packets");
+        assert_eq!(
+            buf.next_seq, 10,
+            "next_seq should not change for late packets"
+        );
     }
 
     #[test]
@@ -809,10 +820,7 @@ mod tests {
 
         // tick should skip seq 0 and release the rest
         let out = buf.tick(now + Duration::from_millis(2));
-        assert!(
-            !out.is_empty(),
-            "Should release packets after gap skip"
-        );
+        assert!(!out.is_empty(), "Should release packets after gap skip");
         assert!(buf.lost_packets >= 1, "seq 0 should be counted as lost");
     }
 
@@ -868,7 +876,10 @@ mod tests {
             !out.is_empty(),
             "Should release something after window advance"
         );
-        assert!(buf.lost_packets > 0, "Window advance should count lost packets");
+        assert!(
+            buf.lost_packets > 0,
+            "Window advance should count lost packets"
+        );
     }
 
     #[test]

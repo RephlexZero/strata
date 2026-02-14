@@ -1472,4 +1472,50 @@ mod tests {
         assert_eq!(cfg.receiver.buffer_capacity, rcv_default.buffer_capacity);
         assert_eq!(cfg.receiver.skip_after, rcv_default.skip_after);
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // deny_unknown_fields coverage for nested sections
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn unknown_key_in_links_rejected() {
+        let toml = r#"
+            version = 1
+            [[links]]
+            uri = "rist://1.2.3.4:5000"
+            bogus_field = 42
+        "#;
+        let result = BondingConfig::from_toml_str(toml);
+        assert!(
+            result.is_err(),
+            "Unknown key in [[links]] should be rejected"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("bogus_field"),
+            "Error should mention the unknown field, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn unknown_key_in_lifecycle_rejected() {
+        let toml = r#"
+            version = 1
+            [lifecycle]
+            cooldown_ms = 5000
+            nonexistent_knob = true
+        "#;
+        let result = BondingConfig::from_toml_str(toml);
+        assert!(
+            result.is_err(),
+            "Unknown key in [lifecycle] should be rejected"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("nonexistent_knob"),
+            "Error should mention the unknown field, got: {}",
+            msg
+        );
+    }
 }

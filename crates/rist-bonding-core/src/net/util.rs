@@ -58,3 +58,53 @@ pub fn bind_url_to_iface(url: &str, iface: &str) -> Option<String> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_loopback_returns_127() {
+        // `lo` exists on every Linux box
+        let ip = resolve_iface_ipv4("lo");
+        assert_eq!(
+            ip,
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
+            "lo should resolve to 127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn resolve_nonexistent_returns_none() {
+        let ip = resolve_iface_ipv4("does_not_exist_xyz99");
+        assert_eq!(ip, None, "Non-existent interface should return None");
+    }
+
+    #[test]
+    fn bind_url_inserts_local_ip() {
+        // Use `lo` since it always resolves to 127.0.0.1
+        let result = bind_url_to_iface("rist://1.2.3.4:5000", "lo");
+        assert_eq!(
+            result,
+            Some("rist://127.0.0.1@1.2.3.4:5000".to_string()),
+            "Should insert local IP before remote address"
+        );
+    }
+
+    #[test]
+    fn bind_url_preserves_existing_binding() {
+        let url = "rist://10.0.0.1@1.2.3.4:5000";
+        let result = bind_url_to_iface(url, "lo");
+        assert_eq!(
+            result,
+            Some(url.to_string()),
+            "Already-bound URL should be returned unchanged"
+        );
+    }
+
+    #[test]
+    fn bind_url_non_rist_scheme_returns_none() {
+        let result = bind_url_to_iface("http://1.2.3.4:5000", "lo");
+        assert_eq!(result, None, "Non-rist scheme should return None");
+    }
+}
