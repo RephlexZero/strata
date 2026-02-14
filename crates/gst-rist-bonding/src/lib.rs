@@ -409,14 +409,8 @@ mod tests {
     fn test_sink_element_metadata() {
         ensure_elements_registered();
         let factory = gst::ElementFactory::find("rsristbondsink").unwrap();
-        assert_eq!(
-            factory.metadata("long-name").unwrap(),
-            "RIST Bonding Sink"
-        );
-        assert_eq!(
-            factory.metadata("klass").unwrap(),
-            "Sink/Network"
-        );
+        assert_eq!(factory.metadata("long-name").unwrap(), "RIST Bonding Sink");
+        assert_eq!(factory.metadata("klass").unwrap(), "Sink/Network");
         assert!(factory.metadata("description").unwrap().contains("RIST"));
     }
 
@@ -428,10 +422,7 @@ mod tests {
             factory.metadata("long-name").unwrap(),
             "RIST Bonding Source"
         );
-        assert_eq!(
-            factory.metadata("klass").unwrap(),
-            "Source/Network"
-        );
+        assert_eq!(factory.metadata("klass").unwrap(), "Source/Network");
         assert!(factory.metadata("description").unwrap().contains("RIST"));
     }
 
@@ -443,12 +434,18 @@ mod tests {
         assert_eq!(templates.len(), 2, "sink should have 2 pad templates");
 
         // Find the always-present sink pad
-        let sink_tmpl = templates.iter().find(|t| t.name_template() == "sink").unwrap();
+        let sink_tmpl = templates
+            .iter()
+            .find(|t| t.name_template() == "sink")
+            .unwrap();
         assert_eq!(sink_tmpl.direction(), gst::PadDirection::Sink);
         assert_eq!(sink_tmpl.presence(), gst::PadPresence::Always);
 
         // Find the request pad template
-        let link_tmpl = templates.iter().find(|t| t.name_template() == "link_%u").unwrap();
+        let link_tmpl = templates
+            .iter()
+            .find(|t| t.name_template() == "link_%u")
+            .unwrap();
         assert_eq!(link_tmpl.direction(), gst::PadDirection::Src);
         assert_eq!(link_tmpl.presence(), gst::PadPresence::Request);
     }
@@ -504,12 +501,20 @@ mod tests {
         // auto-assigns link_0, link_1, etc. by scanning pad_map.
         let pad_a = sink.request_pad(&tmpl, None, None).unwrap();
         let name_a = pad_a.name().to_string();
-        assert!(name_a.starts_with("link_"), "auto-named pad should start with link_: got {}", name_a);
+        assert!(
+            name_a.starts_with("link_"),
+            "auto-named pad should start with link_: got {}",
+            name_a
+        );
 
         // Second pad — must get a different name
         let pad_b = sink.request_pad(&tmpl, None, None).unwrap();
         let name_b = pad_b.name().to_string();
-        assert!(name_b.starts_with("link_"), "auto-named pad should start with link_: got {}", name_b);
+        assert!(
+            name_b.starts_with("link_"),
+            "auto-named pad should start with link_: got {}",
+            name_b
+        );
         assert_ne!(name_a, name_b, "auto-named pads should have unique names");
 
         sink.release_request_pad(&pad_a);

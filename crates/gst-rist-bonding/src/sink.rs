@@ -761,7 +761,10 @@ mod tests {
         // r_ref above threshold: r_vin should exceed RMIN
         let r_ref_above = RMIN / 0.95 + 100.0;
         let (r_vin, _) = compute_nada_rate_signals(r_ref_above, 0.0).unwrap();
-        assert!(r_vin > RMIN as u64, "r_vin should exceed RMIN above the breakpoint");
+        assert!(
+            r_vin > RMIN as u64,
+            "r_vin should exceed RMIN above the breakpoint"
+        );
     }
 }
 

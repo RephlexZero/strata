@@ -30,7 +30,10 @@ mod tests {
         });
         // The thread panicked while holding the lock — join collects the panic.
         let _ = handle.join();
-        assert!(m.is_poisoned(), "mutex should be poisoned after thread panic");
+        assert!(
+            m.is_poisoned(),
+            "mutex should be poisoned after thread panic"
+        );
         // lock_or_recover must succeed on a poisoned mutex.
         let guard = lock_or_recover(&m);
         assert_eq!(*guard, 7);
