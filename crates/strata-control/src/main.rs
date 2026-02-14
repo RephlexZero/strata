@@ -35,6 +35,11 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&database_url).await?;
     db::migrate(&pool).await?;
 
+    // ── Dev seed data ───────────────────────────────────────────
+    if std::env::var("DEV_SEED").is_ok() {
+        db::seed_dev_data(&pool).await?;
+    }
+
     // ── JWT context ─────────────────────────────────────────────
     let jwt_seed = std::env::var("JWT_SEED_B64").unwrap_or_else(|_| {
         tracing::warn!(

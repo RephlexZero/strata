@@ -1,0 +1,16 @@
+# Docker ignore for dev stack builds
+# Keeps build context small and fast
+
+target/
+.git/
+*.md
+docs/
+wiki/
+vendor/librist/.git
+**/*.ts
+
+# Transport crates not needed for platform images
+crates/librist-sys/
+crates/rist-bonding-core/
+crates/gst-rist-bonding/
+crates/rist-network-sim/

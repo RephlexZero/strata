@@ -1,0 +1,58 @@
+# ── Stage 1: Build strata-agent ──────────────────────────────
+FROM rust:1.93-bookworm AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# Write a minimal workspace manifest (avoids needing GStreamer/librist deps)
+COPY Cargo.lock ./
+COPY crates/strata-common/Cargo.toml crates/strata-common/Cargo.toml
+COPY crates/strata-agent/Cargo.toml crates/strata-agent/Cargo.toml
+
+RUN cat > Cargo.toml <<'TOML'
+[workspace]
+resolver = "2"
+members = ["crates/strata-common", "crates/strata-agent"]
+
+[workspace.dependencies]
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+anyhow = "1.0.101"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+toml = "0.9.8"
+TOML
+
+# Stub out sources for dep caching
+RUN mkdir -p crates/strata-common/src && echo "" > crates/strata-common/src/lib.rs && \
+    mkdir -p crates/strata-agent/src && echo "fn main() {}" > crates/strata-agent/src/main.rs
+
+# Pre-build deps
+RUN cargo build --release -p strata-agent 2>/dev/null || true
+
+# Copy real source
+COPY crates/strata-common/src crates/strata-common/src
+COPY crates/strata-agent/src crates/strata-agent/src
+
+# Build for real
+RUN touch crates/strata-common/src/lib.rs crates/strata-agent/src/main.rs && \
+    cargo build --release -p strata-agent
+
+# ── Stage 2: Runtime ────────────────────────────────────────
+FROM debian:12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/strata-agent /usr/local/bin/strata-agent
+
+EXPOSE 3001
+
+ENTRYPOINT ["strata-agent"]

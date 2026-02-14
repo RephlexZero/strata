@@ -1,0 +1,73 @@
+# Strata Platform — Local Dev Stack (Docker Compose)
+#
+# Usage:
+#   cd dev/
+#   docker compose up -d        # start all services
+#   docker compose logs -f      # tail logs
+#   docker compose down -v      # tear down (delete data)
+#
+# This stack validates the Docker packaging and compose networking.
+# For daily development, use `cargo run` directly — see docs/platform/08-local-dev-environment.md
+
+services:
+  # ── PostgreSQL ───────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: strata
+      POSTGRES_USER: strata
+      POSTGRES_PASSWORD: dev-only-password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U strata"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # ── Control Plane ────────────────────────────────────────────
+  strata-control:
+    build:
+      context: ..
+      dockerfile: dev/Dockerfile.control
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://strata:dev-only-password@postgres/strata"
+      LISTEN_ADDR: "0.0.0.0:3000"
+      RUST_LOG: "info,strata_control=debug"
+      DEV_SEED: "1"
+    ports:
+      - "3000:3000"
+      # UDP port range for receiver workers
+      - "15000-15050:15000-15050/udp"
+    restart: unless-stopped
+
+  # ── Simulated Sender Agent ──────────────────────────────────
+  strata-sender-sim:
+    build:
+      context: ..
+      dockerfile: dev/Dockerfile.agent
+    depends_on:
+      - strata-control
+    environment:
+      RUST_LOG: "info,strata_agent=debug"
+    command:
+      - "--simulate"
+      - "--control-url"
+      - "ws://strata-control:3000/agent/ws"
+      - "--portal-addr"
+      - "0.0.0.0:3001"
+      - "--hostname"
+      - "sim-sender-01"
+      - "--heartbeat-interval"
+      - "5"
+    ports:
+      - "3001:3001"
+    restart: unless-stopped
+
+volumes:
+  pgdata:

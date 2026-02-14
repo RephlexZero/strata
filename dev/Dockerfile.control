@@ -1,0 +1,60 @@
+# ── Stage 1: Build strata-control ────────────────────────────
+FROM rust:1.93-bookworm AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System deps for sqlx (native-tls) and build tooling
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# Write a minimal workspace manifest (avoids needing GStreamer/librist deps)
+COPY Cargo.lock ./
+COPY crates/strata-common/Cargo.toml crates/strata-common/Cargo.toml
+COPY crates/strata-control/Cargo.toml crates/strata-control/Cargo.toml
+
+RUN cat > Cargo.toml <<'TOML'
+[workspace]
+resolver = "2"
+members = ["crates/strata-common", "crates/strata-control"]
+
+[workspace.dependencies]
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+anyhow = "1.0.101"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+toml = "0.9.8"
+TOML
+
+# Stub out sources for dependency caching layer
+RUN mkdir -p crates/strata-common/src && echo "" > crates/strata-common/src/lib.rs && \
+    mkdir -p crates/strata-control/src && echo "fn main() {}" > crates/strata-control/src/main.rs
+
+# Pre-build dependencies (cached unless Cargo.toml/lock changes)
+RUN cargo build --release -p strata-control 2>/dev/null || true
+
+# Copy real source
+COPY crates/strata-common/src crates/strata-common/src
+COPY crates/strata-control/src crates/strata-control/src
+COPY crates/strata-control/migrations crates/strata-control/migrations
+
+# Build for real
+RUN touch crates/strata-common/src/lib.rs crates/strata-control/src/main.rs && \
+    cargo build --release -p strata-control
+
+# ── Stage 2: Runtime ────────────────────────────────────────
+FROM debian:12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/strata-control /usr/local/bin/strata-control
+
+EXPOSE 3000
+
+ENTRYPOINT ["strata-control"]
