@@ -151,118 +151,120 @@ impl SbdEngine {
     pub fn process_interval(&mut self) {
         let n = self.n;
         SBD_SCRATCH_SAMPLES.with(|samples_cell| {
-        SBD_SCRATCH_SORTED.with(|sorted_cell| {
-        SBD_SCRATCH_ABS_DEVS.with(|abs_devs_cell| {
-            let mut samples = samples_cell.borrow_mut();
-            let mut sorted = sorted_cell.borrow_mut();
-            let mut abs_devs = abs_devs_cell.borrow_mut();
+            SBD_SCRATCH_SORTED.with(|sorted_cell| {
+                SBD_SCRATCH_ABS_DEVS.with(|abs_devs_cell| {
+                    let mut samples = samples_cell.borrow_mut();
+                    let mut sorted = sorted_cell.borrow_mut();
+                    let mut abs_devs = abs_devs_cell.borrow_mut();
 
-        for state in self.link_states.values_mut() {
-            // Only process if we have enough samples
-            if state.delay_samples.len() < 2 {
-                // Not enough data — push zeros to keep history aligned
-                push_bounded(&mut state.skew_history, 0.0, 16);
-                push_bounded(&mut state.var_history, 0.0, 16);
-                push_bounded(&mut state.freq_history, 0.0, 16);
-                let loss_rate = if state.pkt_count > 0 {
-                    state.pkt_lost as f64 / (state.pkt_count + state.pkt_lost) as f64
-                } else {
-                    0.0
-                };
-                push_bounded(&mut state.loss_history, loss_rate, 16);
-                state.delay_samples.clear();
-                state.pkt_count = 0;
-                state.pkt_lost = 0;
-                continue;
-            }
+                    for state in self.link_states.values_mut() {
+                        // Only process if we have enough samples
+                        if state.delay_samples.len() < 2 {
+                            // Not enough data — push zeros to keep history aligned
+                            push_bounded(&mut state.skew_history, 0.0, 16);
+                            push_bounded(&mut state.var_history, 0.0, 16);
+                            push_bounded(&mut state.freq_history, 0.0, 16);
+                            let loss_rate = if state.pkt_count > 0 {
+                                state.pkt_lost as f64 / (state.pkt_count + state.pkt_lost) as f64
+                            } else {
+                                0.0
+                            };
+                            push_bounded(&mut state.loss_history, loss_rate, 16);
+                            state.delay_samples.clear();
+                            state.pkt_count = 0;
+                            state.pkt_lost = 0;
+                            continue;
+                        }
 
-            // Trim to most recent N samples
-            while state.delay_samples.len() > n {
-                state.delay_samples.pop_front();
-            }
+                        // Trim to most recent N samples
+                        while state.delay_samples.len() > n {
+                            state.delay_samples.pop_front();
+                        }
 
-            samples.clear();
-            samples.extend(state.delay_samples.iter().copied());
-            let count = samples.len() as f64;
+                        samples.clear();
+                        samples.extend(state.delay_samples.iter().copied());
+                        let count = samples.len() as f64;
 
-            // --- Step 2a: Compute mean ---
-            let mean = samples.iter().sum::<f64>() / count;
+                        // --- Step 2a: Compute mean ---
+                        let mean = samples.iter().sum::<f64>() / count;
 
-            // --- Step 2b: skew_est (skewness via mean vs median comparison) ---
-            sorted.clear();
-            sorted.extend(samples.iter().copied());
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median = if sorted.len().is_multiple_of(2) {
-                (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
-            } else {
-                sorted[sorted.len() / 2]
-            };
-            let skew_est = mean - median;
+                        // --- Step 2b: skew_est (skewness via mean vs median comparison) ---
+                        sorted.clear();
+                        sorted.extend(samples.iter().copied());
+                        sorted
+                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let median = if sorted.len().is_multiple_of(2) {
+                            (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+                        } else {
+                            sorted[sorted.len() / 2]
+                        };
+                        let skew_est = mean - median;
 
-            // --- Step 2c: var_est (MAD — Median Absolute Deviation) ---
-            abs_devs.clear();
-            abs_devs.extend(samples.iter().map(|x| (x - median).abs()));
-            abs_devs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let var_est = if abs_devs.len().is_multiple_of(2) {
-                (abs_devs[abs_devs.len() / 2 - 1] + abs_devs[abs_devs.len() / 2]) / 2.0
-            } else {
-                abs_devs[abs_devs.len() / 2]
-            };
+                        // --- Step 2c: var_est (MAD — Median Absolute Deviation) ---
+                        abs_devs.clear();
+                        abs_devs.extend(samples.iter().map(|x| (x - median).abs()));
+                        abs_devs
+                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let var_est = if abs_devs.len().is_multiple_of(2) {
+                            (abs_devs[abs_devs.len() / 2 - 1] + abs_devs[abs_devs.len() / 2]) / 2.0
+                        } else {
+                            abs_devs[abs_devs.len() / 2]
+                        };
 
-            // --- Step 2d: freq_est (oscillation frequency) ---
-            // Count sign changes in the deviation from mean
-            let mut sign_changes = 0u32;
-            let mut prev_sign = 0i32;
-            for &s in samples.iter() {
-                let sign = if s > mean {
-                    1
-                } else if s < mean {
-                    -1
-                } else {
-                    0
-                };
-                if sign != 0 && prev_sign != 0 && sign != prev_sign {
-                    sign_changes += 1;
-                }
-                if sign != 0 {
-                    prev_sign = sign;
-                }
-            }
-            let freq_est = sign_changes as f64 / count;
-            state.sign_changes = sign_changes;
+                        // --- Step 2d: freq_est (oscillation frequency) ---
+                        // Count sign changes in the deviation from mean
+                        let mut sign_changes = 0u32;
+                        let mut prev_sign = 0i32;
+                        for &s in samples.iter() {
+                            let sign = if s > mean {
+                                1
+                            } else if s < mean {
+                                -1
+                            } else {
+                                0
+                            };
+                            if sign != 0 && prev_sign != 0 && sign != prev_sign {
+                                sign_changes += 1;
+                            }
+                            if sign != 0 {
+                                prev_sign = sign;
+                            }
+                        }
+                        let freq_est = sign_changes as f64 / count;
+                        state.sign_changes = sign_changes;
 
-            // --- Loss rate for this interval ---
-            let total_pkts = state.pkt_count + state.pkt_lost;
-            let loss_rate = if total_pkts > 0 {
-                state.pkt_lost as f64 / total_pkts as f64
-            } else {
-                0.0
-            };
+                        // --- Loss rate for this interval ---
+                        let total_pkts = state.pkt_count + state.pkt_lost;
+                        let loss_rate = if total_pkts > 0 {
+                            state.pkt_lost as f64 / total_pkts as f64
+                        } else {
+                            0.0
+                        };
 
-            // Normalize skew_est and var_est by the mean for scale-independence
-            let norm_skew = if mean.abs() > 1e-9 {
-                skew_est / mean
-            } else {
-                0.0
-            };
-            let norm_var = if mean.abs() > 1e-9 {
-                var_est / mean
-            } else {
-                0.0
-            };
+                        // Normalize skew_est and var_est by the mean for scale-independence
+                        let norm_skew = if mean.abs() > 1e-9 {
+                            skew_est / mean
+                        } else {
+                            0.0
+                        };
+                        let norm_var = if mean.abs() > 1e-9 {
+                            var_est / mean
+                        } else {
+                            0.0
+                        };
 
-            push_bounded(&mut state.skew_history, norm_skew, 16);
-            push_bounded(&mut state.var_history, norm_var, 16);
-            push_bounded(&mut state.freq_history, freq_est, 16);
-            push_bounded(&mut state.loss_history, loss_rate, 16);
+                        push_bounded(&mut state.skew_history, norm_skew, 16);
+                        push_bounded(&mut state.var_history, norm_var, 16);
+                        push_bounded(&mut state.freq_history, freq_est, 16);
+                        push_bounded(&mut state.loss_history, loss_rate, 16);
 
-            state.prev_mean = mean;
-            state.delay_samples.clear();
-            state.pkt_count = 0;
-            state.pkt_lost = 0;
-        }
-        }); // abs_devs
-        }); // sorted
+                        state.prev_mean = mean;
+                        state.delay_samples.clear();
+                        state.pkt_count = 0;
+                        state.pkt_lost = 0;
+                    }
+                }); // abs_devs
+            }); // sorted
         }); // samples
     }
 

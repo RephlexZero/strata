@@ -709,7 +709,8 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
     pub fn select_best_n_links(&mut self, packet_len: usize, n: usize) -> Vec<Arc<L>> {
         let packet_cost = packet_len as f64;
         let mut selected = Vec::new();
-        let mut used_kinds: std::collections::HashSet<compact_str::CompactString> = std::collections::HashSet::new();
+        let mut used_kinds: std::collections::HashSet<compact_str::CompactString> =
+            std::collections::HashSet::new();
 
         // Score all alive links
         let mut scored_links: Vec<_> = self
