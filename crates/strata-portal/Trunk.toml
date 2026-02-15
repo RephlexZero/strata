@@ -1,0 +1,13 @@
+[build]
+dist = "dist"
+
+# Pre-build: compile Tailwind CSS + DaisyUI → style/main.css
+[[hooks]]
+stage = "pre_build"
+command = "npx"
+command_arguments = [
+  "@tailwindcss/cli",
+  "-i", "style/input.css",
+  "-o", "style/main.css",
+  "--minify",
+]

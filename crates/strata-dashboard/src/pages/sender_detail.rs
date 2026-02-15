@@ -72,7 +72,6 @@ pub fn SenderDetailPage() -> impl IntoView {
                     Ok(s) => set_sender.set(Some(s)),
                     Err(e) => set_error.set(Some(e)),
                 }
-                // Load streams
                 if let Ok(all) = api::list_streams(&token).await {
                     let filtered: Vec<_> = all.into_iter().filter(|s| s.sender_id == id).collect();
                     if let Some(latest) = filtered.first() {
@@ -80,7 +79,6 @@ pub fn SenderDetailPage() -> impl IntoView {
                     }
                     set_streams.set(filtered);
                 }
-                // Load full status (interfaces, system stats)
                 if let Ok(status) = api::get_sender_status(&token, &id).await {
                     apply_full_status(
                         &status,
@@ -91,7 +89,6 @@ pub fn SenderDetailPage() -> impl IntoView {
                         &set_hw_uptime,
                         &set_hw_receiver_url,
                     );
-                    // Pre-fill receiver input
                     if !receiver_loaded.get_untracked() {
                         if let Some(ref url) = status.receiver_url {
                             set_receiver_input.set(url.clone());
@@ -138,7 +135,6 @@ pub fn SenderDetailPage() -> impl IntoView {
                                 s.online = online;
                             }
                         });
-                        // Update hardware data from heartbeat
                         if let Some(status) = status {
                             apply_full_status(
                                 &status,
@@ -268,48 +264,40 @@ pub fn SenderDetailPage() -> impl IntoView {
     view! {
         <div>
             {move || error.get().map(|e| view! {
-                <div class="error-msg">{e}</div>
+                <div class="alert alert-error text-sm mb-4">{e}</div>
             })}
 
             {move || {
                 let s = sender.get();
                 match s {
-                    None => view! { <p style="color: var(--text-secondary);">"Loading…"</p> }.into_any(),
+                    None => view! { <p class="text-base-content/60">"Loading…"</p> }.into_any(),
                     Some(s) => {
                         let is_online = s.online;
                         let is_live = stream_state.get() == "live" || stream_state.get() == "starting";
                         view! {
                             // ── Page Header ─────────────────────────────
-                            <div class="page-header">
+                            <div class="flex justify-between items-center mb-6">
                                 <div>
-                                    <h2>{s.name.clone().unwrap_or_else(|| s.id.clone())}</h2>
-                                    <p class="subtitle">
+                                    <h2 class="text-2xl font-semibold">{s.name.clone().unwrap_or_else(|| s.id.clone())}</h2>
+                                    <p class="text-sm text-base-content/60 mt-1">
                                         {s.hostname.clone().unwrap_or_else(|| "Unknown host".into())}
                                         " · "
-                                        <span class={if s.online { "badge badge-online" } else { "badge badge-offline" }}>
-                                            <span class={if s.online { "dot dot-green" } else { "dot dot-gray" }}></span>
+                                        <span class={if s.online { "badge badge-success gap-1" } else { "badge badge-ghost gap-1" }}>
+                                            <span class={if s.online { "w-2 h-2 rounded-full bg-success" } else { "w-2 h-2 rounded-full bg-base-content/30" }}></span>
                                             {if s.online { "Online" } else { "Offline" }}
                                         </span>
                                     </p>
                                 </div>
-                                <div style="display: flex; gap: 8px;">
+                                <div class="flex gap-2">
                                     {if is_live {
                                         view! {
-                                            <button
-                                                class="btn btn-danger"
-                                                on:click=stop_stream
-                                                disabled=move || action_loading.get()
-                                            >
+                                            <button class="btn btn-error" on:click=stop_stream disabled=move || action_loading.get()>
                                                 "■ Stop Stream"
                                             </button>
                                         }.into_any()
                                     } else {
                                         view! {
-                                            <button
-                                                class="btn btn-primary"
-                                                on:click=start_stream
-                                                disabled=move || action_loading.get() || !is_online
-                                            >
+                                            <button class="btn btn-primary" on:click=start_stream disabled=move || action_loading.get() || !is_online>
                                                 "▶ Start Stream"
                                             </button>
                                         }.into_any()
@@ -317,38 +305,30 @@ pub fn SenderDetailPage() -> impl IntoView {
                                 </div>
                             </div>
 
-                            // ── System Stats (CPU, Memory, Uptime) ──────
+                            // ── System Stats ────────────────────────────
                             {move || {
                                 let cpu = hw_cpu.get();
                                 let mem = hw_mem.get();
                                 let up = hw_uptime.get();
                                 if cpu.is_some() || mem.is_some() || up.is_some() {
                                     view! {
-                                        <div class="stats-grid" style="margin-bottom: 16px;">
+                                        <div class="stats stats-horizontal bg-base-200 border border-base-300 w-full mb-4">
                                             {cpu.map(|v| view! {
-                                                <div class="stat-card">
-                                                    <div class="stat-label">"CPU"</div>
-                                                    <div class="stat-value">
-                                                        {format!("{:.0}", v)}
-                                                        <span class="stat-unit">"%"</span>
-                                                    </div>
+                                                <div class="stat">
+                                                    <div class="stat-title">"CPU"</div>
+                                                    <div class="stat-value text-lg font-mono">{format!("{:.0}", v)}<span class="text-sm text-base-content/60">" %"</span></div>
                                                 </div>
                                             })}
                                             {mem.map(|v| view! {
-                                                <div class="stat-card">
-                                                    <div class="stat-label">"Memory"</div>
-                                                    <div class="stat-value">
-                                                        {v}
-                                                        <span class="stat-unit">" MB"</span>
-                                                    </div>
+                                                <div class="stat">
+                                                    <div class="stat-title">"Memory"</div>
+                                                    <div class="stat-value text-lg font-mono">{v}<span class="text-sm text-base-content/60">" MB"</span></div>
                                                 </div>
                                             })}
                                             {up.map(|v| view! {
-                                                <div class="stat-card">
-                                                    <div class="stat-label">"Device Uptime"</div>
-                                                    <div class="stat-value">
-                                                        {format_duration(v)}
-                                                    </div>
+                                                <div class="stat">
+                                                    <div class="stat-title">"Device Uptime"</div>
+                                                    <div class="stat-value text-lg font-mono">{format_duration(v)}</div>
                                                 </div>
                                             })}
                                         </div>
@@ -371,302 +351,279 @@ pub fn SenderDetailPage() -> impl IntoView {
                             />
 
                             // ── Receiver Config ─────────────────────────
-                            <div class="card" style="margin-bottom: 16px;">
-                                <div class="card-header">
-                                    <h3>"🎯 Receiver Configuration"</h3>
-                                </div>
+                            <div class="card bg-base-200 border border-base-300 mb-4">
+                                <div class="card-body">
+                                    <h3 class="card-title text-base">"🎯 Receiver Configuration"</h3>
 
-                                {move || config_msg.get().map(|(msg, kind)| {
-                                    let cls = match kind { "ok" => "msg msg-ok", "err" => "msg msg-err", _ => "msg msg-info" };
-                                    view! { <div class={cls}>{msg}</div> }
-                                })}
+                                    {move || config_msg.get().map(|(msg, kind)| {
+                                        let cls = match kind {
+                                            "ok" => "alert alert-success text-sm",
+                                            "err" => "alert alert-error text-sm",
+                                            _ => "alert alert-info text-sm",
+                                        };
+                                        view! { <div class={cls}>{msg}</div> }
+                                    })}
 
-                                <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 14px;">
-                                    "Set the RIST receiver address this sender will transmit to."
-                                </p>
+                                    <p class="text-sm text-base-content/60 mb-3">
+                                        "Set the RIST receiver address this sender will transmit to."
+                                    </p>
 
-                                <div style="display: flex; gap: 12px; align-items: flex-end;">
-                                    <div class="form-group" style="flex: 1; margin-bottom: 0;">
-                                        <label>"Receiver URL"</label>
-                                        <input
-                                            class="form-input"
-                                            type="text"
-                                            placeholder="rist://receiver.example.com:5000"
-                                            prop:value=move || receiver_input.get()
-                                            disabled=!is_online
-                                            on:input=move |ev| {
-                                                set_receiver_input.set(event_target_value(&ev));
-                                            }
-                                        />
+                                    <div class="flex gap-3 items-end">
+                                        <fieldset class="fieldset flex-1">
+                                            <label class="fieldset-label">"Receiver URL"</label>
+                                            <input
+                                                class="input input-bordered w-full"
+                                                type="text"
+                                                placeholder="rist://receiver.example.com:5000"
+                                                prop:value=move || receiver_input.get()
+                                                disabled=!is_online
+                                                on:input=move |ev| {
+                                                    set_receiver_input.set(event_target_value(&ev));
+                                                }
+                                            />
+                                        </fieldset>
+                                        <button class="btn btn-primary" on:click=save_config disabled=!is_online>
+                                            "Save"
+                                        </button>
                                     </div>
-                                    <button
-                                        class="btn btn-primary"
-                                        on:click=save_config
-                                        disabled=!is_online
-                                        style="height: 38px;"
-                                    >
-                                        "Save"
-                                    </button>
-                                </div>
 
-                                {move || {
-                                    let url = hw_receiver_url.get();
-                                    view! {
-                                        <p style="margin-top: 10px; font-size: 12px; color: var(--text-muted); font-family: var(--font-mono);">
-                                            {url.map(|u| format!("Current: {u}")).unwrap_or_else(|| "No receiver configured".into())}
-                                        </p>
-                                    }
-                                }}
+                                    {move || {
+                                        let url = hw_receiver_url.get();
+                                        view! {
+                                            <p class="mt-2 text-xs text-base-content/40 font-mono">
+                                                {url.map(|u| format!("Current: {u}")).unwrap_or_else(|| "No receiver configured".into())}
+                                            </p>
+                                        }
+                                    }}
+                                </div>
                             </div>
 
                             // ── Media Inputs ────────────────────────────
                             <MediaInputsCard inputs=hw_inputs />
 
                             // ── Connectivity Test ───────────────────────
-                            <div class="card" style="margin-bottom: 16px;">
-                                <div class="card-header">
-                                    <h3>"🔍 Connectivity Test"</h3>
+                            <div class="card bg-base-200 border border-base-300 mb-4">
+                                <div class="card-body">
+                                    <h3 class="card-title text-base">"🔍 Connectivity Test"</h3>
+                                    <button
+                                        class="btn btn-ghost btn-sm w-fit"
+                                        on:click=run_test
+                                        disabled=move || test_loading.get() || !is_online
+                                    >
+                                        {move || if test_loading.get() { "Testing…" } else { "Run Test" }}
+                                    </button>
+                                    {move || test_result.get().map(|r| view! {
+                                        <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mt-3">
+                                            <div class="bg-base-300 rounded p-3">
+                                                <div class="text-xs text-base-content/40 uppercase tracking-wide">"Cloud"</div>
+                                                <div class={if r.cloud_reachable { "font-semibold font-mono text-success" } else { "font-semibold font-mono text-error" }}>
+                                                    {if r.cloud_reachable { "✓ Reachable" } else { "✗ Unreachable" }}
+                                                </div>
+                                            </div>
+                                            <div class="bg-base-300 rounded p-3">
+                                                <div class="text-xs text-base-content/40 uppercase tracking-wide">"WebSocket"</div>
+                                                <div class={if r.cloud_connected { "font-semibold font-mono text-success" } else { "font-semibold font-mono text-error" }}>
+                                                    {if r.cloud_connected { "✓ Connected" } else { "✗ Disconnected" }}
+                                                </div>
+                                            </div>
+                                            <div class="bg-base-300 rounded p-3">
+                                                <div class="text-xs text-base-content/40 uppercase tracking-wide">"Receiver"</div>
+                                                <div class={
+                                                    if r.receiver_url.is_some() {
+                                                        if r.receiver_reachable { "font-semibold font-mono text-success" } else { "font-semibold font-mono text-error" }
+                                                    } else {
+                                                        "font-semibold font-mono text-base-content/40"
+                                                    }
+                                                }>
+                                                    {if r.receiver_url.is_some() {
+                                                        if r.receiver_reachable { "✓ Reachable" } else { "✗ Unreachable" }
+                                                    } else {
+                                                        "— Not set"
+                                                    }}
+                                                </div>
+                                            </div>
+                                            <div class="bg-base-300 rounded p-3">
+                                                <div class="text-xs text-base-content/40 uppercase tracking-wide">"Enrolled"</div>
+                                                <div class={if r.enrolled { "font-semibold font-mono text-success" } else { "font-semibold font-mono text-base-content/40" }}>
+                                                    {if r.enrolled { "✓ Yes" } else { "⚠ No" }}
+                                                </div>
+                                            </div>
+                                        </div>
+                                        {r.control_url.as_ref().map(|url| view! {
+                                            <p class="text-xs text-base-content/40 mt-2 font-mono">"Control: " {url.clone()}</p>
+                                        })}
+                                        {r.receiver_url.as_ref().map(|url| view! {
+                                            <p class="text-xs text-base-content/40 mt-1 font-mono">"Receiver: " {url.clone()}</p>
+                                        })}
+                                    })}
                                 </div>
-                                <button
-                                    class="btn btn-ghost"
-                                    on:click=run_test
-                                    disabled=move || test_loading.get() || !is_online
-                                >
-                                    {move || if test_loading.get() { "Testing…" } else { "Run Test" }}
-                                </button>
-                                {move || test_result.get().map(|r| view! {
-                                    <div class="test-grid" style="margin-top: 12px;">
-                                        <div class="test-item">
-                                            <div class="test-label">"Cloud"</div>
-                                            <div class={if r.cloud_reachable { "test-value test-pass" } else { "test-value test-fail" }}>
-                                                {if r.cloud_reachable { "✓ Reachable" } else { "✗ Unreachable" }}
-                                            </div>
-                                        </div>
-                                        <div class="test-item">
-                                            <div class="test-label">"WebSocket"</div>
-                                            <div class={if r.cloud_connected { "test-value test-pass" } else { "test-value test-fail" }}>
-                                                {if r.cloud_connected { "✓ Connected" } else { "✗ Disconnected" }}
-                                            </div>
-                                        </div>
-                                        <div class="test-item">
-                                            <div class="test-label">"Receiver"</div>
-                                            <div class={
-                                                if r.receiver_url.is_some() {
-                                                    if r.receiver_reachable { "test-value test-pass" } else { "test-value test-fail" }
-                                                } else {
-                                                    "test-value test-na"
-                                                }
-                                            }>
-                                                {if r.receiver_url.is_some() {
-                                                    if r.receiver_reachable { "✓ Reachable" } else { "✗ Unreachable" }
-                                                } else {
-                                                    "— Not set"
-                                                }}
-                                            </div>
-                                        </div>
-                                        <div class="test-item">
-                                            <div class="test-label">"Enrolled"</div>
-                                            <div class={if r.enrolled { "test-value test-pass" } else { "test-value test-na" }}>
-                                                {if r.enrolled { "✓ Yes" } else { "⚠ No" }}
-                                            </div>
-                                        </div>
-                                    </div>
-                                    {r.control_url.as_ref().map(|url| view! {
-                                        <p style="font-size: 12px; color: var(--text-muted); margin-top: 8px; font-family: var(--font-mono);">
-                                            "Control: " {url.clone()}
-                                        </p>
-                                    })}
-                                    {r.receiver_url.as_ref().map(|url| view! {
-                                        <p style="font-size: 12px; color: var(--text-muted); margin-top: 4px; font-family: var(--font-mono);">
-                                            "Receiver: " {url.clone()}
-                                        </p>
-                                    })}
-                                })}
                             </div>
 
                             // ── Stream Status ───────────────────────────
-                            <div class="card" style="margin-bottom: 16px;">
-                                <div class="card-header">
-                                    <h3>"Stream"</h3>
-                                    <span class={
-                                        let st = stream_state.get();
-                                        match st.as_str() {
-                                            "live" => "badge badge-live",
-                                            "starting" | "stopping" => "badge badge-starting",
-                                            _ => "badge badge-idle",
-                                        }
-                                    }>
+                            <div class="card bg-base-200 border border-base-300 mb-4">
+                                <div class="card-body">
+                                    <div class="flex justify-between items-center">
+                                        <h3 class="card-title text-base">"Stream"</h3>
                                         <span class={
                                             let st = stream_state.get();
                                             match st.as_str() {
-                                                "live" => "dot dot-red",
-                                                "starting" | "stopping" => "dot dot-yellow",
-                                                _ => "dot dot-gray",
+                                                "live" => "badge badge-error gap-1",
+                                                "starting" | "stopping" => "badge badge-warning gap-1",
+                                                _ => "badge badge-ghost gap-1",
                                             }
-                                        }></span>
-                                        {move || stream_state.get().to_uppercase()}
-                                    </span>
-                                </div>
-
-                                {move || {
-                                    let st = stream_state.get();
-                                    if st == "live" || st == "starting" {
-                                        view! {
-                                            <div class="stats-grid">
-                                                <div class="stat-card">
-                                                    <div class="stat-label">"Bitrate"</div>
-                                                    <div class="stat-value">
-                                                        {move || live_bitrate.get()}
-                                                        <span class="stat-unit">"kbps"</span>
-                                                    </div>
-                                                </div>
-                                                <div class="stat-card">
-                                                    <div class="stat-label">"Uptime"</div>
-                                                    <div class="stat-value">
-                                                        {move || format_duration(live_uptime.get())}
-                                                    </div>
-                                                </div>
-                                                <div class="stat-card">
-                                                    <div class="stat-label">"Links"</div>
-                                                    <div class="stat-value">
-                                                        {move || live_links.get().len()}
-                                                    </div>
-                                                </div>
-                                            </div>
-
-                                            // Link stats table
-                                            {move || {
-                                                let links = live_links.get();
-                                                if links.is_empty() {
-                                                    view! { <p style="color: var(--text-muted); font-size: 13px;">"Waiting for link stats…"</p> }.into_any()
-                                                } else {
-                                                    view! {
-                                                        <div class="table-wrap">
-                                                            <table class="data-table">
-                                                                <thead>
-                                                                    <tr>
-                                                                        <th>"Interface"</th>
-                                                                        <th>"State"</th>
-                                                                        <th>"RTT"</th>
-                                                                        <th>"Loss"</th>
-                                                                        <th>"Capacity"</th>
-                                                                        <th>"Sent"</th>
-                                                                    </tr>
-                                                                </thead>
-                                                                <tbody>
-                                                                    <For
-                                                                        each=move || live_links.get()
-                                                                        key=|l| l.id
-                                                                        children=move |link| {
-                                                                            view! {
-                                                                                <tr>
-                                                                                    <td>{link.interface.clone()}</td>
-                                                                                    <td>{link.state.clone()}</td>
-                                                                                    <td>{format!("{:.1}ms", link.rtt_ms)}</td>
-                                                                                    <td>{format!("{:.2}%", link.loss_rate * 100.0)}</td>
-                                                                                    <td>{format_bps(link.capacity_bps)}</td>
-                                                                                    <td>{format_bytes(link.sent_bytes)}</td>
-                                                                                </tr>
-                                                                            }
-                                                                        }
-                                                                    />
-                                                                </tbody>
-                                                            </table>
-                                                        </div>
-                                                    }.into_any()
+                                        }>
+                                            <span class={
+                                                let st = stream_state.get();
+                                                match st.as_str() {
+                                                    "live" => "w-2 h-2 rounded-full bg-error animate-pulse-dot",
+                                                    "starting" | "stopping" => "w-2 h-2 rounded-full bg-warning",
+                                                    _ => "w-2 h-2 rounded-full bg-base-content/30",
                                                 }
-                                            }}
-                                        }.into_any()
-                                    } else {
-                                        view! {
-                                            <p style="color: var(--text-muted); font-size: 13px;">"No active stream"</p>
-                                        }.into_any()
-                                    }
-                                }}
-                            </div>
-
-                            // ── Details Card ────────────────────────────
-                            <div class="card" style="margin-bottom: 16px;">
-                                <div class="card-header">
-                                    <h3>"Details"</h3>
-                                </div>
-                                <div class="table-wrap">
-                                    <table class="data-table">
-                                        <tbody>
-                                            <tr>
-                                                <td style="color: var(--text-secondary); width: 140px;">"ID"</td>
-                                                <td><code style="font-size: 12px;">{s.id.clone()}</code></td>
-                                            </tr>
-                                            <tr>
-                                                <td style="color: var(--text-secondary);">"Enrolled"</td>
-                                                <td>{if s.enrolled { "Yes" } else { "No" }}</td>
-                                            </tr>
-                                            <tr>
-                                                <td style="color: var(--text-secondary);">"Created"</td>
-                                                <td>{s.created_at.clone()}</td>
-                                            </tr>
-                                            <tr>
-                                                <td style="color: var(--text-secondary);">"Last seen"</td>
-                                                <td>{s.last_seen_at.clone().unwrap_or_else(|| "Never".into())}</td>
-                                            </tr>
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
-
-                            // ── Unenroll Card ───────────────────────────
-                            <div class="card" style="border-color: var(--danger, #e74c3c);">
-                                <div class="card-header">
-                                    <h3 style="color: var(--danger, #e74c3c);">"Danger Zone"</h3>
-                                </div>
-
-                                {move || unenroll_token.get().map(|token| view! {
-                                    <div style="background: var(--bg-card, #1a1d23); border-radius: 8px; padding: 16px; margin-bottom: 12px;">
-                                        <p style="color: var(--success, #2ecc71); margin: 0 0 8px 0;">"Sender unenrolled. New enrollment token:"</p>
-                                        <code style="font-size: 18px; letter-spacing: 2px; color: var(--text-primary);">
-                                            {token}
-                                        </code>
+                                            }></span>
+                                            {move || stream_state.get().to_uppercase()}
+                                        </span>
                                     </div>
-                                })}
 
-                                <div style="display: flex; align-items: center; justify-content: space-between;">
-                                    <div>
-                                        <p style="margin: 0; color: var(--text-primary);">"Unenroll Sender"</p>
-                                        <p style="margin: 4px 0 0 0; font-size: 13px; color: var(--text-secondary);">
-                                            "Disconnects the sender and resets enrollment. A new token will be issued."
-                                        </p>
-                                    </div>
                                     {move || {
-                                        if show_unenroll_confirm.get() {
+                                        let st = stream_state.get();
+                                        if st == "live" || st == "starting" {
                                             view! {
-                                                <div style="display: flex; gap: 8px;">
-                                                    <button
-                                                        class="btn btn-danger"
-                                                        on:click=do_unenroll
-                                                        disabled=move || action_loading.get()
-                                                    >
-                                                        "Confirm Unenroll"
-                                                    </button>
-                                                    <button
-                                                        class="btn btn-secondary"
-                                                        on:click=move |_| set_show_unenroll_confirm.set(false)
-                                                    >
-                                                        "Cancel"
-                                                    </button>
+                                                <div class="stats stats-horizontal bg-base-300 w-full mt-3">
+                                                    <div class="stat">
+                                                        <div class="stat-title">"Bitrate"</div>
+                                                        <div class="stat-value text-lg font-mono">{move || live_bitrate.get()}<span class="text-sm text-base-content/60">" kbps"</span></div>
+                                                    </div>
+                                                    <div class="stat">
+                                                        <div class="stat-title">"Uptime"</div>
+                                                        <div class="stat-value text-lg font-mono">{move || format_duration(live_uptime.get())}</div>
+                                                    </div>
+                                                    <div class="stat">
+                                                        <div class="stat-title">"Links"</div>
+                                                        <div class="stat-value text-lg font-mono">{move || live_links.get().len()}</div>
+                                                    </div>
                                                 </div>
+
+                                                // Link stats table
+                                                {move || {
+                                                    let links = live_links.get();
+                                                    if links.is_empty() {
+                                                        view! { <p class="text-sm text-base-content/40 mt-3">"Waiting for link stats…"</p> }.into_any()
+                                                    } else {
+                                                        view! {
+                                                            <div class="overflow-x-auto mt-3">
+                                                                <table class="table table-sm">
+                                                                    <thead>
+                                                                        <tr>
+                                                                            <th>"Interface"</th>
+                                                                            <th>"State"</th>
+                                                                            <th>"RTT"</th>
+                                                                            <th>"Loss"</th>
+                                                                            <th>"Capacity"</th>
+                                                                            <th>"Sent"</th>
+                                                                        </tr>
+                                                                    </thead>
+                                                                    <tbody>
+                                                                        <For
+                                                                            each=move || live_links.get()
+                                                                            key=|l| l.id
+                                                                            children=move |link| {
+                                                                                view! {
+                                                                                    <tr class="font-mono text-sm">
+                                                                                        <td>{link.interface.clone()}</td>
+                                                                                        <td>{link.state.clone()}</td>
+                                                                                        <td>{format!("{:.1}ms", link.rtt_ms)}</td>
+                                                                                        <td>{format!("{:.2}%", link.loss_rate * 100.0)}</td>
+                                                                                        <td>{format_bps(link.capacity_bps)}</td>
+                                                                                        <td>{format_bytes(link.sent_bytes)}</td>
+                                                                                    </tr>
+                                                                                }
+                                                                            }
+                                                                        />
+                                                                    </tbody>
+                                                                </table>
+                                                            </div>
+                                                        }.into_any()
+                                                    }
+                                                }}
                                             }.into_any()
                                         } else {
                                             view! {
-                                                <button
-                                                    class="btn btn-danger"
-                                                    on:click=move |_| set_show_unenroll_confirm.set(true)
-                                                    disabled=move || action_loading.get()
-                                                >
-                                                    "Unenroll"
-                                                </button>
+                                                <p class="text-sm text-base-content/40">"No active stream"</p>
                                             }.into_any()
                                         }
                                     }}
+                                </div>
+                            </div>
+
+                            // ── Details Card ────────────────────────────
+                            <div class="card bg-base-200 border border-base-300 mb-4">
+                                <div class="card-body">
+                                    <h3 class="card-title text-base">"Details"</h3>
+                                    <div class="overflow-x-auto">
+                                        <table class="table table-sm">
+                                            <tbody>
+                                                <tr>
+                                                    <td class="text-base-content/60 w-36">"ID"</td>
+                                                    <td><code class="text-xs font-mono">{s.id.clone()}</code></td>
+                                                </tr>
+                                                <tr>
+                                                    <td class="text-base-content/60">"Enrolled"</td>
+                                                    <td>{if s.enrolled { "Yes" } else { "No" }}</td>
+                                                </tr>
+                                                <tr>
+                                                    <td class="text-base-content/60">"Created"</td>
+                                                    <td>{s.created_at.clone()}</td>
+                                                </tr>
+                                                <tr>
+                                                    <td class="text-base-content/60">"Last seen"</td>
+                                                    <td>{s.last_seen_at.clone().unwrap_or_else(|| "Never".into())}</td>
+                                                </tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+
+                            // ── Unenroll Card (Danger Zone) ─────────────
+                            <div class="card bg-base-200 border border-error mb-4">
+                                <div class="card-body">
+                                    <h3 class="card-title text-base text-error">"Danger Zone"</h3>
+
+                                    {move || unenroll_token.get().map(|token| view! {
+                                        <div class="bg-base-300 rounded-lg p-4 mb-3">
+                                            <p class="text-success mb-2">"Sender unenrolled. New enrollment token:"</p>
+                                            <code class="text-lg tracking-widest">{token}</code>
+                                        </div>
+                                    })}
+
+                                    <div class="flex items-center justify-between">
+                                        <div>
+                                            <p class="font-medium">"Unenroll Sender"</p>
+                                            <p class="text-sm text-base-content/60 mt-1">
+                                                "Disconnects the sender and resets enrollment. A new token will be issued."
+                                            </p>
+                                        </div>
+                                        {move || {
+                                            if show_unenroll_confirm.get() {
+                                                view! {
+                                                    <div class="flex gap-2">
+                                                        <button class="btn btn-error" on:click=do_unenroll disabled=move || action_loading.get()>
+                                                            "Confirm Unenroll"
+                                                        </button>
+                                                        <button class="btn btn-ghost" on:click=move |_| set_show_unenroll_confirm.set(false)>
+                                                            "Cancel"
+                                                        </button>
+                                                    </div>
+                                                }.into_any()
+                                            } else {
+                                                view! {
+                                                    <button class="btn btn-error" on:click=move |_| set_show_unenroll_confirm.set(true) disabled=move || action_loading.get()>
+                                                        "Unenroll"
+                                                    </button>
+                                                }.into_any()
+                                            }
+                                        }}
+                                    </div>
                                 </div>
                             </div>
                         }.into_any()
@@ -722,127 +679,128 @@ fn NetworkCard(
     };
 
     view! {
-        <div class="card" style="margin-bottom: 16px;">
-            <div class="card-header">
-                <h3>"📡 Network Interfaces"</h3>
-                <div style="display: flex; gap: 8px; align-items: center;">
-                    <span class="badge" style="background: var(--bg-tertiary, #252830);">
-                        {move || interfaces.get().len()} " interfaces"
-                    </span>
-                    <button
-                        class="btn btn-ghost btn-sm"
-                        on:click=do_scan
-                        disabled=!is_online
-                    >
-                        "Scan for New"
-                    </button>
+        <div class="card bg-base-200 border border-base-300 mb-4">
+            <div class="card-body">
+                <div class="flex justify-between items-center">
+                    <h3 class="card-title text-base">"📡 Network Interfaces"</h3>
+                    <div class="flex gap-2 items-center">
+                        <span class="badge badge-ghost badge-sm">
+                            {move || interfaces.get().len()} " interfaces"
+                        </span>
+                        <button class="btn btn-ghost btn-sm" on:click=do_scan disabled=!is_online>
+                            "Scan for New"
+                        </button>
+                    </div>
                 </div>
-            </div>
 
-            {move || scan_msg.get().map(|(msg, kind)| {
-                let cls = match kind { "ok" => "msg msg-ok", "err" => "msg msg-err", _ => "msg msg-info" };
-                view! { <div class={cls}>{msg}</div> }
-            })}
+                {move || scan_msg.get().map(|(msg, kind)| {
+                    let cls = match kind {
+                        "ok" => "alert alert-success text-sm mt-2",
+                        "err" => "alert alert-error text-sm mt-2",
+                        _ => "alert alert-info text-sm mt-2",
+                    };
+                    view! { <div class={cls}>{msg}</div> }
+                })}
 
-            {move || {
-                let ifaces = interfaces.get();
-                if ifaces.is_empty() {
-                    view! {
-                        <p style="color: var(--text-muted); font-size: 13px;">
-                            "No interface data — sender may be offline"
-                        </p>
-                    }.into_any()
-                } else {
-                    view! {
-                        <div class="interface-list">
-                            {ifaces.into_iter().map(|iface| {
-                                let name = iface.name.clone();
-                                let name_toggle = iface.name.clone();
-                                let sender_id = sender_id.clone();
-                                let auth = auth.clone();
-                                let enabled = iface.enabled;
-                                let connected = iface.state == "connected";
-
-                                let (dot, badge_cls, label) = if !enabled {
-                                    ("dot dot-red", "badge badge-offline", "Disabled")
-                                } else if connected {
-                                    ("dot dot-green", "badge badge-online", "Up")
-                                } else {
-                                    ("dot dot-gray", "badge badge-offline", "Down")
-                                };
-
-                                let type_icon = match iface.iface_type.as_str() {
-                                    "cellular" => "📶",
-                                    "wifi" => "📡",
-                                    _ => "🔌",
-                                };
-
-                                let mut meta_parts = vec![];
-                                meta_parts.push(format!("{type_icon} {}", iface.iface_type));
-                                if let Some(t) = &iface.technology { meta_parts.push(t.clone()); }
-                                if let Some(c) = &iface.carrier { meta_parts.push(c.clone()); }
-                                if let Some(db) = iface.signal_dbm { meta_parts.push(format!("{db} dBm")); }
-                                if let Some(ip) = &iface.ip { meta_parts.push(ip.clone()); }
-
-                                let toggle = move |_| {
+                {move || {
+                    let ifaces = interfaces.get();
+                    if ifaces.is_empty() {
+                        view! {
+                            <p class="text-sm text-base-content/40 mt-2">
+                                "No interface data — sender may be offline"
+                            </p>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <div class="flex flex-col gap-2 mt-2">
+                                {ifaces.into_iter().map(|iface| {
+                                    let name = iface.name.clone();
+                                    let name_toggle = iface.name.clone();
                                     let sender_id = sender_id.clone();
-                                    let iface_name = name_toggle.clone();
-                                    let token = auth.token.get_untracked().unwrap_or_default();
-                                    set_iface_loading.set(Some(iface_name.clone()));
-                                    leptos::task::spawn_local(async move {
-                                        let result = if enabled {
-                                            api::disable_interface(&token, &sender_id, &iface_name).await
+                                    let auth = auth.clone();
+                                    let enabled = iface.enabled;
+                                    let connected = iface.state == "connected";
+
+                                    let (badge_cls, label) = if !enabled {
+                                        ("badge badge-error badge-sm gap-1", "Disabled")
+                                    } else if connected {
+                                        ("badge badge-success badge-sm gap-1", "Up")
+                                    } else {
+                                        ("badge badge-ghost badge-sm gap-1", "Down")
+                                    };
+
+                                    let type_icon = match iface.iface_type.as_str() {
+                                        "cellular" => "📶",
+                                        "wifi" => "📡",
+                                        _ => "🔌",
+                                    };
+
+                                    let mut meta_parts = vec![];
+                                    meta_parts.push(format!("{type_icon} {}", iface.iface_type));
+                                    if let Some(t) = &iface.technology { meta_parts.push(t.clone()); }
+                                    if let Some(c) = &iface.carrier { meta_parts.push(c.clone()); }
+                                    if let Some(db) = iface.signal_dbm { meta_parts.push(format!("{db} dBm")); }
+                                    if let Some(ip) = &iface.ip { meta_parts.push(ip.clone()); }
+
+                                    let toggle = move |_| {
+                                        let sender_id = sender_id.clone();
+                                        let iface_name = name_toggle.clone();
+                                        let token = auth.token.get_untracked().unwrap_or_default();
+                                        set_iface_loading.set(Some(iface_name.clone()));
+                                        leptos::task::spawn_local(async move {
+                                            let result = if enabled {
+                                                api::disable_interface(&token, &sender_id, &iface_name).await
+                                            } else {
+                                                api::enable_interface(&token, &sender_id, &iface_name).await
+                                            };
+                                            if let Err(e) = result {
+                                                set_error.set(Some(e));
+                                            }
+                                            set_iface_loading.set(None);
+                                        });
+                                    };
+
+                                    let is_loading = {
+                                        let n = iface.name.clone();
+                                        move || iface_loading.get().as_deref() == Some(&n)
+                                    };
+                                    let is_loading2 = {
+                                        let n = iface.name.clone();
+                                        move || iface_loading.get().as_deref() == Some(&n)
+                                    };
+
+                                    view! {
+                                        <div class={if enabled {
+                                            "flex items-center justify-between p-3 bg-base-300 rounded border border-base-300"
                                         } else {
-                                            api::enable_interface(&token, &sender_id, &iface_name).await
-                                        };
-                                        if let Err(e) = result {
-                                            set_error.set(Some(e));
-                                        }
-                                        set_iface_loading.set(None);
-                                    });
-                                };
-
-                                let is_loading_cls = {
-                                    let n = iface.name.clone();
-                                    move || iface_loading.get().as_deref() == Some(&n)
-                                };
-                                let is_loading_disabled = {
-                                    let n = iface.name.clone();
-                                    move || iface_loading.get().as_deref() == Some(&n)
-                                };
-
-                                view! {
-                                    <div class={if enabled { "interface-item" } else { "interface-item disabled" }}>
-                                        <div style="display: flex; align-items: center; gap: 12px;">
-                                            <label class={move || if is_loading_cls() { "toggle loading" } else { "toggle" }}>
+                                            "flex items-center justify-between p-3 bg-base-300 rounded border border-base-300 opacity-50"
+                                        }}>
+                                            <div class="flex items-center gap-3">
                                                 <input
                                                     type="checkbox"
+                                                    class={move || if is_loading() { "toggle toggle-success toggle-sm animate-pulse" } else { "toggle toggle-success toggle-sm" }}
                                                     checked=enabled
                                                     on:change=toggle
-                                                    disabled=move || is_loading_disabled() || !is_online
+                                                    disabled=move || is_loading2() || !is_online
                                                 />
-                                                <span class="slider"></span>
-                                            </label>
-                                            <div>
-                                                <span class="iface-name">{name}</span>
-                                                <div class="iface-meta">
-                                                    {meta_parts.into_iter().map(|p| view! {
-                                                        <span>{p}</span>
-                                                    }).collect::<Vec<_>>()}
+                                                <div>
+                                                    <span class="font-semibold font-mono text-sm">{name}</span>
+                                                    <div class="flex gap-2 text-xs text-base-content/60">
+                                                        {meta_parts.into_iter().map(|p| view! {
+                                                            <span>{p}</span>
+                                                        }).collect::<Vec<_>>()}
+                                                    </div>
                                                 </div>
                                             </div>
+                                            <span class={badge_cls}>{label}</span>
                                         </div>
-                                        <span class={badge_cls}>
-                                            <span class={dot}></span>
-                                            {label}
-                                        </span>
-                                    </div>
-                                }
-                            }).collect::<Vec<_>>()}
-                        </div>
-                    }.into_any()
-                }
-            }}
+                                    }
+                                }).collect::<Vec<_>>()}
+                            </div>
+                        }.into_any()
+                    }
+                }}
+            </div>
         </div>
     }
 }
@@ -851,52 +809,43 @@ fn NetworkCard(
 #[component]
 fn MediaInputsCard(inputs: ReadSignal<Vec<MediaInput>>) -> impl IntoView {
     view! {
-        <div class="card" style="margin-bottom: 16px;">
-            <div class="card-header">
-                <h3>"🎥 Media Inputs"</h3>
-            </div>
-            {move || {
-                let inputs = inputs.get();
-                if inputs.is_empty() {
-                    view! {
-                        <p style="color: var(--text-muted); font-size: 13px;">"No inputs detected"</p>
-                    }.into_any()
-                } else {
-                    view! {
-                        <div class="interface-list">
-                            {inputs.into_iter().map(|input| {
-                                let caps = input.capabilities.join(", ");
-                                let status_class = match input.status.as_str() {
-                                    "available" => "badge badge-online",
-                                    "in_use" => "badge badge-live",
-                                    _ => "badge badge-offline",
-                                };
-                                let status_dot = match input.status.as_str() {
-                                    "available" => "dot dot-green",
-                                    "in_use" => "dot dot-red",
-                                    _ => "dot dot-gray",
-                                };
-                                view! {
-                                    <div class="interface-item">
-                                        <div>
-                                            <div style="font-weight: 500; margin-bottom: 2px;">{input.label}</div>
-                                            <div class="iface-meta">
-                                                <span>{input.device}</span>
-                                                <span>{input.input_type}</span>
-                                                {(!caps.is_empty()).then(|| view! { <span>{caps}</span> })}
+        <div class="card bg-base-200 border border-base-300 mb-4">
+            <div class="card-body">
+                <h3 class="card-title text-base">"🎥 Media Inputs"</h3>
+                {move || {
+                    let inputs = inputs.get();
+                    if inputs.is_empty() {
+                        view! {
+                            <p class="text-sm text-base-content/40">"No inputs detected"</p>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <div class="flex flex-col gap-2">
+                                {inputs.into_iter().map(|input| {
+                                    let caps = input.capabilities.join(", ");
+                                    let status_badge = match input.status.as_str() {
+                                        "available" => "badge badge-success badge-sm gap-1",
+                                        "in_use" => "badge badge-error badge-sm gap-1",
+                                        _ => "badge badge-ghost badge-sm gap-1",
+                                    };
+                                    view! {
+                                        <div class="flex items-center justify-between p-3 bg-base-300 rounded border border-base-300">
+                                            <div>
+                                                <div class="font-medium text-sm">{input.label}</div>
+                                                <div class="text-xs text-base-content/60 font-mono mt-0.5">
+                                                    {input.device} " · " {input.input_type}
+                                                    {(!caps.is_empty()).then(|| view! { <span>" · " {caps}</span> })}
+                                                </div>
                                             </div>
+                                            <span class={status_badge}>{input.status.clone()}</span>
                                         </div>
-                                        <span class={status_class}>
-                                            <span class={status_dot}></span>
-                                            {input.status.clone()}
-                                        </span>
-                                    </div>
-                                }
-                            }).collect::<Vec<_>>()}
-                        </div>
-                    }.into_any()
-                }
-            }}
+                                    }
+                                }).collect::<Vec<_>>()}
+                            </div>
+                        }.into_any()
+                    }
+                }}
+            </div>
         </div>
     }
 }

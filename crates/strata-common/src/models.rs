@@ -228,3 +228,282 @@ pub struct LinkStats {
     pub sent_bytes: u64,
     pub signal_dbm: Option<i32>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Enum Serde Round-Trips ──────────────────────────────────
+
+    #[test]
+    fn user_role_serde_round_trip() {
+        for role in [UserRole::Admin, UserRole::Operator, UserRole::Viewer] {
+            let json = serde_json::to_string(&role).unwrap();
+            let parsed: UserRole = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, role);
+        }
+    }
+
+    #[test]
+    fn user_role_from_str() {
+        assert_eq!("admin".parse::<UserRole>().unwrap(), UserRole::Admin);
+        assert_eq!("operator".parse::<UserRole>().unwrap(), UserRole::Operator);
+        assert_eq!("viewer".parse::<UserRole>().unwrap(), UserRole::Viewer);
+        assert!("invalid".parse::<UserRole>().is_err());
+    }
+
+    #[test]
+    fn user_role_display() {
+        assert_eq!(UserRole::Admin.to_string(), "admin");
+        assert_eq!(UserRole::Operator.to_string(), "operator");
+        assert_eq!(UserRole::Viewer.to_string(), "viewer");
+    }
+
+    #[test]
+    fn interface_type_serde_round_trip() {
+        for t in [
+            InterfaceType::Cellular,
+            InterfaceType::Ethernet,
+            InterfaceType::Wifi,
+        ] {
+            let json = serde_json::to_string(&t).unwrap();
+            let parsed: InterfaceType = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, t);
+        }
+    }
+
+    #[test]
+    fn interface_state_serde_round_trip() {
+        for s in [
+            InterfaceState::Connected,
+            InterfaceState::Disconnected,
+            InterfaceState::Connecting,
+            InterfaceState::Error,
+        ] {
+            let json = serde_json::to_string(&s).unwrap();
+            let parsed: InterfaceState = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, s);
+        }
+    }
+
+    #[test]
+    fn media_input_type_serde_round_trip() {
+        for t in [
+            MediaInputType::V4l2,
+            MediaInputType::File,
+            MediaInputType::Test,
+        ] {
+            let json = serde_json::to_string(&t).unwrap();
+            let parsed: MediaInputType = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, t);
+        }
+    }
+
+    #[test]
+    fn media_input_status_serde_round_trip() {
+        for s in [
+            MediaInputStatus::Available,
+            MediaInputStatus::InUse,
+            MediaInputStatus::Error,
+        ] {
+            let json = serde_json::to_string(&s).unwrap();
+            let parsed: MediaInputStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, s);
+        }
+    }
+
+    #[test]
+    fn stream_state_serde_round_trip() {
+        for s in [
+            StreamState::Idle,
+            StreamState::Starting,
+            StreamState::Live,
+            StreamState::Stopping,
+            StreamState::Ended,
+            StreamState::Failed,
+        ] {
+            let json = serde_json::to_string(&s).unwrap();
+            let parsed: StreamState = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, s);
+            // Also test Display
+            let display = s.to_string();
+            assert!(!display.is_empty());
+        }
+    }
+
+    #[test]
+    fn destination_platform_serde_round_trip() {
+        for p in [
+            DestinationPlatform::Youtube,
+            DestinationPlatform::Twitch,
+            DestinationPlatform::CustomRtmp,
+            DestinationPlatform::Srt,
+        ] {
+            let json = serde_json::to_string(&p).unwrap();
+            let parsed: DestinationPlatform = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, p);
+            assert_eq!(p.to_string(), json.trim_matches('"'));
+        }
+    }
+
+    // ── Struct Serde Round-Trips ────────────────────────────────
+
+    #[test]
+    fn network_interface_serde() {
+        let iface = NetworkInterface {
+            name: "wwan0".into(),
+            iface_type: InterfaceType::Cellular,
+            state: InterfaceState::Connected,
+            enabled: true,
+            ip: Some("10.0.0.1".into()),
+            carrier: Some("T-Mobile".into()),
+            signal_dbm: Some(-67),
+            technology: Some("5G".into()),
+        };
+        let json = serde_json::to_string(&iface).unwrap();
+        let parsed: NetworkInterface = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "wwan0");
+        assert_eq!(parsed.iface_type, InterfaceType::Cellular);
+        assert_eq!(parsed.state, InterfaceState::Connected);
+        assert!(parsed.enabled);
+        assert_eq!(parsed.signal_dbm, Some(-67));
+    }
+
+    #[test]
+    fn network_interface_enabled_default() {
+        // Verify `enabled` defaults to true when missing from JSON
+        let json = r#"{"name":"eth0","type":"ethernet","state":"connected"}"#;
+        let parsed: NetworkInterface = serde_json::from_str(json).unwrap();
+        assert!(parsed.enabled, "enabled should default to true");
+    }
+
+    #[test]
+    fn media_input_serde() {
+        let input = MediaInput {
+            device: "/dev/video0".into(),
+            input_type: MediaInputType::V4l2,
+            label: "USB Camera".into(),
+            capabilities: vec!["1080p30".into(), "720p60".into()],
+            status: MediaInputStatus::Available,
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        let parsed: MediaInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.device, "/dev/video0");
+        assert_eq!(parsed.capabilities.len(), 2);
+    }
+
+    #[test]
+    fn link_stats_serde() {
+        let stats = LinkStats {
+            id: 1,
+            interface: "wwan0".into(),
+            state: "connected".into(),
+            rtt_ms: 23.5,
+            loss_rate: 0.01,
+            capacity_bps: 15_000_000,
+            sent_bytes: 1_048_576,
+            signal_dbm: Some(-72),
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let parsed: LinkStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, 1);
+        assert!((parsed.rtt_ms - 23.5).abs() < f64::EPSILON);
+        assert_eq!(parsed.capacity_bps, 15_000_000);
+    }
+
+    #[test]
+    fn sender_status_serde() {
+        let status = SenderStatus {
+            network_interfaces: vec![NetworkInterface {
+                name: "eth0".into(),
+                iface_type: InterfaceType::Ethernet,
+                state: InterfaceState::Connected,
+                enabled: true,
+                ip: Some("192.168.1.100".into()),
+                carrier: None,
+                signal_dbm: None,
+                technology: None,
+            }],
+            media_inputs: vec![],
+            stream_state: StreamState::Live,
+            cpu_percent: 42.5,
+            mem_used_mb: 1024,
+            uptime_s: 86400,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: SenderStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.network_interfaces.len(), 1);
+        assert_eq!(parsed.stream_state, StreamState::Live);
+        assert!((parsed.cpu_percent - 42.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn destination_stream_key_skipped_when_none() {
+        let dest = Destination {
+            id: "dst_test".into(),
+            owner_id: "usr_test".into(),
+            platform: DestinationPlatform::Youtube,
+            name: "My Channel".into(),
+            url: "rtmp://example.com/live".into(),
+            stream_key: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&dest).unwrap();
+        assert!(
+            !json.contains("stream_key"),
+            "stream_key should be skipped when None"
+        );
+    }
+
+    #[test]
+    fn destination_stream_key_present_when_some() {
+        let dest = Destination {
+            id: "dst_test".into(),
+            owner_id: "usr_test".into(),
+            platform: DestinationPlatform::Twitch,
+            name: "My Stream".into(),
+            url: "rtmp://live.twitch.tv/app".into(),
+            stream_key: Some("live_secret_key".into()),
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&dest).unwrap();
+        assert!(json.contains("stream_key"));
+        assert!(json.contains("live_secret_key"));
+    }
+
+    #[test]
+    fn user_password_hash_not_serialized() {
+        let user = User {
+            id: "usr_test".into(),
+            email: "test@test.com".into(),
+            password_hash: "secret_hash_value".into(),
+            role: UserRole::Admin,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&user).unwrap();
+        assert!(
+            !json.contains("secret_hash_value"),
+            "password_hash should be skipped in serialization"
+        );
+    }
+
+    #[test]
+    fn stream_serde_round_trip() {
+        let stream = Stream {
+            id: "str_test".into(),
+            sender_id: "snd_abc".into(),
+            destination_id: Some("dst_xyz".into()),
+            state: StreamState::Live,
+            started_at: Some(chrono::Utc::now()),
+            ended_at: None,
+            config_json: Some(r#"{"bitrate":5000}"#.into()),
+            total_bytes: 1_000_000,
+            error_message: None,
+        };
+        let json = serde_json::to_string(&stream).unwrap();
+        let parsed: Stream = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "str_test");
+        assert_eq!(parsed.state, StreamState::Live);
+        assert_eq!(parsed.total_bytes, 1_000_000);
+    }
+}

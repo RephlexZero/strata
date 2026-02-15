@@ -180,62 +180,68 @@ pub fn App() -> impl IntoView {
 
     view! {
         // ── Header ──────────────────────────────────────────────
-        <div class="portal-header">
-            <h1>"Strata Sender"</h1>
-            <div class="header-badges">
+        <div class="bg-base-200 border-b border-base-300 px-6 py-4 flex justify-between items-center">
+            <h1 class="text-xl font-semibold">"Strata Sender"</h1>
+            <div class="flex gap-2">
                 {move || {
                     let s = status.get();
-                    let (cloud_class, cloud_dot, cloud_text) = match s.as_ref().map(|s| s.cloud_connected) {
-                        Some(true) => ("badge badge-online", "dot dot-green", "Connected"),
-                        _ => ("badge badge-offline", "dot dot-gray", "Offline"),
+                    let (cloud_cls, cloud_text) = match s.as_ref().map(|s| s.cloud_connected) {
+                        Some(true) => ("badge badge-success gap-1", "Connected"),
+                        _ => ("badge badge-ghost gap-1", "Offline"),
                     };
-                    let (enroll_class, enroll_dot, enroll_text) = match s.as_ref().map(|s| s.enrolled) {
-                        Some(true) => ("badge badge-online", "dot dot-green", "Enrolled"),
-                        _ => ("badge badge-offline", "dot dot-gray", "Not Enrolled"),
+                    let (enroll_cls, enroll_text) = match s.as_ref().map(|s| s.enrolled) {
+                        Some(true) => ("badge badge-success gap-1", "Enrolled"),
+                        _ => ("badge badge-ghost gap-1", "Not Enrolled"),
                     };
                     view! {
-                        <span class={cloud_class}><span class={cloud_dot}></span>{cloud_text}</span>
-                        <span class={enroll_class}><span class={enroll_dot}></span>{enroll_text}</span>
+                        <span class={cloud_cls}>
+                            <span class={if cloud_text == "Connected" { "w-2 h-2 rounded-full bg-success" } else { "w-2 h-2 rounded-full bg-base-content/30" }}></span>
+                            {cloud_text}
+                        </span>
+                        <span class={enroll_cls}>
+                            <span class={if enroll_text == "Enrolled" { "w-2 h-2 rounded-full bg-success" } else { "w-2 h-2 rounded-full bg-base-content/30" }}></span>
+                            {enroll_text}
+                        </span>
                     }
                 }}
             </div>
         </div>
 
-        <div class="container">
+        <div class="max-w-3xl mx-auto px-4 py-6 space-y-4">
             // ── Error ───────────────────────────────────────────
             {move || error.get().map(|e| view! {
-                <div class="msg msg-err">{e}</div>
+                <div class="alert alert-error text-sm">{e}</div>
             })}
 
             // ── System Stats ────────────────────────────────────
             {move || status.get().map(|s| view! {
-                <div class="card">
-                    <div class="card-header">
-                        <h2>"📊 System"</h2>
-                    </div>
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="stat-label">"CPU"</div>
-                            <div class="stat-value">
-                                {format!("{:.1}", s.cpu_percent)}
-                                <span class="stat-unit">"%"</span>
+                <div class="card bg-base-200 border border-base-300">
+                    <div class="card-body">
+                        <h2 class="card-title text-base">"📊 System"</h2>
+                        <div class="stats stats-horizontal bg-base-300 w-full">
+                            <div class="stat">
+                                <div class="stat-title">"CPU"</div>
+                                <div class="stat-value text-lg font-mono">
+                                    {format!("{:.1}", s.cpu_percent)}
+                                    <span class="text-sm text-base-content/60">" %"</span>
+                                </div>
                             </div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-label">"Memory"</div>
-                            <div class="stat-value">
-                                {s.mem_used_mb}
-                                <span class="stat-unit">" MB"</span>
+                            <div class="stat">
+                                <div class="stat-title">"Memory"</div>
+                                <div class="stat-value text-lg font-mono">
+                                    {s.mem_used_mb}
+                                    <span class="text-sm text-base-content/60">" MB"</span>
+                                </div>
                             </div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-label">"Uptime"</div>
-                            <div class="stat-value">{format_uptime(s.uptime_s)}</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-label">"Pipeline"</div>
-                            <div class="stat-value" style={if s.streaming { "color: var(--red);" } else { "color: var(--text-muted);" }}>
-                                {if s.streaming { "● Live" } else { "Idle" }}
+                            <div class="stat">
+                                <div class="stat-title">"Uptime"</div>
+                                <div class="stat-value text-lg font-mono">{format_uptime(s.uptime_s)}</div>
+                            </div>
+                            <div class="stat">
+                                <div class="stat-title">"Pipeline"</div>
+                                <div class={if s.streaming { "stat-value text-lg font-mono text-error" } else { "stat-value text-lg font-mono text-base-content/40" }}>
+                                    {if s.streaming { "● Live" } else { "Idle" }}
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -255,44 +261,48 @@ pub fn App() -> impl IntoView {
             />
 
             // ── Receiver Config ─────────────────────────────────
-            <div class="card">
-                <div class="card-header">
-                    <h2>"🎯 Receiver"</h2>
-                </div>
+            <div class="card bg-base-200 border border-base-300">
+                <div class="card-body">
+                    <h2 class="card-title text-base">"🎯 Receiver"</h2>
 
-                {move || config_msg.get().map(|(msg, kind)| {
-                    let cls = match kind { "ok" => "msg msg-ok", "err" => "msg msg-err", _ => "msg msg-info" };
-                    view! { <div class={cls}>{msg}</div> }
-                })}
+                    {move || config_msg.get().map(|(msg, kind)| {
+                        let cls = match kind {
+                            "ok" => "alert alert-success text-sm",
+                            "err" => "alert alert-error text-sm",
+                            _ => "alert alert-info text-sm",
+                        };
+                        view! { <div class={cls}>{msg}</div> }
+                    })}
 
-                <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 14px;">
-                    "Set the RIST receiver address this sender will transmit to."
-                </p>
+                    <p class="text-sm text-base-content/60 mb-3">
+                        "Set the RIST receiver address this sender will transmit to."
+                    </p>
 
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>"Receiver URL"</label>
-                        <input
-                            class="form-input"
-                            type="text"
-                            placeholder="rist://receiver.example.com:5000"
-                            prop:value=move || receiver_input.get()
-                            on:input=move |ev| {
-                                set_receiver_input.set(event_target_value(&ev));
-                            }
-                        />
+                    <div class="flex gap-3 items-end">
+                        <fieldset class="fieldset flex-1">
+                            <label class="fieldset-label">"Receiver URL"</label>
+                            <input
+                                class="input input-bordered w-full"
+                                type="text"
+                                placeholder="rist://receiver.example.com:5000"
+                                prop:value=move || receiver_input.get()
+                                on:input=move |ev| {
+                                    set_receiver_input.set(event_target_value(&ev));
+                                }
+                            />
+                        </fieldset>
+                        <button class="btn btn-primary" on:click=save_config>"Save"</button>
                     </div>
-                    <button class="btn btn-primary" on:click=save_config>"Save"</button>
-                </div>
 
-                {move || {
-                    let url = status.get().and_then(|s| s.receiver_url);
-                    view! {
-                        <p style="margin-top: 10px; font-size: 12px; color: var(--text-muted); font-family: var(--font-mono);">
-                            {url.map(|u| format!("Current: {u}")).unwrap_or_else(|| "No receiver configured".into())}
-                        </p>
-                    }
-                }}
+                    {move || {
+                        let url = status.get().and_then(|s| s.receiver_url);
+                        view! {
+                            <p class="mt-2 text-xs text-base-content/40 font-mono">
+                                {url.map(|u| format!("Current: {u}")).unwrap_or_else(|| "No receiver configured".into())}
+                            </p>
+                        }
+                    }}
+                </div>
             </div>
 
             // ── Media Inputs ────────────────────────────────────
@@ -303,166 +313,166 @@ pub fn App() -> impl IntoView {
             />
 
             // ── Cloud Enrollment ────────────────────────────────
-            <div class="card">
-                <div class="card-header">
-                    <h2>"🔗 Cloud Enrollment"</h2>
+            <div class="card bg-base-200 border border-base-300">
+                <div class="card-body">
+                    <h2 class="card-title text-base">"🔗 Cloud Enrollment"</h2>
+
+                    {move || enroll_msg.get().map(|(msg, kind)| {
+                        let cls = match kind {
+                            "ok" => "alert alert-success text-sm",
+                            "err" => "alert alert-error text-sm",
+                            _ => "alert alert-info text-sm",
+                        };
+                        view! { <div class={cls}>{msg}</div> }
+                    })}
+
+                    {move || {
+                        let s = status.get();
+                        let enrolled = s.as_ref().map(|s| s.enrolled).unwrap_or(false);
+
+                        if enrolled {
+                            let sid = s.and_then(|s| s.sender_id).unwrap_or_else(|| "—".into());
+                            view! {
+                                <div class="alert alert-success text-sm">"This device is enrolled and connected to the cloud."</div>
+                                <p class="font-mono text-sm text-base-content/60 mb-3">
+                                    "Sender ID: " {sid}
+                                </p>
+                                {move || if show_unenroll.get() {
+                                    view! {
+                                        <div class="flex gap-2 items-center">
+                                            <button
+                                                class="btn btn-error"
+                                                on:click=do_unenroll
+                                                disabled=move || enroll_loading.get()
+                                            >
+                                                "Confirm Unenroll"
+                                            </button>
+                                            <button
+                                                class="btn btn-ghost"
+                                                on:click=move |_| set_show_unenroll.set(false)
+                                            >
+                                                "Cancel"
+                                            </button>
+                                            <span class="text-sm text-base-content/60">
+                                                "This will disconnect from the cloud. You'll need a new token to re-enroll."
+                                            </span>
+                                        </div>
+                                    }.into_any()
+                                } else {
+                                    view! {
+                                        <button
+                                            class="btn btn-error btn-sm"
+                                            on:click=move |_| set_show_unenroll.set(true)
+                                        >
+                                            "Unenroll Device"
+                                        </button>
+                                    }.into_any()
+                                }}
+                            }.into_any()
+                        } else {
+                            view! {
+                                <p class="text-sm text-base-content/60 mb-3">
+                                    "Enter the enrollment token from your Strata dashboard to link this sender to your account. "
+                                    "Tokens are 8 characters in "
+                                    <span class="font-mono">"XXXX-XXXX"</span>
+                                    " format."
+                                </p>
+                                <fieldset class="fieldset mb-3">
+                                    <label class="fieldset-label">"Enrollment Token"</label>
+                                    <input
+                                        class="input input-bordered w-full max-w-xs font-mono text-lg tracking-widest"
+                                        type="text"
+                                        placeholder="XXXX-XXXX"
+                                        maxlength="9"
+                                        prop:value=move || token_input.get()
+                                        on:input=move |ev| {
+                                            let raw = event_target_value(&ev);
+                                            let formatted = format_token(&raw);
+                                            set_token_input.set(formatted);
+                                        }
+                                    />
+                                </fieldset>
+                                <fieldset class="fieldset mb-3">
+                                    <label class="fieldset-label">"Control Plane URL " <span class="text-base-content/40">"(optional)"</span></label>
+                                    <input
+                                        class="input input-bordered w-full"
+                                        type="text"
+                                        placeholder="wss://platform.example.com/agent/ws"
+                                        prop:value=move || ctrl_url_input.get()
+                                        on:input=move |ev| {
+                                            set_ctrl_url_input.set(event_target_value(&ev));
+                                        }
+                                    />
+                                </fieldset>
+                                <button
+                                    class="btn btn-primary"
+                                    on:click=do_enroll
+                                    disabled=move || enroll_loading.get()
+                                >
+                                    {move || if enroll_loading.get() { "Enrolling…" } else { "Enroll Device" }}
+                                </button>
+                            }.into_any()
+                        }
+                    }}
                 </div>
-
-                {move || enroll_msg.get().map(|(msg, kind)| {
-                    let cls = match kind { "ok" => "msg msg-ok", "err" => "msg msg-err", _ => "msg msg-info" };
-                    view! { <div class={cls}>{msg}</div> }
-                })}
-
-                {move || {
-                    let s = status.get();
-                    let enrolled = s.as_ref().map(|s| s.enrolled).unwrap_or(false);
-
-                    if enrolled {
-                        let sid = s.and_then(|s| s.sender_id).unwrap_or_else(|| "—".into());
-                        view! {
-                            <div class="msg msg-ok">"This device is enrolled and connected to the cloud."</div>
-                            <p style="font-family: var(--font-mono); font-size: 13px; color: var(--text-secondary); margin-bottom: 12px;">
-                                "Sender ID: " {sid}
-                            </p>
-                            {move || if show_unenroll.get() {
-                                view! {
-                                    <div style="display: flex; gap: 8px; align-items: center;">
-                                        <button
-                                            class="btn btn-danger"
-                                            on:click=do_unenroll
-                                            disabled=move || enroll_loading.get()
-                                        >
-                                            "Confirm Unenroll"
-                                        </button>
-                                        <button
-                                            class="btn btn-secondary"
-                                            on:click=move |_| set_show_unenroll.set(false)
-                                        >
-                                            "Cancel"
-                                        </button>
-                                        <span style="font-size: 13px; color: var(--text-secondary);">
-                                            "This will disconnect from the cloud. You'll need a new token to re-enroll."
-                                        </span>
-                                    </div>
-                                }.into_any()
-                            } else {
-                                view! {
-                                    <button
-                                        class="btn btn-danger btn-sm"
-                                        on:click=move |_| set_show_unenroll.set(true)
-                                    >
-                                        "Unenroll Device"
-                                    </button>
-                                }.into_any()
-                            }}
-                        }.into_any()
-                    } else {
-                        view! {
-                            <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 14px;">
-                                "Enter the enrollment token from your Strata dashboard to link this sender to your account. "
-                                "Tokens are 8 characters in "
-                                <span style="font-family: var(--font-mono);">"XXXX-XXXX"</span>
-                                " format."
-                            </p>
-                            <div class="form-group">
-                                <label>"Enrollment Token"</label>
-                                <input
-                                    class="form-input token-input"
-                                    type="text"
-                                    placeholder="XXXX-XXXX"
-                                    maxlength="9"
-                                    prop:value=move || token_input.get()
-                                    on:input=move |ev| {
-                                        let raw = event_target_value(&ev);
-                                        let formatted = format_token(&raw);
-                                        set_token_input.set(formatted);
-                                    }
-                                />
-                            </div>
-                            <div class="form-group">
-                                <label>"Control Plane URL " <span style="color: var(--text-muted);">"(optional)"</span></label>
-                                <input
-                                    class="form-input"
-                                    type="text"
-                                    placeholder="wss://platform.example.com/agent/ws"
-                                    prop:value=move || ctrl_url_input.get()
-                                    on:input=move |ev| {
-                                        set_ctrl_url_input.set(event_target_value(&ev));
-                                    }
-                                />
-                            </div>
-                            <button
-                                class="btn btn-primary"
-                                on:click=do_enroll
-                                disabled=move || enroll_loading.get()
-                            >
-                                {move || if enroll_loading.get() { "Enrolling…" } else { "Enroll Device" }}
-                            </button>
-                        }.into_any()
-                    }
-                }}
             </div>
 
             // ── Connectivity Test ───────────────────────────────
-            <div class="card">
-                <div class="card-header">
-                    <h2>"🔍 Connectivity Test"</h2>
+            <div class="card bg-base-200 border border-base-300">
+                <div class="card-body">
+                    <h2 class="card-title text-base">"🔍 Connectivity Test"</h2>
+                    <button
+                        class="btn btn-ghost btn-sm w-fit"
+                        on:click=run_test
+                        disabled=move || test_loading.get()
+                    >
+                        {move || if test_loading.get() { "Testing…" } else { "Run Test" }}
+                    </button>
+                    {move || test_result.get().map(|r| view! {
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mt-3">
+                            <div class="bg-base-300 rounded p-3">
+                                <div class="text-xs text-base-content/40 uppercase tracking-wide">"Cloud"</div>
+                                <div class={if r.cloud_reachable { "font-semibold font-mono text-success" } else { "font-semibold font-mono text-error" }}>
+                                    {if r.cloud_reachable { "✓ Reachable" } else { "✗ Unreachable" }}
+                                </div>
+                            </div>
+                            <div class="bg-base-300 rounded p-3">
+                                <div class="text-xs text-base-content/40 uppercase tracking-wide">"WebSocket"</div>
+                                <div class={if r.cloud_connected { "font-semibold font-mono text-success" } else { "font-semibold font-mono text-error" }}>
+                                    {if r.cloud_connected { "✓ Connected" } else { "✗ Disconnected" }}
+                                </div>
+                            </div>
+                            <div class="bg-base-300 rounded p-3">
+                                <div class="text-xs text-base-content/40 uppercase tracking-wide">"Receiver"</div>
+                                <div class={
+                                    if r.receiver_url.is_some() {
+                                        if r.receiver_reachable { "font-semibold font-mono text-success" } else { "font-semibold font-mono text-error" }
+                                    } else {
+                                        "font-semibold font-mono text-base-content/40"
+                                    }
+                                }>
+                                    {if r.receiver_url.is_some() {
+                                        if r.receiver_reachable { "✓ Reachable" } else { "✗ Unreachable" }
+                                    } else {
+                                        "— Not set"
+                                    }}
+                                </div>
+                            </div>
+                            <div class="bg-base-300 rounded p-3">
+                                <div class="text-xs text-base-content/40 uppercase tracking-wide">"Enrolled"</div>
+                                <div class={if r.enrolled { "font-semibold font-mono text-success" } else { "font-semibold font-mono text-base-content/40" }}>
+                                    {if r.enrolled { "✓ Yes" } else { "⚠ No" }}
+                                </div>
+                            </div>
+                        </div>
+                        {r.control_url.as_ref().map(|url| view! {
+                            <p class="text-xs text-base-content/40 mt-2 font-mono">"Control: " {url.clone()}</p>
+                        })}
+                        {r.receiver_url.as_ref().map(|url| view! {
+                            <p class="text-xs text-base-content/40 mt-1 font-mono">"Receiver: " {url.clone()}</p>
+                        })}
+                    })}
                 </div>
-                <button
-                    class="btn btn-ghost"
-                    on:click=run_test
-                    disabled=move || test_loading.get()
-                >
-                    {move || if test_loading.get() { "Testing…" } else { "Run Test" }}
-                </button>
-                {move || test_result.get().map(|r| view! {
-                    <div class="test-grid" style="margin-top: 12px;">
-                        <div class="test-item">
-                            <div class="test-label">"Cloud"</div>
-                            <div class={if r.cloud_reachable { "test-value test-pass" } else { "test-value test-fail" }}>
-                                {if r.cloud_reachable { "✓ Reachable" } else { "✗ Unreachable" }}
-                            </div>
-                        </div>
-                        <div class="test-item">
-                            <div class="test-label">"WebSocket"</div>
-                            <div class={if r.cloud_connected { "test-value test-pass" } else { "test-value test-fail" }}>
-                                {if r.cloud_connected { "✓ Connected" } else { "✗ Disconnected" }}
-                            </div>
-                        </div>
-                        <div class="test-item">
-                            <div class="test-label">"Receiver"</div>
-                            <div class={
-                                if r.receiver_url.is_some() {
-                                    if r.receiver_reachable { "test-value test-pass" } else { "test-value test-fail" }
-                                } else {
-                                    "test-value test-na"
-                                }
-                            }>
-                                {if r.receiver_url.is_some() {
-                                    if r.receiver_reachable { "✓ Reachable" } else { "✗ Unreachable" }
-                                } else {
-                                    "— Not set"
-                                }}
-                            </div>
-                        </div>
-                        <div class="test-item">
-                            <div class="test-label">"Enrolled"</div>
-                            <div class={if r.enrolled { "test-value test-pass" } else { "test-value test-na" }}>
-                                {if r.enrolled { "✓ Yes" } else { "⚠ No" }}
-                            </div>
-                        </div>
-                    </div>
-                    {r.control_url.as_ref().map(|url| view! {
-                        <p style="font-size: 12px; color: var(--text-muted); margin-top: 8px; font-family: var(--font-mono);">
-                            "Control: " {url.clone()}
-                        </p>
-                    })}
-                    {r.receiver_url.as_ref().map(|url| view! {
-                        <p style="font-size: 12px; color: var(--text-muted); margin-top: 4px; font-family: var(--font-mono);">
-                            "Receiver: " {url.clone()}
-                        </p>
-                    })}
-                })}
             </div>
         </div>
     }
@@ -506,107 +516,115 @@ fn InterfacesCard(
     };
 
     view! {
-        <div class="card">
-            <div class="card-header">
-                <h2>"📡 Network Interfaces"</h2>
-                <button class="btn btn-ghost btn-sm" on:click=do_scan>"Scan for New"</button>
-            </div>
+        <div class="card bg-base-200 border border-base-300">
+            <div class="card-body">
+                <div class="flex justify-between items-center">
+                    <h2 class="card-title text-base">"📡 Network Interfaces"</h2>
+                    <button class="btn btn-ghost btn-sm" on:click=do_scan>"Scan for New"</button>
+                </div>
 
-            {move || scan_msg.get().map(|(msg, kind)| {
-                let cls = match kind { "ok" => "msg msg-ok", "err" => "msg msg-err", _ => "msg msg-info" };
-                view! { <div class={cls}>{msg}</div> }
-            })}
+                {move || scan_msg.get().map(|(msg, kind)| {
+                    let cls = match kind {
+                        "ok" => "alert alert-success text-sm mt-2",
+                        "err" => "alert alert-error text-sm mt-2",
+                        _ => "alert alert-info text-sm mt-2",
+                    };
+                    view! { <div class={cls}>{msg}</div> }
+                })}
 
-            {move || {
-                let ifaces = interfaces.get();
-                if ifaces.is_empty() {
-                    view! {
-                        <p style="color: var(--text-secondary);">"Scanning…"</p>
-                    }.into_any()
-                } else {
-                    view! {
-                        <div>
-                            {ifaces.into_iter().map(|iface| {
-                                let name = iface.name.clone();
-                                let name_toggle = iface.name.clone();
-                                let enabled = iface.enabled;
-                                let connected = iface.state == "connected";
-                                let (dot, badge_cls, label) = if !enabled {
-                                    ("dot dot-red", "badge badge-offline", "Disabled")
-                                } else if connected {
-                                    ("dot dot-green", "badge badge-online", "Up")
-                                } else {
-                                    ("dot dot-gray", "badge badge-offline", "Down")
-                                };
-                                let type_icon = match iface.iface_type.as_str() {
-                                    "cellular" => "📶",
-                                    "wifi" => "📡",
-                                    _ => "🔌",
-                                };
-                                let mut meta_parts = vec![];
-                                meta_parts.push(format!("{type_icon} {}", iface.iface_type));
-                                if let Some(t) = &iface.technology { meta_parts.push(t.clone()); }
-                                if let Some(c) = &iface.carrier { meta_parts.push(c.clone()); }
-                                if let Some(db) = iface.signal_dbm { meta_parts.push(format!("{db} dBm")); }
-                                if let Some(ip) = &iface.ip { meta_parts.push(ip.clone()); }
+                {move || {
+                    let ifaces = interfaces.get();
+                    if ifaces.is_empty() {
+                        view! {
+                            <p class="text-base-content/60">"Scanning…"</p>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <div class="flex flex-col gap-2 mt-2">
+                                {ifaces.into_iter().map(|iface| {
+                                    let name = iface.name.clone();
+                                    let name_toggle = iface.name.clone();
+                                    let enabled = iface.enabled;
+                                    let connected = iface.state == "connected";
 
-                                let toggle = move |_| {
-                                    let n = name_toggle.clone();
-                                    set_iface_loading.set(Some(n.clone()));
-                                    leptos::task::spawn_local(async move {
-                                        let result = if enabled {
-                                            api::disable_interface(&n).await
+                                    let (badge_cls, label) = if !enabled {
+                                        ("badge badge-error badge-sm gap-1", "Disabled")
+                                    } else if connected {
+                                        ("badge badge-success badge-sm gap-1", "Up")
+                                    } else {
+                                        ("badge badge-ghost badge-sm gap-1", "Down")
+                                    };
+
+                                    let type_icon = match iface.iface_type.as_str() {
+                                        "cellular" => "📶",
+                                        "wifi" => "📡",
+                                        _ => "🔌",
+                                    };
+
+                                    let mut meta_parts = vec![];
+                                    meta_parts.push(format!("{type_icon} {}", iface.iface_type));
+                                    if let Some(t) = &iface.technology { meta_parts.push(t.clone()); }
+                                    if let Some(c) = &iface.carrier { meta_parts.push(c.clone()); }
+                                    if let Some(db) = iface.signal_dbm { meta_parts.push(format!("{db} dBm")); }
+                                    if let Some(ip) = &iface.ip { meta_parts.push(ip.clone()); }
+
+                                    let toggle = move |_| {
+                                        let n = name_toggle.clone();
+                                        set_iface_loading.set(Some(n.clone()));
+                                        leptos::task::spawn_local(async move {
+                                            let result = if enabled {
+                                                api::disable_interface(&n).await
+                                            } else {
+                                                api::enable_interface(&n).await
+                                            };
+                                            if let Err(e) = result {
+                                                set_error.set(Some(format!("Interface error: {e}")));
+                                            }
+                                            set_iface_loading.set(None);
+                                        });
+                                    };
+
+                                    let is_loading = {
+                                        let n = iface.name.clone();
+                                        move || iface_loading.get().as_deref() == Some(&n)
+                                    };
+                                    let is_loading2 = {
+                                        let n = iface.name.clone();
+                                        move || iface_loading.get().as_deref() == Some(&n)
+                                    };
+
+                                    view! {
+                                        <div class={if enabled {
+                                            "flex items-center justify-between p-3 bg-base-300 rounded border border-base-300"
                                         } else {
-                                            api::enable_interface(&n).await
-                                        };
-                                        if let Err(e) = result {
-                                            set_error.set(Some(format!("Interface error: {e}")));
-                                        }
-                                        set_iface_loading.set(None);
-                                    });
-                                };
-
-                                let is_loading_class = {
-                                    let n = iface.name.clone();
-                                    move || iface_loading.get().as_deref() == Some(&n)
-                                };
-                                let is_loading_disabled = {
-                                    let n = iface.name.clone();
-                                    move || iface_loading.get().as_deref() == Some(&n)
-                                };
-
-                                view! {
-                                    <div class={if enabled { "iface-item" } else { "iface-item disabled" }}>
-                                        <div class="iface-left">
-                                            <label class={move || if is_loading_class() { "toggle loading" } else { "toggle" }}>
+                                            "flex items-center justify-between p-3 bg-base-300 rounded border border-base-300 opacity-50"
+                                        }}>
+                                            <div class="flex items-center gap-3">
                                                 <input
                                                     type="checkbox"
+                                                    class={move || if is_loading() { "toggle toggle-success toggle-sm animate-pulse" } else { "toggle toggle-success toggle-sm" }}
                                                     checked=enabled
                                                     on:change=toggle
-                                                    disabled=is_loading_disabled
+                                                    disabled=is_loading2
                                                 />
-                                                <span class="slider"></span>
-                                            </label>
-                                            <span class="iface-name">{name}</span>
-                                        </div>
-                                        <div class="iface-right">
-                                            <div class="iface-meta">
-                                                {meta_parts.into_iter().map(|p| view! {
-                                                    <span>{p}</span>
-                                                }).collect::<Vec<_>>()}
+                                                <div>
+                                                    <span class="font-semibold font-mono text-sm">{name}</span>
+                                                    <div class="flex gap-2 text-xs text-base-content/60">
+                                                        {meta_parts.into_iter().map(|p| view! {
+                                                            <span>{p}</span>
+                                                        }).collect::<Vec<_>>()}
+                                                    </div>
+                                                </div>
                                             </div>
-                                            <span class={badge_cls}>
-                                                <span class={dot}></span>
-                                                {label}
-                                            </span>
+                                            <span class={badge_cls}>{label}</span>
                                         </div>
-                                    </div>
-                                }
-                            }).collect::<Vec<_>>()}
-                        </div>
-                    }.into_any()
-                }
-            }}
+                                    }
+                                }).collect::<Vec<_>>()}
+                            </div>
+                        }.into_any()
+                    }
+                }}
+            </div>
         </div>
     }
 }
@@ -616,37 +634,43 @@ fn InterfacesCard(
 #[component]
 fn MediaInputsCard(inputs: Signal<Vec<MediaInput>>) -> impl IntoView {
     view! {
-        <div class="card">
-            <div class="card-header">
-                <h2>"🎥 Media Inputs"</h2>
-            </div>
-            {move || {
-                let inputs = inputs.get();
-                if inputs.is_empty() {
-                    view! {
-                        <p style="color: var(--text-secondary);">"No inputs detected"</p>
-                    }.into_any()
-                } else {
-                    view! {
-                        <div>
-                            {inputs.into_iter().map(|input| {
-                                let caps = input.capabilities.join(", ");
-                                view! {
-                                    <div class="input-item">
-                                        <div class="input-label">{input.label}</div>
-                                        <div class="input-dev">
-                                            {input.device} " · " {input.input_type}
+        <div class="card bg-base-200 border border-base-300">
+            <div class="card-body">
+                <h2 class="card-title text-base">"🎥 Media Inputs"</h2>
+                {move || {
+                    let inputs = inputs.get();
+                    if inputs.is_empty() {
+                        view! {
+                            <p class="text-sm text-base-content/40">"No inputs detected"</p>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <div class="flex flex-col gap-2">
+                                {inputs.into_iter().map(|input| {
+                                    let caps = input.capabilities.join(", ");
+                                    let status_badge = match input.status.as_str() {
+                                        "available" => "badge badge-success badge-sm gap-1",
+                                        "in_use" => "badge badge-error badge-sm gap-1",
+                                        _ => "badge badge-ghost badge-sm gap-1",
+                                    };
+                                    view! {
+                                        <div class="flex items-center justify-between p-3 bg-base-300 rounded border border-base-300">
+                                            <div>
+                                                <div class="font-medium text-sm">{input.label}</div>
+                                                <div class="text-xs text-base-content/60 font-mono mt-0.5">
+                                                    {input.device} " · " {input.input_type}
+                                                    {(!caps.is_empty()).then(|| view! { <span>" · " {caps}</span> })}
+                                                </div>
+                                            </div>
+                                            <span class={status_badge}>{input.status.clone()}</span>
                                         </div>
-                                        {(!caps.is_empty()).then(|| view! {
-                                            <div class="input-caps">{caps}</div>
-                                        })}
-                                    </div>
-                                }
-                            }).collect::<Vec<_>>()}
-                        </div>
-                    }.into_any()
-                }
-            }}
+                                    }
+                                }).collect::<Vec<_>>()}
+                            </div>
+                        }.into_any()
+                    }
+                }}
+            </div>
         </div>
     }
 }

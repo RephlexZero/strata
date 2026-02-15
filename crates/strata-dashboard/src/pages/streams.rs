@@ -36,32 +36,32 @@ pub fn StreamsPage() -> impl IntoView {
 
     view! {
         <div>
-            <div class="page-header">
+            <div class="flex justify-between items-center mb-6">
                 <div>
-                    <h2>"Streams"</h2>
-                    <p class="subtitle">"Active and recent broadcasts"</p>
+                    <h2 class="text-2xl font-semibold">"Streams"</h2>
+                    <p class="text-sm text-base-content/60 mt-1">"Active and recent broadcasts"</p>
                 </div>
             </div>
 
             {move || error.get().map(|e| view! {
-                <div class="error-msg">{e}</div>
+                <div class="alert alert-error text-sm mb-4">{e}</div>
             })}
 
             {move || {
                 if loading.get() {
-                    view! { <p style="color: var(--text-secondary);">"Loading…"</p> }.into_any()
+                    view! { <p class="text-base-content/60">"Loading…"</p> }.into_any()
                 } else if streams.get().is_empty() {
                     view! {
-                        <div class="empty-state">
-                            <div class="empty-icon">"📺"</div>
-                            <h3>"No streams yet"</h3>
-                            <p>"Start a stream from a sender's detail page to see it here."</p>
+                        <div class="flex flex-col items-center justify-center py-16 text-center">
+                            <div class="text-5xl mb-4">"📺"</div>
+                            <h3 class="text-lg font-medium mb-2">"No streams yet"</h3>
+                            <p class="text-sm text-base-content/60">"Start a stream from a sender's detail page to see it here."</p>
                         </div>
                     }.into_any()
                 } else {
                     view! {
-                        <div class="table-wrap">
-                            <table class="data-table">
+                        <div class="overflow-x-auto">
+                            <table class="table table-sm">
                                 <thead>
                                     <tr>
                                         <th>"Stream ID"</th>
@@ -75,33 +75,27 @@ pub fn StreamsPage() -> impl IntoView {
                                         each=move || streams.get()
                                         key=|s| s.id.clone()
                                         children=move |stream| {
-                                            let state_class = match stream.state.as_str() {
-                                                "live" => "badge badge-live",
-                                                "starting" | "stopping" => "badge badge-starting",
-                                                "ended" => "badge badge-idle",
-                                                "failed" => "badge badge-live",
-                                                _ => "badge badge-idle",
-                                            };
-                                            let dot_class = match stream.state.as_str() {
-                                                "live" => "dot dot-red",
-                                                "starting" | "stopping" => "dot dot-yellow",
-                                                _ => "dot dot-gray",
+                                            let (badge_cls, dot_cls) = match stream.state.as_str() {
+                                                "live" => ("badge badge-error gap-1", "w-2 h-2 rounded-full bg-error animate-pulse-dot"),
+                                                "starting" | "stopping" => ("badge badge-warning gap-1", "w-2 h-2 rounded-full bg-warning"),
+                                                "failed" => ("badge badge-error gap-1", "w-2 h-2 rounded-full bg-error"),
+                                                _ => ("badge badge-ghost gap-1", "w-2 h-2 rounded-full bg-base-content/30"),
                                             };
                                             view! {
                                                 <tr>
-                                                    <td style="font-family: var(--font-mono); font-size: 12px;">{stream.id.clone()}</td>
+                                                    <td class="font-mono text-xs">{stream.id.clone()}</td>
                                                     <td>
-                                                        <a href=format!("/senders/{}", stream.sender_id)>
+                                                        <a class="link link-primary" href=format!("/senders/{}", stream.sender_id)>
                                                             {stream.sender_id.clone()}
                                                         </a>
                                                     </td>
                                                     <td>
-                                                        <span class=state_class>
-                                                            <span class=dot_class></span>
+                                                        <span class=badge_cls>
+                                                            <span class=dot_cls></span>
                                                             {stream.state.clone().to_uppercase()}
                                                         </span>
                                                     </td>
-                                                    <td style="font-size: 12px;">{stream.started_at.clone().unwrap_or_else(|| "—".into())}</td>
+                                                    <td class="text-xs">{stream.started_at.clone().unwrap_or_else(|| "—".into())}</td>
                                                 </tr>
                                             }
                                         }

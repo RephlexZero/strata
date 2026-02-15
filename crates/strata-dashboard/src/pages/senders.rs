@@ -54,7 +54,6 @@ pub fn SendersPage() -> impl IntoView {
                         resp.sender_id.clone(),
                         resp.enrollment_token.clone(),
                     )));
-                    // Reload senders
                     if let Ok(data) = api::list_senders(&token).await {
                         set_senders.set(data);
                     }
@@ -68,10 +67,10 @@ pub fn SendersPage() -> impl IntoView {
 
     view! {
         <div>
-            <div class="page-header">
+            <div class="flex justify-between items-center mb-6">
                 <div>
-                    <h2>"Senders"</h2>
-                    <p class="subtitle">"Manage your field encoder units"</p>
+                    <h2 class="text-2xl font-semibold">"Senders"</h2>
+                    <p class="text-sm text-base-content/60 mt-1">"Manage your field encoder units"</p>
                 </div>
                 <button class="btn btn-primary" on:click=move |_| set_show_create.set(true)>
                     "+ Add Sender"
@@ -79,43 +78,45 @@ pub fn SendersPage() -> impl IntoView {
             </div>
 
             {move || error.get().map(|e| view! {
-                <div class="error-msg">{e}</div>
+                <div class="alert alert-error text-sm mb-4">{e}</div>
             })}
 
             {move || enrollment_info.get().map(|(sid, token)| view! {
-                <div class="card" style="border-color: var(--green); margin-bottom: 16px;">
-                    <div class="card-header">
-                        <h3>"Sender Created"</h3>
-                        <button class="btn btn-ghost btn-sm" on:click=move |_| set_enrollment_info.set(None)>
-                            "Dismiss"
-                        </button>
-                    </div>
-                    <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 8px;">
-                        "Save this enrollment token — it will not be shown again."
-                    </p>
-                    <div style="font-family: var(--font-mono); font-size: 13px; background: var(--bg-tertiary); padding: 8px 12px; border-radius: 4px; word-break: break-all;">
-                        <div>"Sender ID: " {sid}</div>
-                        <div>"Token: " {token}</div>
+                <div class="card bg-base-200 border border-success mb-4">
+                    <div class="card-body">
+                        <div class="flex justify-between items-center mb-3">
+                            <h3 class="font-semibold">"Sender Created"</h3>
+                            <button class="btn btn-ghost btn-sm" on:click=move |_| set_enrollment_info.set(None)>
+                                "Dismiss"
+                            </button>
+                        </div>
+                        <p class="text-sm text-base-content/60 mb-2">
+                            "Save this enrollment token — it will not be shown again."
+                        </p>
+                        <div class="font-mono text-sm bg-base-300 p-2 rounded break-all">
+                            <div>"Sender ID: " {sid}</div>
+                            <div>"Token: " {token}</div>
+                        </div>
                     </div>
                 </div>
             })}
 
             // Create modal
             {move || show_create.get().then(|| view! {
-                <div class="modal-backdrop" on:click=move |_| set_show_create.set(false)>
-                    <div class="modal" on:click=move |ev| ev.stop_propagation()>
-                        <h3>"Add Sender"</h3>
-                        <div class="form-group">
-                            <label>"Name (optional)"</label>
+                <div class="modal modal-open">
+                    <div class="modal-box">
+                        <h3 class="font-bold text-lg">"Add Sender"</h3>
+                        <fieldset class="fieldset mt-4">
+                            <label class="fieldset-label">"Name (optional)"</label>
                             <input
-                                class="form-input"
+                                class="input input-bordered w-full"
                                 type="text"
                                 placeholder="e.g. Camera 1"
                                 prop:value=move || new_name.get()
                                 on:input=move |ev| set_new_name.set(event_target_value(&ev))
                             />
-                        </div>
-                        <div class="modal-actions">
+                        </fieldset>
+                        <div class="modal-action">
                             <button class="btn btn-ghost" on:click=move |_| set_show_create.set(false)>
                                 "Cancel"
                             </button>
@@ -124,23 +125,26 @@ pub fn SendersPage() -> impl IntoView {
                             </button>
                         </div>
                     </div>
+                    <div class="modal-backdrop" on:click=move |_| set_show_create.set(false)>
+                        <button>"close"</button>
+                    </div>
                 </div>
             })}
 
             {move || {
                 if loading.get() {
-                    view! { <p style="color: var(--text-secondary);">"Loading…"</p> }.into_any()
+                    view! { <p class="text-base-content/60">"Loading…"</p> }.into_any()
                 } else if senders.get().is_empty() {
                     view! {
-                        <div class="empty-state">
-                            <div class="empty-icon">"📡"</div>
-                            <h3>"No senders yet"</h3>
-                            <p>"Add a sender to get started. Each sender represents a field encoder unit."</p>
+                        <div class="text-center py-16 text-base-content/60">
+                            <div class="text-5xl mb-4">"📡"</div>
+                            <h3 class="text-lg font-semibold text-base-content mb-2">"No senders yet"</h3>
+                            <p class="text-sm max-w-sm mx-auto mb-5">"Add a sender to get started. Each sender represents a field encoder unit."</p>
                         </div>
                     }.into_any()
                 } else {
                     view! {
-                        <div class="card-grid">
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                             <For
                                 each=move || senders.get()
                                 key=|s| s.id.clone()
@@ -148,24 +152,26 @@ pub fn SendersPage() -> impl IntoView {
                                     let id = sender.id.clone();
                                     let href = format!("/senders/{}", id);
                                     view! {
-                                        <a href=href style="text-decoration: none; color: inherit;">
-                                            <div class="card card-hover sender-card">
-                                                <div class="sender-header">
-                                                    <div>
-                                                        <div class="sender-name">
-                                                            {sender.name.clone().unwrap_or_else(|| sender.id.clone())}
+                                        <a href=href class="no-underline text-base-content">
+                                            <div class="card bg-base-200 border border-base-300 hover:bg-base-300 cursor-pointer transition-colors">
+                                                <div class="card-body gap-3">
+                                                    <div class="flex justify-between items-start">
+                                                        <div>
+                                                            <div class="font-semibold">
+                                                                {sender.name.clone().unwrap_or_else(|| sender.id.clone())}
+                                                            </div>
+                                                            <div class="text-sm text-base-content/60 font-mono">
+                                                                {sender.hostname.clone().unwrap_or_else(|| "—".into())}
+                                                            </div>
                                                         </div>
-                                                        <div class="sender-hostname">
-                                                            {sender.hostname.clone().unwrap_or_else(|| "—".into())}
+                                                        <div class={if sender.online { "badge badge-success gap-1" } else { "badge badge-ghost gap-1" }}>
+                                                            <span class={if sender.online { "w-2 h-2 rounded-full bg-success" } else { "w-2 h-2 rounded-full bg-base-content/30" }}></span>
+                                                            {if sender.online { "Online" } else { "Offline" }}
                                                         </div>
                                                     </div>
-                                                    <div class={if sender.online { "badge badge-online" } else { "badge badge-offline" }}>
-                                                        <span class={if sender.online { "dot dot-green" } else { "dot dot-gray" }}></span>
-                                                        {if sender.online { "Online" } else { "Offline" }}
+                                                    <div class="text-sm text-base-content/60">
+                                                        <span>"ID: " {sender.id.clone()}</span>
                                                     </div>
-                                                </div>
-                                                <div class="sender-meta">
-                                                    <span>"ID: " {sender.id.clone()}</span>
                                                 </div>
                                             </div>
                                         </a>

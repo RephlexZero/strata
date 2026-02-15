@@ -40,46 +40,48 @@ pub fn LoginPage() -> impl IntoView {
     };
 
     view! {
-        <div class="login-page">
-            <div class="login-card">
-                <h1>"Strata"</h1>
-                <p class="login-subtitle">"Bonded streaming control plane"</p>
+        <div class="flex items-center justify-center min-h-screen bg-base-100">
+            <div class="card bg-base-200 border border-base-300 w-full max-w-sm">
+                <div class="card-body">
+                    <h1 class="text-2xl font-bold text-center">"Strata"</h1>
+                    <p class="text-center text-sm text-base-content/60 mb-6">"Bonded streaming control plane"</p>
 
-                {move || error.get().map(|e| view! {
-                    <div class="error-msg">{e}</div>
-                })}
+                    {move || error.get().map(|e| view! {
+                        <div class="alert alert-error text-sm mb-4">{e}</div>
+                    })}
 
-                <form on:submit=on_submit>
-                    <div class="form-group">
-                        <label for="email">"Email"</label>
-                        <input
-                            id="email"
-                            class="form-input"
-                            type="email"
-                            placeholder="admin@strata.local"
-                            prop:value=move || email.get()
-                            on:input=move |ev| set_email.set(event_target_value(&ev))
-                        />
-                    </div>
-                    <div class="form-group">
-                        <label for="password">"Password"</label>
-                        <input
-                            id="password"
-                            class="form-input"
-                            type="password"
-                            placeholder="••••••••"
-                            prop:value=move || password.get()
-                            on:input=move |ev| set_password.set(event_target_value(&ev))
-                        />
-                    </div>
-                    <button
-                        class="btn btn-primary"
-                        type="submit"
-                        disabled=move || loading.get()
-                    >
-                        {move || if loading.get() { "Signing in…" } else { "Sign in" }}
-                    </button>
-                </form>
+                    <form on:submit=on_submit>
+                        <fieldset class="fieldset">
+                            <label class="fieldset-label" for="email">"Email"</label>
+                            <input
+                                id="email"
+                                class="input input-bordered w-full"
+                                type="email"
+                                placeholder="admin@strata.local"
+                                prop:value=move || email.get()
+                                on:input=move |ev| set_email.set(event_target_value(&ev))
+                            />
+                        </fieldset>
+                        <fieldset class="fieldset">
+                            <label class="fieldset-label" for="password">"Password"</label>
+                            <input
+                                id="password"
+                                class="input input-bordered w-full"
+                                type="password"
+                                placeholder="••••••••"
+                                prop:value=move || password.get()
+                                on:input=move |ev| set_password.set(event_target_value(&ev))
+                            />
+                        </fieldset>
+                        <button
+                            class="btn btn-primary w-full mt-4"
+                            type="submit"
+                            disabled=move || loading.get()
+                        >
+                            {move || if loading.get() { "Signing in…" } else { "Sign in" }}
+                        </button>
+                    </form>
+                </div>
             </div>
         </div>
     }

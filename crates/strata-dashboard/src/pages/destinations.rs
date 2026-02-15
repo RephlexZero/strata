@@ -90,10 +90,10 @@ pub fn DestinationsPage() -> impl IntoView {
 
     view! {
         <div>
-            <div class="page-header">
+            <div class="flex justify-between items-center mb-6">
                 <div>
-                    <h2>"Destinations"</h2>
-                    <p class="subtitle">"Streaming endpoints for your broadcasts"</p>
+                    <h2 class="text-2xl font-semibold">"Destinations"</h2>
+                    <p class="text-sm text-base-content/60 mt-1">"Streaming endpoints for your broadcasts"</p>
                 </div>
                 <button class="btn btn-primary" on:click=move |_| set_show_create.set(true)>
                     "+ Add Destination"
@@ -101,18 +101,18 @@ pub fn DestinationsPage() -> impl IntoView {
             </div>
 
             {move || error.get().map(|e| view! {
-                <div class="error-msg">{e}</div>
+                <div class="alert alert-error text-sm mb-4">{e}</div>
             })}
 
             // Create modal
             {move || show_create.get().then(|| view! {
-                <div class="modal-backdrop" on:click=move |_| set_show_create.set(false)>
-                    <div class="modal" on:click=move |ev| ev.stop_propagation()>
-                        <h3>"Add Destination"</h3>
-                        <div class="form-group">
-                            <label>"Platform"</label>
+                <div class="modal modal-open">
+                    <div class="modal-box">
+                        <h3 class="text-lg font-semibold mb-4">"Add Destination"</h3>
+                        <fieldset class="fieldset mb-3">
+                            <label class="fieldset-label">"Platform"</label>
                             <select
-                                class="form-input"
+                                class="select select-bordered w-full"
                                 on:change=move |ev| set_new_platform.set(event_target_value(&ev))
                             >
                                 <option value="youtube">"YouTube"</option>
@@ -120,38 +120,38 @@ pub fn DestinationsPage() -> impl IntoView {
                                 <option value="custom_rtmp">"Custom RTMP"</option>
                                 <option value="srt">"SRT"</option>
                             </select>
-                        </div>
-                        <div class="form-group">
-                            <label>"Name"</label>
+                        </fieldset>
+                        <fieldset class="fieldset mb-3">
+                            <label class="fieldset-label">"Name"</label>
                             <input
-                                class="form-input"
+                                class="input input-bordered w-full"
                                 type="text"
                                 placeholder="e.g. My YouTube Channel"
                                 prop:value=move || new_name.get()
                                 on:input=move |ev| set_new_name.set(event_target_value(&ev))
                             />
-                        </div>
-                        <div class="form-group">
-                            <label>"URL"</label>
+                        </fieldset>
+                        <fieldset class="fieldset mb-3">
+                            <label class="fieldset-label">"URL"</label>
                             <input
-                                class="form-input"
+                                class="input input-bordered w-full"
                                 type="text"
                                 placeholder="rtmp://a.rtmp.youtube.com/live2"
                                 prop:value=move || new_url.get()
                                 on:input=move |ev| set_new_url.set(event_target_value(&ev))
                             />
-                        </div>
-                        <div class="form-group">
-                            <label>"Stream Key (optional)"</label>
+                        </fieldset>
+                        <fieldset class="fieldset mb-3">
+                            <label class="fieldset-label">"Stream Key (optional)"</label>
                             <input
-                                class="form-input"
+                                class="input input-bordered w-full"
                                 type="password"
                                 placeholder="xxxx-xxxx-xxxx-xxxx"
                                 prop:value=move || new_key.get()
                                 on:input=move |ev| set_new_key.set(event_target_value(&ev))
                             />
-                        </div>
-                        <div class="modal-actions">
+                        </fieldset>
+                        <div class="modal-action">
                             <button class="btn btn-ghost" on:click=move |_| set_show_create.set(false)>
                                 "Cancel"
                             </button>
@@ -160,23 +160,24 @@ pub fn DestinationsPage() -> impl IntoView {
                             </button>
                         </div>
                     </div>
+                    <div class="modal-backdrop" on:click=move |_| set_show_create.set(false)></div>
                 </div>
             })}
 
             {move || {
                 if loading.get() {
-                    view! { <p style="color: var(--text-secondary);">"Loading…"</p> }.into_any()
+                    view! { <p class="text-base-content/60">"Loading…"</p> }.into_any()
                 } else if destinations.get().is_empty() {
                     view! {
-                        <div class="empty-state">
-                            <div class="empty-icon">"🎯"</div>
-                            <h3>"No destinations"</h3>
-                            <p>"Add a streaming destination like YouTube or Twitch to broadcast to."</p>
+                        <div class="flex flex-col items-center justify-center py-16 text-center">
+                            <div class="text-5xl mb-4">"🎯"</div>
+                            <h3 class="text-lg font-medium mb-2">"No destinations"</h3>
+                            <p class="text-sm text-base-content/60">"Add a streaming destination like YouTube or Twitch to broadcast to."</p>
                         </div>
                     }.into_any()
                 } else {
                     view! {
-                        <div class="card-grid">
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                             <For
                                 each=move || destinations.get()
                                 key=|d| d.id.clone()
@@ -184,24 +185,26 @@ pub fn DestinationsPage() -> impl IntoView {
                                     let id = dest.id.clone();
                                     let on_del = on_delete;
                                     view! {
-                                        <div class="card">
-                                            <div class="card-header">
-                                                <h3>{dest.name.clone()}</h3>
-                                                <button
-                                                    class="btn btn-ghost btn-sm"
-                                                    on:click=move |_| on_del(id.clone())
-                                                >
-                                                    "Delete"
-                                                </button>
-                                            </div>
-                                            <div style="display: flex; flex-direction: column; gap: 6px; font-size: 13px;">
-                                                <div>
-                                                    <span style="color: var(--text-secondary);">"Platform: "</span>
-                                                    <span style="text-transform: capitalize;">{platform_label(&dest.platform).to_string()}</span>
+                                        <div class="card bg-base-200 border border-base-300">
+                                            <div class="card-body">
+                                                <div class="flex justify-between items-start">
+                                                    <h3 class="card-title text-base">{dest.name.clone()}</h3>
+                                                    <button
+                                                        class="btn btn-ghost btn-sm"
+                                                        on:click=move |_| on_del(id.clone())
+                                                    >
+                                                        "Delete"
+                                                    </button>
                                                 </div>
-                                                <div>
-                                                    <span style="color: var(--text-secondary);">"URL: "</span>
-                                                    <span style="font-family: var(--font-mono); font-size: 12px; word-break: break-all;">{dest.url.clone()}</span>
+                                                <div class="flex flex-col gap-1.5 text-sm">
+                                                    <div>
+                                                        <span class="text-base-content/60">"Platform: "</span>
+                                                        <span class="capitalize">{platform_label(&dest.platform).to_string()}</span>
+                                                    </div>
+                                                    <div>
+                                                        <span class="text-base-content/60">"URL: "</span>
+                                                        <span class="font-mono text-xs break-all">{dest.url.clone()}</span>
+                                                    </div>
                                                 </div>
                                             </div>
                                         </div>

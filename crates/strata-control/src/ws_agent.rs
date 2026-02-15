@@ -122,7 +122,10 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 
 /// Authenticate the agent from the first message.
 /// Returns `Ok((sender_id, response_json))` on success.
-async fn authenticate(state: &AppState, raw: &str) -> Result<(String, Option<String>, String), String> {
+async fn authenticate(
+    state: &AppState,
+    raw: &str,
+) -> Result<(String, Option<String>, String), String> {
     // Parse envelope
     let envelope: Envelope =
         serde_json::from_str(raw).map_err(|e| error_response(&format!("invalid message: {e}")))?;

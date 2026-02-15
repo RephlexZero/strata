@@ -50,3 +50,7 @@ test_output/
 # WASM build output (trunk)
 crates/strata-dashboard/dist/
 crates/strata-portal/dist/
+
+# Node.js (Tailwind CSS build tooling)
+node_modules/
+package-lock.json

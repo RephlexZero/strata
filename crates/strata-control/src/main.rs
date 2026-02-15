@@ -6,12 +6,6 @@
 //! - WebSocket endpoint for live dashboard updates
 //! - Receiver worker process spawner
 
-mod api;
-mod db;
-mod state;
-mod ws_agent;
-mod ws_dashboard;
-
 use std::net::SocketAddr;
 
 use axum::Router;
@@ -19,6 +13,8 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
+
+use strata_control::{api, db, state, ws_agent, ws_dashboard};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

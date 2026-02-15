@@ -94,33 +94,25 @@ fn DashboardShell() -> impl IntoView {
     let ws = expect_context::<WsClient>();
 
     view! {
-        <div class="app-layout">
-            <nav class="sidebar">
-                <div class="sidebar-brand">
-                    <h1>"Strata"</h1>
-                    <span class="version">"v0.1"</span>
+        <div class="flex min-h-screen">
+            // Sidebar
+            <nav class="w-60 bg-base-200 border-r border-base-300 flex flex-col fixed top-0 left-0 bottom-0 z-10">
+                <div class="p-5 border-b border-base-300 flex items-center gap-2.5">
+                    <h1 class="text-lg font-bold tracking-tight">"Strata"</h1>
+                    <span class="text-xs text-base-content/40 font-mono">"v0.1"</span>
                 </div>
-                <div class="sidebar-nav">
-                    <a href="/senders">
-                        <span class="icon">"📡"</span>
-                        "Senders"
-                    </a>
-                    <a href="/streams">
-                        <span class="icon">"📺"</span>
-                        "Streams"
-                    </a>
-                    <a href="/destinations">
-                        <span class="icon">"🎯"</span>
-                        "Destinations"
-                    </a>
-                </div>
-                <div class="sidebar-footer">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                <ul class="menu flex-1 p-2 gap-0.5">
+                    <li><a href="/senders">"📡 Senders"</a></li>
+                    <li><a href="/streams">"📺 Streams"</a></li>
+                    <li><a href="/destinations">"🎯 Destinations"</a></li>
+                </ul>
+                <div class="p-3 border-t border-base-300">
+                    <div class="flex justify-between items-center">
                         <span>
                             {move || if ws.connected.get() {
-                                view! { <span class="badge badge-online"><span class="dot dot-green"></span>"Live"</span> }.into_any()
+                                view! { <span class="badge badge-success badge-sm gap-1"><span class="w-2 h-2 rounded-full bg-success"></span>"Live"</span> }.into_any()
                             } else {
-                                view! { <span class="badge badge-offline"><span class="dot dot-gray"></span>"Offline"</span> }.into_any()
+                                view! { <span class="badge badge-ghost badge-sm gap-1"><span class="w-2 h-2 rounded-full bg-base-content/30"></span>"Offline"</span> }.into_any()
                             }}
                         </span>
                         <button
@@ -132,7 +124,8 @@ fn DashboardShell() -> impl IntoView {
                     </div>
                 </div>
             </nav>
-            <main class="main-content">
+            // Main content
+            <main class="flex-1 ml-60 p-6 max-w-5xl">
                 <Routes fallback=|| view! { <SendersPage /> }>
                     <Route path=path!("/") view=SendersPage />
                     <Route path=path!("/senders") view=SendersPage />

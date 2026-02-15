@@ -1,0 +1,29 @@
+{
+  "name": "rist-bonding",
+  "version": "1.0.0",
+  "description": "**Bonded video transport over RIST for GStreamer, written in Rust.**",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "example": "examples"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RephlexZero/strata.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/RephlexZero/strata/issues"
+  },
+  "homepage": "https://github.com/RephlexZero/strata#readme",
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.18",
+    "daisyui": "^5.5.18",
+    "tailwindcss": "^4.1.18"
+  }
+}
