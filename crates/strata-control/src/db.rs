@@ -75,6 +75,21 @@ pub async fn seed_dev_data(pool: &PgPool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // YouTube destination (stream key set via YOUTUBE_STREAM_KEY env, or placeholder)
+    let yt_key =
+        std::env::var("YOUTUBE_STREAM_KEY").unwrap_or_else(|_| "YOUR_STREAM_KEY".into());
+    sqlx::query(
+        "INSERT INTO destinations (id, owner_id, platform, name, url, stream_key) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind("dst_00000000-0000-0000-0000-000000000002")
+    .bind("usr_00000000-0000-0000-0000-000000000001")
+    .bind("youtube")
+    .bind("YouTube Live")
+    .bind("rtmp://a.rtmp.youtube.com/live2")
+    .bind(&yt_key)
+    .execute(pool)
+    .await?;
+
     tracing::info!("dev seed data inserted (dev@strata.local / development)");
     Ok(())
 }

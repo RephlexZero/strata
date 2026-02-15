@@ -42,6 +42,7 @@ services:
       RUST_LOG: "info,strata_control=debug"
       DEV_SEED: "1"
       RECEIVER_HOST: "strata-receiver"
+      YOUTUBE_STREAM_KEY: "${YOUTUBE_STREAM_KEY:-YOUR_STREAM_KEY}"
     ports:
       - "3000:3000"
     restart: unless-stopped
@@ -62,6 +63,7 @@ services:
     environment:
       RUST_LOG: "info,strata_agent=debug"
       GST_PLUGIN_PATH: "/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
+      DEV_INTERFACES: "1"
     command:
       - "--control-url"
       - "ws://strata-control:3000/agent/ws"

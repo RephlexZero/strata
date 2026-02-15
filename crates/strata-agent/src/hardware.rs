@@ -22,14 +22,20 @@ pub struct HardwareScan {
 /// Scans hardware state — real or simulated.
 pub struct HardwareScanner {
     simulate: bool,
+    /// When true, inject simulated cellular interfaces and a test media input
+    /// alongside real system stats.  Used by the dev Docker container which has
+    /// no real wwan devices or capture cards but needs to look like a field sender.
+    dev_interfaces: bool,
     /// Tracks enabled/disabled state per interface name.
     interface_enabled: std::sync::Mutex<std::collections::HashMap<String, bool>>,
 }
 
 impl HardwareScanner {
     pub fn new(simulate: bool) -> Self {
+        let dev_interfaces = std::env::var("DEV_INTERFACES").is_ok();
         Self {
             simulate,
+            dev_interfaces,
             interface_enabled: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -108,9 +114,17 @@ impl HardwareScanner {
     }
 
     /// Real hardware scan — reads from system interfaces.
+    ///
+    /// When `dev_interfaces` is set, simulated cellular interfaces and a test
+    /// media input are injected so the dashboard looks realistic even inside a
+    /// plain Docker container that only has eth0.
     async fn scan_real(&self) -> HardwareScan {
         let enabled_map = self.interface_enabled.lock().unwrap();
-        let mut interfaces = scan_network_interfaces();
+        let mut interfaces = if self.dev_interfaces {
+            dev_simulated_interfaces(&enabled_map)
+        } else {
+            scan_network_interfaces()
+        };
         // Apply enabled state
         for iface in &mut interfaces {
             iface.enabled = *enabled_map.get(&iface.name).unwrap_or(&true);
@@ -120,7 +134,12 @@ impl HardwareScanner {
             }
         }
         drop(enabled_map);
-        let inputs = scan_media_inputs();
+
+        let inputs = if self.dev_interfaces {
+            dev_simulated_inputs()
+        } else {
+            scan_media_inputs()
+        };
         let (cpu, mem) = scan_system_stats();
 
         HardwareScan {
@@ -164,6 +183,60 @@ impl HardwareScanner {
         }
         new_ifaces
     }
+}
+
+// ── Dev-simulated hardware (for Docker containers without real modems) ────
+
+/// Simulated interfaces for the dev container — three links that look realistic.
+fn dev_simulated_interfaces(
+    enabled_map: &std::collections::HashMap<String, bool>,
+) -> Vec<NetworkInterface> {
+    use rand::Rng;
+    let mut rng = rand::rng();
+
+    vec![
+        NetworkInterface {
+            name: "wwan0".into(),
+            iface_type: InterfaceType::Cellular,
+            state: InterfaceState::Connected,
+            enabled: *enabled_map.get("wwan0").unwrap_or(&true),
+            ip: Some("10.45.0.2".into()),
+            carrier: Some("T-Mobile".into()),
+            signal_dbm: Some(-65 - rng.random_range(0..20)),
+            technology: Some("LTE".into()),
+        },
+        NetworkInterface {
+            name: "wwan1".into(),
+            iface_type: InterfaceType::Cellular,
+            state: InterfaceState::Connected,
+            enabled: *enabled_map.get("wwan1").unwrap_or(&true),
+            ip: Some("10.46.0.3".into()),
+            carrier: Some("Vodafone".into()),
+            signal_dbm: Some(-60 - rng.random_range(0..15)),
+            technology: Some("5G-NSA".into()),
+        },
+        NetworkInterface {
+            name: "eth0".into(),
+            iface_type: InterfaceType::Ethernet,
+            state: InterfaceState::Connected,
+            enabled: *enabled_map.get("eth0").unwrap_or(&true),
+            ip: Some("172.19.0.5".into()),
+            carrier: None,
+            signal_dbm: None,
+            technology: None,
+        },
+    ]
+}
+
+/// Simulated media input for the dev container (no real capture card).
+fn dev_simulated_inputs() -> Vec<MediaInput> {
+    vec![MediaInput {
+        device: "/dev/video0".into(),
+        input_type: MediaInputType::Test,
+        label: "Simulated HDMI Capture".into(),
+        capabilities: vec!["1920x1080@30".into(), "1280x720@60".into()],
+        status: MediaInputStatus::Available,
+    }]
 }
 
 // ── Real hardware scanning helpers ──────────────────────────────────

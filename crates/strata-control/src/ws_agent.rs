@@ -248,6 +248,22 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
         }
         "stream.stats" => {
             if let Ok(payload) = envelope.parse_payload::<StreamStatsPayload>() {
+                // Transition stream from 'starting' → 'live' on first stats message
+                let _ = sqlx::query(
+                    "UPDATE streams SET state = 'live' WHERE id = $1 AND state = 'starting'",
+                )
+                .bind(&payload.stream_id)
+                .execute(state.pool())
+                .await;
+
+                // Notify dashboards of the state transition
+                state.broadcast_dashboard(DashboardEvent::StreamStateChanged {
+                    stream_id: payload.stream_id.clone(),
+                    sender_id: sender_id.to_string(),
+                    state: strata_common::models::StreamState::Live,
+                    error: None,
+                });
+
                 state.broadcast_dashboard(DashboardEvent::StreamStats(payload));
             }
         }
