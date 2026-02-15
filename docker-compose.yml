@@ -6,6 +6,9 @@
 #
 # Dashboard:  http://localhost:3000
 # Login:      dev@strata.local / development
+#
+# To stream to YouTube (or any RTMP target), set RELAY_URL:
+#   RELAY_URL="rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY" docker compose up -d
 
 services:
   # ── PostgreSQL ───────────────────────────────────────────────
@@ -38,21 +41,28 @@ services:
       LISTEN_ADDR: "0.0.0.0:3000"
       RUST_LOG: "info,strata_control=debug"
       DEV_SEED: "1"
+      RECEIVER_HOST: "strata-receiver"
     ports:
       - "3000:3000"
     restart: unless-stopped
 
-  # ── Simulated Sender Agent ──────────────────────────────────
+  # ── Sender Agent (real GStreamer pipeline) ───────────────────
+  #
+  # Runs the strata-agent daemon. When a stream is started from the
+  # dashboard, the agent spawns integration_node which builds a real
+  # GStreamer pipeline: videotestsrc 1080p60 + AAC audio → rsristbondsink
+  # sending over 3 bonded RIST links to the receiver.
   strata-sender-sim:
     build:
       context: .
       dockerfile: dev/Dockerfile.agent
     depends_on:
       - strata-control
+      - strata-receiver
     environment:
       RUST_LOG: "info,strata_agent=debug"
+      GST_PLUGIN_PATH: "/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
     command:
-      - "--simulate"
       - "--control-url"
       - "ws://strata-control:3000/agent/ws"
       - "--enrollment-token"
@@ -63,6 +73,49 @@ services:
       - "5"
     ports:
       - "3001:3001"
+    restart: unless-stopped
+
+  # ── Receiver (bonded RIST → RTMP relay) ─────────────────────
+  #
+  # Receives the bonded RIST stream on 3 UDP ports via rsristbondsrc,
+  # reassembles it, and relays to an RTMP destination using gst-launch-1.0.
+  # No custom binary needed — just the bonding plugin + GStreamer.
+  #
+  # Set RELAY_URL to enable the relay:
+  #   RELAY_URL="rtmp://a.rtmp.youtube.com/live2/YOUR_KEY" docker compose up -d
+  #
+  # Without RELAY_URL the receiver runs in monitor mode (logs packets).
+  strata-receiver:
+    build:
+      context: .
+      dockerfile: dev/Dockerfile.agent
+    environment:
+      RUST_LOG: "info"
+      GST_PLUGIN_PATH: "/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
+      RELAY_URL: "${RELAY_URL:-}"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        BIND="rist://@0.0.0.0:5000,rist://@0.0.0.0:5002,rist://@0.0.0.0:5004"
+        if [ -n "$$RELAY_URL" ]; then
+          echo "=== Receiver: RTMP relay → $$RELAY_URL ==="
+          exec gst-launch-1.0 -e \
+            rsristbondsrc links="$$BIND" latency=200 ! \
+            queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
+            tsdemux name=d \
+            d. ! queue ! h264parse ! flvmux name=mux streamable=true ! \
+            rtmpsink location="$$RELAY_URL" sync=false \
+            d. ! queue ! aacparse ! mux.
+        else
+          echo "=== Receiver: monitor mode (set RELAY_URL to relay) ==="
+          exec gst-launch-1.0 -e -v \
+            rsristbondsrc links="$$BIND" latency=200 ! \
+            fakesink sync=false
+        fi
+    ports:
+      - "5000:5000/udp"
+      - "5002:5002/udp"
+      - "5004:5004/udp"
     restart: unless-stopped
 
 volumes:

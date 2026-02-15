@@ -17,6 +17,8 @@ OPTIONS:
   --uri <uri>         Media URI for uridecodebin (used with --source uri)
                       e.g. file:///home/user/video.mp4
   --bitrate <kbps>    Target encoder bitrate in kbps (default: 3000)
+  --framerate <fps>   Video framerate (default: 30)
+  --audio             Add silent AAC audio track (required for RTMP targets)
   --config <path>     Path to TOML config file (see Configuration Reference)
   --stats-dest <addr> UDP address to relay stats JSON (e.g. 192.168.1.50:9000)
   --help              Show this help
@@ -25,6 +27,10 @@ EXAMPLES:
   # Test pattern over two cellular links
   integration_node sender --dest rist://server:5000,rist://server:5002 \
     --config sender.toml
+
+  # 1080p60 with audio for YouTube relay via receiver
+  integration_node sender --source test --framerate 60 --audio --bitrate 6000 \
+    --dest rist://receiver:5000,rist://receiver:5002,rist://receiver:5004
 
   # HDMI capture card to cloud receiver
   integration_node sender --source v4l2 --device /dev/video0 \
@@ -41,13 +47,20 @@ USAGE: integration_node receiver [OPTIONS] --bind <URL>
 
 OPTIONS:
   --bind <url>        RIST bind URL (required), e.g. rist://@0.0.0.0:5000
+                      Multiple bind addresses: rist://@0.0.0.0:5000,rist://@0.0.0.0:5002
   --output <path>     Record to file (.ts = raw MPEG-TS, .mp4 = remuxed)
+  --relay-url <url>   RTMP/RTMPS URL to relay the received stream to
+                      e.g. rtmp://a.rtmp.youtube.com/live2/STREAM_KEY
   --config <path>     Path to TOML config file (see Configuration Reference)
   --help              Show this help
 
 EXAMPLES:
   # Receive and monitor (no file output)
   integration_node receiver --bind rist://@0.0.0.0:5000
+
+  # Receive bonded stream and relay to YouTube
+  integration_node receiver --bind rist://@0.0.0.0:5000,rist://@0.0.0.0:5002,rist://@0.0.0.0:5004 \
+    --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
 
   # Receive and record to MPEG-TS file
   integration_node receiver --bind rist://@0.0.0.0:5000 --output capture.ts
@@ -103,6 +116,8 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut dest_str = "";
     let mut stats_dest = "";
     let mut bitrate_kbps = 3000u32;
+    let mut framerate = 30u32;
+    let mut add_audio = false;
     let mut config_path = "";
     let mut source_mode = "test";
     let mut device_path = "/dev/video0";
@@ -126,6 +141,13 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--bitrate" if i + 1 < args.len() => {
                 bitrate_kbps = args[i + 1].parse().unwrap_or(3000);
                 i += 1;
+            }
+            "--framerate" if i + 1 < args.len() => {
+                framerate = args[i + 1].parse().unwrap_or(30);
+                i += 1;
+            }
+            "--audio" => {
+                add_audio = true;
             }
             "--config" if i + 1 < args.len() => {
                 config_path = &args[i + 1];
@@ -165,12 +187,17 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     //
     // VBV buffer = bitrate (1-second buffer) constrains the peak rate,
     // preventing unconstrained VBR overshoot with tune=zerolatency.
+    //
+    // key-int-max is set to 2× framerate (keyframe every 2 seconds).
+    let key_int = framerate * 2;
     let source_fragment = match source_mode {
         "test" => {
             // Indefinite SMPTE test pattern — runs until Ctrl+C.
             format!(
-                "videotestsrc is-live=true pattern=smpte ! video/x-raw,width=1920,height=1080,framerate=30/1 ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps}",
-                bps = bitrate_kbps
+                "videotestsrc is-live=true pattern=smpte ! video/x-raw,width=1920,height=1080,framerate={fps}/1 ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps} key-int-max={ki}",
+                fps = framerate,
+                bps = bitrate_kbps,
+                ki = key_int
             )
         }
         "v4l2" => {
@@ -178,9 +205,11 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             // Most capture cards output raw video or MJPEG; we re-encode to H.264.
             // For cards that output H.264 natively, use --source uri with a custom pipeline.
             format!(
-                "v4l2src device={dev} ! videoconvert ! videoscale ! video/x-raw,width=1920,height=1080 ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps}",
+                "v4l2src device={dev} ! videoconvert ! videoscale ! video/x-raw,width=1920,height=1080,framerate={fps}/1 ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps} key-int-max={ki}",
                 dev = device_path,
-                bps = bitrate_kbps
+                fps = framerate,
+                bps = bitrate_kbps,
+                ki = key_int
             )
         }
         "uri" => {
@@ -191,9 +220,11 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
             format!(
-                "uridecodebin uri={uri} ! videoconvert ! videoscale ! video/x-raw,width=1920,height=1080 ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps}",
+                "uridecodebin uri={uri} ! videoconvert ! videoscale ! video/x-raw,width=1920,height=1080,framerate={fps}/1 ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps} key-int-max={ki}",
                 uri = source_uri,
-                bps = bitrate_kbps
+                fps = framerate,
+                bps = bitrate_kbps,
+                ki = key_int
             )
         }
         other => {
@@ -202,9 +233,20 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let pipeline_str = format!(
-        "{source_fragment} ! mpegtsmux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink name=rsink"
-    );
+    // Build the full pipeline string.
+    // When --audio is specified, add a silent AAC audio track — required
+    // for RTMP targets like YouTube which reject video-only streams.
+    let pipeline_str = if add_audio {
+        format!(
+            "{source_fragment} ! queue ! mux. \
+             audiotestsrc is-live=true wave=silence ! audio/x-raw,rate=44100,channels=2 ! voaacenc bitrate=128000 ! queue ! mux. \
+             mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink name=rsink"
+        )
+    } else {
+        format!(
+            "{source_fragment} ! mpegtsmux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink name=rsink"
+        )
+    };
     eprintln!("Sender Pipeline: {}", pipeline_str);
 
     let pipeline = gst::parse::launch(&pipeline_str)?
@@ -319,6 +361,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut bind_str = "";
     let mut output_file = "";
     let mut config_path = "";
+    let mut relay_url = "";
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -338,6 +381,10 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 config_path = &args[i + 1];
                 i += 1;
             }
+            "--relay-url" if i + 1 < args.len() => {
+                relay_url = &args[i + 1];
+                i += 1;
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 eprint!("{RECEIVER_HELP}");
@@ -355,13 +402,35 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     register_plugins()?;
 
-    // Pipeline:
-    // If output_file is set:
-    //   rsristbondsrc ! tee name=t ! queue ! appsink ... t. ! queue ! filesink location=...
-    // Else:
-    //   rsristbondsrc ! appsink ...
+    // Pipeline construction:
+    //
+    // --relay-url (RTMP relay):
+    //   rsristbondsrc ! tsdemux ! h264parse ! flvmux streamable=true ! rtmpsink
+    //   (audio pads are connected dynamically via pad-added signal)
+    //
+    // --output (recording):
+    //   rsristbondsrc ! tee ! appsink + filesink (or tsdemux ! mp4mux ! filesink)
+    //
+    // Default (monitor only):
+    //   rsristbondsrc ! appsink
 
-    let pipeline_str = if !output_file.is_empty() {
+    let use_relay = !relay_url.is_empty();
+
+    let pipeline_str = if use_relay {
+        // RTMP relay pipeline — we use tsdemux with dynamic pads.
+        // The gst_parse syntax `d. !` auto-links pads by type.
+        // This handles both video-only and video+audio MPEG-TS inputs.
+        format!(
+            "rsristbondsrc links=\"{bind}\" name=src latency=200 ! \
+             queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
+             tsdemux name=d \
+             d. ! queue ! h264parse ! flvmux name=mux streamable=true ! \
+             rtmpsink location=\"{url}\" sync=false \
+             d. ! queue ! aacparse ! mux.",
+            bind = bind_str,
+            url = relay_url
+        )
+    } else if !output_file.is_empty() {
         if output_file.ends_with(".ts") {
             // Raw dump
             format!(
@@ -400,37 +469,39 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Setup AppSink
-    let sink = pipeline.by_name("sink").expect("Sink not found");
-    let appsink = sink
-        .dynamic_cast::<gst_app::AppSink>()
-        .expect("Sink is not appsink");
-
+    // Setup AppSink (only used for non-relay monitor/record modes)
     let received_count = Arc::new(Mutex::new(0u64));
     let received_bytes = Arc::new(Mutex::new(0u64));
 
-    let count_clone = received_count.clone();
-    let bytes_clone = received_bytes.clone();
+    if !use_relay {
+        let sink = pipeline.by_name("sink").expect("Sink not found");
+        let appsink = sink
+            .dynamic_cast::<gst_app::AppSink>()
+            .expect("Sink is not appsink");
 
-    appsink.set_callbacks(
-        gst_app::AppSinkCallbacks::builder()
-            .new_sample(move |sink| {
-                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-                let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+        let count_clone = received_count.clone();
+        let bytes_clone = received_bytes.clone();
 
-                let mut c = count_clone.lock().unwrap();
-                *c += 1;
+        appsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                    let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
 
-                let mut b = bytes_clone.lock().unwrap();
-                *b += map.size() as u64;
+                    let mut c = count_clone.lock().unwrap();
+                    *c += 1;
 
-                eprintln!("AppSink: Received buffer #{} ({} bytes)", *c, map.size());
+                    let mut b = bytes_clone.lock().unwrap();
+                    *b += map.size() as u64;
 
-                Ok(gst::FlowSuccess::Ok)
-            })
-            .build(),
-    );
+                    eprintln!("AppSink: Received buffer #{} ({} bytes)", *c, map.size());
+
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+    }
 
     // Setup graceful shutdown handler
     let pipeline_weak = pipeline.downgrade();
@@ -446,7 +517,14 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let bus = pipeline.bus().unwrap();
 
-    eprintln!("Receiver running... Waiting for signal or EOS.");
+    if use_relay {
+        eprintln!(
+            "Receiver running — relaying to {}... Press Ctrl+C to stop.",
+            relay_url
+        );
+    } else {
+        eprintln!("Receiver running... Waiting for signal or EOS.");
+    }
 
     // Standard GStreamer message loop
     for msg in bus.iter_timed(gst::ClockTime::NONE) {

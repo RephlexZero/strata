@@ -29,7 +29,70 @@ RUN cd crates/strata-portal && \
     npx @tailwindcss/cli -i style/input.css -o style/main.css --minify && \
     trunk build --release
 
-# ── Stage 2: Build strata-agent ──────────────────────────────
+# ── Stage 2: Build GStreamer pipeline (integration_node + bonding plugin) ─
+FROM rust:1.93-bookworm AS pipeline
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config clang meson ninja-build \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    libgstreamer-plugins-bad1.0-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# Copy Cargo.lock and workspace-level config
+COPY Cargo.lock ./
+
+# Copy only the crates needed for the pipeline build
+COPY vendor/librist vendor/librist
+COPY crates/librist-sys crates/librist-sys
+COPY crates/rist-bonding-core crates/rist-bonding-core
+COPY crates/gst-rist-bonding crates/gst-rist-bonding
+COPY crates/rist-network-sim crates/rist-network-sim
+
+# Write a minimal workspace manifest for just the pipeline crates
+RUN cat > Cargo.toml <<'TOML'
+[workspace]
+resolver = "2"
+members = [
+    "crates/librist-sys",
+    "crates/rist-bonding-core",
+    "crates/gst-rist-bonding",
+    "crates/rist-network-sim",
+]
+
+[workspace.dependencies]
+gst = { package = "gstreamer", version = "0.24.4" }
+gst-base = { package = "gstreamer-base", version = "0.24.4" }
+gst-app = { package = "gstreamer-app", version = "0.24.4" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+toml = "0.9.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+anyhow = "1.0.101"
+once_cell = "1.21.3"
+bytes = "1.11.1"
+crossbeam-channel = "0.5.15"
+arc-swap = "1.7"
+compact_str = "0.8"
+rtrb = "0.3"
+raptorq = "2.0"
+rand = "0.10.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+TOML
+
+# Build integration_node binary AND libgstristbonding.so plugin
+RUN cargo build --release -p gst-rist-bonding
+
+# ── Stage 3: Build strata-agent ──────────────────────────────
 FROM rust:1.93-bookworm AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -75,17 +138,35 @@ COPY crates/strata-agent/src crates/strata-agent/src
 RUN touch crates/strata-common/src/lib.rs crates/strata-agent/src/main.rs && \
     cargo build --release -p strata-agent
 
-# ── Stage 2: Runtime ────────────────────────────────────────
+# ── Stage 4: Runtime ────────────────────────────────────────
 FROM debian:12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
+    gstreamer1.0-tools \
+    libgstreamer1.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# Agent binary
 COPY --from=builder /src/target/release/strata-agent /usr/local/bin/strata-agent
+
+# Pipeline binary + GStreamer bonding plugin
+# NOTE: The .so must be named libgst*rsristbonding* to match the plugin_define!
+# name. GStreamer strips "libgst" from the filename to derive the plugin name,
+# then looks for symbol gst_plugin_<derived>_get_desc.
+COPY --from=pipeline /src/target/release/integration_node /usr/local/bin/integration_node
+COPY --from=pipeline /src/target/release/libgstristbonding.so /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstrsristbonding.so
+
+# Portal WASM app
 COPY --from=portal /src/crates/strata-portal/dist /app/portal
 
 ENV PORTAL_DIR=/app/portal
+ENV GST_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/gstreamer-1.0
 
 EXPOSE 3001
 

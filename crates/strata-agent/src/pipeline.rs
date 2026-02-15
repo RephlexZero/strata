@@ -157,9 +157,18 @@ fn spawn_integration_node(payload: &StreamStartPayload) -> anyhow::Result<Child>
     cmd.arg("--bitrate")
         .arg(payload.encoder.bitrate_kbps.to_string());
 
-    // Destinations
-    for dest in &payload.destinations {
-        cmd.arg("--dest").arg(dest);
+    // Framerate (from source config, default 30)
+    if let Some(fps) = payload.source.framerate {
+        cmd.arg("--framerate").arg(fps.to_string());
+    }
+
+    // Always add audio for RTMP compatibility
+    cmd.arg("--audio");
+
+    // Destinations (RIST URLs)
+    if !payload.destinations.is_empty() {
+        let dest_str = payload.destinations.join(",");
+        cmd.arg("--dest").arg(&dest_str);
     }
 
     // Write bonding config to temp file if non-empty

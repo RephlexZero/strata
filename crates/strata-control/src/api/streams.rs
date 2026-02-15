@@ -65,19 +65,29 @@ async fn start_stream(
         return Err(ApiError::not_found("sender not found"));
     }
 
-    // Verify destination exists and belongs to this user
-    let dest_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM destinations WHERE id = $1 AND owner_id = $2)",
+    // Resolve destination → RTMP URL + stream key for receiver relay
+    let dest_row = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT platform, url, stream_key FROM destinations WHERE id = $1 AND owner_id = $2",
     )
     .bind(&body.destination_id)
     .bind(&user.user_id)
-    .fetch_one(state.pool())
+    .fetch_optional(state.pool())
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .ok_or_else(|| ApiError::not_found("destination not found"))?;
 
-    if !dest_exists {
-        return Err(ApiError::not_found("destination not found"));
-    }
+    let (_platform, dest_url, stream_key) = dest_row;
+
+    // Build full relay URL (append stream key for RTMP targets)
+    let relay_url = if let Some(ref key) = stream_key {
+        if dest_url.ends_with('/') {
+            format!("{dest_url}{key}")
+        } else {
+            format!("{dest_url}/{key}")
+        }
+    } else {
+        dest_url.clone()
+    };
 
     // Check sender is connected
     let agent = state
@@ -89,22 +99,22 @@ async fn start_stream(
 
     // Create stream record
     let stream_id = ids::stream_id();
-    let config_json = serde_json::to_string(&body).ok();
 
-    sqlx::query(
-        "INSERT INTO streams (id, sender_id, destination_id, state, started_at, config_json) \
-         VALUES ($1, $2, $3, 'starting', $4, $5)",
-    )
-    .bind(&stream_id)
-    .bind(&sender_id)
-    .bind(&body.destination_id)
-    .bind(Utc::now())
-    .bind(&config_json)
-    .execute(state.pool())
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    // Serialize request before consuming body fields
+    let request_json = serde_json::to_value(&body).unwrap_or_default();
 
-    // Build stream.start command and send to agent
+    // Build stream.start command and send to agent.
+    //
+    // RIST destinations point to the receiver service on 3 ports for bonding.
+    // The receiver host is configured via RECEIVER_HOST env (default: strata-receiver).
+    let receiver_host =
+        std::env::var("RECEIVER_HOST").unwrap_or_else(|_| "strata-receiver".into());
+    let rist_dests = vec![
+        format!("rist://{receiver_host}:5000"),
+        format!("rist://{receiver_host}:5002"),
+        format!("rist://{receiver_host}:5004"),
+    ];
+
     let start_payload = StreamStartPayload {
         stream_id: stream_id.clone(),
         source: body
@@ -114,19 +124,40 @@ async fn start_stream(
                 device: None,
                 uri: None,
                 resolution: Some("1920x1080".into()),
-                framerate: Some(30),
+                framerate: Some(60),
             }),
         encoder: body
             .encoder
             .unwrap_or(strata_common::protocol::EncoderConfig {
-                bitrate_kbps: 5000,
+                bitrate_kbps: 6000,
                 tune: Some("zerolatency".into()),
-                keyint_max: Some(60),
+                keyint_max: Some(120),
             }),
-        destinations: vec![], // Will be filled by receiver allocation
+        destinations: rist_dests,
         bonding_config: serde_json::json!({}),
         rist_psk: None,
     };
+
+    // Store the relay URL and request in the stream config for operational visibility.
+    let full_config = serde_json::json!({
+        "request": request_json,
+        "relay_url": relay_url,
+    });
+    let config_json_final = serde_json::to_string(&full_config).ok();
+
+    // Insert stream row into DB
+    sqlx::query(
+        "INSERT INTO streams (id, sender_id, destination_id, state, started_at, config_json) \
+         VALUES ($1, $2, $3, 'starting', $4, $5)",
+    )
+    .bind(&stream_id)
+    .bind(&sender_id)
+    .bind(&body.destination_id)
+    .bind(Utc::now())
+    .bind(&config_json_final)
+    .execute(state.pool())
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let envelope = Envelope::new("stream.start", &start_payload);
     let json = serde_json::to_string(&envelope).unwrap();
