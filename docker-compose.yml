@@ -5,7 +5,7 @@
 #   docker compose down -v          # tear down (delete data)
 #
 # Dashboard:  http://localhost:3000
-# Login:      admin@strata.local / admin
+# Login:      dev@strata.local / development
 
 services:
   # ── PostgreSQL ───────────────────────────────────────────────
