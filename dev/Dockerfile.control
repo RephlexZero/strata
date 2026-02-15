@@ -1,6 +1,11 @@
 # ── Stage 1: Build dashboard WASM ────────────────────────────
 FROM rust:1.93-bookworm AS dashboard
 
+# Node.js required for Tailwind CSS / DaisyUI pre-build hook
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN rustup target add wasm32-unknown-unknown && \
     cargo install trunk --version 0.21.14
 
@@ -18,7 +23,11 @@ resolver = "2"
 members = ["crates/strata-dashboard"]
 TOML
 
-RUN cd crates/strata-dashboard && trunk build --release
+# Install Tailwind CSS + DaisyUI and build CSS, then build WASM with trunk
+RUN cd crates/strata-dashboard && \
+    npm init -y && npm install @tailwindcss/cli daisyui && \
+    npx @tailwindcss/cli -i style/input.css -o style/main.css --minify && \
+    trunk build --release
 
 # ── Stage 2: Build strata-control ────────────────────────────
 FROM rust:1.93-bookworm AS builder
