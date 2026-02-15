@@ -107,8 +107,7 @@ async fn start_stream(
     //
     // RIST destinations point to the receiver service on 3 ports for bonding.
     // The receiver host is configured via RECEIVER_HOST env (default: strata-receiver).
-    let receiver_host =
-        std::env::var("RECEIVER_HOST").unwrap_or_else(|_| "strata-receiver".into());
+    let receiver_host = std::env::var("RECEIVER_HOST").unwrap_or_else(|_| "strata-receiver".into());
     let rist_dests = vec![
         format!("rist://{receiver_host}:5000"),
         format!("rist://{receiver_host}:5002"),

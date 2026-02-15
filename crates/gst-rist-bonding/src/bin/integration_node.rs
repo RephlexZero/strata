@@ -239,7 +239,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let pipeline_str = if add_audio {
         format!(
             "{source_fragment} ! queue ! mux. \
-             audiotestsrc is-live=true wave=silence ! audio/x-raw,rate=44100,channels=2 ! voaacenc bitrate=128000 ! queue ! mux. \
+             audiotestsrc is-live=true wave=silence ! audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! queue ! mux. \
              mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink name=rsink"
         )
     } else {
