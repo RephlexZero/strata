@@ -156,9 +156,7 @@ pub struct StreamDetail {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct StartStreamRequest {
-    pub destination_id: String,
-}
+pub struct StartStreamRequest {}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartStreamResponse {

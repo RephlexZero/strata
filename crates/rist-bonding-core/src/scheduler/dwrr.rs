@@ -393,7 +393,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
 
             if let Some(state) = self.links.get_mut(&id) {
                 let metrics = state.metrics.clone();
-                if !metrics.alive {
+                if !metrics.alive && any_alive {
                     continue;
                 }
 
@@ -411,7 +411,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
 
         for &id in &self.sorted_ids {
             if let Some(state) = self.links.get(&id) {
-                if state.metrics.alive && state.credits > max_creds {
+                if (state.metrics.alive || !any_alive) && state.credits > max_creds {
                     max_creds = state.credits;
                     best_id = Some(id);
                 }
@@ -719,9 +719,13 @@ mod tests {
         dwrr.add_link(link2);
         dwrr.refresh_metrics();
 
-        // Dead links are skipped in both main loop and fallback
+        // When ALL links are dead, the scheduler still selects the best
+        // available link so data can flow while links warm up.
         let result = dwrr.select_link(1200);
-        assert!(result.is_none(), "All dead links should return None");
+        assert!(
+            result.is_some(),
+            "All dead links should still be selectable as fallback"
+        );
     }
 
     #[test]

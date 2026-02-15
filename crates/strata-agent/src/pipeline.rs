@@ -134,7 +134,13 @@ impl PipelineManager {
     ///
     /// Sends a JSON command to the integration_node's control socket.
     /// The command is fire-and-forget — errors are logged but not propagated.
-    pub fn switch_source(&self, mode: &str, device: Option<&str>, uri: Option<&str>, pattern: Option<&str>) {
+    pub fn switch_source(
+        &self,
+        mode: &str,
+        device: Option<&str>,
+        uri: Option<&str>,
+        pattern: Option<&str>,
+    ) {
         if !self.is_running() {
             tracing::warn!("cannot switch source: no pipeline running");
             return;
@@ -213,6 +219,11 @@ fn spawn_integration_node(payload: &StreamStartPayload) -> anyhow::Result<Child>
     // Framerate (from source config, default 30)
     if let Some(fps) = payload.source.framerate {
         cmd.arg("--framerate").arg(fps.to_string());
+    }
+
+    // Resolution (from source config, default 1280x720)
+    if let Some(ref res) = payload.source.resolution {
+        cmd.arg("--resolution").arg(res);
     }
 
     // Always add audio for RTMP compatibility

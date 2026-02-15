@@ -22,7 +22,10 @@ pub async fn run(state: Arc<AgentState>) {
     let stats_rx = std::net::UdpSocket::bind(pipeline::STATS_LISTEN_ADDR).ok();
     if let Some(ref sock) = stats_rx {
         sock.set_nonblocking(true).ok();
-        tracing::info!(addr = pipeline::STATS_LISTEN_ADDR, "stats UDP listener bound");
+        tracing::info!(
+            addr = pipeline::STATS_LISTEN_ADDR,
+            "stats UDP listener bound"
+        );
     }
 
     // Buffer for incoming stats JSON from integration_node
@@ -41,12 +44,16 @@ pub async fn run(state: Arc<AgentState>) {
         let pipeline = state.pipeline.lock().await;
         if !pipeline.is_running() {
             last_real_stats = None;
+            tracing::trace!("telemetry: pipeline not running");
             continue;
         }
 
         let stream_id = match pipeline.stream_id() {
             Some(id) => id.to_string(),
-            None => continue,
+            None => {
+                tracing::trace!("telemetry: no stream_id");
+                continue;
+            }
         };
 
         let elapsed_s = pipeline.elapsed_s();
@@ -54,8 +61,10 @@ pub async fn run(state: Arc<AgentState>) {
 
         // Drain any pending stats from integration_node's UDP relay.
         // We take the most recent one (in case multiple arrived in 1s).
+        let mut udp_count = 0u32;
         if let Some(ref sock) = stats_rx {
             while let Ok((n, _)) = sock.recv_from(&mut recv_buf) {
+                udp_count += 1;
                 if let Ok(parsed) = parse_bonding_stats(&recv_buf[..n]) {
                     last_real_stats = Some(parsed);
                 }
@@ -69,11 +78,14 @@ pub async fn run(state: Arc<AgentState>) {
             last_real_stats.clone().unwrap_or_default()
         };
 
-        let encoder_kbps = links
-            .iter()
-            .map(|l| l.capacity_bps)
-            .sum::<u64>()
-            / 1000;
+        let encoder_kbps = links.iter().map(|l| l.capacity_bps).sum::<u64>() / 1000;
+
+        tracing::debug!(
+            udp_count,
+            link_count = links.len(),
+            encoder_kbps,
+            "telemetry tick"
+        );
 
         let stats = StreamStatsPayload {
             stream_id,
@@ -84,7 +96,9 @@ pub async fn run(state: Arc<AgentState>) {
 
         let envelope = Envelope::new("stream.stats", &stats);
         if let Ok(json) = serde_json::to_string(&envelope) {
-            let _ = state.control_tx.send(json).await;
+            if let Err(e) = state.control_tx.send(json).await {
+                tracing::warn!(error = %e, "failed to send stats to control channel");
+            }
         }
     }
 }
@@ -99,14 +113,8 @@ fn parse_bonding_stats(data: &[u8]) -> Result<Vec<LinkStats>, ()> {
 
     let mut stats = Vec::with_capacity(links_arr.len());
     for link in links_arr {
-        let id = link
-            .get("id")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let rtt_us = link
-            .get("rtt_us")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+        let id = link.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let rtt_us = link.get("rtt_us").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let loss = link
             .get("loss_rate")
             .or_else(|| link.get("loss_percent"))

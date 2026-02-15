@@ -173,13 +173,11 @@ async fn authenticate_enrollment(
     for (sender_id, owner_id, token_hash) in &rows {
         if let Ok(true) = auth::verify_password(&normalized, token_hash) {
             // Mark as enrolled (keep token for reconnection)
-            let _ = sqlx::query(
-                "UPDATE senders SET enrolled = TRUE, hostname = $1 WHERE id = $2",
-            )
-            .bind(&payload.hostname)
-            .bind(sender_id)
-            .execute(state.pool())
-            .await;
+            let _ = sqlx::query("UPDATE senders SET enrolled = TRUE, hostname = $1 WHERE id = $2")
+                .bind(&payload.hostname)
+                .bind(sender_id)
+                .execute(state.pool())
+                .await;
 
             // Issue session JWT
             let now = Utc::now().timestamp();
@@ -251,20 +249,22 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
         "stream.stats" => {
             if let Ok(payload) = envelope.parse_payload::<StreamStatsPayload>() {
                 // Transition stream from 'starting' → 'live' on first stats message
-                let _ = sqlx::query(
+                let rows = sqlx::query(
                     "UPDATE streams SET state = 'live' WHERE id = $1 AND state = 'starting'",
                 )
                 .bind(&payload.stream_id)
                 .execute(state.pool())
                 .await;
 
-                // Notify dashboards of the state transition
-                state.broadcast_dashboard(DashboardEvent::StreamStateChanged {
-                    stream_id: payload.stream_id.clone(),
-                    sender_id: sender_id.to_string(),
-                    state: strata_common::models::StreamState::Live,
-                    error: None,
-                });
+                // Only broadcast state change on the actual transition
+                if rows.as_ref().map(|r| r.rows_affected()).unwrap_or(0) > 0 {
+                    state.broadcast_dashboard(DashboardEvent::StreamStateChanged {
+                        stream_id: payload.stream_id.clone(),
+                        sender_id: sender_id.to_string(),
+                        state: strata_common::models::StreamState::Live,
+                        error: None,
+                    });
+                }
 
                 state.broadcast_dashboard(DashboardEvent::StreamStats(payload));
             }

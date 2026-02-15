@@ -242,11 +242,7 @@ fn read_interface_ip(name: &str) -> Option<String> {
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
     // ip -j returns an array of interface objects
-    let addr_info = json
-        .as_array()?
-        .first()?
-        .get("addr_info")?
-        .as_array()?;
+    let addr_info = json.as_array()?.first()?.get("addr_info")?.as_array()?;
 
     // Find the first "inet" (IPv4) entry
     for addr in addr_info {

@@ -27,22 +27,32 @@ unsafe extern "C" fn log_cb(
 ) -> libc::c_int {
     if !msg.is_null() {
         let message = CStr::from_ptr(msg).to_string_lossy();
+        let trimmed = message.trim_end();
+
+        // Suppress known false-positive from librist ring-buffer wrap-around
+        // (see upstream TODO in udp.c: "figure out why this check fails when
+        // sender_write_index = 0"). Downgrade to debug instead of error.
+        if trimmed.contains("Sender queue is full") {
+            debug!(target: "librist", "{}", trimmed);
+            return 0;
+        }
+
         // Route librist log levels to tracing levels
         match level {
             l if l <= rist_log_level_RIST_LOG_ERROR => {
-                tracing::error!(target: "librist", "{}", message.trim_end());
+                tracing::error!(target: "librist", "{}", trimmed);
             }
             l if l <= rist_log_level_RIST_LOG_WARN => {
-                tracing::warn!(target: "librist", "{}", message.trim_end());
+                tracing::warn!(target: "librist", "{}", trimmed);
             }
             l if l <= rist_log_level_RIST_LOG_NOTICE => {
-                tracing::info!(target: "librist", "{}", message.trim_end());
+                tracing::info!(target: "librist", "{}", trimmed);
             }
             l if l <= rist_log_level_RIST_LOG_INFO => {
-                debug!(target: "librist", "{}", message.trim_end());
+                debug!(target: "librist", "{}", trimmed);
             }
             _ => {
-                trace!(target: "librist", "{}", message.trim_end());
+                trace!(target: "librist", "{}", trimmed);
             }
         }
     }

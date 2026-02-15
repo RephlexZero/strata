@@ -41,7 +41,8 @@ apply_impairment() {
     tc qdisc add dev "$iface" root netem \
         rate "${rate_kbit}kbit" \
         delay "${delay_ms}ms" "${jitter_ms}ms" \
-        loss "${loss_pct}%"
+        loss "${loss_pct}%" \
+        limit 10000
 }
 
 # Match impairments to interfaces by subnet rather than by interface

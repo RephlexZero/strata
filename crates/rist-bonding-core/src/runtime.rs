@@ -204,26 +204,32 @@ fn apply_config(
     config: BondingConfig,
     ewma_alpha: f64,
 ) {
-    let desired_ids: std::collections::HashSet<usize> = config.links.iter().map(|l| l.id).collect();
+    // Only reconcile links if the config explicitly defines them.
+    // An empty links list means "don't touch existing links" — this allows
+    // scheduler-only config updates without removing pad-configured links.
+    if !config.links.is_empty() {
+        let desired_ids: std::collections::HashSet<usize> =
+            config.links.iter().map(|l| l.id).collect();
 
-    // Remove links no longer present in config
-    let existing_ids: Vec<usize> = current_links.keys().copied().collect();
-    for id in existing_ids {
-        if !desired_ids.contains(&id) {
-            scheduler.remove_link(id);
-            current_links.remove(&id);
+        // Remove links no longer present in config
+        let existing_ids: Vec<usize> = current_links.keys().copied().collect();
+        for id in existing_ids {
+            if !desired_ids.contains(&id) {
+                scheduler.remove_link(id);
+                current_links.remove(&id);
+            }
         }
-    }
 
-    // Add or update links that changed
-    for link in config.links {
-        let needs_update = match current_links.get(&link.id) {
-            Some(existing) => existing != &link,
-            None => true,
-        };
+        // Add or update links that changed
+        for link in config.links {
+            let needs_update = match current_links.get(&link.id) {
+                Some(existing) => existing != &link,
+                None => true,
+            };
 
-        if needs_update {
-            apply_link(scheduler, current_links, lifecycle_config, link, ewma_alpha);
+            if needs_update {
+                apply_link(scheduler, current_links, lifecycle_config, link, ewma_alpha);
+            }
         }
     }
 }

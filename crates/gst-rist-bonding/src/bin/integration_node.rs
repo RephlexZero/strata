@@ -126,7 +126,7 @@ fn register_plugins() -> Result<(), gst::glib::BoolError> {
 fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut dest_str = "";
     let mut stats_dest = "";
-    let mut bitrate_kbps = 2000u32;
+    let mut bitrate_kbps = 1000u32;
     let mut framerate = 30u32;
     let mut add_audio = false;
     let mut config_path = "";
@@ -134,6 +134,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut device_path = "/dev/video0";
     let mut source_uri = "";
     let mut control_sock_path = "/tmp/strata-pipeline.sock";
+    let mut resolution = "1280x720";
 
     let mut i = 0;
     while i < args.len() {
@@ -181,6 +182,10 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 control_sock_path = &args[i + 1];
                 i += 1;
             }
+            "--resolution" if i + 1 < args.len() => {
+                resolution = &args[i + 1];
+                i += 1;
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 eprint!("{SENDER_HELP}");
@@ -195,6 +200,19 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         eprint!("{SENDER_HELP}");
         std::process::exit(1);
     }
+
+    // Parse resolution (WxH)
+    let (res_w, res_h) = {
+        let parts: Vec<&str> = resolution.split('x').collect();
+        if parts.len() == 2 {
+            (
+                parts[0].parse::<u32>().unwrap_or(1280),
+                parts[1].parse::<u32>().unwrap_or(720),
+            )
+        } else {
+            (1280, 720)
+        }
+    };
 
     register_plugins()?;
 
@@ -219,13 +237,15 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let pipeline_str = format!(
         "videotestsrc name=testsrc is-live=true pattern=smpte \
-         ! video/x-raw,width=1920,height=1080,framerate={fps}/1 \
+         ! video/x-raw,width={w},height={h},framerate={fps}/1 \
          ! queue name=testq max-size-buffers=3 ! sel. \
          input-selector name=sel \
          ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps} key-int-max={ki} \
          ! queue ! mux.{audio} \
          mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 \
          ! rsristbondsink name=rsink",
+        w = res_w,
+        h = res_h,
         fps = framerate,
         bps = bitrate_kbps,
         ki = key_int,
@@ -260,6 +280,8 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             device_path,
             source_uri,
             framerate,
+            res_w,
+            res_h,
         ) {
             Ok(new_pad) => {
                 selector.set_property("active-pad", &new_pad);
@@ -331,9 +353,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     .expect("Error setting signal handler");
 
     pipeline.set_state(gst::State::Playing)?;
-    eprintln!(
-        "Sender running (source={source_mode})... Press Ctrl+C to stop."
-    );
+    eprintln!("Sender running (source={source_mode})... Press Ctrl+C to stop.");
 
     // ── Bus message loop ──
     let bus = pipeline.bus().unwrap();
@@ -353,11 +373,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(s) = app.structure() {
                     if s.name() == "source-switch" {
                         handle_source_switch(
-                            &pipeline,
-                            &selector,
-                            &test_pad,
-                            s,
-                            framerate,
+                            &pipeline, &selector, &test_pad, s, framerate, res_w, res_h,
                         );
                     }
                 }
@@ -386,9 +402,10 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     } else if s.name() == "rist-bonding-stats" {
                         if let Some(sock) = &stats_socket {
-                            if let Ok(stats_json) = s.get::<&str>("stats_json") {
-                                let _ = sock.send_to(stats_json.as_bytes(), stats_dest);
-                            }
+                            // Serialize the per-link fields into a JSON
+                            // object that the agent telemetry can parse.
+                            let json = serialize_bonding_stats(s);
+                            let _ = sock.send_to(json.as_bytes(), stats_dest);
                         }
                     }
                 }
@@ -402,10 +419,61 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// ── Stats serialization ─────────────────────────────────────────────
+
+/// Serialize the `rist-bonding-stats` GStreamer structure into JSON
+/// that the agent telemetry module can parse.
+///
+/// The structure has per-link fields like `link_0_rtt`, `link_0_capacity`,
+/// `link_0_loss`, etc.  We iterate alive links and build a JSON object:
+/// `{"links":[{"id":0,"rtt_us":35000,"loss_rate":0.01,...},...]}`
+fn serialize_bonding_stats(s: &gst::StructureRef) -> String {
+    let alive_links = s.get::<u64>("alive_links").unwrap_or(0);
+    let mut links = Vec::new();
+
+    // The link IDs in the structure are not necessarily 0..N contiguous,
+    // so we probe link_<id>_rtt for ids 0..max_reasonable
+    let max_probe = alive_links.max(8) as u32;
+    for id in 0..max_probe {
+        let rtt_key = format!("link_{}_rtt", id);
+        if let Ok(rtt_ms) = s.get::<f64>(&rtt_key) {
+            let capacity = s
+                .get::<f64>(&format!("link_{}_capacity", id))
+                .unwrap_or(0.0);
+            let loss = s.get::<f64>(&format!("link_{}_loss", id)).unwrap_or(0.0);
+            let observed_bytes = s
+                .get::<u64>(&format!("link_{}_observed_bytes", id))
+                .unwrap_or(0);
+            let iface = s
+                .get::<&str>(&format!("link_{}_iface", id))
+                .unwrap_or("unknown");
+            let alive = s
+                .get::<bool>(&format!("link_{}_alive", id))
+                .unwrap_or(false);
+
+            if !alive {
+                continue;
+            }
+
+            links.push(serde_json::json!({
+                "id": id,
+                "rtt_us": (rtt_ms * 1000.0) as u64,
+                "loss_rate": loss,
+                "capacity_bps": capacity as u64,
+                "sent_bytes": observed_bytes,
+                "interface": iface,
+            }));
+        }
+    }
+
+    serde_json::json!({ "links": links }).to_string()
+}
+
 // ── Hot-swap helpers ────────────────────────────────────────────────
 
 /// Add a new source branch to the pipeline and link it to input-selector.
 /// Returns the new sink pad on the selector that this branch feeds into.
+#[allow(clippy::too_many_arguments)]
 fn add_source_branch(
     pipeline: &gst::Pipeline,
     selector: &gst::Element,
@@ -413,10 +481,12 @@ fn add_source_branch(
     device: &str,
     uri: &str,
     framerate: u32,
+    width: u32,
+    height: u32,
 ) -> Result<gst::Pad, Box<dyn std::error::Error>> {
     let caps = gst::Caps::builder("video/x-raw")
-        .field("width", 1920i32)
-        .field("height", 1080i32)
+        .field("width", width as i32)
+        .field("height", height as i32)
         .field("framerate", gst::Fraction::new(framerate as i32, 1))
         .build();
 
@@ -515,10 +585,10 @@ fn handle_source_switch(
     test_pad: &gst::Pad,
     structure: &gst::StructureRef,
     framerate: u32,
+    res_w: u32,
+    res_h: u32,
 ) {
-    let mode = structure
-        .get::<&str>("mode")
-        .unwrap_or("test");
+    let mode = structure.get::<&str>("mode").unwrap_or("test");
 
     match mode {
         "test" => {
@@ -546,10 +616,10 @@ fn handle_source_switch(
             }
         }
         "v4l2" => {
-            let device = structure
-                .get::<&str>("device")
-                .unwrap_or("/dev/video0");
-            match add_source_branch(pipeline, selector, "v4l2", device, "", framerate) {
+            let device = structure.get::<&str>("device").unwrap_or("/dev/video0");
+            match add_source_branch(
+                pipeline, selector, "v4l2", device, "", framerate, res_w, res_h,
+            ) {
                 Ok(new_pad) => {
                     selector.set_property("active-pad", &new_pad);
                     eprintln!("Switched to v4l2 source (device={})", device);
@@ -560,14 +630,12 @@ fn handle_source_switch(
             }
         }
         "uri" => {
-            let uri = structure
-                .get::<&str>("uri")
-                .unwrap_or("");
+            let uri = structure.get::<&str>("uri").unwrap_or("");
             if uri.is_empty() {
                 eprintln!("Source switch to URI requires 'uri' field");
                 return;
             }
-            match add_source_branch(pipeline, selector, "uri", "", uri, framerate) {
+            match add_source_branch(pipeline, selector, "uri", "", uri, framerate, res_w, res_h) {
                 Ok(new_pad) => {
                     selector.set_property("active-pad", &new_pad);
                     eprintln!("Switched to URI source (uri={})", uri);
@@ -585,10 +653,7 @@ fn handle_source_switch(
 
 /// Run the Unix domain socket listener for hot-swap control commands.
 /// Posts `source-switch` Application messages to the pipeline's bus.
-fn run_control_socket(
-    path: &str,
-    pipeline_weak: gst::glib::WeakRef<gst::Pipeline>,
-) {
+fn run_control_socket(path: &str, pipeline_weak: gst::glib::WeakRef<gst::Pipeline>) {
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
 

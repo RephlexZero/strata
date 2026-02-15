@@ -18,8 +18,9 @@ use strata_common::models::StreamState;
 use strata_common::protocol::{
     AuthLoginPayload, AuthLoginResponsePayload, ConfigSetPayload, ConfigSetResponsePayload,
     DeviceStatusPayload, Envelope, InterfaceCommandPayload, InterfaceCommandResponsePayload,
-    InterfacesScanPayload, InterfacesScanResponsePayload, StreamEndReason, StreamEndedPayload,
-    StreamStartPayload, StreamStopPayload, SourceSwitchPayload, TestRunPayload, TestRunResponsePayload,
+    InterfacesScanPayload, InterfacesScanResponsePayload, SourceSwitchPayload, StreamEndReason,
+    StreamEndedPayload, StreamStartPayload, StreamStopPayload, TestRunPayload,
+    TestRunResponsePayload,
 };
 
 use crate::AgentState;

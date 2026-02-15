@@ -5,8 +5,8 @@ use leptos::prelude::*;
 
 use crate::api;
 use crate::types::{
-    DashboardEvent, DestinationSummary, LinkStats, MediaInput, NetworkInterface, SenderDetail,
-    SenderFullStatus, StreamSummary, TestRunResponse,
+    DashboardEvent, LinkStats, MediaInput, NetworkInterface, SenderDetail, SenderFullStatus,
+    StreamSummary, TestRunResponse,
 };
 use crate::ws::WsClient;
 use crate::AuthState;
@@ -58,9 +58,6 @@ pub fn SenderDetailPage() -> impl IntoView {
 
     // Destination picker for starting a stream
     let (show_start_modal, set_show_start_modal) = signal(false);
-    let (destinations, set_destinations) = signal(Vec::<DestinationSummary>::new());
-    let (selected_dest, set_selected_dest) = signal(String::new());
-    let (dests_loading, set_dests_loading) = signal(false);
 
     // Receiver URL change confirmation
     let (show_receiver_confirm, set_show_receiver_confirm) = signal(false);
@@ -161,42 +158,18 @@ pub fn SenderDetailPage() -> impl IntoView {
         }
     });
 
-    let auth_start = auth.clone();
     let open_start_modal = move |_| {
-        let token = auth_start.token.get_untracked().unwrap_or_default();
-        set_dests_loading.set(true);
-        set_selected_dest.set(String::new());
         set_show_start_modal.set(true);
-        leptos::task::spawn_local(async move {
-            match api::list_destinations(&token).await {
-                Ok(dests) => {
-                    // Auto-select the first destination if there's only one
-                    if dests.len() == 1 {
-                        set_selected_dest.set(dests[0].id.clone());
-                    }
-                    set_destinations.set(dests);
-                    set_dests_loading.set(false);
-                }
-                Err(e) => {
-                    set_error.set(Some(e));
-                    set_dests_loading.set(false);
-                }
-            }
-        });
     };
 
     let auth_start2 = auth.clone();
     let confirm_start_stream = move |_| {
         let id = params.get().get("id").unwrap_or_default();
         let token = auth_start2.token.get_untracked().unwrap_or_default();
-        let dest_id = selected_dest.get_untracked();
-        if dest_id.is_empty() {
-            return; // guard — button should be disabled
-        }
         set_action_loading.set(true);
         set_show_start_modal.set(false);
         leptos::task::spawn_local(async move {
-            match api::start_stream(&token, &id, dest_id).await {
+            match api::start_stream(&token, &id).await {
                 Ok(resp) => {
                     set_stream_state.set(resp.state);
                     set_action_loading.set(false);
@@ -355,50 +328,18 @@ pub fn SenderDetailPage() -> impl IntoView {
                                 </div>
                             </div>
 
-                            // ── Start Stream Modal (destination picker) ─
+                            // ── Start Stream Confirmation ────────────
                             {move || show_start_modal.get().then(|| {
-                                let dests = destinations.get();
-                                let loading = dests_loading.get();
                                 view! {
                                     <div class="modal modal-open">
                                         <div class="modal-box">
                                             <h3 class="font-bold text-lg">"Start Stream"</h3>
                                             <p class="text-sm text-base-content/60 mt-2">
-                                                "Select a destination for this stream."
+                                                "Start broadcasting on all enabled bonded links?"
                                             </p>
-
-                                            {if loading {
-                                                view! {
-                                                    <div class="flex justify-center py-6">
-                                                        <span class="loading loading-spinner loading-md"></span>
-                                                    </div>
-                                                }.into_any()
-                                            } else if dests.is_empty() {
-                                                view! {
-                                                    <div class="alert alert-warning mt-4 text-sm">
-                                                        "No destinations configured. Add a destination first."
-                                                    </div>
-                                                }.into_any()
-                                            } else {
-                                                view! {
-                                                    <fieldset class="fieldset mt-4">
-                                                        <label class="fieldset-label">"Destination"</label>
-                                                        <select
-                                                            class="select select-bordered w-full"
-                                                            on:change=move |ev| set_selected_dest.set(event_target_value(&ev))
-                                                            prop:value=move || selected_dest.get()
-                                                        >
-                                                            <option value="" disabled=true selected=true>"Choose a destination…"</option>
-                                                            {dests.into_iter().map(|d| {
-                                                                let id = d.id.clone();
-                                                                let label = format!("{} — {} ({})", d.name, d.platform, d.url);
-                                                                view! { <option value={id}>{label}</option> }
-                                                            }).collect::<Vec<_>>()}
-                                                        </select>
-                                                    </fieldset>
-                                                }.into_any()
-                                            }}
-
+                                            <p class="text-sm text-base-content/60 mt-1">
+                                                "The stream will use the SMPTE test source at 1 Mbps."
+                                            </p>
                                             <div class="modal-action">
                                                 <button class="btn btn-ghost" on:click=move |_| set_show_start_modal.set(false)>
                                                     "Cancel"
@@ -406,7 +347,6 @@ pub fn SenderDetailPage() -> impl IntoView {
                                                 <button
                                                     class="btn btn-primary"
                                                     on:click=confirm_start_stream
-                                                    disabled=move || selected_dest.get().is_empty()
                                                 >
                                                     "▶ Go Live"
                                                 </button>

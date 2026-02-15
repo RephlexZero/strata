@@ -34,7 +34,7 @@ pub fn router() -> Router<AppState> {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct StartStreamRequest {
-    pub destination_id: String,
+    pub destination_id: Option<String>,
     pub source: Option<strata_common::protocol::SourceConfig>,
     pub encoder: Option<strata_common::protocol::EncoderConfig>,
 }
@@ -65,28 +65,35 @@ async fn start_stream(
         return Err(ApiError::not_found("sender not found"));
     }
 
-    // Resolve destination → RTMP URL + stream key for receiver relay
-    let dest_row = sqlx::query_as::<_, (String, String, Option<String>)>(
-        "SELECT platform, url, stream_key FROM destinations WHERE id = $1 AND owner_id = $2",
-    )
-    .bind(&body.destination_id)
-    .bind(&user.user_id)
-    .fetch_optional(state.pool())
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?
-    .ok_or_else(|| ApiError::not_found("destination not found"))?;
-
-    let (_platform, dest_url, stream_key) = dest_row;
-
-    // Build full relay URL (append stream key for RTMP targets)
-    let relay_url = if let Some(ref key) = stream_key {
-        if dest_url.ends_with('/') {
-            format!("{dest_url}{key}")
+    // Resolve destination → RTMP relay URL (optional — bonded RIST
+    // streams don't require a destination record)
+    let relay_url = if let Some(ref dest_id) = body.destination_id {
+        if dest_id.is_empty() {
+            String::new()
         } else {
-            format!("{dest_url}/{key}")
+            let dest_row = sqlx::query_as::<_, (String, String, Option<String>)>(
+                "SELECT platform, url, stream_key FROM destinations WHERE id = $1 AND owner_id = $2",
+            )
+            .bind(dest_id)
+            .bind(&user.user_id)
+            .fetch_optional(state.pool())
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .ok_or_else(|| ApiError::not_found("destination not found"))?;
+
+            let (_platform, dest_url, stream_key) = dest_row;
+            if let Some(ref key) = stream_key {
+                if dest_url.ends_with('/') {
+                    format!("{dest_url}{key}")
+                } else {
+                    format!("{dest_url}/{key}")
+                }
+            } else {
+                dest_url
+            }
         }
     } else {
-        dest_url.clone()
+        String::new()
     };
 
     // Check sender is connected
@@ -120,14 +127,16 @@ async fn start_stream(
         .map(|s| {
             s.network_interfaces
                 .iter()
-                .filter(|i| i.enabled && i.state == strata_common::models::InterfaceState::Connected)
+                .filter(|i| {
+                    i.enabled && i.state == strata_common::models::InterfaceState::Connected
+                })
                 .count()
         })
         .unwrap_or(receiver_links.len());
     let link_count = enabled_count.min(receiver_links.len());
     let rist_dests: Vec<String> = receiver_links[..link_count]
         .iter()
-        .map(|addr| format!("rist://{addr}"))
+        .map(|addr| format!("rist://{addr}?buffer=2000"))
         .collect();
 
     tracing::info!(
@@ -144,18 +153,27 @@ async fn start_stream(
                 mode: "test".into(),
                 device: None,
                 uri: None,
-                resolution: Some("1920x1080".into()),
+                resolution: Some("1280x720".into()),
                 framerate: Some(30),
             }),
         encoder: body
             .encoder
             .unwrap_or(strata_common::protocol::EncoderConfig {
-                bitrate_kbps: 2000,
+                bitrate_kbps: 1000,
                 tune: Some("zerolatency".into()),
                 keyint_max: Some(60),
             }),
         destinations: rist_dests,
-        bonding_config: serde_json::json!({}),
+        bonding_config: serde_json::json!({
+            "version": 1,
+            "scheduler": {
+                "critical_broadcast": false,
+                "redundancy_enabled": false,
+                "capacity_floor_bps": 500_000.0,
+                "failover_enabled": true,
+                "failover_duration_ms": 3000
+            }
+        }),
         rist_psk: None,
     };
 
@@ -173,7 +191,7 @@ async fn start_stream(
     )
     .bind(&stream_id)
     .bind(&sender_id)
-    .bind(&body.destination_id)
+    .bind(body.destination_id.as_deref().filter(|s| !s.is_empty()))
     .bind(Utc::now())
     .bind(&config_json_final)
     .execute(state.pool())
