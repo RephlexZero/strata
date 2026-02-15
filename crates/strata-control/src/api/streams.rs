@@ -105,14 +105,36 @@ async fn start_stream(
 
     // Build stream.start command and send to agent.
     //
-    // RIST destinations point to the receiver service on 3 ports for bonding.
-    // The receiver host is configured via RECEIVER_HOST env (default: strata-receiver).
-    let receiver_host = std::env::var("RECEIVER_HOST").unwrap_or_else(|_| "strata-receiver".into());
-    let rist_dests = vec![
-        format!("rist://{receiver_host}:5000"),
-        format!("rist://{receiver_host}:5002"),
-        format!("rist://{receiver_host}:5004"),
-    ];
+    // RIST destinations are built dynamically based on the sender's
+    // currently enabled network interfaces.  Each link targets the
+    // receiver's IP on the matching subnet so traffic flows over
+    // physically separate paths.
+    //
+    // RECEIVER_LINKS env var provides the list of receiver endpoints
+    // (one per network link), e.g. "172.30.0.20:5000,172.30.1.20:5002,..."
+    // Falls back to RECEIVER_HOST with 3 hardcoded ports for single-network setups.
+    let receiver_links = build_receiver_links();
+    let enabled_count = state
+        .device_status()
+        .get(&sender_id)
+        .map(|s| {
+            s.network_interfaces
+                .iter()
+                .filter(|i| i.enabled && i.state == strata_common::models::InterfaceState::Connected)
+                .count()
+        })
+        .unwrap_or(receiver_links.len());
+    let link_count = enabled_count.min(receiver_links.len());
+    let rist_dests: Vec<String> = receiver_links[..link_count]
+        .iter()
+        .map(|addr| format!("rist://{addr}"))
+        .collect();
+
+    tracing::info!(
+        links = link_count,
+        dests = ?rist_dests,
+        "building RIST destinations for sender"
+    );
 
     let start_payload = StreamStartPayload {
         stream_id: stream_id.clone(),
@@ -123,14 +145,14 @@ async fn start_stream(
                 device: None,
                 uri: None,
                 resolution: Some("1920x1080".into()),
-                framerate: Some(60),
+                framerate: Some(30),
             }),
         encoder: body
             .encoder
             .unwrap_or(strata_common::protocol::EncoderConfig {
-                bitrate_kbps: 6000,
+                bitrate_kbps: 2000,
                 tune: Some("zerolatency".into()),
-                keyint_max: Some(120),
+                keyint_max: Some(60),
             }),
         destinations: rist_dests,
         bonding_config: serde_json::json!({}),
@@ -336,4 +358,27 @@ async fn get_stream(
         total_bytes,
         error_message,
     }))
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+/// Build the list of receiver link addresses from environment config.
+///
+/// Reads `RECEIVER_LINKS` (comma-separated `host:port` pairs).
+/// Falls back to `RECEIVER_HOST` with ports 5000, 5002, 5004.
+fn build_receiver_links() -> Vec<String> {
+    if let Ok(links) = std::env::var("RECEIVER_LINKS") {
+        return links
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+
+    let host = std::env::var("RECEIVER_HOST").unwrap_or_else(|_| "strata-receiver".into());
+    vec![
+        format!("{host}:5000"),
+        format!("{host}:5002"),
+        format!("{host}:5004"),
+    ]
 }

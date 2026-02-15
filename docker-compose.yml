@@ -9,6 +9,12 @@
 #
 # To stream to YouTube (or any RTMP target), set RELAY_URL:
 #   RELAY_URL="rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY" docker compose up -d
+#
+# Network Topology:
+#   Three isolated bridge networks (link0/link1/link2) simulate bonded
+#   cellular links.  tc netem impairments are applied at container start
+#   via dev/entrypoint-sender.sh giving realistic cellular-grade
+#   delay, jitter, loss, and rate-limiting (~3500 kbps aggregate).
 
 services:
   # ── PostgreSQL ───────────────────────────────────────────────
@@ -42,17 +48,24 @@ services:
       RUST_LOG: "info,strata_control=debug"
       DEV_SEED: "1"
       RECEIVER_HOST: "strata-receiver"
-      YOUTUBE_STREAM_KEY: "${YOUTUBE_STREAM_KEY:-YOUR_STREAM_KEY}"
+      # Per-link receiver IPs (one per Docker network, matching compose subnets)
+      RECEIVER_LINKS: "172.30.0.20:5000,172.30.1.20:5002,172.30.2.20:5004"
     ports:
       - "3000:3000"
     restart: unless-stopped
 
   # ── Sender Agent (real GStreamer pipeline) ───────────────────
   #
-  # Runs the strata-agent daemon. When a stream is started from the
-  # dashboard, the agent spawns integration_node which builds a real
-  # GStreamer pipeline: videotestsrc 1080p60 + AAC audio → rsristbondsink
-  # sending over 3 bonded RIST links to the receiver.
+  # Runs the strata-agent daemon.  The sender is attached to three
+  # isolated Docker networks (link0, link1, link2) which give it
+  # three genuine eth interfaces.  The entrypoint script applies
+  # tc netem impairments modelled after realistic LTE/5G cellular
+  # links before handing off to the agent binary.
+  #
+  # When a stream is started from the dashboard, the agent spawns
+  # integration_node which builds a real GStreamer pipeline:
+  # videotestsrc → x264enc → mpegtsmux → rsristbondsink
+  # sending over bonded RIST links to the receiver.
   strata-sender-sim:
     build:
       context: .
@@ -60,10 +73,17 @@ services:
     depends_on:
       - strata-control
       - strata-receiver
+    cap_add:
+      - NET_ADMIN
     environment:
       RUST_LOG: "info,strata_agent=debug"
       GST_PLUGIN_PATH: "/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
-      DEV_INTERFACES: "1"
+      # Per-link tc netem impairment config (override to tune)
+      # Format: RATE_KBIT DELAY_MS JITTER_MS LOSS_PERCENT
+      LINK0_IMPAIRMENT: "1500 40 10 1.0"
+      LINK1_IMPAIRMENT: "800 60 15 2.0"
+      LINK2_IMPAIRMENT: "1200 35 8 0.5"
+    entrypoint: ["/usr/local/bin/entrypoint-sender.sh"]
     command:
       - "--control-url"
       - "ws://strata-control:3000/agent/ws"
@@ -75,13 +95,22 @@ services:
       - "5"
     ports:
       - "3001:3001"
+    networks:
+      link0:
+        ipv4_address: 172.30.0.10
+      link1:
+        ipv4_address: 172.30.1.10
+      link2:
+        ipv4_address: 172.30.2.10
+      default: {}   # management — control plane access (no impairment)
     restart: unless-stopped
 
   # ── Receiver (bonded RIST → RTMP relay) ─────────────────────
   #
-  # Receives the bonded RIST stream on 3 UDP ports via rsristbondsrc,
-  # reassembles it, and relays to an RTMP destination using gst-launch-1.0.
-  # No custom binary needed — just the bonding plugin + GStreamer.
+  # Receives the bonded RIST stream on UDP ports via rsristbondsrc,
+  # reassembles it, and relays to an RTMP destination.
+  # Attached to same link networks as the sender so traffic flows
+  # across the impaired paths.
   #
   # Set RELAY_URL to enable the relay:
   #   RELAY_URL="rtmp://a.rtmp.youtube.com/live2/YOUR_KEY" docker compose up -d
@@ -95,10 +124,19 @@ services:
       RUST_LOG: "info"
       GST_PLUGIN_PATH: "/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
       RELAY_URL: "${RELAY_URL:-}"
+      RIST_LINK_COUNT: "3"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        BIND="rist://@0.0.0.0:5000,rist://@0.0.0.0:5002,rist://@0.0.0.0:5004"
+        # Build bind URL from RIST_LINK_COUNT (default 3)
+        COUNT=$${RIST_LINK_COUNT:-3}
+        BIND=""
+        for i in $$(seq 0 $$((COUNT - 1))); do
+          PORT=$$((5000 + i * 2))
+          if [ -n "$$BIND" ]; then BIND="$$BIND,"; fi
+          BIND="$${BIND}rist://@0.0.0.0:$$PORT"
+        done
+        echo "=== Receiver: binding $$BIND ==="
         if [ -n "$$RELAY_URL" ]; then
           echo "=== Receiver: RTMP relay → $$RELAY_URL ==="
           exec gst-launch-1.0 -e \
@@ -118,7 +156,36 @@ services:
       - "5000:5000/udp"
       - "5002:5002/udp"
       - "5004:5004/udp"
+    networks:
+      link0:
+        ipv4_address: 172.30.0.20
+      link1:
+        ipv4_address: 172.30.1.20
+      link2:
+        ipv4_address: 172.30.2.20
+      default: {}   # management — host access for RELAY_URL
     restart: unless-stopped
+
+networks:
+  # Three isolated bridge networks simulate independent cellular links.
+  # Each has its own subnet and each container gets a real eth interface
+  # per network.  tc netem impairments are applied on the sender's side
+  # only (matching real-world: impairment is on the uplink from sender).
+  link0:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  link1:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.1.0/24
+  link2:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.2.0/24
 
 volumes:
   pgdata:

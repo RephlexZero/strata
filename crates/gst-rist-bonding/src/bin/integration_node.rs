@@ -9,37 +9,48 @@ USAGE: integration_node sender [OPTIONS] --dest <URL[,URL...]>
 OPTIONS:
   --dest <urls>       Comma-separated RIST destination URLs (required)
                       e.g. rist://192.168.1.100:5000,rist://10.0.0.100:5000
-  --source <mode>     Video source mode (default: test)
+  --source <mode>     Initial video source mode (default: test)
                         test   - SMPTE colour bars (videotestsrc)
                         v4l2   - Camera / HDMI capture card (v4l2src)
                         uri    - File or network stream (uridecodebin)
   --device <path>     V4L2 device path (default: /dev/video0, used with --source v4l2)
   --uri <uri>         Media URI for uridecodebin (used with --source uri)
                       e.g. file:///home/user/video.mp4
-  --bitrate <kbps>    Target encoder bitrate in kbps (default: 3000)
+  --bitrate <kbps>    Target encoder bitrate in kbps (default: 2000)
   --framerate <fps>   Video framerate (default: 30)
   --audio             Add silent AAC audio track (required for RTMP targets)
   --config <path>     Path to TOML config file (see Configuration Reference)
-  --stats-dest <addr> UDP address to relay stats JSON (e.g. 192.168.1.50:9000)
+  --stats-dest <addr> UDP address to relay stats JSON (e.g. 127.0.0.1:9100)
+  --control <path>    Unix socket path for hot-swap commands
+                      (default: /tmp/strata-pipeline.sock)
   --help              Show this help
+
+SOURCE HOT-SWAP:
+  While the pipeline is running, send JSON commands to the control socket
+  to switch video sources without stopping the stream:
+
+    echo '{"cmd":"switch_source","mode":"test","pattern":"ball"}' | \
+      socat - UNIX:/tmp/strata-pipeline.sock
+
+  Supported commands:
+    {"cmd":"switch_source","mode":"test","pattern":"<pattern>"}
+      Patterns: smpte, ball, snow, black, white, red, green, blue
+    {"cmd":"switch_source","mode":"v4l2","device":"/dev/video0"}
+    {"cmd":"switch_source","mode":"uri","uri":"file:///path/to/video.mp4"}
 
 EXAMPLES:
   # Test pattern over two cellular links
   integration_node sender --dest rist://server:5000,rist://server:5002 \
     --config sender.toml
 
-  # 1080p60 with audio for YouTube relay via receiver
-  integration_node sender --source test --framerate 60 --audio --bitrate 6000 \
+  # 1080p30 with audio for YouTube relay via receiver
+  integration_node sender --source test --framerate 30 --audio --bitrate 2000 \
     --dest rist://receiver:5000,rist://receiver:5002,rist://receiver:5004
 
   # HDMI capture card to cloud receiver
   integration_node sender --source v4l2 --device /dev/video0 \
     --dest rist://cloud.example.com:5000,rist://cloud.example.com:5002 \
-    --bitrate 5000 --config sender.toml
-
-  # Pre-recorded file (for testing without hardware)
-  integration_node sender --source uri --uri file:///tmp/test.mp4 \
-    --dest rist://192.168.1.100:5000
+    --bitrate 2000 --config sender.toml
 "#;
 
 const RECEIVER_HELP: &str = r#"
@@ -115,13 +126,14 @@ fn register_plugins() -> Result<(), gst::glib::BoolError> {
 fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut dest_str = "";
     let mut stats_dest = "";
-    let mut bitrate_kbps = 3000u32;
+    let mut bitrate_kbps = 2000u32;
     let mut framerate = 30u32;
     let mut add_audio = false;
     let mut config_path = "";
     let mut source_mode = "test";
     let mut device_path = "/dev/video0";
     let mut source_uri = "";
+    let mut control_sock_path = "/tmp/strata-pipeline.sock";
 
     let mut i = 0;
     while i < args.len() {
@@ -139,7 +151,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
             }
             "--bitrate" if i + 1 < args.len() => {
-                bitrate_kbps = args[i + 1].parse().unwrap_or(3000);
+                bitrate_kbps = args[i + 1].parse().unwrap_or(2000);
                 i += 1;
             }
             "--framerate" if i + 1 < args.len() => {
@@ -165,6 +177,10 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 source_uri = &args[i + 1];
                 i += 1;
             }
+            "--control" if i + 1 < args.len() => {
+                control_sock_path = &args[i + 1];
+                i += 1;
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 eprint!("{SENDER_HELP}");
@@ -182,79 +198,84 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     register_plugins()?;
 
-    // Build the source portion of the pipeline based on the selected mode.
-    // All modes produce encoded H.264 MPEG-TS output for rsristbondsink.
+    // ── Build pipeline with input-selector for hot-swap support ──
     //
-    // VBV buffer = bitrate (1-second buffer) constrains the peak rate,
-    // preventing unconstrained VBR overshoot with tune=zerolatency.
+    // Pipeline structure:
+    //   videotestsrc ! capsfilter ! queue ─┐
+    //                                      ├─ input-selector ! x264enc ! [audio] ! mux ! rsristbondsink
+    //   [dynamic v4l2/uri sources] ────────┘
     //
-    // key-int-max is set to 2× framerate (keyframe every 2 seconds).
+    // The initial source (--source flag) determines which branch is active.
+    // Additional branches are added dynamically via the control socket.
     let key_int = framerate * 2;
-    let source_fragment = match source_mode {
-        "test" => {
-            // Indefinite SMPTE test pattern — runs until Ctrl+C.
-            format!(
-                "videotestsrc is-live=true pattern=smpte ! video/x-raw,width=1920,height=1080,framerate={fps}/1 ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps} key-int-max={ki}",
-                fps = framerate,
-                bps = bitrate_kbps,
-                ki = key_int
-            )
-        }
-        "v4l2" => {
-            // V4L2 camera or HDMI capture card.
-            // Most capture cards output raw video or MJPEG; we re-encode to H.264.
-            // For cards that output H.264 natively, use --source uri with a custom pipeline.
-            format!(
-                "v4l2src device={dev} ! videoconvert ! videoscale ! video/x-raw,width=1920,height=1080,framerate={fps}/1 ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps} key-int-max={ki}",
-                dev = device_path,
-                fps = framerate,
-                bps = bitrate_kbps,
-                ki = key_int
-            )
-        }
-        "uri" => {
-            // File or network stream via uridecodebin.  Useful for testing with
-            // pre-recorded content without camera hardware.
-            if source_uri.is_empty() {
-                eprintln!("--source uri requires --uri <media-uri>");
-                std::process::exit(1);
-            }
-            format!(
-                "uridecodebin uri={uri} ! videoconvert ! videoscale ! video/x-raw,width=1920,height=1080,framerate={fps}/1 ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps} key-int-max={ki}",
-                uri = source_uri,
-                fps = framerate,
-                bps = bitrate_kbps,
-                ki = key_int
-            )
-        }
-        other => {
-            eprintln!("Unknown source mode: {other}  (valid: test, v4l2, uri)");
-            std::process::exit(1);
-        }
+
+    // Build the pipeline with input-selector.
+    // The test source is always available as the fallback.
+    let audio_fragment = if add_audio {
+        " audiotestsrc is-live=true wave=silence ! audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! queue ! mux."
+    } else {
+        ""
     };
 
-    // Build the full pipeline string.
-    // When --audio is specified, add a silent AAC audio track — required
-    // for RTMP targets like YouTube which reject video-only streams.
-    let pipeline_str = if add_audio {
-        format!(
-            "{source_fragment} ! queue ! mux. \
-             audiotestsrc is-live=true wave=silence ! audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! queue ! mux. \
-             mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink name=rsink"
-        )
-    } else {
-        format!(
-            "{source_fragment} ! mpegtsmux alignment=7 pat-interval=10 pmt-interval=10 ! rsristbondsink name=rsink"
-        )
-    };
+    let pipeline_str = format!(
+        "videotestsrc name=testsrc is-live=true pattern=smpte \
+         ! video/x-raw,width=1920,height=1080,framerate={fps}/1 \
+         ! queue name=testq max-size-buffers=3 ! sel. \
+         input-selector name=sel \
+         ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps} key-int-max={ki} \
+         ! queue ! mux.{audio} \
+         mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 \
+         ! rsristbondsink name=rsink",
+        fps = framerate,
+        bps = bitrate_kbps,
+        ki = key_int,
+        audio = audio_fragment,
+    );
+
     eprintln!("Sender Pipeline: {}", pipeline_str);
 
     let pipeline = gst::parse::launch(&pipeline_str)?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "Failed to cast to pipeline")?;
 
+    // Keep a handle to the input-selector and its test-source pad
+    let selector = pipeline
+        .by_name("sel")
+        .ok_or("Failed to find input-selector")?;
+    let test_pad = selector
+        .static_pad("sink_0")
+        .or_else(|| {
+            // gst::parse may name it differently; find the first sink pad
+            selector.iterate_sink_pads().into_iter().flatten().next()
+        })
+        .ok_or("Failed to find test source pad on input-selector")?;
+
+    // If the initial source is not 'test', try to create the requested
+    // source and make it active instead.
+    if source_mode != "test" {
+        match add_source_branch(
+            &pipeline,
+            &selector,
+            source_mode,
+            device_path,
+            source_uri,
+            framerate,
+        ) {
+            Ok(new_pad) => {
+                selector.set_property("active-pad", &new_pad);
+                eprintln!("Initial source: {} (active)", source_mode);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to create {} source ({}), falling back to test",
+                    source_mode, e
+                );
+            }
+        }
+    }
+
+    // ── Configure RIST destinations ──
     if let Some(sink) = pipeline.by_name("rsink") {
-        // Apply TOML config file if provided
         if !config_path.is_empty() {
             let config_toml = std::fs::read_to_string(config_path)
                 .map_err(|e| format!("Failed to read config file '{}': {}", config_path, e))?;
@@ -277,18 +298,29 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Err("Failed to find rsristbondsink element".into());
     }
 
-    // Setup Stats Relay if requested
+    // ── Stats relay (always if stats-dest is configured) ──
     let mut stats_socket = None;
     if !stats_dest.is_empty() {
         let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
         stats_socket = Some(sock);
+        eprintln!("Stats relay → {}", stats_dest);
     }
 
-    // Track the current NADA-derived ceiling (updated continuously via
-    // bandwidth-available messages).
+    // ── NADA ceiling tracking ──
     let nada_ceiling_kbps = Arc::new(Mutex::new(bitrate_kbps));
 
-    // Graceful shutdown: send EOS on Ctrl+C so the pipeline flushes cleanly.
+    // ── Control socket for hot-swap commands ──
+    // Remove stale socket file, then listen.
+    let _ = std::fs::remove_file(control_sock_path);
+    let control_socket_path_owned = control_sock_path.to_string();
+    let pipeline_weak_ctrl = pipeline.downgrade();
+    std::thread::Builder::new()
+        .name("ctrl-sock".into())
+        .spawn(move || {
+            run_control_socket(&control_socket_path_owned, pipeline_weak_ctrl);
+        })?;
+
+    // ── Graceful shutdown ──
     let pipeline_weak = pipeline.downgrade();
     ctrlc::set_handler(move || {
         eprintln!("\nReceived shutdown signal. Sending EOS to pipeline...");
@@ -299,8 +331,11 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     .expect("Error setting signal handler");
 
     pipeline.set_state(gst::State::Playing)?;
-    eprintln!("Sender running (source={source_mode})... Press Ctrl+C to stop.");
+    eprintln!(
+        "Sender running (source={source_mode})... Press Ctrl+C to stop."
+    );
 
+    // ── Bus message loop ──
     let bus = pipeline.bus().unwrap();
     for msg in bus.iter_timed(gst::ClockTime::NONE) {
         match msg.view() {
@@ -313,19 +348,31 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 pipeline.set_state(gst::State::Null)?;
                 return Err(Box::new(err.error().clone()));
             }
+            MessageView::Application(app) => {
+                // Hot-swap commands posted by the control socket thread.
+                if let Some(s) = app.structure() {
+                    if s.name() == "source-switch" {
+                        handle_source_switch(
+                            &pipeline,
+                            &selector,
+                            &test_pad,
+                            s,
+                            framerate,
+                        );
+                    }
+                }
+            }
             MessageView::Element(element) => {
                 if let Some(s) = element.structure() {
                     if s.name() == "congestion-control" {
                         if let Ok(recommended) = s.get::<u64>("recommended-bitrate") {
-                            // RFC 8698 §5.2.2: Set encoder bitrate to r_vin
-                            // (NADA-derived target).  Clamp to [500, configured_max].
                             if let Some(enc) = pipeline.by_name("enc") {
                                 let recommended_kbps = (recommended / 1000) as u32;
                                 let target = recommended_kbps.clamp(500, bitrate_kbps);
                                 let current: u32 = enc.property("bitrate");
                                 if target != current {
                                     eprintln!(
-                                        "NADA Rate Signal: Setting bitrate {} -> {} kbps (r_vin={})",
+                                        "NADA Rate Signal: {} -> {} kbps (r_vin={})",
                                         current, target, recommended
                                     );
                                     enc.set_property("bitrate", target);
@@ -333,14 +380,11 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     } else if s.name() == "bandwidth-available" {
-                        // Update NADA ceiling — the maximum safe rate
-                        // according to the aggregate estimate.
                         if let Ok(max_bps) = s.get::<u64>("max-bitrate") {
                             let ceiling = ((max_bps / 1000) as u32).min(bitrate_kbps);
                             *nada_ceiling_kbps.lock().unwrap() = ceiling;
                         }
                     } else if s.name() == "rist-bonding-stats" {
-                        // Relay to UDP if configured
                         if let Some(sock) = &stats_socket {
                             if let Ok(stats_json) = s.get::<&str>("stats_json") {
                                 let _ = sock.send_to(stats_json.as_bytes(), stats_dest);
@@ -354,7 +398,267 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     pipeline.set_state(gst::State::Null)?;
+    let _ = std::fs::remove_file(control_sock_path);
     Ok(())
+}
+
+// ── Hot-swap helpers ────────────────────────────────────────────────
+
+/// Add a new source branch to the pipeline and link it to input-selector.
+/// Returns the new sink pad on the selector that this branch feeds into.
+fn add_source_branch(
+    pipeline: &gst::Pipeline,
+    selector: &gst::Element,
+    mode: &str,
+    device: &str,
+    uri: &str,
+    framerate: u32,
+) -> Result<gst::Pad, Box<dyn std::error::Error>> {
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("width", 1920i32)
+        .field("height", 1080i32)
+        .field("framerate", gst::Fraction::new(framerate as i32, 1))
+        .build();
+
+    let (elements, src_element_name): (Vec<gst::Element>, String) = match mode {
+        "v4l2" => {
+            let src = gst::ElementFactory::make("v4l2src")
+                .property("device", device)
+                .build()?;
+            let conv = gst::ElementFactory::make("videoconvert").build()?;
+            let scale = gst::ElementFactory::make("videoscale").build()?;
+            let filter = gst::ElementFactory::make("capsfilter")
+                .property("caps", &caps)
+                .build()?;
+            let queue = gst::ElementFactory::make("queue")
+                .property("max-size-buffers", 3u32)
+                .build()?;
+            let name = src.name().to_string();
+            (vec![src, conv, scale, filter, queue], name)
+        }
+        "uri" => {
+            if uri.is_empty() {
+                return Err("URI source requires a non-empty URI".into());
+            }
+            let src = gst::ElementFactory::make("uridecodebin")
+                .property("uri", uri)
+                .build()?;
+            let conv = gst::ElementFactory::make("videoconvert").build()?;
+            let scale = gst::ElementFactory::make("videoscale").build()?;
+            let filter = gst::ElementFactory::make("capsfilter")
+                .property("caps", &caps)
+                .build()?;
+            let queue = gst::ElementFactory::make("queue")
+                .property("max-size-buffers", 3u32)
+                .build()?;
+            let name = src.name().to_string();
+            // uridecodebin has dynamic pads — connect later via pad-added
+            let conv_weak = conv.downgrade();
+            src.connect_pad_added(move |_, pad| {
+                if let Some(conv) = conv_weak.upgrade() {
+                    if let Some(sink_pad) = conv.static_pad("sink") {
+                        if !sink_pad.is_linked() {
+                            let _ = pad.link(&sink_pad);
+                        }
+                    }
+                }
+            });
+            // Link conv→scale→filter→queue (src→conv linked via pad-added)
+            (vec![src, conv, scale, filter, queue], name)
+        }
+        other => {
+            return Err(format!("Unknown source mode: {other}").into());
+        }
+    };
+
+    // Add all elements to the pipeline
+    for el in &elements {
+        pipeline.add(el)?;
+    }
+
+    // Link chain: elements[0] → elements[1] → ... → elements[N-1]
+    // For v4l2: src → conv → scale → filter → queue
+    // For uri: conv → scale → filter → queue (src→conv via pad-added)
+    if mode == "v4l2" {
+        gst::Element::link_many(&elements)?;
+    } else {
+        // Skip the first element (uridecodebin) — linked via pad-added
+        gst::Element::link_many(&elements[1..])?;
+    }
+
+    // Request a new pad on input-selector and link
+    let sel_pad = selector
+        .request_pad_simple("sink_%u")
+        .ok_or("Failed to request selector pad")?;
+    let last = elements.last().unwrap();
+    let src_pad = last.static_pad("src").ok_or("No src pad on last element")?;
+    src_pad.link(&sel_pad)?;
+
+    // Sync states with parent
+    for el in &elements {
+        el.sync_state_with_parent()?;
+    }
+
+    eprintln!(
+        "Added {} source branch ({}) → selector pad {}",
+        mode,
+        src_element_name,
+        sel_pad.name()
+    );
+    Ok(sel_pad)
+}
+
+/// Handle a source-switch Application message from the control socket.
+fn handle_source_switch(
+    pipeline: &gst::Pipeline,
+    selector: &gst::Element,
+    test_pad: &gst::Pad,
+    structure: &gst::StructureRef,
+    framerate: u32,
+) {
+    let mode = structure
+        .get::<&str>("mode")
+        .unwrap_or("test");
+
+    match mode {
+        "test" => {
+            // Switch back to test source and optionally change pattern
+            selector.set_property("active-pad", test_pad);
+            if let Ok(pattern) = structure.get::<&str>("pattern") {
+                if let Some(testsrc) = pipeline.by_name("testsrc") {
+                    let pattern_enum = match pattern {
+                        "smpte" => 0i32,
+                        "snow" => 1,
+                        "black" | "solid-color" => 2,
+                        "ball" => 18,
+                        "smpte100" => 13,
+                        "bar" | "colors" => 14,
+                        _ => {
+                            eprintln!("Unknown test pattern: {pattern}, using smpte");
+                            0
+                        }
+                    };
+                    testsrc.set_property("pattern", pattern_enum);
+                    eprintln!("Switched to test source (pattern={})", pattern);
+                }
+            } else {
+                eprintln!("Switched to test source");
+            }
+        }
+        "v4l2" => {
+            let device = structure
+                .get::<&str>("device")
+                .unwrap_or("/dev/video0");
+            match add_source_branch(pipeline, selector, "v4l2", device, "", framerate) {
+                Ok(new_pad) => {
+                    selector.set_property("active-pad", &new_pad);
+                    eprintln!("Switched to v4l2 source (device={})", device);
+                }
+                Err(e) => {
+                    eprintln!("Failed to switch to v4l2: {}", e);
+                }
+            }
+        }
+        "uri" => {
+            let uri = structure
+                .get::<&str>("uri")
+                .unwrap_or("");
+            if uri.is_empty() {
+                eprintln!("Source switch to URI requires 'uri' field");
+                return;
+            }
+            match add_source_branch(pipeline, selector, "uri", "", uri, framerate) {
+                Ok(new_pad) => {
+                    selector.set_property("active-pad", &new_pad);
+                    eprintln!("Switched to URI source (uri={})", uri);
+                }
+                Err(e) => {
+                    eprintln!("Failed to switch to URI source: {}", e);
+                }
+            }
+        }
+        other => {
+            eprintln!("Unknown source mode in switch command: {other}");
+        }
+    }
+}
+
+/// Run the Unix domain socket listener for hot-swap control commands.
+/// Posts `source-switch` Application messages to the pipeline's bus.
+fn run_control_socket(
+    path: &str,
+    pipeline_weak: gst::glib::WeakRef<gst::Pipeline>,
+) {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+
+    let listener = match UnixListener::bind(path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Failed to bind control socket at {}: {}", path, e);
+            return;
+        }
+    };
+    eprintln!("Control socket listening on {}", path);
+
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Control socket accept error: {}", e);
+                continue;
+            }
+        };
+
+        let pipeline = match pipeline_weak.upgrade() {
+            Some(p) => p,
+            None => return, // Pipeline gone, exit thread
+        };
+
+        let reader = BufReader::new(stream);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            let line = line.trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+
+            // Parse JSON command
+            let cmd: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Control: invalid JSON: {} — {}", line, e);
+                    continue;
+                }
+            };
+
+            if cmd.get("cmd").and_then(|v| v.as_str()) == Some("switch_source") {
+                let mut builder = gst::Structure::builder("source-switch");
+                if let Some(mode) = cmd.get("mode").and_then(|v| v.as_str()) {
+                    builder = builder.field("mode", mode);
+                }
+                if let Some(pattern) = cmd.get("pattern").and_then(|v| v.as_str()) {
+                    builder = builder.field("pattern", pattern);
+                }
+                if let Some(device) = cmd.get("device").and_then(|v| v.as_str()) {
+                    builder = builder.field("device", device);
+                }
+                if let Some(uri) = cmd.get("uri").and_then(|v| v.as_str()) {
+                    builder = builder.field("uri", uri);
+                }
+
+                let structure = builder.build();
+                let msg = gst::message::Application::new(structure);
+                let _ = pipeline.post_message(msg);
+                eprintln!("Control: queued source-switch command");
+            } else {
+                eprintln!("Control: unknown command: {}", line);
+            }
+        }
+    }
 }
 
 fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {

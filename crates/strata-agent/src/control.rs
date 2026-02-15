@@ -19,7 +19,7 @@ use strata_common::protocol::{
     AuthLoginPayload, AuthLoginResponsePayload, ConfigSetPayload, ConfigSetResponsePayload,
     DeviceStatusPayload, Envelope, InterfaceCommandPayload, InterfaceCommandResponsePayload,
     InterfacesScanPayload, InterfacesScanResponsePayload, StreamEndReason, StreamEndedPayload,
-    StreamStartPayload, StreamStopPayload, TestRunPayload, TestRunResponsePayload,
+    StreamStartPayload, StreamStopPayload, SourceSwitchPayload, TestRunPayload, TestRunResponsePayload,
 };
 
 use crate::AgentState;
@@ -271,6 +271,22 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
         }
         "config.update" => {
             tracing::info!("received config.update (hot-reload not yet implemented)");
+        }
+        "source.switch" => {
+            if let Ok(payload) = envelope.parse_payload::<SourceSwitchPayload>() {
+                tracing::info!(
+                    mode = %payload.mode,
+                    pattern = ?payload.pattern,
+                    "received source.switch"
+                );
+                let pipeline = state.pipeline.lock().await;
+                pipeline.switch_source(
+                    &payload.mode,
+                    payload.device.as_deref(),
+                    payload.uri.as_deref(),
+                    payload.pattern.as_deref(),
+                );
+            }
         }
         "interface.command" => {
             if let Ok(payload) = envelope.parse_payload::<InterfaceCommandPayload>() {

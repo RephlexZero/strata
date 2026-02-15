@@ -3,11 +3,23 @@
 //! The agent spawns `integration_node` as a child process for clean isolation.
 //! In simulation mode, it runs a lightweight fake pipeline that generates
 //! synthetic stats without actual media processing.
+//!
+//! Stats are relayed from integration_node via UDP to 127.0.0.1:9100,
+//! where the telemetry module reads and forwards them to the control plane.
+//!
+//! Hot-swap source switching is supported via a Unix domain socket at
+//! `/tmp/strata-pipeline.sock`.
 
 use std::process::Child;
 use std::time::Instant;
 
 use strata_common::protocol::StreamStartPayload;
+
+/// UDP address where integration_node sends stats JSON.
+pub const STATS_LISTEN_ADDR: &str = "127.0.0.1:9100";
+
+/// Unix socket path for pipeline control (hot-swap commands).
+pub const CONTROL_SOCK_PATH: &str = "/tmp/strata-pipeline.sock";
 
 /// Pipeline manager state.
 pub struct PipelineManager {
@@ -118,6 +130,47 @@ impl PipelineManager {
         stats
     }
 
+    /// Switch the active video source on a running pipeline.
+    ///
+    /// Sends a JSON command to the integration_node's control socket.
+    /// The command is fire-and-forget — errors are logged but not propagated.
+    pub fn switch_source(&self, mode: &str, device: Option<&str>, uri: Option<&str>, pattern: Option<&str>) {
+        if !self.is_running() {
+            tracing::warn!("cannot switch source: no pipeline running");
+            return;
+        }
+
+        let mut cmd = serde_json::json!({
+            "cmd": "switch_source",
+            "mode": mode,
+        });
+        if let Some(d) = device {
+            cmd["device"] = serde_json::json!(d);
+        }
+        if let Some(u) = uri {
+            cmd["uri"] = serde_json::json!(u);
+        }
+        if let Some(p) = pattern {
+            cmd["pattern"] = serde_json::json!(p);
+        }
+
+        // Connect to the control socket and send the command
+        match std::os::unix::net::UnixStream::connect(CONTROL_SOCK_PATH) {
+            Ok(mut stream) => {
+                use std::io::Write;
+                let msg = format!("{}\n", cmd);
+                if let Err(e) = stream.write_all(msg.as_bytes()) {
+                    tracing::warn!(error = %e, "failed to send source switch command");
+                } else {
+                    tracing::info!(mode, "source switch command sent");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to connect to pipeline control socket");
+            }
+        }
+    }
+
     /// Update accumulated bytes (called from telemetry).
     pub fn add_bytes(&mut self, bytes: u64) {
         self.total_bytes += bytes;
@@ -164,6 +217,12 @@ fn spawn_integration_node(payload: &StreamStartPayload) -> anyhow::Result<Child>
 
     // Always add audio for RTMP compatibility
     cmd.arg("--audio");
+
+    // Stats relay — always relay stats to the agent's telemetry listener
+    cmd.arg("--stats-dest").arg(STATS_LISTEN_ADDR);
+
+    // Control socket for hot-swap
+    cmd.arg("--control").arg(CONTROL_SOCK_PATH);
 
     // Destinations (RIST URLs)
     if !payload.destinations.is_empty() {

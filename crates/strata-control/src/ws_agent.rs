@@ -157,9 +157,11 @@ async fn authenticate_enrollment(
     token: &str,
     payload: &AuthLoginPayload,
 ) -> Result<(String, Option<String>, String), String> {
-    // Find senders with unfulfilled enrollment tokens
+    // Find senders with enrollment tokens.
+    // Include already-enrolled senders so agents can reconnect after
+    // a restart without requiring a separate device_key auth flow.
     let rows = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT id, owner_id, enrollment_token FROM senders WHERE enrolled = FALSE AND enrollment_token IS NOT NULL",
+        "SELECT id, owner_id, enrollment_token FROM senders WHERE enrollment_token IS NOT NULL",
     )
     .fetch_all(state.pool())
     .await
@@ -170,9 +172,9 @@ async fn authenticate_enrollment(
     // Try each — the tokens are hashed, so we verify against each
     for (sender_id, owner_id, token_hash) in &rows {
         if let Ok(true) = auth::verify_password(&normalized, token_hash) {
-            // Mark as enrolled
+            // Mark as enrolled (keep token for reconnection)
             let _ = sqlx::query(
-                "UPDATE senders SET enrolled = TRUE, hostname = $1, enrollment_token = NULL WHERE id = $2",
+                "UPDATE senders SET enrolled = TRUE, hostname = $1 WHERE id = $2",
             )
             .bind(&payload.hostname)
             .bind(sender_id)

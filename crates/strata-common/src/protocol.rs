@@ -182,6 +182,23 @@ pub struct ConfigUpdatePayload {
     pub scheduler: Option<serde_json::Value>,
 }
 
+/// Command to switch the active video source on a running pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceSwitchPayload {
+    /// Source mode: "test", "v4l2", "uri".
+    pub mode: String,
+    /// V4L2 device path (used when mode = "v4l2").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// Media URI (used when mode = "uri").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// Test pattern name (used when mode = "test").
+    /// E.g. "smpte", "ball", "snow", "black".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+}
+
 /// Command to manage a network interface on the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceCommandPayload {

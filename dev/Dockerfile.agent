@@ -143,6 +143,7 @@ FROM debian:12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    iproute2 \
     gstreamer1.0-plugins-base \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad \
@@ -161,6 +162,9 @@ COPY --from=builder /src/target/release/strata-agent /usr/local/bin/strata-agent
 # then looks for symbol gst_plugin_<derived>_get_desc.
 COPY --from=pipeline /src/target/release/integration_node /usr/local/bin/integration_node
 COPY --from=pipeline /src/target/release/libgstristbonding.so /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstrsristbonding.so
+
+# Entrypoint script (applies tc netem impairments before starting agent)
+COPY dev/entrypoint-sender.sh /usr/local/bin/entrypoint-sender.sh
 
 # Portal WASM app
 COPY --from=portal /src/crates/strata-portal/dist /app/portal
