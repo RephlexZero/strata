@@ -2,7 +2,6 @@ use anyhow::Result;
 use librist_sys::*;
 use std::ffi::CStr;
 use std::ffi::CString;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, trace};
@@ -21,56 +20,32 @@ pub struct RecoveryConfig {
     pub recovery_reorder_buffer: Option<u32>, // ms
 }
 
-// Rate-limit counter for repetitive librist log messages.
-// Counts consecutive suppressed messages per thread.
-std::thread_local! {
-    static SUPPRESSED_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
 unsafe extern "C" fn log_cb(
     _arg: *mut libc::c_void,
     level: rist_log_level,
     msg: *const libc::c_char,
 ) -> libc::c_int {
-    // SAFETY: catch_unwind prevents panics from crossing the FFI boundary (UB).
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        if !msg.is_null() {
-            let message = CStr::from_ptr(msg).to_string_lossy();
-            let trimmed = message.trim_end();
-
-            // Rate-limit repetitive messages (e.g. "Sender queue is full")
-            // to avoid flooding logs during congestion. Log every 500th.
-            if level <= rist_log_level_RIST_LOG_ERROR && trimmed.contains("Sender queue is full") {
-                SUPPRESSED_COUNT.with(|c| {
-                    let n = c.get() + 1;
-                    c.set(n);
-                    if n == 1 || n % 500 == 0 {
-                        tracing::warn!(target: "librist", "{} (repeated {} times)", trimmed, n);
-                    }
-                });
-                return;
+    if !msg.is_null() {
+        let message = CStr::from_ptr(msg).to_string_lossy();
+        // Route librist log levels to tracing levels
+        match level {
+            l if l <= rist_log_level_RIST_LOG_ERROR => {
+                tracing::error!(target: "librist", "{}", message.trim_end());
             }
-
-            // Route librist log levels to tracing levels
-            match level {
-                l if l <= rist_log_level_RIST_LOG_ERROR => {
-                    tracing::error!(target: "librist", "{}", trimmed);
-                }
-                l if l <= rist_log_level_RIST_LOG_WARN => {
-                    tracing::warn!(target: "librist", "{}", trimmed);
-                }
-                l if l <= rist_log_level_RIST_LOG_NOTICE => {
-                    tracing::info!(target: "librist", "{}", trimmed);
-                }
-                l if l <= rist_log_level_RIST_LOG_INFO => {
-                    debug!(target: "librist", "{}", trimmed);
-                }
-                _ => {
-                    trace!(target: "librist", "{}", trimmed);
-                }
+            l if l <= rist_log_level_RIST_LOG_WARN => {
+                tracing::warn!(target: "librist", "{}", message.trim_end());
+            }
+            l if l <= rist_log_level_RIST_LOG_NOTICE => {
+                tracing::info!(target: "librist", "{}", message.trim_end());
+            }
+            l if l <= rist_log_level_RIST_LOG_INFO => {
+                debug!(target: "librist", "{}", message.trim_end());
+            }
+            _ => {
+                trace!(target: "librist", "{}", message.trim_end());
             }
         }
-    }));
+    }
     0
 }
 
@@ -106,7 +81,7 @@ impl Drop for RistContext {
             // Free logging settings — safe to call after rist_destroy since the
             // context no longer references the logging handle.
             if !self.logging_settings.is_null() {
-                rist_logging_settings_free2(&mut self.logging_settings);
+                libc::free(self.logging_settings as *mut libc::c_void);
             }
         }
     }
@@ -120,85 +95,86 @@ unsafe extern "C" fn stats_cb(
         return 0;
     }
 
-    // SAFETY: catch_unwind prevents panics from crossing the FFI boundary (UB).
-    // The stats container is freed in all paths (including panic) to avoid leaks.
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        let stats_ref = &*stats_container;
-        // Check type
-        if stats_ref.stats_type == rist_stats_type_RIST_STATS_SENDER_PEER {
-            let sender_stats = &stats_ref.stats.sender_peer;
-            let link_stats = &*(arg as *const LinkStats);
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            link_stats.last_stats_ms.store(now_ms, Ordering::Relaxed);
+    let stats_ref = &*stats_container;
+    // Check type
+    if stats_ref.stats_type == rist_stats_type_RIST_STATS_SENDER_PEER {
+        let sender_stats = &stats_ref.stats.sender_peer;
+        let link_stats = &*(arg as *const LinkStats);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        link_stats.last_stats_ms.store(now_ms, Ordering::Relaxed);
 
-            // Raw updates
-            link_stats
-                .rtt
-                .store(sender_stats.rtt as u64, Ordering::Relaxed);
-            link_stats.sent.store(sender_stats.sent, Ordering::Relaxed);
-            link_stats
-                .retransmitted
-                .store(sender_stats.retransmitted, Ordering::Relaxed);
+        // Raw updates
+        link_stats
+            .rtt
+            .store(sender_stats.rtt as u64, Ordering::Relaxed);
+        link_stats.sent.store(sender_stats.sent, Ordering::Relaxed);
+        link_stats
+            .retransmitted
+            .store(sender_stats.retransmitted, Ordering::Relaxed);
 
-            // EWMA Update
-            // We take the lock. Since this runs infrequently (100ms), lock contention is negligible.
-            if let Ok(mut ewma) = link_stats.ewma_state.lock() {
-                ewma.rtt.update(sender_stats.rtt as f64);
+        // EWMA Update
+        // We take the lock. Since this runs infrequently (100ms), lock contention is negligible.
+        if let Ok(mut ewma) = link_stats.ewma_state.lock() {
+            ewma.rtt.update(sender_stats.rtt as f64);
 
-                // Note: librist's `stats_sender_instant` counters are
-                // **per-interval** — zeroed via memset after each stats
-                // callback (see vendor/librist/src/stats.c). Use the raw
-                // values directly instead of computing deltas against
-                // the previous callback's values.
-                let sent = sender_stats.sent;
-                let rex = sender_stats.retransmitted;
+            let sent = sender_stats.sent;
+            let rex = sender_stats.retransmitted;
 
-                ewma.last_sent = sent;
-                ewma.last_rex = rex;
-                ewma.last_stats_ms = now_ms;
+            let delta_sent = sent.saturating_sub(ewma.last_sent);
+            let delta_rex = rex.saturating_sub(ewma.last_rex);
 
-                // Loss: only update when packets were sent this interval.
-                if sent > 0 {
-                    let loss_ratio = rex as f64 / sent as f64;
-                    ewma.loss.update(loss_ratio);
-                }
+            let dt_ms = if ewma.last_stats_ms > 0 {
+                now_ms.saturating_sub(ewma.last_stats_ms)
+            } else {
+                0
+            };
 
-                // Bandwidth: use librist's native estimation.
-                //
-                // librist maintains a rolling bitrate estimator (peer->bw)
-                // updated on every UDP send via rist_calculate_bitrate().
-                // The reported `bandwidth` field is eight_times_bitrate_fast/8
-                // — an EWMA over 100ms windows of actual wire-rate bytes.
-                // This is NOT zeroed by the per-interval memset of
-                // stats_sender_instant (which only affects sent/retransmitted
-                // counters). See vendor/librist/src/stats.c:59,102.
-                let bw_bps = sender_stats.bandwidth as f64;
-                if bw_bps > 0.0 {
-                    ewma.bandwidth.update(bw_bps);
-                    link_stats.bandwidth.store(bw_bps as u64, Ordering::Relaxed);
-                }
+            ewma.last_sent = sent;
+            ewma.last_rex = rex;
+            ewma.last_stats_ms = now_ms;
 
-                // Update Cached Smooth Values
-                // RTT in micros
-                let rtt_us = (ewma.rtt.value() * 1000.0) as u64;
-                link_stats.smoothed_rtt_us.store(rtt_us, Ordering::Relaxed);
+            // Calculate "Badness" ratio: (Retransmitted) / Sent
+            // If sent is 0 (idle), we keep previous estimate or decay?
+            // If idle, loss is 0.
+            let loss_ratio = if delta_sent > 0 {
+                delta_rex as f64 / delta_sent as f64
+            } else {
+                0.0
+            };
 
-                let bw = ewma.bandwidth.value() as u64;
-                link_stats.smoothed_bw_bps.store(bw, Ordering::Relaxed);
+            // Update EWMA with current loss ratio (0.0 - 1.0+)
+            ewma.loss.update(loss_ratio);
 
-                // Loss in micro-loss (0-1_000_000). 1_000_000 = 100% loss.
-                let loss_micro = (ewma.loss.value() * 1_000_000.0) as u64;
-                link_stats
-                    .smoothed_loss_micro
-                    .store(loss_micro, Ordering::Relaxed);
+            // Bandwidth update (fallback if librist reports 0)
+            let mut bw_bps = sender_stats.bandwidth as f64;
+            if bw_bps <= 0.0 && dt_ms > 0 && delta_sent > 0 {
+                bw_bps = (delta_sent as f64 * 8.0 * 1000.0) / dt_ms as f64;
             }
-        }
-    }));
+            ewma.bandwidth.update(bw_bps);
+            link_stats
+                .bandwidth
+                .store(bw_bps.max(0.0) as u64, Ordering::Relaxed);
 
-    // Free the stats container — must happen even if the closure panicked.
+            // Update Cached Smooth Values
+            // RTT in micros
+            let rtt_us = (ewma.rtt.value() * 1000.0) as u64;
+            link_stats.smoothed_rtt_us.store(rtt_us, Ordering::Relaxed);
+
+            let bw = ewma.bandwidth.value() as u64;
+            link_stats.smoothed_bw_bps.store(bw, Ordering::Relaxed);
+
+            // Loss in permille (0-1000)
+            let loss_pm = (ewma.loss.value() * 1000.0) as u64;
+            link_stats
+                .smoothed_loss_permille
+                .store(loss_pm, Ordering::Relaxed);
+        }
+    }
+
+    // Free the stats container
     rist_stats_free(stats_container);
 
     0
@@ -225,7 +201,7 @@ impl RistContext {
             if ret != 0 {
                 // Clean up logging settings on failure
                 if !log_settings.is_null() {
-                    rist_logging_settings_free2(&mut log_settings);
+                    libc::free(log_settings as *mut libc::c_void);
                 }
                 return Err(anyhow::anyhow!(
                     "Failed to create RIST sender context: {}",
@@ -247,19 +223,14 @@ impl RistContext {
         }
 
         let arg_ptr = Arc::into_raw(stats) as *mut libc::c_void;
+        self.stats_arg = arg_ptr;
 
         unsafe {
             let ret = rist_stats_callback_set(self.ctx, interval_ms, Some(stats_cb), arg_ptr);
             if ret != 0 {
-                // Reclaim the Arc to avoid leaking it — registration failed so
-                // the callback will never be invoked and Drop won't free it.
-                let _ = Arc::from_raw(arg_ptr as *const LinkStats);
                 return Err(anyhow::anyhow!("Failed to set stats callback: {}", ret));
             }
         }
-
-        // Only store the pointer after successful registration.
-        self.stats_arg = arg_ptr;
         Ok(())
     }
 
@@ -298,7 +269,7 @@ impl RistContext {
             let ret = rist_peer_create(self.ctx, &mut peer, peer_config);
 
             // We must free the config allocated by parse_address2
-            rist_peer_config_free2(&mut peer_config);
+            libc::free(peer_config as *mut libc::c_void);
 
             if ret != 0 {
                 return Err(anyhow::anyhow!("Failed to create peer: {}", ret));
@@ -345,7 +316,7 @@ impl Drop for RistReceiverContext {
                 rist_destroy(self.ctx);
             }
             if !self.logging_settings.is_null() {
-                rist_logging_settings_free2(&mut self.logging_settings);
+                libc::free(self.logging_settings as *mut libc::c_void);
             }
         }
     }
@@ -371,7 +342,7 @@ impl RistReceiverContext {
 
             if ret != 0 {
                 if !log_settings.is_null() {
-                    rist_logging_settings_free2(&mut log_settings);
+                    libc::free(log_settings as *mut libc::c_void);
                 }
                 return Err(anyhow::anyhow!(
                     "Failed to create RIST receiver context: {}",
@@ -405,7 +376,7 @@ impl RistReceiverContext {
 
             let mut peer: *mut rist_peer = ptr::null_mut();
             let ret = rist_peer_create(self.ctx, &mut peer, peer_config);
-            rist_peer_config_free2(&mut peer_config);
+            libc::free(peer_config as *mut libc::c_void);
 
             if ret != 0 {
                 return Err(anyhow::anyhow!("Failed to create receiver peer: {}", ret));

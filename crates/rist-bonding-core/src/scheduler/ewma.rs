@@ -24,13 +24,7 @@ impl Ewma {
     }
 
     /// Feeds a new measurement into the filter, updating the smoothed value.
-    ///
-    /// NaN or infinite measurements are silently ignored to prevent
-    /// poisoning the smoothed value.
     pub fn update(&mut self, measurement: f64) {
-        if measurement.is_nan() || measurement.is_infinite() {
-            return;
-        }
         if !self.initialized {
             self.value = measurement;
             self.initialized = true;
@@ -122,39 +116,5 @@ mod tests {
             ewma.update(42.0);
         }
         assert!((ewma.value() - 42.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_ewma_nan_guard() {
-        let mut ewma = Ewma::new(0.5);
-        ewma.update(10.0);
-        assert!((ewma.value() - 10.0).abs() < f64::EPSILON);
-
-        // NaN should be silently ignored
-        ewma.update(f64::NAN);
-        assert!((ewma.value() - 10.0).abs() < f64::EPSILON);
-
-        // Infinity should be silently ignored
-        ewma.update(f64::INFINITY);
-        assert!((ewma.value() - 10.0).abs() < f64::EPSILON);
-
-        ewma.update(f64::NEG_INFINITY);
-        assert!((ewma.value() - 10.0).abs() < f64::EPSILON);
-
-        // Normal values should still work after NaN/Inf
-        ewma.update(20.0);
-        assert!((ewma.value() - 15.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_ewma_nan_on_first_sample() {
-        let mut ewma = Ewma::new(0.5);
-        ewma.update(f64::NAN);
-        // Should remain uninitialized
-        assert!((ewma.value() - 0.0).abs() < f64::EPSILON);
-
-        // First valid sample should initialize
-        ewma.update(42.0);
-        assert!((ewma.value() - 42.0).abs() < f64::EPSILON);
     }
 }

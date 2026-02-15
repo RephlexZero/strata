@@ -25,35 +25,20 @@ pub struct ImpairmentConfig {
     pub duplicate_percent: Option<f32>,
     pub reorder_percent: Option<f32>,
     pub corrupt_percent: Option<f32>,
-    /// Override the netem queue `limit` (in packets).  When `None` and
-    /// `rate_kbit` is set, an appropriate limit is auto-calculated from the
-    /// bandwidth-delay product (~2× BDP).  This keeps the queue finite so
-    /// excess packets are dropped at the netem level — drops that are visible
-    /// to the receiver and produce RTCP NACKs, enabling AIMD convergence.
-    ///
-    /// Set explicitly to fine-tune burst tolerance.  A larger limit absorbs
-    /// more bursts but delays congestion detection; a smaller limit is more
-    /// aggressive but may drop packets even within capacity.
-    pub netem_limit: Option<u32>,
 }
 
 /// Applies network impairment to an interface inside a namespace using `tc netem`.
 ///
-/// Removes any existing root qdisc first, then installs netem with the specified
-/// delay, loss, rate, duplication, reorder, and corruption parameters.
-///
-/// When `rate_kbit` is set, the netem `rate` parameter adds serialization delay
-/// and the queue `limit` is set to a finite value (auto-calculated from the
-/// bandwidth-delay product if not explicitly provided).  This finite queue causes
-/// netem to **drop excess packets** when the sender exceeds link capacity — drops
-/// that are visible to the receiver and trigger RTCP NACKs, enabling AIMD
-/// convergence.
+/// Removes any existing root qdisc first, then configures the specified
+/// delay, loss, rate-limit, duplication, reorder, and corruption parameters.
 pub fn apply_impairment(
     ns: &Namespace,
     interface: &str,
     config: ImpairmentConfig,
 ) -> io::Result<()> {
     // 1. Remove existing qdisc (best effort) to ensure clean state or update
+    // command: tc qdisc del dev <interface> root
+    // We ignore errors here because the qdisc might not exist.
     let _ = ns.exec("tc", &["qdisc", "del", "dev", interface, "root"]);
 
     // If no config intended (clearing impairments), we are done.
@@ -68,42 +53,67 @@ pub fn apply_impairment(
         return Ok(());
     }
 
-    // 2. Build netem command: tc qdisc add dev <iface> root netem [limit N] ...
+    // 2. Build netem command arguments
+    // command: tc qdisc add dev <interface> root netem ...
     let mut args_storage: Vec<String> = vec![
-        "qdisc".into(),
-        "add".into(),
-        "dev".into(),
-        interface.into(),
-        "root".into(),
-        "netem".into(),
+        "qdisc".to_string(),
+        "add".to_string(),
+        "dev".to_string(),
+        interface.to_string(),
+        "root".to_string(),
+        "netem".to_string(),
     ];
 
-    // Determine queue limit.  When rate_kbit is set, we need a finite limit to
-    // enforce bandwidth by dropping excess packets.  Auto-calculate from BDP if
-    // not explicitly provided.
-    let limit = if let Some(explicit) = config.netem_limit {
-        Some(explicit)
-    } else if let Some(rate) = config.rate_kbit {
-        // BDP-based auto limit: 2 × (rate × rtt) / MTU, minimum 20.
-        // Uses one-way delay (half RTT) from config, doubled for full RTT.
-        let rtt_ms = config.delay_ms.unwrap_or(20) as u64 * 2;
-        let bdp_bytes = rate * 1000 / 8 * rtt_ms / 1000; // bytes in one BDP
-        let mtu = 1400u64;
-        let bdp_packets = bdp_bytes / mtu;
-        Some(std::cmp::max(bdp_packets as u32 * 2, 20))
-    } else {
-        None
-    };
+    if let Some(delay) = config.delay_ms {
+        args_storage.push("delay".to_string());
+        args_storage.push(format!("{}ms", delay));
 
-    if let Some(lim) = limit {
-        args_storage.push("limit".into());
-        args_storage.push(lim.to_string());
+        if let Some(jitter) = config.jitter_ms {
+            if jitter > 0 {
+                args_storage.push(format!("{}ms", jitter));
+            }
+        }
     }
 
-    append_netem_params(&config, &mut args_storage);
+    if let Some(gemodel) = &config.gemodel {
+        args_storage.push("loss".to_string());
+        args_storage.push("gemodel".to_string());
+        args_storage.push(format!("{}%", gemodel.p));
+        args_storage.push(format!("{}%", gemodel.r));
+        args_storage.push(format!("{}%", gemodel.one_h));
+        args_storage.push(format!("{}%", gemodel.one_k));
+    } else if let Some(loss) = config.loss_percent {
+        args_storage.push("loss".to_string());
+        args_storage.push(format!("{}%", loss));
+        if let Some(corr) = config.loss_correlation {
+            args_storage.push(format!("{}%", corr));
+        }
+    }
+
+    if let Some(dup) = config.duplicate_percent {
+        args_storage.push("duplicate".to_string());
+        args_storage.push(format!("{}%", dup));
+    }
+
+    if let Some(reorder) = config.reorder_percent {
+        args_storage.push("reorder".to_string());
+        args_storage.push(format!("{}%", reorder));
+    }
+
+    if let Some(corrupt) = config.corrupt_percent {
+        args_storage.push("corrupt".to_string());
+        args_storage.push(format!("{}%", corrupt));
+    }
+
+    if let Some(rate) = config.rate_kbit {
+        args_storage.push("rate".to_string());
+        args_storage.push(format!("{}kbit", rate));
+    }
 
     let args: Vec<&str> = args_storage.iter().map(|s| s.as_str()).collect();
+
     let output = ns.exec("tc", &args)?;
+
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "Failed to apply tc netem: {}\nCommand: tc {}",
@@ -113,56 +123,6 @@ pub fn apply_impairment(
     }
 
     Ok(())
-}
-
-/// Appends the netem-specific parameters (delay, loss, rate, duplicate,
-/// reorder, corrupt) to an arg list.
-fn append_netem_params(config: &ImpairmentConfig, args: &mut Vec<String>) {
-    if let Some(delay) = config.delay_ms {
-        args.push("delay".into());
-        args.push(format!("{}ms", delay));
-
-        if let Some(jitter) = config.jitter_ms {
-            if jitter > 0 {
-                args.push(format!("{}ms", jitter));
-            }
-        }
-    }
-
-    if let Some(gemodel) = &config.gemodel {
-        args.push("loss".into());
-        args.push("gemodel".into());
-        args.push(format!("{}%", gemodel.p));
-        args.push(format!("{}%", gemodel.r));
-        args.push(format!("{}%", gemodel.one_h));
-        args.push(format!("{}%", gemodel.one_k));
-    } else if let Some(loss) = config.loss_percent {
-        args.push("loss".into());
-        args.push(format!("{}%", loss));
-        if let Some(corr) = config.loss_correlation {
-            args.push(format!("{}%", corr));
-        }
-    }
-
-    if let Some(dup) = config.duplicate_percent {
-        args.push("duplicate".into());
-        args.push(format!("{}%", dup));
-    }
-
-    if let Some(reorder) = config.reorder_percent {
-        args.push("reorder".into());
-        args.push(format!("{}%", reorder));
-    }
-
-    if let Some(corrupt) = config.corrupt_percent {
-        args.push("corrupt".into());
-        args.push(format!("{}%", corrupt));
-    }
-
-    if let Some(rate) = config.rate_kbit {
-        args.push("rate".into());
-        args.push(format!("{}kbit", rate));
-    }
 }
 
 #[cfg(test)]

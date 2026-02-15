@@ -14,16 +14,11 @@
 //! - [`runtime`] — Thread-safe runtime that owns the scheduler loop
 
 pub mod config;
-pub(crate) mod net;
+pub mod net;
 pub mod protocol;
 pub mod receiver;
 pub mod runtime;
 pub mod scheduler;
-pub mod stats;
-
-// Re-export types that downstream crates need from `net`.
-pub use net::interface::{LinkMetrics, LinkPhase, LinkSender};
-pub use net::wrapper::{RecoveryConfig, RistContext, RistReceiverContext};
 
 /// Initialize the rist-bonding-core library.
 ///
@@ -31,8 +26,9 @@ pub use net::wrapper::{RecoveryConfig, RistContext, RistReceiverContext};
 /// is already set. Safe to call multiple times — subsequent calls are no-ops.
 /// Controlled by `RUST_LOG` env var (e.g., `RUST_LOG=rist_bonding_core=debug`).
 pub fn init() {
-    use std::sync::LazyLock;
-    static INIT: LazyLock<()> = LazyLock::new(|| {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
         // Only install if no subscriber is already set (e.g., by the host application).
         if tracing::dispatcher::has_been_set() {
             tracing::info!("Rist Bonding Core: tracing subscriber already set");
@@ -51,6 +47,4 @@ pub fn init() {
             tracing::info!("Rist Bonding Core initialized");
         }
     });
-    // Force evaluation; the closure runs at most once.
-    let _ = &*INIT;
 }

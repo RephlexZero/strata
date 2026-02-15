@@ -76,8 +76,7 @@ pub async fn seed_dev_data(pool: &PgPool) -> anyhow::Result<()> {
     .await?;
 
     // YouTube destination (stream key set via YOUTUBE_STREAM_KEY env, or placeholder)
-    let yt_key =
-        std::env::var("YOUTUBE_STREAM_KEY").unwrap_or_else(|_| "YOUR_STREAM_KEY".into());
+    let yt_key = std::env::var("YOUTUBE_STREAM_KEY").unwrap_or_else(|_| "YOUR_STREAM_KEY".into());
     sqlx::query(
         "INSERT INTO destinations (id, owner_id, platform, name, url, stream_key) VALUES ($1, $2, $3, $4, $5, $6)",
     )

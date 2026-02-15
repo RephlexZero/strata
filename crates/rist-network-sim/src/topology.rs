@@ -157,11 +157,8 @@ mod tests {
             return;
         }
 
-        use crate::test_util::unique_ns_name;
-        let ns1_name = unique_ns_name("rst_a");
-        let ns2_name = unique_ns_name("rst_b");
-        let ns1 = Namespace::new(&ns1_name).expect("Failed to create ns1");
-        let _ns2 = Namespace::new(&ns2_name).expect("Failed to create ns2");
+        let ns1 = Namespace::new("rst_ns_a").expect("Failed to create ns1");
+        let _ns2 = Namespace::new("rst_ns_b").expect("Failed to create ns2");
 
         let out1 = ns1.exec("ip", &["link"]).expect("Failed to exec ip link");
         let out1_str = String::from_utf8_lossy(&out1.stdout);
@@ -175,11 +172,8 @@ mod tests {
             return;
         }
 
-        use crate::test_util::unique_ns_name;
-        let ns1_name = unique_ns_name("rst_la");
-        let ns2_name = unique_ns_name("rst_lb");
-        let ns1 = Namespace::new(&ns1_name).expect("Failed to create ns1");
-        let ns2 = Namespace::new(&ns2_name).expect("Failed to create ns2");
+        let ns1 = Namespace::new("rst_link_a").expect("Failed to create ns1");
+        let ns2 = Namespace::new("rst_link_b").expect("Failed to create ns2");
 
         // Use random suffix/distinct names to avoid parallel conflicts
         // Interface name limit is 15 chars. "veth_a_" is 7 chars. We have 8 chars left.

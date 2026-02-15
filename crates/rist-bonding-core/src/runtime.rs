@@ -4,11 +4,10 @@ use crate::net::link::Link;
 use crate::net::wrapper::RecoveryConfig;
 use crate::scheduler::bonding::BondingScheduler;
 use crate::scheduler::PacketProfile;
-use arc_swap::ArcSwap;
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -22,8 +21,7 @@ pub enum PacketSendError {
 
 enum RuntimeMessage {
     Packet(Bytes, PacketProfile),
-    ApplyConfig(Box<BondingConfig>),
-    UpdateSchedulerConfig(Box<SchedulerConfig>),
+    ApplyConfig(BondingConfig),
     AddLink(LinkConfig),
     RemoveLink(usize),
     Shutdown,
@@ -39,7 +37,7 @@ enum RuntimeMessage {
 /// Dropping the runtime triggers a graceful shutdown of the worker thread.
 pub struct BondingRuntime {
     sender: Sender<RuntimeMessage>,
-    metrics: Arc<ArcSwap<HashMap<usize, LinkMetrics>>>,
+    metrics: Arc<Mutex<HashMap<usize, LinkMetrics>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -53,13 +51,13 @@ impl BondingRuntime {
     pub fn with_config(scheduler_config: SchedulerConfig) -> Self {
         let channel_capacity = scheduler_config.channel_capacity;
         let (tx, rx) = bounded(channel_capacity);
-        let metrics = Arc::new(ArcSwap::from_pointee(HashMap::new()));
+        let metrics = Arc::new(Mutex::new(HashMap::new()));
         let metrics_clone = metrics.clone();
 
         let handle = thread::Builder::new()
             .name("rist-bond-worker".into())
             .spawn(move || runtime_worker(rx, metrics_clone, scheduler_config))
-            .unwrap_or_else(|e| panic!("failed to spawn bonding runtime worker: {}", e));
+            .expect("failed to spawn bonding runtime worker");
 
         Self {
             sender: tx,
@@ -87,7 +85,7 @@ impl BondingRuntime {
     /// Sends a full configuration update to the worker thread.
     pub fn apply_config(&self, config: BondingConfig) -> anyhow::Result<()> {
         self.sender
-            .send(RuntimeMessage::ApplyConfig(Box::new(config)))
+            .send(RuntimeMessage::ApplyConfig(config))
             .map_err(|e| anyhow::anyhow!("Failed to send config: {}", e))
     }
 
@@ -105,20 +103,16 @@ impl BondingRuntime {
             .map_err(|e| anyhow::anyhow!("Failed to remove link: {}", e))
     }
 
-    /// Live-update the scheduler configuration (e.g. max_capacity_bps).
-    pub fn update_scheduler_config(&self, config: SchedulerConfig) -> anyhow::Result<()> {
-        self.sender
-            .send(RuntimeMessage::UpdateSchedulerConfig(Box::new(config)))
-            .map_err(|e| anyhow::anyhow!("Failed to update scheduler config: {}", e))
-    }
-
-    /// Returns a snapshot of all link metrics (lock-free read via ArcSwap).
+    /// Returns a snapshot of all link metrics (thread-safe clone).
     pub fn get_metrics(&self) -> HashMap<usize, LinkMetrics> {
-        (**self.metrics.load()).clone()
+        self.metrics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
-    /// Returns a shared handle to the metrics for external polling.
-    pub fn metrics_handle(&self) -> Arc<ArcSwap<HashMap<usize, LinkMetrics>>> {
+    /// Returns a shared handle to the metrics map for external polling.
+    pub fn metrics_handle(&self) -> Arc<Mutex<HashMap<usize, LinkMetrics>>> {
         self.metrics.clone()
     }
 
@@ -145,7 +139,7 @@ impl Drop for BondingRuntime {
 
 fn runtime_worker(
     rx: Receiver<RuntimeMessage>,
-    metrics: Arc<ArcSwap<HashMap<usize, LinkMetrics>>>,
+    metrics: Arc<Mutex<HashMap<usize, LinkMetrics>>>,
     scheduler_config: SchedulerConfig,
 ) {
     let mut scheduler = BondingScheduler::with_config(scheduler_config.clone());
@@ -160,9 +154,7 @@ fn runtime_worker(
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(msg) => match msg {
                 RuntimeMessage::Packet(data, profile) => {
-                    if let Err(e) = scheduler.send(data, profile) {
-                        tracing::debug!("Scheduler send failed: {}", e);
-                    }
+                    let _ = scheduler.send(data, profile);
                 }
                 RuntimeMessage::AddLink(link) => {
                     apply_link(
@@ -177,10 +169,6 @@ fn runtime_worker(
                     scheduler.remove_link(id);
                     current_links.remove(&id);
                 }
-                RuntimeMessage::UpdateSchedulerConfig(sched_cfg) => {
-                    ewma_alpha = sched_cfg.ewma_alpha;
-                    scheduler.update_config(*sched_cfg);
-                }
                 RuntimeMessage::ApplyConfig(config) => {
                     lifecycle_config = config.lifecycle.clone();
                     ewma_alpha = config.scheduler.ewma_alpha;
@@ -189,7 +177,7 @@ fn runtime_worker(
                         &mut scheduler,
                         &mut current_links,
                         &lifecycle_config,
-                        *config,
+                        config,
                         ewma_alpha,
                     );
                 }
@@ -201,7 +189,9 @@ fn runtime_worker(
 
         if last_fast_stats.elapsed() >= fast_stats_interval {
             scheduler.refresh_metrics();
-            metrics.store(Arc::new(scheduler.get_all_metrics()));
+            if let Ok(mut m) = metrics.lock() {
+                *m = scheduler.get_all_metrics();
+            }
             last_fast_stats = Instant::now();
         }
     }
@@ -452,7 +442,7 @@ mod tests {
     fn metrics_handle_shared() {
         let rt = BondingRuntime::new();
         let handle = rt.metrics_handle();
-        let m = handle.load();
+        let m = handle.lock().unwrap();
         assert!(m.is_empty());
     }
 
@@ -498,72 +488,5 @@ mod tests {
         let rc = recovery_config_from_link(&link).unwrap();
         assert_eq!(rc.recovery_maxbitrate, None);
         assert_eq!(rc.recovery_rtt_max, Some(200));
-    }
-
-    #[test]
-    fn update_scheduler_config_reaches_worker() {
-        let rt = BondingRuntime::new();
-        let new_config = SchedulerConfig {
-            ewma_alpha: 0.5,
-            channel_capacity: 64,
-            ..SchedulerConfig::default()
-        };
-        let result = rt.update_scheduler_config(new_config);
-        assert!(
-            result.is_ok(),
-            "update_scheduler_config should succeed: {:?}",
-            result.err()
-        );
-        // Give the worker time to process the message
-        thread::sleep(Duration::from_millis(200));
-        // If the worker panicked processing the message, metrics would be poisoned
-        let _metrics = rt.get_metrics();
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // ArcSwap lock-free metrics tests (#11)
-    // ────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn metrics_handle_lock_free_read() {
-        let rt = BondingRuntime::new();
-        let handle = rt.metrics_handle();
-
-        // Multiple concurrent reads should never block.
-        let handles: Vec<_> = (0..8)
-            .map(|_| {
-                let h = handle.clone();
-                thread::spawn(move || {
-                    for _ in 0..100 {
-                        let m = h.load();
-                        let _ = m.len();
-                    }
-                })
-            })
-            .collect();
-
-        for h in handles {
-            h.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn metrics_snapshot_is_consistent() {
-        let rt = BondingRuntime::new();
-        let link = LinkConfig {
-            id: 1,
-            uri: "rist://127.0.0.1:19200".to_string(),
-            interface: None,
-            recovery_maxbitrate: None,
-            recovery_rtt_max: None,
-            recovery_reorder_buffer: None,
-        };
-        rt.add_link(link).unwrap();
-        thread::sleep(Duration::from_millis(300));
-
-        // get_metrics returns a clone — mutations don't affect the source.
-        let m1 = rt.get_metrics();
-        let m2 = rt.get_metrics();
-        assert_eq!(m1.len(), m2.len());
     }
 }

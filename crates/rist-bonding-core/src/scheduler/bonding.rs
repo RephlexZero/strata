@@ -1,20 +1,13 @@
 use crate::config::SchedulerConfig;
 use crate::net::interface::LinkSender;
 use crate::scheduler::dwrr::Dwrr;
-use crate::scheduler::QueueClass;
 use anyhow::Result;
 use bytes::Bytes;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, warn};
-
-/// Entry in a STORM dual-queue.
-struct QueuedPacket {
-    payload: Bytes,
-    profile: crate::scheduler::PacketProfile,
-    enqueue_time: Instant,
-}
 
 /// Top-level bonding packet scheduler.
 ///
@@ -23,35 +16,19 @@ struct QueuedPacket {
 /// - Fast-failover mode (broadcasts all traffic on link instability)
 /// - Adaptive redundancy (duplicates important packets when spare capacity allows)
 /// - Escalating dead-link logging
-/// - STORM dual-queue: reliable vs unreliable queues with weighted scheduling
 ///
 /// Used by [`crate::runtime::BondingRuntime`] on the worker thread.
 pub struct BondingScheduler<L: LinkSender + ?Sized> {
     scheduler: Dwrr<L>,
     next_seq: u64,
-    /// Monotonic start time for bonding header timestamps.
-    start_time: Instant,
     // Fast-failover state
     failover_until: Option<Instant>,
     prev_phases: HashMap<usize, crate::net::interface::LinkPhase>,
     prev_rtts: HashMap<usize, f64>,
     /// Counter for consecutive all-links-dead failures (for escalation)
     consecutive_dead_count: u64,
-    /// Total packets dropped due to all links being dead (used for log messages)
-    total_dead_drops: u64,
-    /// Total packets discarded by the sender-side deadline primitive.
-    discarded_deadline: u64,
-    // ── STORM dual-queue state ──
-    /// Reliable queue (critical / non-droppable packets).
-    reliable_queue: VecDeque<QueuedPacket>,
-    /// Unreliable queue (droppable, latency-sensitive packets).
-    unreliable_queue: VecDeque<QueuedPacket>,
-    /// DWRR deficit counter for the reliable queue (bytes).
-    reliable_deficit: f64,
-    /// DWRR deficit counter for the unreliable queue (bytes).
-    unreliable_deficit: f64,
-    /// Total packets aged-out from the unreliable queue.
-    storm_aged_out: u64,
+    /// Total packets dropped due to all links being dead
+    pub total_dead_drops: Arc<AtomicU64>,
 }
 
 impl<L: LinkSender + ?Sized> BondingScheduler<L> {
@@ -65,18 +42,11 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         Self {
             scheduler: Dwrr::with_config(config),
             next_seq: 0,
-            start_time: Instant::now(),
             failover_until: None,
             prev_phases: HashMap::new(),
             prev_rtts: HashMap::new(),
             consecutive_dead_count: 0,
-            total_dead_drops: 0,
-            discarded_deadline: 0,
-            reliable_queue: VecDeque::new(),
-            unreliable_queue: VecDeque::new(),
-            reliable_deficit: 0.0,
-            unreliable_deficit: 0.0,
-            storm_aged_out: 0,
+            total_dead_drops: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -159,12 +129,6 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         }
     }
 
-    /// Creates a bonding header with a monotonic send timestamp for OWD measurement.
-    fn make_header(&self, seq: u64) -> crate::protocol::header::BondingHeader {
-        let send_time_us = self.start_time.elapsed().as_micros() as u64;
-        crate::protocol::header::BondingHeader::with_timestamp(seq, send_time_us)
-    }
-
     /// Returns a snapshot of metrics for all registered links.
     pub fn get_all_metrics(&self) -> HashMap<usize, crate::net::interface::LinkMetrics> {
         self.scheduler.get_active_links().into_iter().collect()
@@ -172,165 +136,13 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
 
     /// Schedules a packet for transmission across the bonded links.
     ///
-    /// When STORM dual-queue is **disabled** (default) the packet is sent
-    /// immediately using the existing broadcast / redundancy / DWRR path.
-    ///
-    /// When STORM is **enabled** the packet is first enqueued into the
-    /// appropriate class queue (reliable or unreliable) and then both
-    /// queues are drained using weighted deficit round-robin.
+    /// Routing decision depends on the packet profile and current link state:
+    /// 1. **Broadcast** — critical packets or failover mode → sent to all alive links
+    /// 2. **Redundancy** — spare capacity available → duplicated to N best links
+    /// 3. **Standard** — DWRR selects the best single link
     pub fn send(&mut self, payload: Bytes, profile: crate::scheduler::PacketProfile) -> Result<()> {
-        if !self.scheduler.config().storm_enabled {
-            return self.send_immediate(payload, profile);
-        }
-
-        // ── STORM enqueue ──
-        let class = profile.queue_class();
-        let cap = self.scheduler.config().storm_queue_capacity;
-        let entry = QueuedPacket {
-            payload,
-            profile,
-            enqueue_time: Instant::now(),
-        };
-        match class {
-            QueueClass::Reliable => {
-                if self.reliable_queue.len() >= cap {
-                    // Reliable never drops — evict oldest unreliable instead
-                    // to make room in total memory budget.
-                    self.unreliable_queue.pop_front();
-                }
-                self.reliable_queue.push_back(entry);
-            }
-            QueueClass::Unreliable => {
-                if self.unreliable_queue.len() >= cap {
-                    // Drop oldest unreliable to make room.
-                    self.unreliable_queue.pop_front();
-                    self.storm_aged_out += 1;
-                }
-                self.unreliable_queue.push_back(entry);
-            }
-        }
-
-        // ── Drain both queues ──
-        self.drain_queues()
-    }
-
-    /// Drain the STORM dual-queues using weighted deficit round-robin.
-    ///
-    /// The reliable queue receives `storm_reliable_weight` share of the
-    /// bandwidth and the unreliable queue receives the remainder.
-    /// Unreliable entries older than `storm_unreliable_max_age_ms` are
-    /// silently discarded.
-    fn drain_queues(&mut self) -> Result<()> {
-        let config = self.scheduler.config().clone();
-        let max_age = Duration::from_millis(config.storm_unreliable_max_age_ms);
-        let now = Instant::now();
-
-        // Age-discard stale unreliable entries.
-        let before = self.unreliable_queue.len();
-        self.unreliable_queue
-            .retain(|e| now.duration_since(e.enqueue_time) < max_age);
-        self.storm_aged_out += (before - self.unreliable_queue.len()) as u64;
-
-        // Weighted DWRR across the two queues.
-        // Each round adds weight-proportional credits (in bytes). We use a
-        // quantum of 1500 bytes (≈ 1 MTU) scaled by weight.
-        const QUANTUM: f64 = 1500.0;
-        let r_quantum = QUANTUM * config.storm_reliable_weight;
-        let u_quantum = QUANTUM * (1.0 - config.storm_reliable_weight);
-
-        // Process up to a bounded number of packets per call to avoid
-        // unbounded latency in `send()`.
-        let max_drain = 64;
-        let mut drained = 0;
-        let mut succeeded = 0;
-        let mut last_err: Option<anyhow::Error> = None;
-
-        while drained < max_drain
-            && (!self.reliable_queue.is_empty() || !self.unreliable_queue.is_empty())
-        {
-            // Replenish deficits.
-            if !self.reliable_queue.is_empty() {
-                self.reliable_deficit += r_quantum;
-            }
-            if !self.unreliable_queue.is_empty() {
-                self.unreliable_deficit += u_quantum;
-            }
-
-            // Service reliable queue first (higher priority).
-            while let Some(front) = self.reliable_queue.front() {
-                let cost = front.profile.size_bytes.max(1) as f64;
-                if self.reliable_deficit < cost {
-                    break;
-                }
-                let pkt = self.reliable_queue.pop_front().unwrap();
-                self.reliable_deficit -= cost;
-                drained += 1;
-                match self.send_immediate(pkt.payload, pkt.profile) {
-                    Ok(()) => succeeded += 1,
-                    Err(e) => last_err = Some(e),
-                }
-            }
-
-            // Service unreliable queue.
-            while let Some(front) = self.unreliable_queue.front() {
-                let cost = front.profile.size_bytes.max(1) as f64;
-                if self.unreliable_deficit < cost {
-                    break;
-                }
-                let pkt = self.unreliable_queue.pop_front().unwrap();
-                self.unreliable_deficit -= cost;
-                drained += 1;
-                match self.send_immediate(pkt.payload, pkt.profile) {
-                    Ok(()) => succeeded += 1,
-                    Err(e) => last_err = Some(e),
-                }
-            }
-
-            // If neither queue could make progress, break to avoid spin.
-            if self.reliable_queue.is_empty() && self.unreliable_queue.is_empty() {
-                break;
-            }
-            if drained >= max_drain {
-                break;
-            }
-        }
-
-        match last_err {
-            Some(e) if succeeded == 0 => Err(e),
-            _ => Ok(()),
-        }
-    }
-
-    /// Immediately send a single packet (bypass STORM queues).
-    ///
-    /// This is the original scheduling path: discard primitive → broadcast
-    /// → redundancy → DWRR single-link selection.
-    fn send_immediate(
-        &mut self,
-        payload: Bytes,
-        profile: crate::scheduler::PacketProfile,
-    ) -> Result<()> {
         let packet_len = payload.len();
         let config = self.scheduler.config();
-
-        // ── Discard primitive ──
-        // If the packet has a deadline and is droppable, check the
-        // estimated minimum OWD across alive links.  When even the
-        // *best* link would deliver the packet after its deadline,
-        // drop it here to save bandwidth for timely data.
-        let deadline = if profile.deadline_ms > 0 {
-            profile.deadline_ms
-        } else {
-            config.discard_deadline_ms
-        };
-        if deadline > 0 && profile.can_drop && !profile.is_critical {
-            let min_owd = self.scheduler.min_alive_owd_ms();
-            if min_owd > deadline as f64 {
-                self.discarded_deadline += 1;
-                self.log_discard(deadline, min_owd);
-                return Ok(());
-            }
-        }
 
         // Fast-failover: Broadcast during link instability
         let should_broadcast = (config.critical_broadcast && profile.is_critical)
@@ -345,7 +157,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             let seq = self.next_seq;
             self.next_seq += 1;
 
-            let header = self.make_header(seq);
+            let header = crate::protocol::header::BondingHeader::new(seq);
             let wrapped = header.wrap(payload);
 
             for link in links {
@@ -358,9 +170,27 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
 
         // Adaptive Redundancy: Use spare capacity for important packets
         if config.redundancy_enabled {
-            // Use cached spare ratio (updated by refresh_metrics) to avoid
-            // cloning all LinkMetrics on the hot packet path.
-            let spare_ratio = self.scheduler.cached_spare_ratio();
+            let spare_capacity = self.scheduler.total_spare_capacity();
+            let total_capacity: f64 = self
+                .scheduler
+                .get_active_links()
+                .iter()
+                .filter(|(_, m)| {
+                    m.alive
+                        && matches!(
+                            m.phase,
+                            crate::net::interface::LinkPhase::Live
+                                | crate::net::interface::LinkPhase::Warm
+                        )
+                })
+                .map(|(_, m)| m.capacity_bps)
+                .sum();
+
+            let spare_ratio = if total_capacity > 0.0 {
+                spare_capacity / total_capacity
+            } else {
+                0.0
+            };
 
             let should_duplicate = spare_ratio > config.redundancy_spare_ratio
                 && !profile.can_drop
@@ -374,7 +204,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
                     let seq = self.next_seq;
                     self.next_seq += 1;
 
-                    let header = self.make_header(seq);
+                    let header = crate::protocol::header::BondingHeader::new(seq);
                     let wrapped = header.wrap(payload);
 
                     for link in links {
@@ -393,7 +223,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             let seq = self.next_seq;
             self.next_seq += 1;
 
-            let header = self.make_header(seq);
+            let header = crate::protocol::header::BondingHeader::new(seq);
             let wrapped = header.wrap(payload);
 
             link.send(&wrapped)?;
@@ -403,60 +233,28 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         }
 
         // All links dead — escalate logging based on consecutive failures.
-        self.log_dead_links();
         self.consecutive_dead_count += 1;
-        self.total_dead_drops += 1;
+        self.total_dead_drops.fetch_add(1, Ordering::Relaxed);
 
-        Err(anyhow::anyhow!("Link selection failed (all links dead)"))
-    }
-
-    /// Cold helper for dead-link logging — separated so the compiler can
-    /// inline the hot path of `send()` without bloating it with log
-    /// formatting code (#9).
-    #[cold]
-    #[inline(never)]
-    fn log_dead_links(&self) {
-        // Escalating severity: first occurrence is a warning,
-        // sustained failures (100+) escalate to error.
-        if self.consecutive_dead_count == 0 {
+        // Log at escalating severity: first occurrence is a warning,
+        // sustained failures (100+ consecutive) escalate to error.
+        if self.consecutive_dead_count == 1 {
             warn!("All links dead: dropped packet (seq={})", self.next_seq);
-        } else if self.consecutive_dead_count == 99 {
+        } else if self.consecutive_dead_count == 100 {
             error!(
                 "All links dead for {} consecutive packets — total drops: {}",
-                self.consecutive_dead_count + 1,
-                self.total_dead_drops + 1
+                self.consecutive_dead_count,
+                self.total_dead_drops.load(Ordering::Relaxed)
             );
-        } else if (self.consecutive_dead_count + 1).is_multiple_of(1000) {
+        } else if self.consecutive_dead_count.is_multiple_of(1000) {
             error!(
                 "All links still dead after {} consecutive drops (total: {})",
-                self.consecutive_dead_count + 1,
-                self.total_dead_drops + 1
+                self.consecutive_dead_count,
+                self.total_dead_drops.load(Ordering::Relaxed)
             );
         }
-    }
 
-    /// Cold helper for deadline-discard logging.
-    #[cold]
-    #[inline(never)]
-    fn log_discard(&self, deadline_ms: u64, min_owd_ms: f64) {
-        if self.discarded_deadline.is_multiple_of(100) || self.discarded_deadline == 1 {
-            tracing::debug!(
-                "Discard primitive: OWD {:.1}ms > deadline {}ms — {} discarded total",
-                min_owd_ms,
-                deadline_ms,
-                self.discarded_deadline,
-            );
-        }
-    }
-
-    /// Returns the number of packets discarded by the sender-side deadline.
-    pub fn discarded_deadline(&self) -> u64 {
-        self.discarded_deadline
-    }
-
-    /// Returns the number of unreliable packets aged-out by the STORM queue.
-    pub fn storm_aged_out(&self) -> u64 {
-        self.storm_aged_out
+        Err(anyhow::anyhow!("Link selection failed (all links dead)"))
     }
 }
 
@@ -496,9 +294,6 @@ mod tests {
                     mtu: None,
                     iface: None,
                     link_kind: None,
-                    estimated_capacity_bps: 0.0,
-                    owd_ms: 0.0,
-                    signal_dbm: None,
                 }),
                 sent_packets: Mutex::new(Vec::new()),
             }
@@ -548,7 +343,6 @@ mod tests {
             is_critical: false,
             can_drop: true, // Droppable packets are not duplicated
             size_bytes: payload.len(),
-            ..Default::default()
         };
 
         scheduler.send(payload, profile).unwrap();
@@ -604,7 +398,6 @@ mod tests {
             is_critical: true,
             can_drop: false,
             size_bytes: payload.len(),
-            ..Default::default()
         };
 
         scheduler.send(payload, profile).unwrap();
@@ -640,7 +433,6 @@ mod tests {
             is_critical: false,
             can_drop: false,
             size_bytes: payload.len(),
-            ..Default::default()
         };
 
         scheduler.send(payload, profile).unwrap();
@@ -694,7 +486,6 @@ mod tests {
             is_critical: false,
             can_drop: false,
             size_bytes: payload.len(),
-            ..Default::default()
         };
 
         scheduler.send(payload, profile).unwrap();
@@ -728,7 +519,6 @@ mod tests {
             is_critical: false,
             can_drop: false,
             size_bytes: payload.len(),
-            ..Default::default()
         };
 
         scheduler.send(payload, profile).unwrap();
@@ -761,7 +551,6 @@ mod tests {
             is_critical: false,
             can_drop: true,
             size_bytes: payload.len(),
-            ..Default::default()
         };
 
         scheduler.send(payload, profile).unwrap();
@@ -799,7 +588,6 @@ mod tests {
             is_critical: false,
             can_drop: false,
             size_bytes: payload.len(),
-            ..Default::default()
         };
 
         scheduler.send(payload, profile).unwrap();
@@ -859,7 +647,6 @@ mod tests {
             is_critical: true,
             can_drop: false,
             size_bytes: payload.len(),
-            ..Default::default()
         };
 
         scheduler.send(payload, profile).unwrap();
@@ -869,543 +656,5 @@ mod tests {
 
         // Should be sent to single link, not broadcast
         assert_eq!(l1_count + l2_count, 1);
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // Discard primitive tests
-    // ────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn discard_drops_when_owd_exceeds_deadline() {
-        use crate::config::SchedulerConfig;
-        let config = SchedulerConfig {
-            discard_deadline_ms: 100,
-            critical_broadcast: false,
-            redundancy_enabled: false,
-            failover_enabled: false,
-            ..SchedulerConfig::default()
-        };
-        let mut sched = BondingScheduler::with_config(config);
-        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        // Set OWD above deadline
-        link.metrics.lock().unwrap().owd_ms = 150.0;
-        sched.add_link(link.clone());
-        sched.refresh_metrics();
-
-        let profile = crate::scheduler::PacketProfile {
-            is_critical: false,
-            can_drop: true,
-            size_bytes: 100,
-            deadline_ms: 0, // use config default
-        };
-        sched.send(Bytes::from_static(b"data"), profile).unwrap();
-
-        assert_eq!(
-            link.sent_packets.lock().unwrap().len(),
-            0,
-            "Packet should be discarded — OWD 150 > deadline 100"
-        );
-        assert_eq!(sched.discarded_deadline(), 1);
-    }
-
-    #[test]
-    fn discard_sends_when_owd_within_deadline() {
-        use crate::config::SchedulerConfig;
-        let config = SchedulerConfig {
-            discard_deadline_ms: 100,
-            critical_broadcast: false,
-            redundancy_enabled: false,
-            failover_enabled: false,
-            ..SchedulerConfig::default()
-        };
-        let mut sched = BondingScheduler::with_config(config);
-        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        link.metrics.lock().unwrap().owd_ms = 50.0;
-        sched.add_link(link.clone());
-        sched.refresh_metrics();
-
-        let profile = crate::scheduler::PacketProfile {
-            is_critical: false,
-            can_drop: true,
-            size_bytes: 100,
-            deadline_ms: 0,
-        };
-        sched.send(Bytes::from_static(b"data"), profile).unwrap();
-
-        assert_eq!(
-            link.sent_packets.lock().unwrap().len(),
-            1,
-            "Packet should be sent — OWD 50 < deadline 100"
-        );
-        assert_eq!(sched.discarded_deadline(), 0);
-    }
-
-    #[test]
-    fn discard_never_drops_critical() {
-        use crate::config::SchedulerConfig;
-        let config = SchedulerConfig {
-            discard_deadline_ms: 10,
-            critical_broadcast: false,
-            redundancy_enabled: false,
-            failover_enabled: false,
-            ..SchedulerConfig::default()
-        };
-        let mut sched = BondingScheduler::with_config(config);
-        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        link.metrics.lock().unwrap().owd_ms = 200.0;
-        sched.add_link(link.clone());
-        sched.refresh_metrics();
-
-        let profile = crate::scheduler::PacketProfile {
-            is_critical: true,
-            can_drop: false,
-            size_bytes: 100,
-            deadline_ms: 0,
-        };
-        sched
-            .send(Bytes::from_static(b"keyframe"), profile)
-            .unwrap();
-
-        assert_eq!(
-            link.sent_packets.lock().unwrap().len(),
-            1,
-            "Critical packets must never be discarded"
-        );
-    }
-
-    #[test]
-    fn discard_uses_per_packet_deadline() {
-        use crate::config::SchedulerConfig;
-        let config = SchedulerConfig {
-            discard_deadline_ms: 0, // config disabled
-            critical_broadcast: false,
-            redundancy_enabled: false,
-            failover_enabled: false,
-            ..SchedulerConfig::default()
-        };
-        let mut sched = BondingScheduler::with_config(config);
-        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        link.metrics.lock().unwrap().owd_ms = 80.0;
-        sched.add_link(link.clone());
-        sched.refresh_metrics();
-
-        let profile = crate::scheduler::PacketProfile {
-            is_critical: false,
-            can_drop: true,
-            size_bytes: 100,
-            deadline_ms: 50, // per-packet deadline
-        };
-        sched.send(Bytes::from_static(b"late"), profile).unwrap();
-
-        assert_eq!(
-            link.sent_packets.lock().unwrap().len(),
-            0,
-            "Per-packet deadline should take effect: OWD 80 > deadline 50"
-        );
-        assert_eq!(sched.discarded_deadline(), 1);
-    }
-
-    #[test]
-    fn discard_disabled_when_zero() {
-        use crate::config::SchedulerConfig;
-        let config = SchedulerConfig {
-            discard_deadline_ms: 0,
-            critical_broadcast: false,
-            redundancy_enabled: false,
-            failover_enabled: false,
-            ..SchedulerConfig::default()
-        };
-        let mut sched = BondingScheduler::with_config(config);
-        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        link.metrics.lock().unwrap().owd_ms = 999.0;
-        sched.add_link(link.clone());
-        sched.refresh_metrics();
-
-        let profile = crate::scheduler::PacketProfile {
-            is_critical: false,
-            can_drop: true,
-            size_bytes: 100,
-            deadline_ms: 0,
-        };
-        sched.send(Bytes::from_static(b"data"), profile).unwrap();
-
-        assert_eq!(
-            link.sent_packets.lock().unwrap().len(),
-            1,
-            "Discard disabled (deadline=0) — always send"
-        );
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // Header timestamp & sequence wiring tests
-    // ────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn send_wraps_with_non_zero_timestamp() {
-        use crate::protocol::header::BondingHeader;
-
-        let config = SchedulerConfig {
-            critical_broadcast: false,
-            redundancy_enabled: false,
-            failover_enabled: false,
-            ..SchedulerConfig::default()
-        };
-        let mut sched = BondingScheduler::with_config(config);
-        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        sched.add_link(link.clone());
-        sched.refresh_metrics();
-
-        // Small sleep so timestamp is non-zero
-        std::thread::sleep(std::time::Duration::from_millis(1));
-
-        let payload = Bytes::from_static(b"test-payload");
-        let profile = crate::scheduler::PacketProfile {
-            is_critical: false,
-            can_drop: false,
-            size_bytes: payload.len(),
-            ..Default::default()
-        };
-        sched.send(payload, profile).unwrap();
-
-        let packets = link.sent_packets.lock().unwrap();
-        assert_eq!(packets.len(), 1);
-
-        let raw = Bytes::from(packets[0].clone());
-        let (header, body) = BondingHeader::unwrap(raw).expect("Should have a valid header");
-
-        assert_eq!(header.seq_id, 0, "First packet should be seq 0");
-        assert!(
-            header.send_time_us > 0,
-            "send_time_us should be non-zero for OWD measurement, got {}",
-            header.send_time_us
-        );
-        assert_eq!(body, Bytes::from_static(b"test-payload"));
-    }
-
-    #[test]
-    fn seq_increments_monotonically() {
-        use crate::protocol::header::BondingHeader;
-
-        let config = SchedulerConfig {
-            critical_broadcast: false,
-            redundancy_enabled: false,
-            failover_enabled: false,
-            ..SchedulerConfig::default()
-        };
-        let mut sched = BondingScheduler::with_config(config);
-        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        sched.add_link(link.clone());
-        sched.refresh_metrics();
-
-        let profile = crate::scheduler::PacketProfile {
-            is_critical: false,
-            can_drop: false,
-            size_bytes: 100,
-            ..Default::default()
-        };
-        for _ in 0..10 {
-            sched.send(Bytes::from_static(b"data"), profile).unwrap();
-        }
-
-        let packets = link.sent_packets.lock().unwrap();
-        assert_eq!(packets.len(), 10);
-
-        for (i, pkt) in packets.iter().enumerate() {
-            let raw = Bytes::from(pkt.clone());
-            let (hdr, _) = BondingHeader::unwrap(raw).unwrap();
-            assert_eq!(
-                hdr.seq_id, i as u64,
-                "Seq should be monotonically increasing"
-            );
-        }
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // Error path & wrapper-level API tests
-    // ────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn send_all_links_dead_returns_error() {
-        let config = SchedulerConfig {
-            critical_broadcast: false,
-            redundancy_enabled: false,
-            failover_enabled: false,
-            ..SchedulerConfig::default()
-        };
-        let mut sched = BondingScheduler::with_config(config);
-        // Add a link but set it to dead phase
-        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        link.set_phase(LinkPhase::Init);
-        // Make metrics show not alive
-        link.metrics.lock().unwrap().alive = false;
-        sched.add_link(link);
-        sched.refresh_metrics();
-
-        let profile = crate::scheduler::PacketProfile {
-            is_critical: false,
-            can_drop: false,
-            size_bytes: 100,
-            ..Default::default()
-        };
-        let result = sched.send(Bytes::from_static(b"data"), profile);
-        assert!(result.is_err(), "Send should fail when all links are dead");
-    }
-
-    #[test]
-    fn remove_link_on_bonding_scheduler() {
-        let mut sched = BondingScheduler::new();
-        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        let l2 = Arc::new(MockLink::new(2, 5_000_000.0, 10.0));
-        sched.add_link(l1);
-        sched.add_link(l2);
-        sched.refresh_metrics();
-
-        let metrics = sched.get_all_metrics();
-        assert!(metrics.contains_key(&1));
-        assert!(metrics.contains_key(&2));
-
-        sched.remove_link(1);
-        sched.refresh_metrics();
-
-        let metrics = sched.get_all_metrics();
-        assert!(
-            !metrics.contains_key(&1),
-            "Link 1 should be gone after remove"
-        );
-        assert!(metrics.contains_key(&2), "Link 2 should remain");
-    }
-
-    #[test]
-    fn get_all_metrics_reflects_links() {
-        let mut sched = BondingScheduler::new();
-        assert!(
-            sched.get_all_metrics().is_empty(),
-            "No links → empty metrics"
-        );
-
-        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        sched.add_link(l1);
-        sched.refresh_metrics();
-
-        let metrics = sched.get_all_metrics();
-        assert_eq!(metrics.len(), 1);
-        assert!(metrics.contains_key(&1));
-        assert!(
-            (metrics[&1].capacity_bps - 10_000_000.0).abs() < 1e-6,
-            "Capacity should reflect link's reported value"
-        );
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // STORM dual-queue tests
-    // ────────────────────────────────────────────────────────────────
-
-    fn storm_config() -> SchedulerConfig {
-        SchedulerConfig {
-            storm_enabled: true,
-            storm_reliable_weight: 0.7,
-            storm_unreliable_max_age_ms: 200,
-            storm_queue_capacity: 64,
-            critical_broadcast: false,
-            redundancy_enabled: false,
-            failover_enabled: false,
-            ..SchedulerConfig::default()
-        }
-    }
-
-    #[test]
-    fn storm_reliable_packet_is_delivered() {
-        let mut sched = BondingScheduler::with_config(storm_config());
-        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        sched.add_link(link.clone());
-        sched.refresh_metrics();
-
-        let profile = crate::scheduler::PacketProfile {
-            is_critical: true,
-            can_drop: false,
-            size_bytes: 100,
-            deadline_ms: 0,
-        };
-        sched
-            .send(Bytes::from_static(b"keyframe"), profile)
-            .unwrap();
-
-        assert_eq!(
-            link.sent_packets.lock().unwrap().len(),
-            1,
-            "Reliable packet must be delivered through STORM queue"
-        );
-    }
-
-    #[test]
-    fn storm_unreliable_packet_is_delivered() {
-        let mut sched = BondingScheduler::with_config(storm_config());
-        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        sched.add_link(link.clone());
-        sched.refresh_metrics();
-
-        let profile = crate::scheduler::PacketProfile {
-            is_critical: false,
-            can_drop: true,
-            size_bytes: 100,
-            deadline_ms: 0,
-        };
-        sched.send(Bytes::from_static(b"bframe"), profile).unwrap();
-
-        assert_eq!(
-            link.sent_packets.lock().unwrap().len(),
-            1,
-            "Unreliable packet should be delivered when links are healthy"
-        );
-    }
-
-    #[test]
-    fn storm_age_discards_stale_unreliable() {
-        let mut config = storm_config();
-        config.storm_unreliable_max_age_ms = 1; // 1ms age limit
-        let mut sched = BondingScheduler::with_config(config);
-        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        sched.add_link(link.clone());
-        sched.refresh_metrics();
-
-        // Enqueue directly into unreliable queue with old timestamp
-        sched.unreliable_queue.push_back(QueuedPacket {
-            payload: Bytes::from_static(b"old"),
-            profile: crate::scheduler::PacketProfile {
-                is_critical: false,
-                can_drop: true,
-                size_bytes: 100,
-                deadline_ms: 0,
-            },
-            enqueue_time: Instant::now() - Duration::from_millis(50),
-        });
-
-        // Now send a fresh reliable packet — drain should age-discard the stale one
-        let profile = crate::scheduler::PacketProfile {
-            is_critical: true,
-            can_drop: false,
-            size_bytes: 100,
-            deadline_ms: 0,
-        };
-        sched.send(Bytes::from_static(b"fresh"), profile).unwrap();
-
-        assert_eq!(
-            link.sent_packets.lock().unwrap().len(),
-            1,
-            "Only the fresh reliable packet should be sent"
-        );
-        assert!(
-            sched.storm_aged_out() >= 1,
-            "Stale unreliable entry should be aged out"
-        );
-    }
-
-    #[test]
-    fn storm_reliable_weight_prioritizes_reliable() {
-        let mut sched = BondingScheduler::with_config(storm_config());
-        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        sched.add_link(link.clone());
-        sched.refresh_metrics();
-
-        // Send a mix: 5 unreliable then 5 reliable
-        for _ in 0..5 {
-            let p = crate::scheduler::PacketProfile {
-                is_critical: false,
-                can_drop: true,
-                size_bytes: 100,
-                deadline_ms: 0,
-            };
-            sched.send(Bytes::from_static(b"U"), p).unwrap();
-        }
-        for _ in 0..5 {
-            let p = crate::scheduler::PacketProfile {
-                is_critical: true,
-                can_drop: false,
-                size_bytes: 100,
-                deadline_ms: 0,
-            };
-            sched.send(Bytes::from_static(b"R"), p).unwrap();
-        }
-
-        // All 10 should be delivered (no loss, healthy link)
-        assert_eq!(
-            link.sent_packets.lock().unwrap().len(),
-            10,
-            "STORM should deliver all packets on healthy link"
-        );
-    }
-
-    #[test]
-    fn storm_queue_overflow_drops_unreliable() {
-        let mut config = storm_config();
-        config.storm_queue_capacity = 2;
-        let mut sched = BondingScheduler::with_config(config);
-        let link = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        sched.add_link(link.clone());
-        sched.refresh_metrics();
-
-        // Pre-fill the unreliable queue to capacity via direct manipulation
-        // (drain would immediately send them on the healthy link).
-        for i in 0..2 {
-            sched.unreliable_queue.push_back(QueuedPacket {
-                payload: Bytes::from(format!("fill-{}", i)),
-                profile: crate::scheduler::PacketProfile {
-                    is_critical: false,
-                    can_drop: true,
-                    size_bytes: 100,
-                    deadline_ms: 0,
-                },
-                enqueue_time: Instant::now(),
-            });
-        }
-        assert_eq!(sched.unreliable_queue.len(), 2);
-
-        // Now send another unreliable — should evict oldest
-        let p = crate::scheduler::PacketProfile {
-            is_critical: false,
-            can_drop: true,
-            size_bytes: 100,
-            deadline_ms: 0,
-        };
-        sched.send(Bytes::from_static(b"new"), p).unwrap();
-
-        // One overflow eviction should have occurred
-        assert!(
-            sched.storm_aged_out() >= 1,
-            "At least 1 packet should be shed from overflow, got {}",
-            sched.storm_aged_out()
-        );
-    }
-
-    #[test]
-    fn storm_queue_class_classification() {
-        use crate::scheduler::QueueClass;
-
-        // Critical → Reliable
-        let p = crate::scheduler::PacketProfile {
-            is_critical: true,
-            can_drop: false,
-            size_bytes: 100,
-            deadline_ms: 0,
-        };
-        assert_eq!(p.queue_class(), QueueClass::Reliable);
-
-        // Non-droppable → Reliable
-        let p = crate::scheduler::PacketProfile {
-            is_critical: false,
-            can_drop: false,
-            size_bytes: 100,
-            deadline_ms: 0,
-        };
-        assert_eq!(p.queue_class(), QueueClass::Reliable);
-
-        // Droppable, not critical → Unreliable
-        let p = crate::scheduler::PacketProfile {
-            is_critical: false,
-            can_drop: true,
-            size_bytes: 100,
-            deadline_ms: 0,
-        };
-        assert_eq!(p.queue_class(), QueueClass::Unreliable);
     }
 }

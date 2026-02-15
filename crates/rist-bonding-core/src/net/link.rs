@@ -1,9 +1,8 @@
+use crate::net::interface::bind_url_to_iface;
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
 use crate::net::state::LinkStats;
-use crate::net::util::bind_url_to_iface;
 use crate::net::wrapper::{RecoveryConfig, RistContext};
 use anyhow::Result;
-use compact_str::CompactString;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,12 +25,10 @@ pub struct Link {
 }
 
 impl Link {
-    #[cfg(test)]
     pub fn new(id: usize, url: &str) -> Result<Self> {
         Self::new_with_iface(id, url, None, crate::config::LinkLifecycleConfig::default())
     }
 
-    #[cfg(test)]
     pub fn new_with_iface(
         id: usize,
         url: &str,
@@ -140,11 +137,7 @@ impl LinkSender for Link {
     }
 
     fn send(&self, packet: &[u8]) -> Result<usize> {
-        let n = self.ctx.send_data(packet)?;
-        self.stats
-            .bytes_written
-            .fetch_add(n as u64, Ordering::Relaxed);
-        Ok(n)
+        self.ctx.send_data(packet)
     }
 
     fn get_metrics(&self) -> LinkMetrics {
@@ -154,7 +147,7 @@ impl LinkSender for Link {
         let raw_rtt_ms = self.stats.rtt.load(Ordering::Relaxed) as f64;
         let raw_bw = self.stats.bandwidth.load(Ordering::Relaxed) as f64;
         let bw = self.stats.smoothed_bw_bps.load(Ordering::Relaxed) as f64;
-        let loss_micro = self.stats.smoothed_loss_micro.load(Ordering::Relaxed);
+        let loss_pm = self.stats.smoothed_loss_permille.load(Ordering::Relaxed);
 
         let rtt_ms = if rtt_us > 0 {
             rtt_us as f64 / 1000.0
@@ -164,7 +157,7 @@ impl LinkSender for Link {
 
         let bw = if bw > 0.0 { bw } else { raw_bw };
 
-        let loss_rate = loss_micro as f64 / 1_000_000.0;
+        let loss_rate = loss_pm as f64 / 1000.0;
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -228,37 +221,20 @@ impl LinkSender for Link {
             (None, None, None, None)
         };
 
-        let current_bytes = self.stats.bytes_written.load(Ordering::Relaxed);
-
         LinkMetrics {
             rtt_ms,
             capacity_bps: bw,
             loss_rate,
-            // observed_bps is filled in by DWRR::refresh_metrics() from its
-            // own sent_bytes accounting, avoiding redundant per-link tracking.
             observed_bps: 0.0,
-            observed_bytes: current_bytes,
-            // TODO(queue-depth): librist does not expose per-peer send-queue
-            // depth.  Implementing this would require either extending the
-            // librist C API or tracking pending retransmissions via stats
-            // callbacks.  Until then these are placeholder values and
-            // consumers should NOT use them for congestion signaling.
-            queue_depth: 0,
+            observed_bytes: 0,
+            queue_depth: 0, // Need to implement if possible via stats or wrapper tracking
             max_queue: 1000,
             alive,
             phase,
             os_up,
             mtu,
-            iface: iface_name.map(CompactString::from),
-            link_kind: link_kind.map(CompactString::from),
-            estimated_capacity_bps: 0.0,
-            // Use RTT/2 as a proxy for one-way delay when true OWD
-            // is unavailable.  This feeds the SBD engine (RFC 8382)
-            // with a reasonable delay signal.
-            owd_ms: rtt_ms / 2.0,
-            // Signal strength is populated by the signal-watermark
-            // subsystem when available (Wi-Fi / cellular interfaces).
-            signal_dbm: None,
+            iface: iface_name,
+            link_kind,
         }
     }
 }
@@ -310,20 +286,5 @@ mod tests {
         assert!(!should_poll_os(1000, 900));
         assert!(should_poll_os(1500, 900));
         assert!(should_poll_os(2000, 1499));
-    }
-
-    #[test]
-    fn infer_kind_case_insensitive() {
-        assert_eq!(infer_kind_from_iface_name("WLAN0"), Some("wifi"));
-        assert_eq!(infer_kind_from_iface_name("Eth0"), Some("wired"));
-        assert_eq!(infer_kind_from_iface_name("WWAN0"), Some("cellular"));
-        assert_eq!(infer_kind_from_iface_name("WiFi0"), Some("wifi"));
-        assert_eq!(infer_kind_from_iface_name("LO"), Some("loopback"));
-    }
-
-    #[test]
-    fn infer_kind_cdc_cellular() {
-        assert_eq!(infer_kind_from_iface_name("cdc-wdm0"), Some("cellular"));
-        assert_eq!(infer_kind_from_iface_name("cdc0"), Some("cellular"));
     }
 }

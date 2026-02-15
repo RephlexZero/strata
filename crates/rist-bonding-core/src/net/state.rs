@@ -54,11 +54,7 @@ pub struct LinkStats {
     pub lost: AtomicU64,
     pub smoothed_rtt_us: AtomicU64,
     pub smoothed_bw_bps: AtomicU64,
-    /// Smoothed loss stored as micro-loss (× 1,000,000). 1,000,000 = 100% loss.
-    /// Micro-loss precision prevents truncation of sub-0.1% loss rates that
-    /// are important for early congestion detection in the NADA controller.
-    pub smoothed_loss_micro: AtomicU64,
-    pub bytes_written: AtomicU64,
+    pub smoothed_loss_permille: AtomicU64, // Stored as * 1000. 1000 = 100% loss.
     pub last_stats_ms: AtomicU64,
     pub os_up_i32: AtomicI32, // -1 unknown, 0 down, 1 up
     pub mtu_i32: AtomicI32,   // -1 unknown
@@ -81,8 +77,7 @@ impl LinkStats {
             lost: AtomicU64::new(0),
             smoothed_rtt_us: AtomicU64::new(0),
             smoothed_bw_bps: AtomicU64::new(0),
-            smoothed_loss_micro: AtomicU64::new(0),
-            bytes_written: AtomicU64::new(0),
+            smoothed_loss_permille: AtomicU64::new(0),
             last_stats_ms: AtomicU64::new(0),
             os_up_i32: AtomicI32::new(-1),
             mtu_i32: AtomicI32::new(-1),
@@ -154,7 +149,6 @@ impl LinkLifecycle {
 
         let stats_stale = stats_age > std::time::Duration::from_millis(self.config.stats_stale_ms);
 
-        let old_phase = self.phase;
         self.phase = match self.phase {
             LinkPhase::Init => {
                 if fresh {
@@ -217,23 +211,10 @@ impl LinkLifecycle {
             }
         };
 
-        // Record last_transition for all phases that carry traffic or
-        // transition outward.  Cooldown and Reset use last_transition as
-        // their entry timestamp (timer start), so we must NOT overwrite it
-        // while *staying* in those phases, but we DO set it on the tick
-        // that first enters them.
-        let entered_cooldown_or_reset = (self.phase == LinkPhase::Cooldown
-            || self.phase == LinkPhase::Reset)
-            && old_phase != self.phase;
-
         if self.phase != LinkPhase::Cooldown
             && self.phase != LinkPhase::Reset
             && self.phase != LinkPhase::Init
         {
-            self.last_transition = now;
-        } else if entered_cooldown_or_reset {
-            // First tick entering Cooldown/Reset — record entry time so the
-            // cooldown timer measures from the correct instant.
             self.last_transition = now;
         }
 
@@ -500,97 +481,5 @@ mod tests {
         assert_eq!(ls.mtu_i32.load(Ordering::Relaxed), -1);
         let lc = ls.lifecycle.lock().unwrap();
         assert_eq!(lc.phase, LinkPhase::Init);
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // Cooldown timer & loss precision edge-case tests
-    // ────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn cooldown_boundary_exact_ms() {
-        let config = LinkLifecycleConfig {
-            cooldown_ms: 100,
-            ..LinkLifecycleConfig::default()
-        };
-        let mut lc = LinkLifecycle::new(config);
-        let start = Instant::now();
-
-        // Drive to Live phase through normal good metrics
-        for i in 0..20 {
-            let now = start + Duration::from_millis(i * 200);
-            lc.update(now, 10.0, 0.001, 5_000_000.0, Duration::from_millis(200));
-        }
-        assert_eq!(lc.phase, LinkPhase::Live);
-
-        // Trigger degradation
-        let degrade_time = start + Duration::from_secs(10);
-        for i in 0..10 {
-            let now = degrade_time + Duration::from_millis(i * 100);
-            lc.update(now, 10.0, 0.5, 5_000_000.0, Duration::from_millis(100));
-        }
-        let phase_after_degrade = lc.phase;
-        // If degraded, test cooldown boundary
-        if phase_after_degrade == LinkPhase::Degrade {
-            let transition_time = Instant::now();
-            // At exactly cooldown-1 ms, should still be degraded
-            let phase_before = lc.update(
-                transition_time + Duration::from_millis(99),
-                10.0,
-                0.001, // Good metric
-                5_000_000.0,
-                Duration::from_millis(99),
-            );
-
-            // At exactly cooldown ms, should be able to transition
-            let phase_at = lc.update(
-                transition_time + Duration::from_millis(100),
-                10.0,
-                0.001,
-                5_000_000.0,
-                Duration::from_millis(100),
-            );
-
-            // The key assertion: after cooldown elapses, metrics can drive transitions
-            // (exact behavior depends on good_count thresholds, so we verify no panic)
-            let _ = (phase_before, phase_at);
-        }
-
-        assert_eq!(LinkLifecycleConfig::default().cooldown_ms, 2000);
-    }
-
-    #[test]
-    fn loss_micro_precision() {
-        // Verify conversion: 0.001% loss = 0.00001 → 10 micro-loss units
-        let loss_rate = 0.00001_f64;
-        let micro_loss = (loss_rate * 1_000_000.0) as u64;
-        assert_eq!(micro_loss, 10, "0.001% loss should be 10 micro-loss units");
-
-        // Roundtrip: micro → rate
-        let recovered = micro_loss as f64 / 1_000_000.0;
-        assert!(
-            (recovered - loss_rate).abs() < 1e-9,
-            "Micro-loss roundtrip should preserve precision"
-        );
-
-        // With old permille (×1000), this would have been truncated to 0
-        let permille = (loss_rate * 1_000.0) as u64;
-        assert_eq!(
-            permille, 0,
-            "Old permille precision would truncate 0.001% to 0"
-        );
-    }
-
-    #[test]
-    fn lifecycle_init_to_probe_on_first_good_update() {
-        let mut lc = LinkLifecycle::new(LinkLifecycleConfig::default());
-        assert_eq!(lc.phase, LinkPhase::Init);
-
-        let now = Instant::now();
-        let phase = lc.update(now, 10.0, 0.001, 5_000_000.0, Duration::from_millis(100));
-        assert_eq!(
-            phase,
-            LinkPhase::Probe,
-            "First good update should move Init → Probe"
-        );
     }
 }

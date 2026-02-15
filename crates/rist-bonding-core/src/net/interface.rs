@@ -1,5 +1,64 @@
 use anyhow::Result;
-use compact_str::CompactString;
+use std::net::IpAddr;
+
+/// Resolve a network interface name (e.g., "eth0") to its first IPv4 address.
+/// Returns `None` if the interface doesn't exist or has no IPv4 address.
+pub fn resolve_iface_ipv4(iface: &str) -> Option<IpAddr> {
+    let path = format!("/sys/class/net/{}/", iface);
+    if !std::path::Path::new(&path).exists() {
+        return None;
+    }
+
+    // Use libc getifaddrs for reliable interface address resolution.
+    unsafe {
+        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifaddrs) != 0 {
+            return None;
+        }
+
+        let mut current = ifaddrs;
+        let mut result = None;
+
+        while !current.is_null() {
+            let ifa = &*current;
+            if !ifa.ifa_addr.is_null() {
+                let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
+                if name == iface && (*ifa.ifa_addr).sa_family == libc::AF_INET as u16 {
+                    let addr = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    let ip =
+                        IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)));
+                    result = Some(ip);
+                    break;
+                }
+            }
+            current = ifa.ifa_next;
+        }
+
+        libc::freeifaddrs(ifaddrs);
+        result
+    }
+}
+
+/// Modify a RIST URL to bind to a specific local IP address.
+/// e.g., "rist://1.2.3.4:5000" + iface "eth0" (IP 10.0.0.1) -> "rist://10.0.0.1@1.2.3.4:5000"
+/// This tells librist to use the specified local address for the socket,
+/// effectively binding traffic to that interface.
+pub fn bind_url_to_iface(url: &str, iface: &str) -> Option<String> {
+    let local_ip = resolve_iface_ipv4(iface)?;
+
+    // RIST URL format: rist://[local_ip@]remote_ip:port[?params]
+    // We need to insert local_ip@ before the remote address.
+    if let Some(rest) = url.strip_prefix("rist://") {
+        // Check if there's already a local binding (@)
+        if rest.contains('@') {
+            // Already has a local binding, don't override
+            return Some(url.to_string());
+        }
+        Some(format!("rist://{}@{}", local_ip, rest))
+    } else {
+        None
+    }
+}
 
 /// Lifecycle phase of a network link.
 ///
@@ -44,10 +103,6 @@ impl LinkPhase {
 /// Populated by [`LinkSender::get_metrics()`] from smoothed EWMA values
 /// and OS-level interface state (operstate, MTU). The scheduler uses these
 /// to compute effective capacity and credit accrual rates.
-///
-/// `iface` and `link_kind` use [`CompactString`] (inline up to 24 bytes)
-/// to eliminate heap allocation when cloning — these short strings ("eth0",
-/// "wired", etc.) never exceed the inline threshold.
 #[derive(Default, Debug, Clone)]
 pub struct LinkMetrics {
     pub rtt_ms: f64,
@@ -61,16 +116,8 @@ pub struct LinkMetrics {
     pub phase: LinkPhase,
     pub os_up: Option<bool>,
     pub mtu: Option<u32>,
-    pub iface: Option<CompactString>,
-    pub link_kind: Option<CompactString>,
-    /// AIMD delay-gradient capacity estimate (0.0 if estimator disabled).
-    pub estimated_capacity_bps: f64,
-    /// One-way delay estimate in milliseconds (0.0 if not available).
-    /// Computed from `BondingHeader::send_time_us` when OWD timestamps are present.
-    pub owd_ms: f64,
-    /// Wireless signal strength in dBm (`None` for wired links).
-    /// Read from sysfs/netlink for Wi-Fi or cellular interfaces.
-    pub signal_dbm: Option<f64>,
+    pub iface: Option<String>,
+    pub link_kind: Option<String>,
 }
 
 /// Abstraction for a network link capable of sending packets and reporting metrics.
@@ -84,36 +131,4 @@ pub trait LinkSender: Send + Sync {
     fn send(&self, packet: &[u8]) -> Result<usize>;
     /// Returns a snapshot of the link's current metrics.
     fn get_metrics(&self) -> LinkMetrics;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn link_phase_as_str_all_variants() {
-        assert_eq!(LinkPhase::Init.as_str(), "init");
-        assert_eq!(LinkPhase::Probe.as_str(), "probe");
-        assert_eq!(LinkPhase::Warm.as_str(), "warm");
-        assert_eq!(LinkPhase::Live.as_str(), "live");
-        assert_eq!(LinkPhase::Degrade.as_str(), "degrade");
-        assert_eq!(LinkPhase::Cooldown.as_str(), "cooldown");
-        assert_eq!(LinkPhase::Reset.as_str(), "reset");
-    }
-
-    #[test]
-    fn link_metrics_default_values() {
-        let m = LinkMetrics::default();
-        assert!((m.rtt_ms - 0.0).abs() < f64::EPSILON);
-        assert!((m.capacity_bps - 0.0).abs() < f64::EPSILON);
-        assert!((m.loss_rate - 0.0).abs() < f64::EPSILON);
-        assert!(!m.alive);
-        assert_eq!(m.phase, LinkPhase::Init);
-        assert_eq!(m.os_up, None);
-        assert_eq!(m.mtu, None);
-        assert!(m.iface.is_none());
-        assert!(m.link_kind.is_none());
-        assert!((m.estimated_capacity_bps - 0.0).abs() < f64::EPSILON);
-        assert!((m.owd_ms - 0.0).abs() < f64::EPSILON);
-    }
 }
