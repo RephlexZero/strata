@@ -104,8 +104,7 @@ impl WsClient {
         ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
         on_message.forget();
 
-        // Keep the WebSocket alive — leak it intentionally.
-        // A proper implementation would store it for cleanup.
+        // Keep the WebSocket alive for the lifetime of the app.
         std::mem::forget(ws);
     }
 }

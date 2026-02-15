@@ -19,8 +19,8 @@ use tokio::sync::mpsc;
 
 use strata_common::auth;
 use strata_common::protocol::{
-    AuthLoginPayload, AuthLoginResponsePayload, ControlMessage, DashboardEvent,
-    DeviceStatusPayload, Envelope, StreamEndedPayload, StreamStatsPayload,
+    AuthLoginPayload, AuthLoginResponsePayload, DashboardEvent, DeviceStatusPayload, Envelope,
+    StreamEndedPayload, StreamStatsPayload,
 };
 
 use crate::state::{AgentHandle, AppState};
@@ -35,9 +35,9 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // Wait for the first message — must be auth.login
-    let sender_id = match ws_rx.next().await {
+    let (sender_id, hostname) = match ws_rx.next().await {
         Some(Ok(Message::Text(text))) => match authenticate(&state, &text).await {
-            Ok((sid, response_json)) => {
+            Ok((sid, hostname, response_json)) => {
                 if ws_tx
                     .send(Message::Text(response_json.into()))
                     .await
@@ -45,7 +45,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                 {
                     return;
                 }
-                sid
+                (sid, hostname)
             }
             Err(err_json) => {
                 let _ = ws_tx.send(Message::Text(err_json.into())).await;
@@ -63,7 +63,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     // Register agent in shared state
     state
         .agents()
-        .insert(sender_id.clone(), AgentHandle { tx, hostname: None });
+        .insert(sender_id.clone(), AgentHandle { tx, hostname });
 
     // Notify dashboard
     state.broadcast_dashboard(DashboardEvent::SenderStatus {
@@ -103,6 +103,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 
     // Cleanup
     state.agents().remove(&sender_id);
+    state.device_status().remove(&sender_id);
     state.broadcast_dashboard(DashboardEvent::SenderStatus {
         sender_id: sender_id.clone(),
         online: false,
@@ -121,7 +122,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 
 /// Authenticate the agent from the first message.
 /// Returns `Ok((sender_id, response_json))` on success.
-async fn authenticate(state: &AppState, raw: &str) -> Result<(String, String), String> {
+async fn authenticate(state: &AppState, raw: &str) -> Result<(String, Option<String>, String), String> {
     // Parse envelope
     let envelope: Envelope =
         serde_json::from_str(raw).map_err(|e| error_response(&format!("invalid message: {e}")))?;
@@ -152,7 +153,7 @@ async fn authenticate_enrollment(
     state: &AppState,
     token: &str,
     payload: &AuthLoginPayload,
-) -> Result<(String, String), String> {
+) -> Result<(String, Option<String>, String), String> {
     // Find senders with unfulfilled enrollment tokens
     let rows = sqlx::query_as::<_, (String, String, String)>(
         "SELECT id, owner_id, enrollment_token FROM senders WHERE enrolled = FALSE AND enrollment_token IS NOT NULL",
@@ -161,9 +162,11 @@ async fn authenticate_enrollment(
     .await
     .map_err(|e| error_response(&format!("db error: {e}")))?;
 
+    // Normalize the token (strip dashes/spaces, uppercase) before verifying
+    let normalized = strata_common::ids::normalize_enrollment_token(token);
     // Try each — the tokens are hashed, so we verify against each
     for (sender_id, owner_id, token_hash) in &rows {
-        if let Ok(true) = auth::verify_password(token, token_hash) {
+        if let Ok(true) = auth::verify_password(&normalized, token_hash) {
             // Mark as enrolled
             let _ = sqlx::query(
                 "UPDATE senders SET enrolled = TRUE, hostname = $1, enrollment_token = NULL WHERE id = $2",
@@ -195,13 +198,12 @@ async fn authenticate_enrollment(
                 error: None,
             };
 
-            let resp_msg = ControlMessage::AuthLoginResponse(response);
-            let envelope = Envelope::new("auth.login.response", &resp_msg);
+            let envelope = Envelope::new("auth.login.response", &response);
             let json = serde_json::to_string(&envelope).unwrap();
 
             tracing::info!(sender_id = %sender_id, hostname = %payload.hostname, "sender enrolled");
 
-            return Ok((sender_id.clone(), json));
+            return Ok((sender_id.clone(), Some(payload.hostname.clone()), json));
         }
     }
 
@@ -227,6 +229,11 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
                     .bind(sender_id)
                     .execute(state.pool())
                     .await;
+
+                // Cache latest status for REST API consumers
+                state
+                    .device_status()
+                    .insert(sender_id.to_string(), payload.clone());
 
                 // Broadcast to dashboard
                 state.broadcast_dashboard(DashboardEvent::SenderStatus {
@@ -261,6 +268,17 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
                 });
             }
         }
+        // Route request-response messages back to pending callers
+        "config.set.response"
+        | "test.run.response"
+        | "interfaces.scan.response"
+        | "interface.command.response" => {
+            if let Some(request_id) = envelope.payload.get("request_id").and_then(|v| v.as_str()) {
+                if let Some((_, tx)) = state.pending_requests().remove(request_id) {
+                    let _ = tx.send(envelope.payload.clone());
+                }
+            }
+        }
         other => {
             tracing::debug!(sender_id = %sender_id, msg_type = %other, "unhandled agent message type");
         }
@@ -275,7 +293,6 @@ fn error_response(msg: &str) -> String {
         session_token: None,
         error: Some(msg.to_string()),
     };
-    let resp_msg = ControlMessage::AuthLoginResponse(response);
-    let envelope = Envelope::new("auth.login.response", &resp_msg);
+    let envelope = Envelope::new("auth.login.response", &response);
     serde_json::to_string(&envelope).unwrap()
 }

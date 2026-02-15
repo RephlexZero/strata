@@ -49,3 +49,4 @@ test_output/
 
 # WASM build output (trunk)
 crates/strata-dashboard/dist/
+crates/strata-portal/dist/

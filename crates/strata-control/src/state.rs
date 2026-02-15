@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use sqlx::PgPool;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 
 use strata_common::auth::JwtContext;
-use strata_common::protocol::DashboardEvent;
+use strata_common::protocol::{DashboardEvent, DeviceStatusPayload};
 
 /// State shared across all request handlers.
 #[derive(Clone)]
@@ -20,6 +20,10 @@ struct Inner {
     pub jwt: JwtContext,
     /// Connected sender agents, keyed by sender_id.
     pub agents: DashMap<String, AgentHandle>,
+    /// Cached latest device status per sender, updated on each heartbeat.
+    pub device_status: DashMap<String, DeviceStatusPayload>,
+    /// Pending request-response calls to agents, keyed by request_id.
+    pub pending_requests: DashMap<String, oneshot::Sender<serde_json::Value>>,
     /// Broadcast channel for dashboard WebSocket subscribers.
     pub dashboard_tx: broadcast::Sender<DashboardEvent>,
 }
@@ -28,8 +32,8 @@ struct Inner {
 pub struct AgentHandle {
     /// Channel to send control messages to this agent's WebSocket task.
     pub tx: tokio::sync::mpsc::Sender<String>,
-    /// The sender's hostname (for display).
-    #[allow(dead_code)] // Used when status display is wired up
+    /// The sender's hostname (for display in future API responses).
+    #[allow(dead_code)]
     pub hostname: Option<String>,
 }
 
@@ -41,6 +45,8 @@ impl AppState {
                 pool,
                 jwt,
                 agents: DashMap::new(),
+                device_status: DashMap::new(),
+                pending_requests: DashMap::new(),
                 dashboard_tx,
             }),
         }
@@ -56,6 +62,16 @@ impl AppState {
 
     pub fn agents(&self) -> &DashMap<String, AgentHandle> {
         &self.inner.agents
+    }
+
+    /// Get the cached device status map.
+    pub fn device_status(&self) -> &DashMap<String, DeviceStatusPayload> {
+        &self.inner.device_status
+    }
+
+    /// Get the pending requests map (for request-response patterns to agents).
+    pub fn pending_requests(&self) -> &DashMap<String, oneshot::Sender<serde_json::Value>> {
+        &self.inner.pending_requests
     }
 
     /// Broadcast a dashboard event to all subscribed browsers.

@@ -82,10 +82,17 @@ pub struct NetworkInterface {
     #[serde(rename = "type")]
     pub iface_type: InterfaceType,
     pub state: InterfaceState,
+    /// Whether this interface is administratively enabled (user can toggle).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub ip: Option<String>,
     pub carrier: Option<String>,
     pub signal_dbm: Option<i32>,
     pub technology: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

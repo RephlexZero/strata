@@ -213,9 +213,133 @@ pub async fn delete_destination(token: &str, id: &str) -> ApiResult<()> {
     }
 }
 
-/// Helper: send a JSON POST without a typed body.
-pub async fn _post_empty<T: serde::de::DeserializeOwned>(token: &str, url: &str) -> ApiResult<T> {
-    let resp = Request::post(url)
+// ── Sender Management ───────────────────────────────────────────────
+
+/// Get full sender status (hardware, network interfaces, system stats).
+pub async fn get_sender_status(token: &str, id: &str) -> ApiResult<SenderFullStatus> {
+    let resp = Request::get(&format!("/api/senders/{id}/status"))
+        .header("Authorization", &auth_header(token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Unenroll a sender — resets its enrollment and issues a new token.
+pub async fn unenroll_sender(token: &str, id: &str) -> ApiResult<UnenrollResponse> {
+    let resp = Request::post(&format!("/api/senders/{id}/unenroll"))
+        .header("Authorization", &auth_header(token))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Enable a network interface on a sender.
+pub async fn enable_interface(token: &str, sender_id: &str, iface: &str) -> ApiResult<()> {
+    let resp = Request::post(&format!(
+        "/api/senders/{sender_id}/interfaces/{iface}/enable"
+    ))
+    .header("Authorization", &auth_header(token))
+    .header("Content-Type", "application/json")
+    .body("{}")
+    .map_err(|e| e.to_string())?
+    .send()
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Disable a network interface on a sender.
+pub async fn disable_interface(token: &str, sender_id: &str, iface: &str) -> ApiResult<()> {
+    let resp = Request::post(&format!(
+        "/api/senders/{sender_id}/interfaces/{iface}/disable"
+    ))
+    .header("Authorization", &auth_header(token))
+    .header("Content-Type", "application/json")
+    .body("{}")
+    .map_err(|e| e.to_string())?
+    .send()
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Set receiver config on a sender (proxied to agent).
+pub async fn set_sender_config(
+    token: &str,
+    sender_id: &str,
+    receiver_url: Option<String>,
+) -> ApiResult<crate::types::ConfigSetResponse> {
+    #[derive(serde::Serialize)]
+    struct Body {
+        receiver_url: Option<String>,
+    }
+    let resp = Request::post(&format!("/api/senders/{sender_id}/config"))
+        .header("Authorization", &auth_header(token))
+        .json(&Body { receiver_url })
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Run a connectivity test on a sender (proxied to agent).
+pub async fn run_sender_test(
+    token: &str,
+    sender_id: &str,
+) -> ApiResult<crate::types::TestRunResponse> {
+    let resp = Request::post(&format!("/api/senders/{sender_id}/test"))
+        .header("Authorization", &auth_header(token))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Scan for new interfaces on a sender (proxied to agent).
+pub async fn scan_sender_interfaces(
+    token: &str,
+    sender_id: &str,
+) -> ApiResult<crate::types::InterfaceScanResponse> {
+    let resp = Request::post(&format!("/api/senders/{sender_id}/interfaces/scan"))
         .header("Authorization", &auth_header(token))
         .header("Content-Type", "application/json")
         .body("{}")

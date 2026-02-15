@@ -19,6 +19,18 @@ if ! cargo release -V >/dev/null 2>&1; then
     cargo install cargo-release
 fi
 
+# Install trunk for WASM dashboard builds
+if ! trunk -V >/dev/null 2>&1; then
+    echo "Installing trunk…"
+    cargo install trunk
+fi
+
+# Add wasm32 target for dashboard
+if ! rustup target list --installed | grep -q wasm32-unknown-unknown; then
+    echo "Adding wasm32-unknown-unknown target…"
+    rustup target add wasm32-unknown-unknown
+fi
+
 # Enable repo git hooks (pre-commit/pre-push)
 git config core.hooksPath .githooks
 chmod +x .githooks/pre-commit .githooks/pre-push 2>/dev/null || true

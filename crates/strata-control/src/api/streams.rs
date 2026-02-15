@@ -13,7 +13,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use strata_common::ids;
-use strata_common::protocol::{ControlMessage, Envelope, StreamStartPayload, StreamStopPayload};
+use strata_common::protocol::{Envelope, StreamStartPayload, StreamStopPayload};
 
 use crate::api::auth::ApiError;
 use crate::state::AppState;
@@ -114,8 +114,7 @@ async fn start_stream(
         rist_psk: None,
     };
 
-    let msg = ControlMessage::StreamStart(start_payload);
-    let envelope = Envelope::new("stream.start", &msg);
+    let envelope = Envelope::new("stream.start", &start_payload);
     let json = serde_json::to_string(&envelope).unwrap();
 
     agent_tx
@@ -177,8 +176,7 @@ async fn stop_stream(
             stream_id: stream_id.clone(),
             reason: "user_request".into(),
         };
-        let msg = ControlMessage::StreamStop(stop_payload);
-        let envelope = Envelope::new("stream.stop", &msg);
+        let envelope = Envelope::new("stream.stop", &stop_payload);
         let json = serde_json::to_string(&envelope).unwrap();
         let _ = agent.tx.send(json).await;
     }

@@ -22,11 +22,16 @@ pub struct HardwareScan {
 /// Scans hardware state — real or simulated.
 pub struct HardwareScanner {
     simulate: bool,
+    /// Tracks enabled/disabled state per interface name.
+    interface_enabled: std::sync::Mutex<std::collections::HashMap<String, bool>>,
 }
 
 impl HardwareScanner {
     pub fn new(simulate: bool) -> Self {
-        Self { simulate }
+        Self {
+            simulate,
+            interface_enabled: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     /// Perform a hardware scan.
@@ -42,12 +47,14 @@ impl HardwareScanner {
     async fn scan_simulated(&self) -> HardwareScan {
         use rand::Rng;
         let mut rng = rand::rng();
+        let enabled_map = self.interface_enabled.lock().unwrap();
 
-        let interfaces = vec![
+        let mut interfaces = vec![
             NetworkInterface {
                 name: "wwan0".into(),
                 iface_type: InterfaceType::Cellular,
                 state: InterfaceState::Connected,
+                enabled: *enabled_map.get("wwan0").unwrap_or(&true),
                 ip: Some("10.45.0.2".into()),
                 carrier: Some("T-Mobile".into()),
                 signal_dbm: Some(-65 - rng.random_range(0..20)),
@@ -57,6 +64,7 @@ impl HardwareScanner {
                 name: "wwan1".into(),
                 iface_type: InterfaceType::Cellular,
                 state: InterfaceState::Connected,
+                enabled: *enabled_map.get("wwan1").unwrap_or(&true),
                 ip: Some("10.46.0.3".into()),
                 carrier: Some("Vodafone".into()),
                 signal_dbm: Some(-60 - rng.random_range(0..15)),
@@ -66,12 +74,21 @@ impl HardwareScanner {
                 name: "eth0".into(),
                 iface_type: InterfaceType::Ethernet,
                 state: InterfaceState::Disconnected,
+                enabled: *enabled_map.get("eth0").unwrap_or(&true),
                 ip: None,
                 carrier: None,
                 signal_dbm: None,
                 technology: None,
             },
         ];
+
+        // Apply enabled state: if disabled, force state to Disconnected
+        for iface in &mut interfaces {
+            if !iface.enabled {
+                iface.state = InterfaceState::Disconnected;
+                iface.ip = None;
+            }
+        }
 
         let inputs = vec![MediaInput {
             device: "/dev/video0".into(),
@@ -92,7 +109,17 @@ impl HardwareScanner {
 
     /// Real hardware scan — reads from system interfaces.
     async fn scan_real(&self) -> HardwareScan {
-        let interfaces = scan_network_interfaces();
+        let enabled_map = self.interface_enabled.lock().unwrap();
+        let mut interfaces = scan_network_interfaces();
+        // Apply enabled state
+        for iface in &mut interfaces {
+            iface.enabled = *enabled_map.get(&iface.name).unwrap_or(&true);
+            if !iface.enabled {
+                iface.state = InterfaceState::Disconnected;
+                iface.ip = None;
+            }
+        }
+        drop(enabled_map);
         let inputs = scan_media_inputs();
         let (cpu, mem) = scan_system_stats();
 
@@ -103,6 +130,39 @@ impl HardwareScanner {
             mem_used_mb: mem,
             uptime_s: get_uptime_s(),
         }
+    }
+
+    /// Enable or disable a network interface by name.
+    pub fn set_interface_enabled(&self, name: &str, enabled: bool) -> bool {
+        let mut map = self.interface_enabled.lock().unwrap();
+        map.insert(name.to_string(), enabled);
+
+        // In real mode, actually bring the interface up/down
+        if !self.simulate {
+            let action = if enabled { "up" } else { "down" };
+            let status = std::process::Command::new("ip")
+                .args(["link", "set", name, action])
+                .status();
+            if let Err(e) = status {
+                tracing::warn!(interface = %name, action, error = %e, "failed to set interface state");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Discover new network interfaces not previously seen.
+    /// Returns the list of newly discovered interface names.
+    pub async fn discover_interfaces(&self) -> Vec<String> {
+        let scan = self.scan().await;
+        let map = self.interface_enabled.lock().unwrap();
+        let mut new_ifaces = Vec::new();
+        for iface in &scan.interfaces {
+            if !map.contains_key(&iface.name) {
+                new_ifaces.push(iface.name.clone());
+            }
+        }
+        new_ifaces
     }
 }
 
@@ -151,6 +211,7 @@ fn scan_network_interfaces() -> Vec<NetworkInterface> {
             name,
             iface_type,
             state,
+            enabled: true, // will be overridden by scan_real
             ip: None,      // TODO: read from `ip addr`
             carrier: None, // TODO: read from ModemManager
             signal_dbm: None,

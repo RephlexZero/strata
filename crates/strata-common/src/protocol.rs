@@ -82,6 +82,9 @@ pub struct DeviceStatusPayload {
     pub cpu_percent: f32,
     pub mem_used_mb: u32,
     pub uptime_s: u64,
+    /// Current receiver URL (if configured).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +180,71 @@ pub struct StreamStopPayload {
 pub struct ConfigUpdatePayload {
     /// Partial config — only fields present are updated.
     pub scheduler: Option<serde_json::Value>,
+}
+
+/// Command to manage a network interface on the agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceCommandPayload {
+    /// The interface name (e.g. "wwan0").
+    pub interface: String,
+    /// Action: "enable", "disable".
+    pub action: String,
+}
+
+/// Response to an interface command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceCommandResponsePayload {
+    pub success: bool,
+    pub interface: String,
+    pub action: String,
+    pub error: Option<String>,
+}
+
+/// Set receiver/config on the agent (proxied from control plane).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigSetPayload {
+    pub request_id: String,
+    pub receiver_url: Option<String>,
+}
+
+/// Response to config.set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigSetResponsePayload {
+    pub request_id: String,
+    pub success: bool,
+    pub receiver_url: Option<String>,
+}
+
+/// Request the agent to run a connectivity test.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestRunPayload {
+    pub request_id: String,
+}
+
+/// Connectivity test results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestRunResponsePayload {
+    pub request_id: String,
+    pub cloud_reachable: bool,
+    pub cloud_connected: bool,
+    pub receiver_reachable: bool,
+    pub receiver_url: Option<String>,
+    pub enrolled: bool,
+    pub control_url: Option<String>,
+}
+
+/// Request the agent to scan for new network interfaces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfacesScanPayload {
+    pub request_id: String,
+}
+
+/// Interface scan results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfacesScanResponsePayload {
+    pub request_id: String,
+    pub discovered: Vec<String>,
+    pub total: usize,
 }
 
 // ── Dashboard WebSocket Events ──────────────────────────────────────

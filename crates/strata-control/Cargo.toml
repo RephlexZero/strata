@@ -16,7 +16,12 @@ strata-common = { path = "../strata-common" }
 axum = { version = "0.8", features = ["ws", "macros"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "fs", "set-header"] }
+tower-http = { version = "0.6", features = [
+    "cors",
+    "trace",
+    "fs",
+    "set-header",
+] }
 tokio = { version = "1", features = ["full"] }
 hyper = "1"
 

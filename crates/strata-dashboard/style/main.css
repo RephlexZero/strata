@@ -46,6 +46,7 @@ a {
     color: var(--accent);
     text-decoration: none;
 }
+
 a:hover {
     color: var(--accent-hover);
     text-decoration: underline;
@@ -273,14 +274,33 @@ a:hover {
     display: inline-block;
 }
 
-.dot-green { background: var(--green); }
-.dot-red { background: var(--red); animation: pulse 2s infinite; }
-.dot-yellow { background: var(--yellow); }
-.dot-gray { background: var(--text-muted); }
+.dot-green {
+    background: var(--green);
+}
+
+.dot-red {
+    background: var(--red);
+    animation: pulse 2s infinite;
+}
+
+.dot-yellow {
+    background: var(--yellow);
+}
+
+.dot-gray {
+    background: var(--text-muted);
+}
 
 @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.5;
+    }
 }
 
 /* ── Buttons ────────────────────────────────────────────────── */
@@ -303,6 +323,7 @@ a:hover {
     background: var(--accent);
     color: #fff;
 }
+
 .btn-primary:hover {
     background: var(--accent-hover);
 }
@@ -311,6 +332,7 @@ a:hover {
     background: var(--red);
     color: #fff;
 }
+
 .btn-danger:hover {
     opacity: 0.9;
 }
@@ -320,6 +342,7 @@ a:hover {
     color: var(--text-secondary);
     border-color: var(--border);
 }
+
 .btn-ghost:hover {
     background: var(--bg-tertiary);
     color: var(--text-primary);
@@ -597,14 +620,192 @@ table.data-table tr:last-child td {
     .sidebar {
         display: none;
     }
+
     .main-content {
         margin-left: 0;
         padding: 16px;
     }
+
     .card-grid {
         grid-template-columns: 1fr;
     }
+
     .stats-grid {
         grid-template-columns: repeat(2, 1fr);
     }
+}
+
+/* ── Toggle Switch ──────────────────────────────────────────── */
+
+.toggle {
+    position: relative;
+    display: inline-block;
+    width: 44px;
+    height: 24px;
+    flex-shrink: 0;
+    cursor: pointer;
+}
+
+.toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle .slider {
+    position: absolute;
+    inset: 0;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    transition: all 0.2s;
+}
+
+.toggle .slider::before {
+    content: "";
+    position: absolute;
+    width: 18px;
+    height: 18px;
+    left: 2px;
+    bottom: 2px;
+    background: var(--text-muted);
+    border-radius: 50%;
+    transition: all 0.2s;
+}
+
+.toggle input:checked+.slider {
+    background: var(--green-bg);
+    border-color: var(--green);
+}
+
+.toggle input:checked+.slider::before {
+    transform: translateX(20px);
+    background: var(--green);
+}
+
+.toggle.loading .slider::before {
+    animation: pulse 1s infinite;
+}
+
+.toggle input:disabled+.slider {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* ── Toggle Buttons (fallback) ──────────────────────────────── */
+
+.toggle-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 48px;
+    padding: 4px 8px;
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    border: 1px solid var(--border);
+    cursor: pointer;
+    transition: all 0.15s;
+    text-transform: uppercase;
+}
+
+.toggle-btn.toggle-on {
+    background: var(--green-bg);
+    color: var(--green);
+    border-color: var(--green);
+}
+
+.toggle-btn.toggle-off {
+    background: rgba(139, 148, 158, 0.1);
+    color: var(--text-muted);
+}
+
+.toggle-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* ── Message / Alert Bars ───────────────────────────────────── */
+
+.msg {
+    padding: 10px 14px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    margin-bottom: 12px;
+}
+
+.msg-ok {
+    background: var(--green-bg);
+    color: var(--green);
+}
+
+.msg-err {
+    background: var(--red-bg);
+    color: var(--red);
+}
+
+.msg-info {
+    background: rgba(88, 166, 255, 0.1);
+    color: var(--accent);
+}
+
+/* ── Test Grid ──────────────────────────────────────────────── */
+
+.test-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 10px;
+}
+
+.test-item {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm);
+    padding: 12px;
+}
+
+.test-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+
+.test-value {
+    font-size: 14px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+}
+
+.test-pass {
+    color: var(--green);
+}
+
+.test-fail {
+    color: var(--red);
+}
+
+.test-na {
+    color: var(--text-muted);
+}
+
+/* ── Secondary Button ────────────────────────────────────────── */
+
+.btn-secondary {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border-color: var(--border);
+}
+
+.btn-secondary:hover {
+    background: var(--bg-card-hover);
+    color: var(--text-primary);
+}
+
+/* ── Interface List (enhanced) ──────────────────────────────── */
+
+.interface-item.disabled {
+    opacity: 0.5;
 }

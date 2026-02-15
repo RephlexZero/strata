@@ -46,6 +46,12 @@ pub async fn seed_dev_data(pool: &PgPool) -> anyhow::Result<()> {
         .execute(pool)
         .await?;
 
+    // Hash the enrollment token the same way the create_sender API does,
+    // so that the agent can authenticate with the raw token.
+    // Short, typeable enrollment token for dev (matches the new XXXX-XXXX format)
+    let dev_token_normalized = strata_common::ids::normalize_enrollment_token("DEV1-TEST");
+    let enrollment_token_hash = strata_common::auth::hash_password(&dev_token_normalized)?;
+
     sqlx::query(
         "INSERT INTO senders (id, owner_id, name, hostname, enrollment_token, enrolled) VALUES ($1, $2, $3, $4, $5, $6)"
     )
@@ -53,7 +59,7 @@ pub async fn seed_dev_data(pool: &PgPool) -> anyhow::Result<()> {
     .bind("usr_00000000-0000-0000-0000-000000000001")
     .bind("Dev Simulator")
     .bind("sim-sender-01")
-    .bind("dev-enrollment-token")
+    .bind(&enrollment_token_hash)
     .bind(false)
     .execute(pool)
     .await?;

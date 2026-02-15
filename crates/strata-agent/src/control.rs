@@ -16,11 +16,26 @@ use tokio_tungstenite::tungstenite::Message;
 
 use strata_common::models::StreamState;
 use strata_common::protocol::{
-    AgentMessage, AuthLoginPayload, ControlMessage, DeviceStatusPayload, Envelope, StreamEndReason,
-    StreamEndedPayload,
+    AuthLoginPayload, AuthLoginResponsePayload, ConfigSetPayload, ConfigSetResponsePayload,
+    DeviceStatusPayload, Envelope, InterfaceCommandPayload, InterfaceCommandResponsePayload,
+    InterfacesScanPayload, InterfacesScanResponsePayload, StreamEndReason, StreamEndedPayload,
+    StreamStartPayload, StreamStopPayload, TestRunPayload, TestRunResponsePayload,
 };
 
 use crate::AgentState;
+
+/// Send a typed envelope to the control plane, logging on failure.
+async fn send_envelope(state: &AgentState, msg_type: &str, payload: &impl serde::Serialize) {
+    let envelope = Envelope::new(msg_type, payload);
+    match serde_json::to_string(&envelope) {
+        Ok(json) => {
+            let _ = state.control_tx.send(json).await;
+        }
+        Err(e) => {
+            tracing::error!(msg_type, error = %e, "failed to serialize envelope");
+        }
+    }
+}
 
 /// Run the control channel loop — connects, authenticates, then runs the
 /// bidirectional message loop. Reconnects on failure with exponential backoff.
@@ -49,6 +64,9 @@ pub async fn run(
         .await
         {
             Ok(()) => {
+                state
+                    .control_connected
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 tracing::info!("control connection closed cleanly");
                 // Check if shutting down
                 if *state.shutdown.borrow() {
@@ -57,6 +75,9 @@ pub async fn run(
                 backoff = Duration::from_secs(1);
             }
             Err(e) => {
+                state
+                    .control_connected
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(error = %e, "control connection failed");
             }
         }
@@ -95,8 +116,8 @@ async fn connect_and_run(
         arch: std::env::consts::ARCH.to_string(),
     };
 
-    let auth_msg = AgentMessage::AuthLogin(auth_payload);
-    let envelope = Envelope::new("auth.login", &auth_msg);
+    // Send the raw payload in the envelope (not wrapped in AgentMessage)
+    let envelope = Envelope::new("auth.login", &auth_payload);
     let json = serde_json::to_string(&envelope)?;
     ws_tx.send(Message::Text(json.into())).await?;
 
@@ -104,11 +125,8 @@ async fn connect_and_run(
     let auth_response = match ws_rx.next().await {
         Some(Ok(Message::Text(text))) => {
             let envelope: Envelope = serde_json::from_str(&text)?;
-            let resp: ControlMessage = envelope.parse_payload()?;
-            match resp {
-                ControlMessage::AuthLoginResponse(r) => r,
-                _ => anyhow::bail!("unexpected response to auth.login"),
-            }
+            let resp: AuthLoginResponsePayload = envelope.parse_payload()?;
+            resp
         }
         Some(Ok(Message::Close(_))) => anyhow::bail!("connection closed during auth"),
         Some(Err(e)) => anyhow::bail!("WebSocket error during auth: {e}"),
@@ -132,6 +150,9 @@ async fn connect_and_run(
         *state.sender_id.lock().await = Some(sender_id.clone());
         *state.session_token.lock().await = auth_response.session_token;
     }
+    state
+        .control_connected
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     // ── Heartbeat + message loop ────────────────────────────────
     let mut heartbeat = tokio::time::interval(Duration::from_secs(heartbeat_interval));
@@ -190,6 +211,7 @@ async fn connect_and_run(
 async fn build_heartbeat(state: &AgentState) -> DeviceStatusPayload {
     let hw = state.hardware.scan().await;
     let pipeline = state.pipeline.lock().await;
+    let receiver_url = state.receiver_url.lock().await.clone();
 
     DeviceStatusPayload {
         network_interfaces: hw.interfaces,
@@ -202,6 +224,7 @@ async fn build_heartbeat(state: &AgentState) -> DeviceStatusPayload {
         cpu_percent: hw.cpu_percent,
         mem_used_mb: hw.mem_used_mb,
         uptime_s: hw.uptime_s,
+        receiver_url,
     }
 }
 
@@ -217,47 +240,145 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
 
     match envelope.msg_type.as_str() {
         "stream.start" => {
-            if let Ok(ControlMessage::StreamStart(payload)) =
-                envelope.parse_payload::<ControlMessage>()
-            {
+            if let Ok(payload) = envelope.parse_payload::<StreamStartPayload>() {
                 tracing::info!(stream_id = %payload.stream_id, "received stream.start");
                 let mut pipeline = state.pipeline.lock().await;
                 if let Err(e) = pipeline.start(payload.clone()) {
                     tracing::error!(error = %e, "failed to start pipeline");
-                    // Send stream.ended with error
                     let ended = StreamEndedPayload {
                         stream_id: payload.stream_id,
                         reason: StreamEndReason::Error,
                         duration_s: 0,
                         total_bytes: 0,
                     };
-                    let envelope = Envelope::new("stream.ended", &ended);
-                    let json = serde_json::to_string(&envelope).unwrap();
-                    let _ = state.control_tx.send(json).await;
+                    send_envelope(state, "stream.ended", &ended).await;
                 }
             }
         }
         "stream.stop" => {
-            if let Ok(ControlMessage::StreamStop(payload)) =
-                envelope.parse_payload::<ControlMessage>()
-            {
+            if let Ok(payload) = envelope.parse_payload::<StreamStopPayload>() {
                 tracing::info!(stream_id = %payload.stream_id, "received stream.stop");
                 let mut pipeline = state.pipeline.lock().await;
                 let stats = pipeline.stop();
-                // Send stream.ended
                 let ended = StreamEndedPayload {
                     stream_id: payload.stream_id,
                     reason: StreamEndReason::ControlPlaneStop,
                     duration_s: stats.duration_s,
                     total_bytes: stats.total_bytes,
                 };
-                let envelope = Envelope::new("stream.ended", &ended);
-                let json = serde_json::to_string(&envelope).unwrap();
-                let _ = state.control_tx.send(json).await;
+                send_envelope(state, "stream.ended", &ended).await;
             }
         }
         "config.update" => {
             tracing::info!("received config.update (hot-reload not yet implemented)");
+        }
+        "interface.command" => {
+            if let Ok(payload) = envelope.parse_payload::<InterfaceCommandPayload>() {
+                tracing::info!(
+                    interface = %payload.interface,
+                    action = %payload.action,
+                    "received interface.command"
+                );
+                let (success, error) = match payload.action.as_str() {
+                    "enable" => {
+                        let ok = state
+                            .hardware
+                            .set_interface_enabled(&payload.interface, true);
+                        (
+                            ok,
+                            if ok {
+                                None
+                            } else {
+                                Some("failed to enable interface".into())
+                            },
+                        )
+                    }
+                    "disable" => {
+                        let ok = state
+                            .hardware
+                            .set_interface_enabled(&payload.interface, false);
+                        (
+                            ok,
+                            if ok {
+                                None
+                            } else {
+                                Some("failed to disable interface".into())
+                            },
+                        )
+                    }
+                    other => (false, Some(format!("unknown action: {other}"))),
+                };
+                let resp = InterfaceCommandResponsePayload {
+                    success,
+                    interface: payload.interface,
+                    action: payload.action,
+                    error,
+                };
+                send_envelope(state, "interface.command.response", &resp).await;
+                send_envelope(state, "device.status", &build_heartbeat(state).await).await;
+            }
+        }
+        "config.set" => {
+            if let Ok(payload) = envelope.parse_payload::<ConfigSetPayload>() {
+                tracing::info!(receiver_url = ?payload.receiver_url, "received config.set");
+                {
+                    let mut r = state.receiver_url.lock().await;
+                    *r = payload.receiver_url.clone().filter(|s| !s.is_empty());
+                }
+                let current = state.receiver_url.lock().await.clone();
+                let resp = ConfigSetResponsePayload {
+                    request_id: payload.request_id,
+                    success: true,
+                    receiver_url: current,
+                };
+                send_envelope(state, "config.set.response", &resp).await;
+                send_envelope(state, "device.status", &build_heartbeat(state).await).await;
+            }
+        }
+        "test.run" => {
+            if let Ok(payload) = envelope.parse_payload::<TestRunPayload>() {
+                tracing::info!("received test.run");
+                let control_connected = state
+                    .control_connected
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let sender_id = state.sender_id.lock().await.clone();
+                let control_url = state.control_url.lock().await.clone();
+                let receiver_url = state.receiver_url.lock().await.clone();
+
+                let cloud_reachable = match &control_url {
+                    Some(url) => crate::util::check_tcp_reachable(url, 5).await,
+                    None => false,
+                };
+                let receiver_reachable = match &receiver_url {
+                    Some(url) => crate::util::check_tcp_reachable(url, 3).await,
+                    None => false,
+                };
+
+                let resp = TestRunResponsePayload {
+                    request_id: payload.request_id,
+                    cloud_reachable,
+                    cloud_connected: control_connected,
+                    receiver_reachable,
+                    receiver_url,
+                    enrolled: sender_id.is_some(),
+                    control_url,
+                };
+                send_envelope(state, "test.run.response", &resp).await;
+            }
+        }
+        "interfaces.scan" => {
+            if let Ok(payload) = envelope.parse_payload::<InterfacesScanPayload>() {
+                tracing::info!("received interfaces.scan");
+                let new_ifaces = state.hardware.discover_interfaces().await;
+                let hw = state.hardware.scan().await;
+                let resp = InterfacesScanResponsePayload {
+                    request_id: payload.request_id,
+                    discovered: new_ifaces,
+                    total: hw.interfaces.len(),
+                };
+                send_envelope(state, "interfaces.scan.response", &resp).await;
+                send_envelope(state, "device.status", &build_heartbeat(state).await).await;
+            }
         }
         other => {
             tracing::debug!(msg_type = %other, "unhandled control message");

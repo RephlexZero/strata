@@ -58,8 +58,8 @@ async fn main() -> anyhow::Result<()> {
     // ── Router ──────────────────────────────────────────────────
     // Dashboard: serve the trunk-built WASM SPA from a directory.
     // DASHBOARD_DIR defaults to ../strata-dashboard/dist (dev) or /app/dashboard (Docker).
-    let dashboard_dir = std::env::var("DASHBOARD_DIR")
-        .unwrap_or_else(|_| "../strata-dashboard/dist".into());
+    let dashboard_dir =
+        std::env::var("DASHBOARD_DIR").unwrap_or_else(|_| "../strata-dashboard/dist".into());
 
     let spa_fallback = ServeFile::new(format!("{dashboard_dir}/index.html"));
     let dashboard_service = ServeDir::new(&dashboard_dir).not_found_service(spa_fallback);

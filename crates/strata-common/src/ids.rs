@@ -32,9 +32,33 @@ pub fn destination_id() -> String {
     prefixed_id("dst")
 }
 
-/// Generate an enrollment token: `enr_<uuid7>`
+/// Generate a short, human-readable enrollment token: `XXXX-XXXX`.
+///
+/// Uses an unambiguous character set (no 0/O, 1/I/l confusion).
+/// 32^8 ≈ 1.1 trillion combinations — more than sufficient for
+/// single-use, rate-limited enrollment tokens.
 pub fn enrollment_token() -> String {
-    prefixed_id("enr")
+    use rand::Rng;
+    // Unambiguous charset: digits 2-9, letters A-Z minus I and O
+    const CHARSET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+    let mut rng = rand::rng();
+    let mut token = String::with_capacity(9);
+    for i in 0..8 {
+        if i == 4 {
+            token.push('-');
+        }
+        let idx = rng.random_range(0..CHARSET.len());
+        token.push(CHARSET[idx] as char);
+    }
+    token
+}
+
+/// Normalize an enrollment token for comparison: uppercase, strip dashes/spaces.
+pub fn normalize_enrollment_token(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
 }
 
 #[cfg(test)]
@@ -47,7 +71,37 @@ mod tests {
         assert!(sender_id().starts_with("snd_"));
         assert!(stream_id().starts_with("str_"));
         assert!(destination_id().starts_with("dst_"));
-        assert!(enrollment_token().starts_with("enr_"));
+    }
+
+    #[test]
+    fn enrollment_token_format() {
+        let token = enrollment_token();
+        assert_eq!(token.len(), 9, "XXXX-XXXX = 9 chars");
+        assert_eq!(&token[4..5], "-");
+        // All chars should be from unambiguous set
+        for c in token.chars() {
+            if c == '-' {
+                continue;
+            }
+            assert!(
+                "23456789ABCDEFGHJKLMNPQRSTUVWXYZ".contains(c),
+                "unexpected char: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn enrollment_tokens_are_unique() {
+        let a = enrollment_token();
+        let b = enrollment_token();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn normalize_token() {
+        assert_eq!(normalize_enrollment_token("abcd-1234"), "ABCD1234");
+        assert_eq!(normalize_enrollment_token("ABCD 1234"), "ABCD1234");
+        assert_eq!(normalize_enrollment_token("abcd1234"), "ABCD1234");
     }
 
     #[test]

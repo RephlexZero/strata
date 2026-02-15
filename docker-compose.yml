@@ -1,11 +1,14 @@
-# Strata Platform — Dev Stack (run from dev/ directory)
+# Strata Platform — Full Dev Stack
 #
-# Prefer running from the project root instead:
-#   docker compose up --build -d
+#   docker compose up --build -d    # build & start everything
+#   docker compose logs -f          # tail logs
+#   docker compose down -v          # tear down (delete data)
 #
-# This file exists for backwards compatibility.
+# Dashboard:  http://localhost:3000
+# Login:      admin@strata.local / admin
 
 services:
+  # ── PostgreSQL ───────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     environment:
@@ -22,9 +25,10 @@ services:
       timeout: 3s
       retries: 10
 
+  # ── Control Plane (REST + WSS + Dashboard on :3000) ──────────
   strata-control:
     build:
-      context: ..
+      context: .
       dockerfile: dev/Dockerfile.control
     depends_on:
       postgres:
@@ -38,9 +42,10 @@ services:
       - "3000:3000"
     restart: unless-stopped
 
+  # ── Simulated Sender Agent ──────────────────────────────────
   strata-sender-sim:
     build:
-      context: ..
+      context: .
       dockerfile: dev/Dockerfile.agent
     depends_on:
       - strata-control

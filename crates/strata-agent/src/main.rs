@@ -11,9 +11,12 @@
 mod control;
 mod hardware;
 mod pipeline;
+mod portal;
 mod telemetry;
+pub(crate) mod util;
 
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -58,6 +61,18 @@ pub struct AgentState {
     pub pipeline: tokio::sync::Mutex<pipeline::PipelineManager>,
     pub control_tx: mpsc::Sender<String>,
     pub shutdown: watch::Receiver<bool>,
+    /// Whether the control plane WebSocket is currently connected.
+    pub control_connected: AtomicBool,
+    /// Current control plane URL (may be updated via portal enrollment).
+    pub control_url: tokio::sync::Mutex<Option<String>>,
+    /// Pending enrollment token (set via portal, consumed by control loop).
+    pub pending_enrollment_token: tokio::sync::Mutex<Option<String>>,
+    /// Pending control URL override (set via portal).
+    pub pending_control_url: tokio::sync::Mutex<Option<String>>,
+    /// Notify the control loop to reconnect (e.g. after portal enrollment).
+    pub reconnect_tx: tokio::sync::watch::Sender<()>,
+    /// Receiver URL — where to send RIST/SRT traffic (set via portal or control plane).
+    pub receiver_url: tokio::sync::Mutex<Option<String>>,
 }
 
 #[tokio::main]
@@ -86,6 +101,9 @@ async fn main() -> anyhow::Result<()> {
     // Channel for sending messages to the control plane WebSocket
     let (control_tx, control_rx) = mpsc::channel::<String>(128);
 
+    // Reconnect signal (portal can trigger reconnect after enrollment)
+    let (reconnect_tx, _reconnect_rx) = watch::channel(());
+
     // Build shared state
     let state = Arc::new(AgentState {
         simulate: cli.simulate,
@@ -95,6 +113,12 @@ async fn main() -> anyhow::Result<()> {
         pipeline: tokio::sync::Mutex::new(pipeline::PipelineManager::new(cli.simulate)),
         control_tx: control_tx.clone(),
         shutdown: shutdown_rx.clone(),
+        control_connected: AtomicBool::new(false),
+        control_url: tokio::sync::Mutex::new(Some(cli.control_url.clone())),
+        pending_enrollment_token: tokio::sync::Mutex::new(cli.enrollment_token.clone()),
+        pending_control_url: tokio::sync::Mutex::new(None),
+        reconnect_tx,
+        receiver_url: tokio::sync::Mutex::new(None),
     });
 
     // ── Task 1: Control plane WebSocket connection ──────────────
@@ -124,17 +148,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Task 3: Onboarding portal (HTTP) ────────────────────────
     let portal_state = state.clone();
     let portal_addr: SocketAddr = cli.portal_addr.parse()?;
-    let portal_enrollment_token = cli.enrollment_token.clone();
-    let portal_control_url = cli.control_url.clone();
-    let portal_handle = tokio::spawn(async move {
-        run_portal(
-            portal_state,
-            portal_addr,
-            portal_enrollment_token,
-            portal_control_url,
-        )
-        .await
-    });
+    let portal_handle = tokio::spawn(async move { portal::run(portal_state, portal_addr).await });
 
     // ── Shutdown handling ───────────────────────────────────────
     tokio::select! {
@@ -156,55 +170,6 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("strata-agent stopped");
     Ok(())
-}
-
-/// Simple onboarding portal — serves status and enrollment API.
-async fn run_portal(
-    state: Arc<AgentState>,
-    addr: SocketAddr,
-    _enrollment_token: Option<String>,
-    _control_url: String,
-) -> anyhow::Result<()> {
-    use axum::routing::get;
-    use axum::Router;
-
-    let app = Router::new()
-        .route("/", get(portal_index))
-        .route("/api/status", get(portal_status))
-        .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(state);
-
-    tracing::info!("onboarding portal on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-async fn portal_index() -> axum::response::Html<&'static str> {
-    axum::response::Html(
-        r#"<!DOCTYPE html>
-<html><head><title>Strata Sender</title></head>
-<body>
-<h1>Strata Sender Agent</h1>
-<p>Onboarding portal. <a href="/api/status">View status JSON</a></p>
-</body></html>"#,
-    )
-}
-
-async fn portal_status(
-    axum::extract::State(state): axum::extract::State<Arc<AgentState>>,
-) -> axum::Json<serde_json::Value> {
-    let status = state.hardware.scan().await;
-    let sender_id = state.sender_id.lock().await.clone();
-    let pipeline = state.pipeline.lock().await;
-
-    axum::Json(serde_json::json!({
-        "sender_id": sender_id,
-        "enrolled": sender_id.is_some(),
-        "simulate": state.simulate,
-        "streaming": pipeline.is_running(),
-        "hardware": status,
-    }))
 }
 
 fn gethostname() -> Option<String> {

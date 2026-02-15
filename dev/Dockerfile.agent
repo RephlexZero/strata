@@ -1,4 +1,26 @@
-# ── Stage 1: Build strata-agent ──────────────────────────────
+# ── Stage 1: Build portal WASM ───────────────────────────────
+FROM rust:1.93-bookworm AS portal
+
+RUN rustup target add wasm32-unknown-unknown && \
+    cargo install trunk --version 0.21.14
+
+WORKDIR /src
+
+COPY crates/strata-portal/Cargo.toml crates/strata-portal/Cargo.toml
+COPY crates/strata-portal/src crates/strata-portal/src
+COPY crates/strata-portal/index.html crates/strata-portal/index.html
+COPY crates/strata-portal/style crates/strata-portal/style
+
+# Trunk needs a workspace-like layout — create a minimal one
+RUN cat > Cargo.toml <<'TOML'
+[workspace]
+resolver = "2"
+members = ["crates/strata-portal"]
+TOML
+
+RUN cd crates/strata-portal && trunk build --release
+
+# ── Stage 2: Build strata-agent ──────────────────────────────
 FROM rust:1.93-bookworm AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -52,6 +74,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/strata-agent /usr/local/bin/strata-agent
+COPY --from=portal /src/crates/strata-portal/dist /app/portal
+
+ENV PORTAL_DIR=/app/portal
 
 EXPOSE 3001
 

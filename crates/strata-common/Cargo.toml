@@ -17,4 +17,5 @@ argon2 = "0.5"
 jsonwebtoken = "9"
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+rand = "0.9"
 base64 = "0.22"

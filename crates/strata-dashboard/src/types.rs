@@ -55,10 +55,82 @@ pub struct CreateSenderResponse {
     pub enrollment_token: String,
 }
 
+/// Full sender status including hardware data (from agent heartbeat).
 #[derive(Debug, Clone, Deserialize)]
-pub struct SenderStatusResponse {
+pub struct SenderFullStatus {
+    pub sender_id: Option<String>,
+    pub online: Option<bool>,
+    pub network_interfaces: Option<Vec<NetworkInterface>>,
+    pub media_inputs: Option<Vec<MediaInput>>,
+    pub stream_state: Option<String>,
+    pub cpu_percent: Option<f32>,
+    pub mem_used_mb: Option<u32>,
+    pub uptime_s: Option<u64>,
+    pub receiver_url: Option<String>,
+}
+
+/// Network interface status.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct NetworkInterface {
+    pub name: String,
+    #[serde(rename = "type", alias = "iface_type")]
+    pub iface_type: String,
+    pub state: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub ip: Option<String>,
+    pub carrier: Option<String>,
+    pub signal_dbm: Option<i32>,
+    pub technology: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Media input.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaInput {
+    pub device: String,
+    #[serde(rename = "type", alias = "input_type")]
+    pub input_type: String,
+    pub label: String,
+    pub capabilities: Vec<String>,
+    pub status: String,
+}
+
+/// Response from unenrolling a sender.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnenrollResponse {
     pub sender_id: String,
-    pub online: bool,
+    pub enrollment_token: String,
+    pub message: String,
+}
+
+/// Response from setting sender config.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigSetResponse {
+    pub request_id: Option<String>,
+    pub success: bool,
+    pub receiver_url: Option<String>,
+}
+
+/// Connectivity test result.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TestRunResponse {
+    pub cloud_reachable: bool,
+    pub cloud_connected: bool,
+    pub receiver_reachable: bool,
+    pub receiver_url: Option<String>,
+    pub enrolled: bool,
+    pub control_url: Option<String>,
+}
+
+/// Interface scan result.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InterfaceScanResponse {
+    pub discovered: Vec<String>,
+    pub total: usize,
 }
 
 // ── Streams ─────────────────────────────────────────────────────────
@@ -124,7 +196,12 @@ pub struct CreateDestinationResponse {
 #[serde(tag = "type", content = "data")]
 pub enum DashboardEvent {
     #[serde(rename = "sender.status")]
-    SenderStatus { sender_id: String, online: bool },
+    SenderStatus {
+        sender_id: String,
+        online: bool,
+        #[serde(default)]
+        status: Option<SenderFullStatus>,
+    },
 
     #[serde(rename = "stream.stats")]
     StreamStats {

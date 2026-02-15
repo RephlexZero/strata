@@ -1,4 +1,26 @@
-# ── Stage 1: Build strata-control ────────────────────────────
+# ── Stage 1: Build dashboard WASM ────────────────────────────
+FROM rust:1.93-bookworm AS dashboard
+
+RUN rustup target add wasm32-unknown-unknown && \
+    cargo install trunk --version 0.21.14
+
+WORKDIR /src
+
+COPY crates/strata-dashboard/Cargo.toml crates/strata-dashboard/Cargo.toml
+COPY crates/strata-dashboard/src crates/strata-dashboard/src
+COPY crates/strata-dashboard/index.html crates/strata-dashboard/index.html
+COPY crates/strata-dashboard/style crates/strata-dashboard/style
+
+# Trunk needs a workspace-like layout — create a minimal one
+RUN cat > Cargo.toml <<'TOML'
+[workspace]
+resolver = "2"
+members = ["crates/strata-dashboard"]
+TOML
+
+RUN cd crates/strata-dashboard && trunk build --release
+
+# ── Stage 2: Build strata-control ────────────────────────────
 FROM rust:1.93-bookworm AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -46,7 +68,7 @@ COPY crates/strata-control/migrations crates/strata-control/migrations
 RUN touch crates/strata-common/src/lib.rs crates/strata-control/src/main.rs && \
     cargo build --release -p strata-control
 
-# ── Stage 2: Runtime ────────────────────────────────────────
+# ── Stage 3: Runtime ────────────────────────────────────────
 FROM debian:12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -54,6 +76,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/strata-control /usr/local/bin/strata-control
+COPY --from=dashboard /src/crates/strata-dashboard/dist /app/dashboard
+
+ENV DASHBOARD_DIR=/app/dashboard
 
 EXPOSE 3000
 
