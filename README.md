@@ -1,10 +1,11 @@
 # Strata
 
-**Bonded video transport over RIST for GStreamer, written in Rust.**
+**Bonded video transport and live-streaming management platform, written in Rust.**
 
 [![CI](https://github.com/RephlexZero/strata/actions/workflows/ci.yml/badge.svg)](https://github.com/RephlexZero/strata/actions/workflows/ci.yml)
+[![Platform CI](https://github.com/RephlexZero/strata/actions/workflows/platform.yml/badge.svg)](https://github.com/RephlexZero/strata/actions/workflows/platform.yml)
 
-Strata aggregates bandwidth across multiple unreliable network interfaces — cellular modems, WiFi, Ethernet, satellite — into a single resilient video stream. It ships as a pair of GStreamer elements (`rsristbondsink` / `rsristbondsrc`) backed by an intelligent scheduling core that handles load balancing, adaptive redundancy, congestion control, and seamless failover.
+Strata aggregates bandwidth across multiple unreliable network interfaces — cellular modems, WiFi, Ethernet, satellite — into a single resilient video stream. It combines a high-performance GStreamer transport engine (`rsristbondsink` / `rsristbondsrc`) with a full management platform: a control plane, operator dashboard, and field-device portal — all built in Rust.
 
 Designed for field deployment on constrained hardware (e.g. Orange Pi 5 Plus with USB cellular modems) where link conditions are unpredictable and every bit of available bandwidth matters.
 
@@ -72,6 +73,54 @@ See the [Getting Started](https://github.com/RephlexZero/strata/wiki/Getting-Sta
 
 ---
 
+## Strata Platform
+
+Beyond the GStreamer transport plugin, Strata includes a full management platform for operating bonded senders in the field.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Operator Dashboard                       │
+│                   (Leptos WASM · :3000)                     │
+│         Senders · Streams · Destinations · Stats            │
+└────────────────────────┬────────────────────────────────────┘
+                         │ REST + WebSocket
+┌────────────────────────▼────────────────────────────────────┐
+│                    Control Plane                            │
+│              (Axum · PostgreSQL · JWT)                      │
+│   API · Agent WS · Dashboard WS · Migrations · Auth        │
+└──────┬──────────────────────────────────────────────────────┘
+       │ WebSocket (ed25519 device auth)
+┌──────▼──────────────────────────────────────────────────────┐
+│               Sender Agent (field device)                   │
+│     Hardware scan · Interface mgmt · Stream lifecycle       │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │            Sender Portal (Leptos WASM · :3001)       │   │
+│  │     Enrollment · Config · Interfaces · Test          │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+| Crate | Role |
+|---|---|
+| **strata-common** | Shared types, protocol messages, auth (JWT + ed25519), ID generation |
+| **strata-control** | Control plane server — Axum REST API, WebSocket hubs, PostgreSQL |
+| **strata-agent** | Sender daemon — hardware scanning, interface management, stream control |
+| **strata-dashboard** | Operator web UI — Leptos CSR WASM, Tailwind CSS + DaisyUI |
+| **strata-portal** | Field device web UI — enrollment, configuration, connectivity test |
+
+### Running the Dev Stack
+
+```bash
+docker compose up -d          # PostgreSQL + control plane + simulated sender
+# Dashboard:  http://localhost:3000   (admin@strata.local / admin)
+# Portal:     http://localhost:3001
+```
+
+See the [Strata Platform](https://github.com/RephlexZero/strata/wiki/Strata-Platform) wiki page for the full architecture and development guide.
+
+---
+
 ## Development
 
 ### Recommended: Dev Container (zero local setup)
@@ -109,7 +158,9 @@ gst-inspect-1.0 rsristbondsink
 
 ```bash
 cargo test --workspace --lib                                   # Unit tests (no privileges needed)
-sudo cargo test -p gst-rist-bonding --test end_to_end          # Integration (needs NET_ADMIN)
+cargo test -p strata-common                                    # Platform model + protocol tests
+cargo test -p strata-control                                   # API integration tests (needs PostgreSQL)
+sudo cargo test -p gst-rist-bonding --test end_to_end          # Transport integration (needs NET_ADMIN)
 ```
 
 See the [Testing](https://github.com/RephlexZero/strata/wiki/Testing) wiki page for the full test matrix.
@@ -132,6 +183,7 @@ Full documentation is in the **[Wiki](https://github.com/RephlexZero/strata/wiki
 | Page | Description |
 |---|---|
 | [Architecture](https://github.com/RephlexZero/strata/wiki/Architecture) | System design, component overview, key decisions |
+| [Strata Platform](https://github.com/RephlexZero/strata/wiki/Strata-Platform) | Management platform — control plane, dashboard, portal, agent |
 | [Getting Started](https://github.com/RephlexZero/strata/wiki/Getting-Started) | Prerequisites, building, quick start |
 | [Configuration Reference](https://github.com/RephlexZero/strata/wiki/Configuration-Reference) | Full TOML config for links, scheduler, receiver, lifecycle |
 | [GStreamer Elements](https://github.com/RephlexZero/strata/wiki/GStreamer-Elements) | `rsristbondsink` and `rsristbondsrc` property + pad reference |
@@ -150,10 +202,16 @@ crates/
   rist-bonding-core/     Core bonding logic (no GStreamer dependency)
   librist-sys/           FFI bindings to librist (built from source via Meson)
   rist-network-sim/      Linux netns + tc-netem test infrastructure
+  strata-common/         Shared types, protocol, auth, ID generation
+  strata-control/        Control plane — Axum API, WebSocket, PostgreSQL
+  strata-agent/          Sender agent daemon (field devices)
+  strata-dashboard/      Operator dashboard — Leptos CSR WASM + Tailwind/DaisyUI
+  strata-portal/         Field device portal — Leptos CSR WASM + Tailwind/DaisyUI
 vendor/
   librist/               librist source (git submodule, statically linked)
 docker/
   Dockerfile.cross-aarch64   Cross-compile for Orange Pi / aarch64
+docker-compose.yml       Dev stack (PostgreSQL, control plane, simulated agent)
 .devcontainer/           Dev Container config (recommended for development)
 .github/workflows/       CI and release automation
 ```

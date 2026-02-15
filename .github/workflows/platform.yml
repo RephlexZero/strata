@@ -1,0 +1,143 @@
+name: Platform CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/strata-*/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/platform.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/strata-*/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/platform.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: Check & Clippy (platform)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Fetch required submodules
+        run: git submodule update --init --recursive vendor/librist
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake pkg-config \
+            meson ninja-build \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            libfontconfig1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check (platform crates)
+        run: |
+          cargo fmt -p strata-common -- --check
+          cargo fmt -p strata-control -- --check
+          cargo fmt -p strata-agent -- --check
+          cargo fmt -p strata-dashboard -- --check
+          cargo fmt -p strata-portal -- --check
+
+      - name: Clippy (native crates)
+        run: |
+          cargo clippy \
+            -p strata-common \
+            -p strata-control \
+            -p strata-agent \
+            -- -D warnings
+
+      - name: Check WASM crates
+        run: |
+          cargo check \
+            -p strata-dashboard \
+            -p strata-portal \
+            --target wasm32-unknown-unknown
+
+  test-common:
+    name: Tests (strata-common)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run strata-common tests
+        run: cargo test -p strata-common
+
+  test-control:
+    name: Tests (strata-control)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: strata
+          POSTGRES_PASSWORD: ci-test-password
+          POSTGRES_DB: strata_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U strata"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Fetch required submodules
+        run: git submodule update --init --recursive vendor/librist
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake pkg-config \
+            meson ninja-build \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            libfontconfig1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run strata-control integration tests
+        env:
+          TEST_DATABASE_URL: postgres://strata:ci-test-password@localhost:5432/strata_test
+        run: cargo test -p strata-control -- --nocapture
+
+  test-agent:
+    name: Tests (strata-agent)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run strata-agent tests
+        run: cargo test -p strata-agent
