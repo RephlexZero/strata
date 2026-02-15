@@ -15,7 +15,9 @@ pub fn SendersPage() -> impl IntoView {
     let (loading, set_loading) = signal(true);
     let (show_create, set_show_create) = signal(false);
     let (new_name, set_new_name) = signal(String::new());
-    let (enrollment_info, set_enrollment_info) = signal(Option::<(String, String)>::None);
+    let (creating, set_creating) = signal(false);
+    // After creation, the modal transitions to show the enrollment token
+    let (created_info, set_created_info) = signal(Option::<(String, String)>::None);
 
     // Load senders on mount
     let auth_load = auth.clone();
@@ -47,22 +49,32 @@ pub fn SendersPage() -> impl IntoView {
             Some(name_val)
         };
         let token = auth_create.token.get_untracked().unwrap_or_default();
+        set_creating.set(true);
         leptos::task::spawn_local(async move {
             match api::create_sender(&token, name).await {
                 Ok(resp) => {
-                    set_enrollment_info.set(Some((
+                    // Transition the modal to show enrollment info
+                    set_created_info.set(Some((
                         resp.sender_id.clone(),
                         resp.enrollment_token.clone(),
                     )));
+                    set_creating.set(false);
+                    set_new_name.set(String::new());
                     if let Ok(data) = api::list_senders(&token).await {
                         set_senders.set(data);
                     }
-                    set_show_create.set(false);
-                    set_new_name.set(String::new());
                 }
-                Err(e) => set_error.set(Some(e)),
+                Err(e) => {
+                    set_error.set(Some(e));
+                    set_creating.set(false);
+                }
             }
         });
+    };
+
+    let close_modal = move |_| {
+        set_show_create.set(false);
+        set_created_info.set(None);
     };
 
     view! {
@@ -81,54 +93,76 @@ pub fn SendersPage() -> impl IntoView {
                 <div class="alert alert-error text-sm mb-4">{e}</div>
             })}
 
-            {move || enrollment_info.get().map(|(sid, token)| view! {
-                <div class="card bg-base-200 border border-success mb-4">
-                    <div class="card-body">
-                        <div class="flex justify-between items-center mb-3">
-                            <h3 class="font-semibold">"Sender Created"</h3>
-                            <button class="btn btn-ghost btn-sm" on:click=move |_| set_enrollment_info.set(None)>
-                                "Dismiss"
-                            </button>
+            // Create modal — transitions between form and enrollment token display
+            {move || show_create.get().then(|| {
+                let info = created_info.get();
+                if let Some((sid, token)) = info {
+                    // ── Post-creation: show enrollment token ─────────
+                    view! {
+                        <div class="modal modal-open">
+                            <div class="modal-box">
+                                <h3 class="font-bold text-lg text-success">"✓ Sender Created"</h3>
+                                <div class="mt-4">
+                                    <div class="alert alert-warning text-sm mb-4">
+                                        "Save this enrollment token — it will not be shown again."
+                                    </div>
+                                    <div class="font-mono text-sm bg-base-300 p-4 rounded space-y-2">
+                                        <div class="flex justify-between">
+                                            <span class="text-base-content/60">"Sender ID"</span>
+                                            <span class="font-semibold">{sid}</span>
+                                        </div>
+                                        <div class="flex justify-between">
+                                            <span class="text-base-content/60">"Token"</span>
+                                            <span class="font-semibold tracking-wider">{token}</span>
+                                        </div>
+                                    </div>
+                                    <p class="text-sm text-base-content/60 mt-4">
+                                        "Enter this token on the sender device's portal to enroll it."
+                                    </p>
+                                </div>
+                                <div class="modal-action">
+                                    <button class="btn btn-primary" on:click=close_modal>
+                                        "Done"
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="modal-backdrop" on:click=close_modal>
+                                <button>"close"</button>
+                            </div>
                         </div>
-                        <p class="text-sm text-base-content/60 mb-2">
-                            "Save this enrollment token — it will not be shown again."
-                        </p>
-                        <div class="font-mono text-sm bg-base-300 p-2 rounded break-all">
-                            <div>"Sender ID: " {sid}</div>
-                            <div>"Token: " {token}</div>
+                    }.into_any()
+                } else {
+                    // ── Create form ─────────────────────────────────
+                    view! {
+                        <div class="modal modal-open">
+                            <div class="modal-box">
+                                <h3 class="font-bold text-lg">"Add Sender"</h3>
+                                <fieldset class="fieldset mt-4">
+                                    <label class="fieldset-label">"Name"</label>
+                                    <input
+                                        class="input input-bordered w-full"
+                                        type="text"
+                                        placeholder="e.g. Camera 1"
+                                        prop:value=move || new_name.get()
+                                        on:input=move |ev| set_new_name.set(event_target_value(&ev))
+                                    />
+                                    <p class="text-xs text-base-content/40 mt-1">"A friendly name for this encoder unit"</p>
+                                </fieldset>
+                                <div class="modal-action">
+                                    <button class="btn btn-ghost" on:click=close_modal>
+                                        "Cancel"
+                                    </button>
+                                    <button class="btn btn-primary" on:click=on_create disabled=move || creating.get()>
+                                        {move || if creating.get() { "Creating…" } else { "Create Sender" }}
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="modal-backdrop" on:click=close_modal>
+                                <button>"close"</button>
+                            </div>
                         </div>
-                    </div>
-                </div>
-            })}
-
-            // Create modal
-            {move || show_create.get().then(|| view! {
-                <div class="modal modal-open">
-                    <div class="modal-box">
-                        <h3 class="font-bold text-lg">"Add Sender"</h3>
-                        <fieldset class="fieldset mt-4">
-                            <label class="fieldset-label">"Name (optional)"</label>
-                            <input
-                                class="input input-bordered w-full"
-                                type="text"
-                                placeholder="e.g. Camera 1"
-                                prop:value=move || new_name.get()
-                                on:input=move |ev| set_new_name.set(event_target_value(&ev))
-                            />
-                        </fieldset>
-                        <div class="modal-action">
-                            <button class="btn btn-ghost" on:click=move |_| set_show_create.set(false)>
-                                "Cancel"
-                            </button>
-                            <button class="btn btn-primary" on:click=on_create>
-                                "Create"
-                            </button>
-                        </div>
-                    </div>
-                    <div class="modal-backdrop" on:click=move |_| set_show_create.set(false)>
-                        <button>"close"</button>
-                    </div>
-                </div>
+                    }.into_any()
+                }
             })}
 
             {move || {

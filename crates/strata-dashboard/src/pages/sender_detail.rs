@@ -5,8 +5,8 @@ use leptos::prelude::*;
 
 use crate::api;
 use crate::types::{
-    DashboardEvent, LinkStats, MediaInput, NetworkInterface, SenderDetail, SenderFullStatus,
-    StreamSummary, TestRunResponse,
+    DashboardEvent, DestinationSummary, LinkStats, MediaInput, NetworkInterface, SenderDetail,
+    SenderFullStatus, StreamSummary, TestRunResponse,
 };
 use crate::ws::WsClient;
 use crate::AuthState;
@@ -55,6 +55,15 @@ pub fn SenderDetailPage() -> impl IntoView {
     // Connectivity test
     let (test_result, set_test_result) = signal(Option::<TestRunResponse>::None);
     let (test_loading, set_test_loading) = signal(false);
+
+    // Destination picker for starting a stream
+    let (show_start_modal, set_show_start_modal) = signal(false);
+    let (destinations, set_destinations) = signal(Vec::<DestinationSummary>::new());
+    let (selected_dest, set_selected_dest) = signal(String::new());
+    let (dests_loading, set_dests_loading) = signal(false);
+
+    // Receiver URL change confirmation
+    let (show_receiver_confirm, set_show_receiver_confirm) = signal(false);
 
     // Load sender detail + status
     let auth_load = auth.clone();
@@ -153,12 +162,41 @@ pub fn SenderDetailPage() -> impl IntoView {
     });
 
     let auth_start = auth.clone();
-    let start_stream = move |_| {
-        let id = params.get().get("id").unwrap_or_default();
+    let open_start_modal = move |_| {
         let token = auth_start.token.get_untracked().unwrap_or_default();
-        set_action_loading.set(true);
+        set_dests_loading.set(true);
+        set_selected_dest.set(String::new());
+        set_show_start_modal.set(true);
         leptos::task::spawn_local(async move {
-            match api::start_stream(&token, &id, None).await {
+            match api::list_destinations(&token).await {
+                Ok(dests) => {
+                    // Auto-select the first destination if there's only one
+                    if dests.len() == 1 {
+                        set_selected_dest.set(dests[0].id.clone());
+                    }
+                    set_destinations.set(dests);
+                    set_dests_loading.set(false);
+                }
+                Err(e) => {
+                    set_error.set(Some(e));
+                    set_dests_loading.set(false);
+                }
+            }
+        });
+    };
+
+    let auth_start2 = auth.clone();
+    let confirm_start_stream = move |_| {
+        let id = params.get().get("id").unwrap_or_default();
+        let token = auth_start2.token.get_untracked().unwrap_or_default();
+        let dest_id = selected_dest.get_untracked();
+        if dest_id.is_empty() {
+            return; // guard — button should be disabled
+        }
+        set_action_loading.set(true);
+        set_show_start_modal.set(false);
+        leptos::task::spawn_local(async move {
+            match api::start_stream(&token, &id, dest_id).await {
                 Ok(resp) => {
                     set_stream_state.set(resp.state);
                     set_action_loading.set(false);
@@ -222,13 +260,14 @@ pub fn SenderDetailPage() -> impl IntoView {
         });
     };
 
-    // Config save handler
+    // Config save — with confirmation guard when online/streaming
     let auth_config = auth.clone();
-    let save_config = move |_| {
+    let do_save_config = move |_| {
         let id = params.get().get("id").unwrap_or_default();
         let token = auth_config.token.get_untracked().unwrap_or_default();
         let url = receiver_input.get_untracked();
         let url_val = if url.is_empty() { None } else { Some(url) };
+        set_show_receiver_confirm.set(false);
         leptos::task::spawn_local(async move {
             match api::set_sender_config(&token, &id, url_val).await {
                 Ok(resp) => {
@@ -243,6 +282,17 @@ pub fn SenderDetailPage() -> impl IntoView {
                 Err(e) => set_config_msg.set(Some((format!("Save failed: {e}"), "err"))),
             }
         });
+    };
+
+    let save_config = move |_| {
+        // If online or streaming, show warning first
+        let is_online = sender.get().map(|s| s.online).unwrap_or(false);
+        let st = stream_state.get_untracked();
+        if is_online || st == "live" || st == "starting" {
+            set_show_receiver_confirm.set(true);
+        } else {
+            do_save_config(());
+        }
     };
 
     // Test handler
@@ -297,13 +347,107 @@ pub fn SenderDetailPage() -> impl IntoView {
                                         }.into_any()
                                     } else {
                                         view! {
-                                            <button class="btn btn-primary" on:click=start_stream disabled=move || action_loading.get() || !is_online>
+                                            <button class="btn btn-primary" on:click=open_start_modal disabled=move || action_loading.get() || !is_online>
                                                 "▶ Start Stream"
                                             </button>
                                         }.into_any()
                                     }}
                                 </div>
                             </div>
+
+                            // ── Start Stream Modal (destination picker) ─
+                            {move || show_start_modal.get().then(|| {
+                                let dests = destinations.get();
+                                let loading = dests_loading.get();
+                                view! {
+                                    <div class="modal modal-open">
+                                        <div class="modal-box">
+                                            <h3 class="font-bold text-lg">"Start Stream"</h3>
+                                            <p class="text-sm text-base-content/60 mt-2">
+                                                "Select a destination for this stream."
+                                            </p>
+
+                                            {if loading {
+                                                view! {
+                                                    <div class="flex justify-center py-6">
+                                                        <span class="loading loading-spinner loading-md"></span>
+                                                    </div>
+                                                }.into_any()
+                                            } else if dests.is_empty() {
+                                                view! {
+                                                    <div class="alert alert-warning mt-4 text-sm">
+                                                        "No destinations configured. Add a destination first."
+                                                    </div>
+                                                }.into_any()
+                                            } else {
+                                                view! {
+                                                    <fieldset class="fieldset mt-4">
+                                                        <label class="fieldset-label">"Destination"</label>
+                                                        <select
+                                                            class="select select-bordered w-full"
+                                                            on:change=move |ev| set_selected_dest.set(event_target_value(&ev))
+                                                            prop:value=move || selected_dest.get()
+                                                        >
+                                                            <option value="" disabled=true selected=true>"Choose a destination…"</option>
+                                                            {dests.into_iter().map(|d| {
+                                                                let id = d.id.clone();
+                                                                let label = format!("{} — {} ({})", d.name, d.platform, d.url);
+                                                                view! { <option value={id}>{label}</option> }
+                                                            }).collect::<Vec<_>>()}
+                                                        </select>
+                                                    </fieldset>
+                                                }.into_any()
+                                            }}
+
+                                            <div class="modal-action">
+                                                <button class="btn btn-ghost" on:click=move |_| set_show_start_modal.set(false)>
+                                                    "Cancel"
+                                                </button>
+                                                <button
+                                                    class="btn btn-primary"
+                                                    on:click=confirm_start_stream
+                                                    disabled=move || selected_dest.get().is_empty()
+                                                >
+                                                    "▶ Go Live"
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <div class="modal-backdrop" on:click=move |_| set_show_start_modal.set(false)>
+                                            <button>"close"</button>
+                                        </div>
+                                    </div>
+                                }
+                            })}
+
+                            // ── Receiver URL Change Confirmation ────────
+                            {move || show_receiver_confirm.get().then(|| view! {
+                                <div class="modal modal-open">
+                                    <div class="modal-box">
+                                        <h3 class="font-bold text-lg text-warning">"⚠ Change Receiver URL?"</h3>
+                                        <p class="mt-3 text-sm">
+                                            "This sender is currently "
+                                            <strong>{if stream_state.get() == "live" { "streaming" } else { "online" }}</strong>
+                                            ". Changing the receiver URL may cause a "
+                                            <strong>"connection loss"</strong>
+                                            " and require re-pairing."
+                                        </p>
+                                        <p class="mt-2 text-sm text-base-content/60">
+                                            "Are you sure you want to proceed?"
+                                        </p>
+                                        <div class="modal-action">
+                                            <button class="btn btn-ghost" on:click=move |_| set_show_receiver_confirm.set(false)>
+                                                "Cancel"
+                                            </button>
+                                            <button class="btn btn-warning" on:click=move |_| do_save_config(())>
+                                                "Yes, Change Receiver"
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div class="modal-backdrop" on:click=move |_| set_show_receiver_confirm.set(false)>
+                                        <button>"close"</button>
+                                    </div>
+                                </div>
+                            })}
 
                             // ── System Stats ────────────────────────────
                             {move || {

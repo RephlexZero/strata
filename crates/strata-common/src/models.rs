@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 
 // ── User ────────────────────────────────────────────────────────────
 
-/// A platform user (admin, operator, or viewer).
+/// A platform user (operator or viewer).
+///
+/// There is no admin role — every user owns exactly their own data,
+/// isolated by `owner_id` on every table.  No user can see or modify
+/// another user's resources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: String,
@@ -23,7 +27,6 @@ pub struct User {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserRole {
-    Admin,
     Operator,
     Viewer,
 }
@@ -31,7 +34,6 @@ pub enum UserRole {
 impl std::fmt::Display for UserRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UserRole::Admin => write!(f, "admin"),
             UserRole::Operator => write!(f, "operator"),
             UserRole::Viewer => write!(f, "viewer"),
         }
@@ -43,7 +45,6 @@ impl std::str::FromStr for UserRole {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "admin" => Ok(UserRole::Admin),
             "operator" => Ok(UserRole::Operator),
             "viewer" => Ok(UserRole::Viewer),
             other => Err(format!("unknown role: {other}")),
@@ -237,7 +238,7 @@ mod tests {
 
     #[test]
     fn user_role_serde_round_trip() {
-        for role in [UserRole::Admin, UserRole::Operator, UserRole::Viewer] {
+        for role in [UserRole::Operator, UserRole::Viewer] {
             let json = serde_json::to_string(&role).unwrap();
             let parsed: UserRole = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, role);
@@ -246,15 +247,14 @@ mod tests {
 
     #[test]
     fn user_role_from_str() {
-        assert_eq!("admin".parse::<UserRole>().unwrap(), UserRole::Admin);
         assert_eq!("operator".parse::<UserRole>().unwrap(), UserRole::Operator);
         assert_eq!("viewer".parse::<UserRole>().unwrap(), UserRole::Viewer);
+        assert!("admin".parse::<UserRole>().is_err());
         assert!("invalid".parse::<UserRole>().is_err());
     }
 
     #[test]
     fn user_role_display() {
-        assert_eq!(UserRole::Admin.to_string(), "admin");
         assert_eq!(UserRole::Operator.to_string(), "operator");
         assert_eq!(UserRole::Viewer.to_string(), "viewer");
     }
@@ -477,7 +477,7 @@ mod tests {
             id: "usr_test".into(),
             email: "test@test.com".into(),
             password_hash: "secret_hash_value".into(),
-            role: UserRole::Admin,
+            role: UserRole::Operator,
             created_at: chrono::Utc::now(),
         };
         let json = serde_json::to_string(&user).unwrap();

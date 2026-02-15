@@ -1,6 +1,7 @@
 @import "tailwindcss";
+
 @plugin "daisyui" {
-  themes: dark --default;
+    themes: dark --default;
 }
 
 /* Source: scan Leptos view macros for class references */
@@ -10,20 +11,28 @@
 /* ── Custom overrides ───────────────────────────────────────── */
 
 @theme {
-  --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+    --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
 }
 
 @layer base {
-  body {
-    @apply antialiased;
-  }
+    body {
+        @apply antialiased;
+    }
 }
 
 /* Pulse animation for live indicators */
 @keyframes pulse-dot {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.4;
+    }
 }
+
 .animate-pulse-dot {
-  animation: pulse-dot 2s ease-in-out infinite;
+    animation: pulse-dot 2s ease-in-out infinite;
 }

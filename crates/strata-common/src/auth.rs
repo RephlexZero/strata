@@ -64,7 +64,7 @@ pub struct Claims {
     pub exp: i64,
     /// Issued-at time (Unix timestamp).
     pub iat: i64,
-    /// Role: "admin", "operator", "viewer", or "sender".
+    /// Role: "operator", "viewer", or "sender".
     pub role: String,
     /// Owner user ID (for sender tokens, the user who owns this sender).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -189,7 +189,7 @@ mod tests {
             iss: "strata-control".into(),
             exp: now + 3600,
             iat: now,
-            role: "admin".into(),
+            role: "operator".into(),
             owner: None,
         };
 
@@ -197,7 +197,7 @@ mod tests {
         let recovered = ctx.verify_token(&token).unwrap();
 
         assert_eq!(recovered.sub, "usr_test123");
-        assert_eq!(recovered.role, "admin");
+        assert_eq!(recovered.role, "operator");
     }
 
     #[test]
@@ -229,7 +229,7 @@ mod tests {
             iss: "strata-control".into(),
             exp: now + 3600,
             iat: now,
-            role: "admin".into(),
+            role: "operator".into(),
             owner: None,
         };
 

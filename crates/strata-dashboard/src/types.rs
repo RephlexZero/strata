@@ -157,7 +157,7 @@ pub struct StreamDetail {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StartStreamRequest {
-    pub destination_id: Option<String>,
+    pub destination_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

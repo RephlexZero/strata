@@ -34,7 +34,7 @@ pub fn router() -> Router<AppState> {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct StartStreamRequest {
-    pub destination_id: Option<String>,
+    pub destination_id: String,
     pub source: Option<strata_common::protocol::SourceConfig>,
     pub encoder: Option<strata_common::protocol::EncoderConfig>,
 }
@@ -63,6 +63,20 @@ async fn start_stream(
 
     if !exists {
         return Err(ApiError::not_found("sender not found"));
+    }
+
+    // Verify destination exists and belongs to this user
+    let dest_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM destinations WHERE id = $1 AND owner_id = $2)",
+    )
+    .bind(&body.destination_id)
+    .bind(&user.user_id)
+    .fetch_one(state.pool())
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    if !dest_exists {
+        return Err(ApiError::not_found("destination not found"));
     }
 
     // Check sender is connected

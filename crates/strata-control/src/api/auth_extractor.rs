@@ -12,7 +12,7 @@ use crate::state::AppState;
 /// provides the authenticated user's ID and role.
 pub struct AuthUser {
     pub user_id: String,
-    #[allow(dead_code)] // Used when RBAC checks are added
+    #[allow(dead_code)] // Field available for future role-based checks (operator/viewer)
     pub role: String,
 }
 

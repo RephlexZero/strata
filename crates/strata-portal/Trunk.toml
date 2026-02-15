@@ -6,8 +6,10 @@ dist = "dist"
 stage = "pre_build"
 command = "npx"
 command_arguments = [
-  "@tailwindcss/cli",
-  "-i", "style/input.css",
-  "-o", "style/main.css",
-  "--minify",
+    "@tailwindcss/cli",
+    "-i",
+    "style/input.css",
+    "-o",
+    "style/main.css",
+    "--minify",
 ]

@@ -21,28 +21,28 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Insert development seed data (admin user, test sender, test destination).
+/// Insert development seed data (dev user, test sender, test destination).
 /// Activated by setting `DEV_SEED=1` environment variable.
 pub async fn seed_dev_data(pool: &PgPool) -> anyhow::Result<()> {
-    // Admin user: admin@strata.local / admin
-    let admin_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+    // Dev user: dev@strata.local / development
+    let dev_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
         .bind("usr_00000000-0000-0000-0000-000000000001")
         .fetch_one(pool)
         .await?;
 
-    if admin_exists {
+    if dev_exists {
         tracing::info!("dev seed data already exists, skipping");
         return Ok(());
     }
 
-    // Hash "admin" with argon2id
-    let password_hash = strata_common::auth::hash_password("admin")?;
+    // Hash "development" with argon2id
+    let password_hash = strata_common::auth::hash_password("development")?;
 
     sqlx::query("INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, $3, $4)")
         .bind("usr_00000000-0000-0000-0000-000000000001")
-        .bind("admin@strata.local")
+        .bind("dev@strata.local")
         .bind(&password_hash)
-        .bind("admin")
+        .bind("operator")
         .execute(pool)
         .await?;
 
@@ -75,6 +75,6 @@ pub async fn seed_dev_data(pool: &PgPool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
-    tracing::info!("dev seed data inserted (admin@strata.local / admin)");
+    tracing::info!("dev seed data inserted (dev@strata.local / development)");
     Ok(())
 }
