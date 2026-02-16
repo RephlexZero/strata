@@ -128,6 +128,12 @@ pub fn SenderDetailPage() -> impl IntoView {
                     set_live_bitrate.set(encoder_bitrate_kbps);
                     set_live_uptime.set(uptime_s);
                     set_live_links.set(links);
+                    // Stats flowing means the stream is live — auto-promote
+                    // from "starting" in case we missed the state change event.
+                    let st = stream_state.get_untracked();
+                    if st == "starting" {
+                        set_stream_state.set("live".into());
+                    }
                 }
                 DashboardEvent::StreamStateChanged {
                     sender_id: sid,

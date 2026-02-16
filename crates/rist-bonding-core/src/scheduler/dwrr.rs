@@ -53,8 +53,8 @@ pub struct Dwrr<L: LinkSender + ?Sized> {
 /// tightly limited. Loss further reduces the window.
 fn compute_burst_window_s(phase: LinkPhase, loss_rate: f64) -> f64 {
     let base = match phase {
-        LinkPhase::Probe => 0.02,
-        LinkPhase::Warm => 0.05,
+        LinkPhase::Probe => 0.05,
+        LinkPhase::Warm => 0.08,
         LinkPhase::Live => 0.1,
         LinkPhase::Degrade => 0.04,
         LinkPhase::Cooldown | LinkPhase::Reset | LinkPhase::Init => 0.01,
@@ -348,8 +348,8 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 let rtt_factor = 1.0 / (1.0 + predicted_rtt / 200.0);
 
                 let phase_factor = match metrics.phase {
-                    LinkPhase::Probe => 0.2,
-                    LinkPhase::Warm => 0.6,
+                    LinkPhase::Probe => 0.5,
+                    LinkPhase::Warm => 0.8,
                     LinkPhase::Live => 1.0,
                     LinkPhase::Degrade => 0.7,
                     LinkPhase::Cooldown | LinkPhase::Reset | LinkPhase::Init => 0.1,
@@ -559,7 +559,7 @@ mod tests {
 
         let rtt_factor = 1.0 / (1.0 + 10.0 / 200.0);
         let live_max = (1_000_000.0 * rtt_factor / 8.0) * live_burst;
-        let probe_max = (1_000_000.0 * rtt_factor * 0.2 / 8.0) * probe_burst;
+        let probe_max = (1_000_000.0 * rtt_factor * 0.5 / 8.0) * probe_burst;
 
         assert!(live_state.credits <= live_max + 1.0);
         assert!(probe_state.credits <= probe_max + 1.0);

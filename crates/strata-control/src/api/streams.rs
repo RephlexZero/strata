@@ -167,9 +167,9 @@ async fn start_stream(
         bonding_config: serde_json::json!({
             "version": 1,
             "scheduler": {
-                "critical_broadcast": false,
-                "redundancy_enabled": false,
-                "capacity_floor_bps": 500_000.0,
+                "critical_broadcast": true,
+                "redundancy_enabled": true,
+                "capacity_floor_bps": 5_000_000.0,
                 "failover_enabled": true,
                 "failover_duration_ms": 3000
             }
