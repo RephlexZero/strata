@@ -335,11 +335,20 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
                 };
                 let resp = InterfaceCommandResponsePayload {
                     success,
-                    interface: payload.interface,
-                    action: payload.action,
+                    interface: payload.interface.clone(),
+                    action: payload.action.clone(),
                     error,
                 };
                 send_envelope(state, "interface.command.response", &resp).await;
+
+                // Notify the running pipeline to add/remove this link from
+                // the bonding transport (without touching OS connectivity).
+                if success {
+                    let enabled = payload.action == "enable";
+                    let pipeline = state.pipeline.lock().await;
+                    pipeline.toggle_link(&payload.interface, enabled);
+                }
+
                 send_envelope(state, "device.status", &build_heartbeat(state).await).await;
             }
         }

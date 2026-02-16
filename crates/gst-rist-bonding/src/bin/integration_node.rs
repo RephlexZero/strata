@@ -414,6 +414,10 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     pipeline.set_state(gst::State::Playing)?;
     eprintln!("Sender running (source={source_mode})... Press Ctrl+C to stop.");
 
+    // ── Disabled link tracker (for toggle_link re-enable) ──
+    let disabled_links: Mutex<std::collections::HashMap<String, (String, String)>> =
+        Mutex::new(std::collections::HashMap::new());
+
     // ── Bus message loop ──
     let bus = pipeline.bus().unwrap();
     for msg in bus.iter_timed(gst::ClockTime::NONE) {
@@ -434,6 +438,10 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         handle_source_switch(
                             &pipeline, &selector, &test_pad, s, framerate, res_w, res_h,
                         );
+                    } else if s.name() == "toggle-link" {
+                        if let Some(sink) = pipeline.by_name("rsink") {
+                            handle_toggle_link(&sink, s, &disabled_links);
+                        }
                     }
                 }
             }
@@ -504,6 +512,92 @@ fn resolve_interface_for_uri(uri: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ── Link toggling ───────────────────────────────────────────────────
+
+/// Handle a `toggle-link` command from the control socket.
+///
+/// Finds the sink pad whose `interface` property matches the requested
+/// interface name and either removes or re-adds the corresponding RIST
+/// link in the bonding runtime.
+///
+/// **Disable:** releases the pad from the element, which triggers
+/// `release_pad` → `remove_link_by_pad_name` internally.
+///
+/// **Enable:** requests a new pad, copies the URI and interface from
+/// the disabled pad info, and triggers `add_link_from_pad`.
+///
+/// We maintain a small map of disabled interfaces to their (URI, iface)
+/// so they can be re-enabled.
+fn handle_toggle_link(
+    sink: &gst::Element,
+    structure: &gst::StructureRef,
+    disabled_links: &Mutex<std::collections::HashMap<String, (String, String)>>,
+) {
+    let iface = match structure.get::<&str>("interface") {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            eprintln!("toggle-link: missing 'interface' field");
+            return;
+        }
+    };
+    let enabled = structure.get::<bool>("enabled").unwrap_or(true);
+
+    if enabled {
+        // Re-enable: retrieve stored URI and create a new pad
+        let stored = disabled_links.lock().unwrap().remove(&iface);
+        if let Some((uri, iface_name)) = stored {
+            if let Some(pad) = sink.request_pad_simple("link_%u") {
+                pad.set_property("uri", &uri);
+                pad.set_property("interface", &iface_name);
+                eprintln!(
+                    "toggle-link: re-enabled {} → {} (pad {})",
+                    iface_name,
+                    uri,
+                    pad.name()
+                );
+            } else {
+                eprintln!("toggle-link: failed to request new pad for {}", iface);
+                // Put it back so user can retry
+                disabled_links
+                    .lock()
+                    .unwrap()
+                    .insert(iface, (uri, iface_name));
+            }
+        } else {
+            eprintln!("toggle-link: interface '{}' is not disabled", iface);
+        }
+    } else {
+        // Disable: find the pad, store its info, then release it
+        let mut target_pad: Option<gst::Pad> = None;
+        for pad in sink.pads() {
+            if pad.direction() != gst::PadDirection::Sink {
+                continue;
+            }
+            let pad_iface: String = pad.property("interface");
+            if pad_iface == iface {
+                target_pad = Some(pad);
+                break;
+            }
+        }
+
+        if let Some(pad) = target_pad {
+            let uri: String = pad.property("uri");
+            let pad_iface: String = pad.property("interface");
+            disabled_links
+                .lock()
+                .unwrap()
+                .insert(iface.clone(), (uri, pad_iface));
+            sink.release_request_pad(&pad);
+            eprintln!(
+                "toggle-link: disabled link on {} (released pad)",
+                iface
+            );
+        } else {
+            eprintln!("toggle-link: no pad found for interface '{}'", iface);
+        }
+    }
 }
 
 // ── Stats serialization ─────────────────────────────────────────────
@@ -806,6 +900,22 @@ fn run_control_socket(path: &str, pipeline_weak: gst::glib::WeakRef<gst::Pipelin
                 let msg = gst::message::Application::new(structure);
                 let _ = pipeline.post_message(msg);
                 eprintln!("Control: queued source-switch command");
+            } else if cmd.get("cmd").and_then(|v| v.as_str()) == Some("toggle_link") {
+                // Enable/disable a bonding link by OS interface name.
+                // Posts a "toggle-link" Application message processed in the bus loop.
+                let iface = cmd.get("interface").and_then(|v| v.as_str()).unwrap_or("");
+                let enabled = cmd.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+                if iface.is_empty() {
+                    eprintln!("Control: toggle_link missing 'interface'");
+                } else {
+                    let structure = gst::Structure::builder("toggle-link")
+                        .field("interface", iface)
+                        .field("enabled", enabled)
+                        .build();
+                    let msg = gst::message::Application::new(structure);
+                    let _ = pipeline.post_message(msg);
+                    eprintln!("Control: queued toggle-link iface={} enabled={}", iface, enabled);
+                }
             } else {
                 eprintln!("Control: unknown command: {}", line);
             }

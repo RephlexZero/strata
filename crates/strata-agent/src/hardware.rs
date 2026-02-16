@@ -136,21 +136,15 @@ impl HardwareScanner {
     }
 
     /// Enable or disable a network interface by name.
+    ///
+    /// This only updates the in-memory admin state — it does **not** bring the
+    /// OS interface down.  The caller is responsible for telling the running
+    /// pipeline to exclude/include the corresponding RIST link so that
+    /// disabling an interface only removes it from the bonding transport
+    /// without killing connectivity used by other services.
     pub fn set_interface_enabled(&self, name: &str, enabled: bool) -> bool {
         let mut map = self.interface_enabled.lock().unwrap();
         map.insert(name.to_string(), enabled);
-
-        // In real mode, actually bring the interface up/down
-        if !self.simulate {
-            let action = if enabled { "up" } else { "down" };
-            let status = std::process::Command::new("ip")
-                .args(["link", "set", name, action])
-                .status();
-            if let Err(e) = status {
-                tracing::warn!(interface = %name, action, error = %e, "failed to set interface state");
-                return false;
-            }
-        }
         true
     }
 

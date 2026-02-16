@@ -177,6 +177,40 @@ impl PipelineManager {
         }
     }
 
+    /// Tell the running pipeline to enable or disable a RIST link
+    /// associated with the given OS interface name.
+    ///
+    /// This sends a `toggle_link` command over the control socket so the
+    /// integration_node can add or remove the link at runtime without
+    /// affecting OS-level connectivity.
+    pub fn toggle_link(&self, iface: &str, enabled: bool) {
+        if !self.is_running() {
+            tracing::debug!(iface, enabled, "no pipeline running, skip toggle_link");
+            return;
+        }
+
+        let cmd = serde_json::json!({
+            "cmd": "toggle_link",
+            "interface": iface,
+            "enabled": enabled,
+        });
+
+        match std::os::unix::net::UnixStream::connect(CONTROL_SOCK_PATH) {
+            Ok(mut stream) => {
+                use std::io::Write;
+                let msg = format!("{}\n", cmd);
+                if let Err(e) = stream.write_all(msg.as_bytes()) {
+                    tracing::warn!(error = %e, "failed to send toggle_link command");
+                } else {
+                    tracing::info!(iface, enabled, "toggle_link command sent");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to connect to pipeline control socket");
+            }
+        }
+    }
+
     /// Update accumulated bytes (called from telemetry).
     pub fn add_bytes(&mut self, bytes: u64) {
         self.total_bytes += bytes;

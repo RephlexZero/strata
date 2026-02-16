@@ -274,6 +274,9 @@ async fn api_interface_enable(
     Path(name): Path<String>,
 ) -> Json<serde_json::Value> {
     let ok = state.hardware.set_interface_enabled(&name, true);
+    if ok {
+        state.pipeline.lock().await.toggle_link(&name, true);
+    }
     tracing::info!(interface = %name, "interface enabled via portal");
     Json(serde_json::json!({
         "interface": name,
@@ -289,6 +292,9 @@ async fn api_interface_disable(
     Path(name): Path<String>,
 ) -> Json<serde_json::Value> {
     let ok = state.hardware.set_interface_enabled(&name, false);
+    if ok {
+        state.pipeline.lock().await.toggle_link(&name, false);
+    }
     tracing::info!(interface = %name, "interface disabled via portal");
     Json(serde_json::json!({
         "interface": name,
