@@ -175,6 +175,11 @@ async fn start_stream(
             }
         }),
         rist_psk: None,
+        relay_url: if relay_url.is_empty() {
+            None
+        } else {
+            Some(relay_url.clone())
+        },
     };
 
     // Store the relay URL and request in the stream config for operational visibility.

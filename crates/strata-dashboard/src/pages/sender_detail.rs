@@ -83,7 +83,12 @@ pub fn SenderDetailPage() -> impl IntoView {
                 }
                 if let Ok(all) = api::list_streams(&token).await {
                     let filtered: Vec<_> = all.into_iter().filter(|s| s.sender_id == id).collect();
-                    if let Some(latest) = filtered.first() {
+                    // Prefer a live/starting stream over the most-recent (which may be "ended")
+                    let active = filtered
+                        .iter()
+                        .find(|s| s.state == "live" || s.state == "starting")
+                        .or(filtered.first());
+                    if let Some(latest) = active {
                         set_stream_state.set(latest.state.clone());
                     }
                     set_streams.set(filtered);

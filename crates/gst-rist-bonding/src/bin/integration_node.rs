@@ -21,6 +21,8 @@ OPTIONS:
   --audio             Add silent AAC audio track (required for RTMP targets)
   --config <path>     Path to TOML config file (see Configuration Reference)
   --stats-dest <addr> UDP address to relay stats JSON (e.g. 127.0.0.1:9100)
+  --relay-url <url>   RTMP/RTMPS URL to relay encoded stream to in parallel
+                      (tees output: one copy goes via RIST, another via RTMP)
   --control <path>    Unix socket path for hot-swap commands
                       (default: /tmp/strata-pipeline.sock)
   --help              Show this help
@@ -46,6 +48,11 @@ EXAMPLES:
   # 1080p30 with audio for YouTube relay via receiver
   integration_node sender --source test --framerate 30 --audio --bitrate 2000 \
     --dest rist://receiver:5000,rist://receiver:5002,rist://receiver:5004
+
+  # Direct RTMP relay to YouTube (sender tees output: RIST + RTMP)
+  integration_node sender --source test --bitrate 2000 \
+    --dest rist://receiver:5000,rist://receiver:5002 \
+    --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
 
   # HDMI capture card to cloud receiver
   integration_node sender --source v4l2 --device /dev/video0 \
@@ -135,6 +142,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut source_uri = "";
     let mut control_sock_path = "/tmp/strata-pipeline.sock";
     let mut resolution = "1280x720";
+    let mut relay_url = "";
 
     let mut i = 0;
     while i < args.len() {
@@ -186,6 +194,10 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 resolution = &args[i + 1];
                 i += 1;
             }
+            "--relay-url" if i + 1 < args.len() => {
+                relay_url = &args[i + 1];
+                i += 1;
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 eprint!("{SENDER_HELP}");
@@ -229,10 +241,48 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the pipeline with input-selector.
     // The test source is always available as the fallback.
-    let audio_fragment = if add_audio {
-        " audiotestsrc is-live=true wave=silence ! audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! queue ! mux."
+    //
+    // When --relay-url is set, the encoded video and audio are teed:
+    //   x264enc → tee → queue → mpegtsmux → rsristbondsink   (RIST)
+    //                 └→ queue → h264parse → flvmux → rtmpsink (RTMP)
+    //   voaacenc → tee → aacparse → queue → mpegtsmux         (RIST)
+    //                 └→ queue → aacparse → flvmux             (RTMP)
+    let use_relay = !relay_url.is_empty();
+
+    // When relay is enabled, force audio on (RTMP requires it)
+    if use_relay {
+        add_audio = true;
+    }
+
+    let (audio_fragment, rtmp_fragment) = if use_relay {
+        // Audio with tee — one path to RIST mux, another to FLV mux
+        let audio = " audiotestsrc is-live=true wave=silence \
+            ! audioconvert ! audioresample ! voaacenc bitrate=128000 \
+            ! tee name=atee \
+            atee. ! queue ! aacparse ! mux. \
+            atee. ! queue ! aacparse ! fmux.";
+        // RTMP mux + sink
+        let rtmp = format!(
+            " flvmux name=fmux streamable=true ! rtmpsink location=\"{url}\" sync=false",
+            url = relay_url
+        );
+        (audio.to_string(), rtmp)
+    } else if add_audio {
+        (
+            " audiotestsrc is-live=true wave=silence ! audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! queue ! mux.".to_string(),
+            String::new(),
+        )
     } else {
-        ""
+        (String::new(), String::new())
+    };
+
+    // Video path: with relay, tee after encoder; without, straight to mux
+    let video_to_mux = if use_relay {
+        "! tee name=vtee \
+         vtee. ! queue ! mux. \
+         vtee. ! queue ! h264parse ! fmux."
+    } else {
+        "! queue ! mux."
     };
 
     let pipeline_str = format!(
@@ -241,15 +291,17 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
          ! queue name=testq max-size-buffers=3 ! sel. \
          input-selector name=sel \
          ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps} key-int-max={ki} \
-         ! queue ! mux.{audio} \
+         {video_to_mux}{audio} \
          mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 \
-         ! rsristbondsink name=rsink",
+         ! rsristbondsink name=rsink{rtmp}",
         w = res_w,
         h = res_h,
         fps = framerate,
         bps = bitrate_kbps,
         ki = key_int,
+        video_to_mux = video_to_mux,
         audio = audio_fragment,
+        rtmp = rtmp_fragment,
     );
 
     eprintln!("Sender Pipeline: {}", pipeline_str);
