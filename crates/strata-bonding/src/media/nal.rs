@@ -103,7 +103,7 @@ fn parse_h265_nal(payload: &[u8]) -> Option<NalInfo> {
         32 => (NalClass::ParameterSet, false),      // VPS
         33 => (NalClass::ParameterSet, false),      // SPS
         34 => (NalClass::ParameterSet, false),      // PPS
-        19..=20 => (NalClass::Keyframe, true),     // IDR_W_RADL, IDR_N_LP
+        19..=20 => (NalClass::Keyframe, true),      // IDR_W_RADL, IDR_N_LP
         21 => (NalClass::Keyframe, true),           // CRA
         16..=18 => (NalClass::Keyframe, true),      // BLA variants
         0 => (NalClass::NonReference, false),       // TRAIL_N

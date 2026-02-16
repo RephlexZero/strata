@@ -212,6 +212,11 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             .collect()
     }
 
+    /// Get a link reference by ID.
+    pub fn get_link(&self, id: usize) -> Option<Arc<L>> {
+        self.links.get(&id).map(|s| s.link.clone())
+    }
+
     pub fn record_send(&mut self, id: usize, bytes: u64) {
         if let Some(state) = self.links.get_mut(&id) {
             state.sent_bytes = state.sent_bytes.saturating_add(bytes);

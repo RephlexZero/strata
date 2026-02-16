@@ -5,3 +5,4 @@
 //! metrics for stable scoring.
 
 pub mod health;
+pub mod supervisor;

@@ -13,6 +13,7 @@
 //! - [`config`] — TOML-based configuration with versioned schema
 //! - [`runtime`] — Thread-safe runtime that owns the scheduler loop
 
+pub mod adaptation;
 pub mod config;
 pub mod media;
 pub mod modem;
