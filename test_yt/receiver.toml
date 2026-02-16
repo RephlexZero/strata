@@ -1,0 +1,4 @@
+# Receiver TOML — matches the 3-link sender config
+
+[receiver]
+latency = 200        # reassembly buffer latency in ms (covers worst-link RTT + jitter)

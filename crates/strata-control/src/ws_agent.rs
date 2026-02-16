@@ -250,8 +250,7 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
             if let Ok(mut payload) = envelope.parse_payload::<StreamStatsPayload>() {
                 // Stamp sender_id and timestamp at the trust boundary
                 payload.sender_id = sender_id.to_string();
-                payload.timestamp_ms =
-                    chrono::Utc::now().timestamp_millis() as u64;
+                payload.timestamp_ms = chrono::Utc::now().timestamp_millis() as u64;
 
                 // Transition stream from 'starting' → 'live' on first stats message.
                 // Only run the UPDATE if we haven't already transitioned this stream.
@@ -264,9 +263,7 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
                     .await;
 
                     // Track the stream as live so we don't re-query every second
-                    state
-                        .live_streams()
-                        .insert(payload.stream_id.clone());
+                    state.live_streams().insert(payload.stream_id.clone());
 
                     // Only broadcast state change on the actual transition
                     if rows.as_ref().map(|r| r.rows_affected()).unwrap_or(0) > 0 {

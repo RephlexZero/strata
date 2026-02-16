@@ -1,0 +1,71 @@
+# Sender TOML — 3-link bonded to YouTube via RTMP relay
+# Aggregate target: ~5000 kbps across 3 cellular-sim links
+#
+# Links are NOT defined here — they come from --dest on the CLI,
+# which also does automatic interface resolution.  This file only
+# carries the scheduler / lifecycle / receiver tuning knobs.
+
+[scheduler]
+# ── Feature Toggles ──
+redundancy_enabled   = true
+critical_broadcast   = true
+failover_enabled     = true
+
+# ── Redundancy ──
+redundancy_spare_ratio     = 0.4     # duplicate when ≥40 % spare capacity
+redundancy_max_packet_bytes = 10000
+redundancy_target_links     = 1      # send 1 extra copy (not all links)
+
+# ── Failover ──
+failover_duration_ms    = 3000
+failover_rtt_spike_factor = 3.0
+
+# ── Link Quality / EWMA ──
+ewma_alpha             = 0.15       # slightly reactive for cellular
+prediction_horizon_s   = 0.5
+capacity_floor_bps     = 500000.0   # 500 kbps floor per link (conservative)
+penalty_decay          = 0.7
+penalty_recovery       = 0.05
+
+# ── Receiver Buffer ──
+jitter_latency_multiplier = 4.0
+max_latency_ms            = 500
+
+# ── Runtime / Telemetry ──
+stats_interval_ms = 500             # emit stats every 500 ms for verbose logging
+channel_capacity  = 1000
+
+# ── STORM Dual-Queue ──
+storm_enabled               = true
+storm_reliable_weight       = 0.7
+storm_unreliable_max_age_ms = 200
+storm_queue_capacity        = 256
+
+# ── AIMD Capacity Estimation ──
+capacity_estimate_enabled = true
+rtt_congestion_ratio      = 1.8
+md_factor                 = 0.7
+ai_step_ratio             = 0.08
+decrease_cooldown_ms      = 500
+rtt_min_fast_window_s     = 3.0
+rtt_min_slow_window_s     = 30.0
+max_capacity_bps          = 0.0     # uncapped
+loss_md_threshold         = 0.03
+
+# ── NADA ──
+dloss_ref_ms  = 10.0
+plr_ref       = 0.01
+gamma_max     = 0.5
+qbound_ms     = 50.0
+qeps_ms       = 10.0
+nada_kappa    = 0.5
+nada_eta      = 2.0
+nada_tau_ms   = 500.0
+nada_xref_ms  = 10.0
+nada_prio     = 1.0
+
+# ── Discard ──
+discard_deadline_ms = 200
+
+[lifecycle]
+# Use defaults — link state machine Init→Probe→Warm→Live→Degrade→Cooldown→Reset

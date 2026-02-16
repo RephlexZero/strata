@@ -633,12 +633,8 @@ fn serialize_bonding_stats(s: &gst::StructureRef) -> String {
             let phase = s
                 .get::<&str>(&format!("link_{}_phase", id))
                 .unwrap_or("unknown");
-            let os_up = s
-                .get::<i32>(&format!("link_{}_os_up", id))
-                .unwrap_or(-1);
-            let kind = s
-                .get::<&str>(&format!("link_{}_kind", id))
-                .unwrap_or("");
+            let os_up = s.get::<i32>(&format!("link_{}_os_up", id)).unwrap_or(-1);
+            let kind = s.get::<&str>(&format!("link_{}_kind", id)).unwrap_or("");
 
             links.push(serde_json::json!({
                 "id": id,
