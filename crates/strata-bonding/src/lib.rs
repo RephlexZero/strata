@@ -14,6 +14,8 @@
 //! - [`runtime`] — Thread-safe runtime that owns the scheduler loop
 
 pub mod config;
+pub mod media;
+pub mod modem;
 pub mod net;
 pub mod protocol;
 pub mod receiver;

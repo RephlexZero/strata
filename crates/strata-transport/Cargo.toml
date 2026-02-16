@@ -1,8 +1,8 @@
 [package]
 name = "strata-transport"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Pure Rust implementation of RIST SIMPLE profile (RFC 4588 / VSF TR-06-2)"
+description = "Strata pure-Rust transport protocol — custom wire format, hybrid FEC+ARQ, Biscay CC"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -11,6 +11,13 @@ bytes = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
+slab = "0.4"
+reed-solomon-simd = "3"
+quanta = "0.12"
+serde = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+proptest = "1"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"

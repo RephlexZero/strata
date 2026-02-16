@@ -1,14 +1,29 @@
 //! # strata-transport
 //!
-//! Next-generation reliable media transport over bonded links.
+//! Strata pure-Rust transport protocol.
 //!
-//! Design pending — see research notes.
+//! Custom wire format with QUIC-style VarInt sequence numbers, hybrid FEC+ARQ
+//! reliability, Biscay radio-aware congestion control, and media-aware packet
+//! prioritization.
+//!
+//! ## Crate structure
+//!
+//! - [`wire`] — Packet header serialization, control packets, VarInt
+//! - [`pool`] — Slab-based packet buffer pool
+//! - [`session`] — Session handshake, keepalive, RTT tracking
+//! - [`codec`] — FEC encoding/decoding (Reed-Solomon)
+//! - [`arq`] — NACK-based loss detection and retransmission
+//! - [`congestion`] — Biscay congestion control (BBRv3-inspired)
+//! - [`stats`] — Per-link and aggregate statistics
+//! - [`sender`] — Sender state machine
+//! - [`receiver`] — Receiver state machine
 
-// Modules will be added after research phase
-// pub mod rtp;
-// pub mod rtcp;
-// pub mod socket;
-// pub mod sender;
-// pub mod receiver;
-// pub mod arq;
-// pub mod stats;
+pub mod arq;
+pub mod codec;
+pub mod congestion;
+pub mod pool;
+pub mod receiver;
+pub mod sender;
+pub mod session;
+pub mod stats;
+pub mod wire;

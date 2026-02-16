@@ -7,9 +7,15 @@
 //! - Adaptive redundancy (duplicate important packets when spare capacity exists)
 //! - Fast-failover (broadcast all traffic when link instability is detected)
 
+pub mod blest;
 pub mod bonding;
 pub mod dwrr;
 pub mod ewma;
+pub mod fec;
+pub mod iods;
+pub mod kalman;
+pub mod sbd;
+pub mod thompson;
 
 /// Describes the importance and characteristics of a packet for scheduling decisions.
 ///
