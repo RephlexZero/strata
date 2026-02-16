@@ -61,10 +61,8 @@ pub async fn run(state: Arc<AgentState>) {
 
         // Drain any pending stats from integration_node's UDP relay.
         // We take the most recent one (in case multiple arrived in 1s).
-        let mut udp_count = 0u32;
         if let Some(ref sock) = stats_rx {
             while let Ok((n, _)) = sock.recv_from(&mut recv_buf) {
-                udp_count += 1;
                 if let Ok(parsed) = parse_bonding_stats(&recv_buf[..n]) {
                     last_real_stats = Some(parsed);
                 }
@@ -79,13 +77,6 @@ pub async fn run(state: Arc<AgentState>) {
         };
 
         let encoder_kbps = links.iter().map(|l| l.capacity_bps).sum::<u64>() / 1000;
-
-        tracing::debug!(
-            udp_count,
-            link_count = links.len(),
-            encoder_kbps,
-            "telemetry tick"
-        );
 
         let stats = StreamStatsPayload {
             stream_id,

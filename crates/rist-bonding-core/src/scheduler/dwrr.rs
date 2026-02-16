@@ -16,6 +16,10 @@ pub(crate) struct LinkState<L: ?Sized> {
     pub sent_bytes: u64,
     pub last_sent_bytes: u64,
     pub last_sent_at: Instant,
+    /// Bytes that the scheduler attempted to send but the link rejected
+    /// (e.g. RIST queue overflow). Used for congestion detection.
+    pub failed_bytes: u64,
+    pub last_failed_bytes: u64,
     pub measured_bps: f64,
     pub spare_capacity_bps: f64,
     pub has_traffic: bool,
@@ -100,6 +104,8 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 sent_bytes: 0,
                 last_sent_bytes: 0,
                 last_sent_at: now,
+                failed_bytes: 0,
+                last_failed_bytes: 0,
                 measured_bps: 0.0,
                 spare_capacity_bps: 0.0,
                 has_traffic: false,
@@ -128,16 +134,21 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             let dt_sent = now.duration_since(state.last_sent_at).as_secs_f64();
             if dt_sent > 0.0 {
                 let delta_bytes = state.sent_bytes.saturating_sub(state.last_sent_bytes);
-                if delta_bytes > 0 {
-                    state.measured_bps = (delta_bytes as f64 * 8.0) / dt_sent;
+                let delta_failed = state.failed_bytes.saturating_sub(state.last_failed_bytes);
+                let delta_total = delta_bytes + delta_failed;
+                if delta_total > 0 {
+                    state.measured_bps = (delta_total as f64 * 8.0) / dt_sent;
                     state.has_traffic = true;
                 }
                 state.last_sent_bytes = state.sent_bytes;
+                state.last_failed_bytes = state.failed_bytes;
                 state.last_sent_at = now;
             }
 
             state.metrics.observed_bps = state.measured_bps;
-            state.metrics.observed_bytes = state.sent_bytes;
+            // observed_bytes includes both delivered and failed sends so
+            // that congestion detection sees the *attempted* throughput.
+            state.metrics.observed_bytes = state.sent_bytes.saturating_add(state.failed_bytes);
 
             // Calculate spare capacity: only when we have observed traffic,
             // otherwise spare is 0 to prevent premature duplication at startup
@@ -203,6 +214,18 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
     pub fn record_send(&mut self, id: usize, bytes: u64) {
         if let Some(state) = self.links.get_mut(&id) {
             state.sent_bytes = state.sent_bytes.saturating_add(bytes);
+            state.has_traffic = true;
+        }
+    }
+
+    /// Records a failed send attempt for congestion detection.
+    ///
+    /// When `link.send()` fails (e.g. RIST queue overflow), the bytes
+    /// still count toward the link's "observed" throughput so the
+    /// congestion signal fires correctly.
+    pub fn record_send_failed(&mut self, id: usize, bytes: u64) {
+        if let Some(state) = self.links.get_mut(&id) {
+            state.failed_bytes = state.failed_bytes.saturating_add(bytes);
             state.has_traffic = true;
         }
     }

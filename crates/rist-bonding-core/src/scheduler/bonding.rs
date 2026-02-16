@@ -161,8 +161,15 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             let wrapped = header.wrap(payload);
 
             for link in links {
-                if link.send(&wrapped).is_ok() {
-                    self.scheduler.record_send(link.id(), packet_len as u64);
+                match link.send(&wrapped) {
+                    Ok(_) => {
+                        self.scheduler.record_send(link.id(), packet_len as u64);
+                    }
+                    Err(e) => {
+                        self.scheduler
+                            .record_send_failed(link.id(), packet_len as u64);
+                        tracing::debug!(link_id = link.id(), error = %e, "broadcast send failed");
+                    }
                 }
             }
             return Ok(());
@@ -208,8 +215,14 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
                     let wrapped = header.wrap(payload);
 
                     for link in links {
-                        if link.send(&wrapped).is_ok() {
-                            self.scheduler.record_send(link.id(), packet_len as u64);
+                        match link.send(&wrapped) {
+                            Ok(_) => {
+                                self.scheduler.record_send(link.id(), packet_len as u64);
+                            }
+                            Err(_) => {
+                                self.scheduler
+                                    .record_send_failed(link.id(), packet_len as u64);
+                            }
                         }
                     }
                     return Ok(());
@@ -226,10 +239,19 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             let header = crate::protocol::header::BondingHeader::new(seq);
             let wrapped = header.wrap(payload);
 
-            link.send(&wrapped)?;
-            self.scheduler.record_send(link.id(), packet_len as u64);
-            self.consecutive_dead_count = 0;
-            return Ok(());
+            let link_id = link.id();
+            match link.send(&wrapped) {
+                Ok(_) => {
+                    self.scheduler.record_send(link_id, packet_len as u64);
+                    self.consecutive_dead_count = 0;
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.scheduler
+                        .record_send_failed(link_id, packet_len as u64);
+                    // Fall through to dead-links path
+                }
+            }
         }
 
         // All links dead — escalate logging based on consecutive failures.

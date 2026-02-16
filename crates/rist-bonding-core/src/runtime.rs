@@ -189,8 +189,9 @@ fn runtime_worker(
 
         if last_fast_stats.elapsed() >= fast_stats_interval {
             scheduler.refresh_metrics();
+            let all_metrics = scheduler.get_all_metrics();
             if let Ok(mut m) = metrics.lock() {
-                *m = scheduler.get_all_metrics();
+                *m = all_metrics;
             }
             last_fast_stats = Instant::now();
         }

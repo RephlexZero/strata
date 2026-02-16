@@ -80,9 +80,9 @@ services:
       GST_PLUGIN_PATH: "/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
       # Per-link tc netem impairment config (override to tune)
       # Format: RATE_KBIT DELAY_MS JITTER_MS LOSS_PERCENT
-      LINK0_IMPAIRMENT: "1500 40 10 1.0"
-      LINK1_IMPAIRMENT: "800 60 15 2.0"
-      LINK2_IMPAIRMENT: "1200 35 8 0.5"
+      LINK0_IMPAIRMENT: "8000 40 10 1.0"
+      LINK1_IMPAIRMENT: "5000 60 15 2.0"
+      LINK2_IMPAIRMENT: "6000 35 8 0.5"
     entrypoint: ["/usr/local/bin/entrypoint-sender.sh"]
     command:
       - "--control-url"
