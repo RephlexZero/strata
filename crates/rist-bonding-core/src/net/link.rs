@@ -175,11 +175,6 @@ impl LinkSender for Link {
             phase = lifecycle.update(now, rtt_ms, loss_rate, bw, stats_age);
         }
 
-        let alive = matches!(
-            phase,
-            LinkPhase::Probe | LinkPhase::Warm | LinkPhase::Live | LinkPhase::Degrade
-        ) || self.created_at.elapsed().as_secs() < 5;
-
         let (os_up, mtu, iface_name, link_kind) = if let Some(iface) = &self.iface {
             let last_poll_ms = self.stats.os_last_poll_ms.load(Ordering::Relaxed);
             if should_poll_os(now_ms, last_poll_ms) {
@@ -220,6 +215,16 @@ impl LinkSender for Link {
         } else {
             (None, None, None, None)
         };
+
+        // A link is alive based on lifecycle phase, but immediately killed
+        // when the OS reports the interface as down.  This prevents the
+        // scheduler from sending traffic into a downed NIC.
+        let os_is_down = os_up == Some(false);
+        let alive = !os_is_down
+            && (matches!(
+                phase,
+                LinkPhase::Probe | LinkPhase::Warm | LinkPhase::Live | LinkPhase::Degrade
+            ) || self.created_at.elapsed().as_secs() < 5);
 
         LinkMetrics {
             rtt_ms,

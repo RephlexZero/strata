@@ -10,6 +10,7 @@ mod imp {
     #[derive(Default)]
     pub struct RsRistBondSinkPad {
         pub uri: Mutex<String>,
+        pub interface: Mutex<Option<String>>,
     }
 
     #[glib::object_subclass]
@@ -24,11 +25,18 @@ mod imp {
             static PROPERTIES: std::sync::OnceLock<Vec<glib::ParamSpec>> =
                 std::sync::OnceLock::new();
             PROPERTIES.get_or_init(|| {
-                vec![glib::ParamSpecString::builder("uri")
-                    .nick("URI")
-                    .blurb("RIST URI for this link (e.g. rist://1.2.3.4:5000)")
-                    .mutable_ready()
-                    .build()]
+                vec![
+                    glib::ParamSpecString::builder("uri")
+                        .nick("URI")
+                        .blurb("RIST URI for this link (e.g. rist://1.2.3.4:5000)")
+                        .mutable_ready()
+                        .build(),
+                    glib::ParamSpecString::builder("interface")
+                        .nick("Interface")
+                        .blurb("OS network interface name (e.g. eth0) to bind this link to")
+                        .mutable_ready()
+                        .build(),
+                ]
             })
         }
 
@@ -49,6 +57,11 @@ mod imp {
                         self.obj().notify("uri");
                     }
                 }
+                "interface" => {
+                    let iface: String = value.get().expect("type checked upstream");
+                    let mut current = lock_or_recover(&self.interface);
+                    *current = if iface.is_empty() { None } else { Some(iface) };
+                }
                 _ => {
                     gst::warning!(gst::CAT_DEFAULT, "Unknown pad property: {}", pspec.name());
                 }
@@ -60,6 +73,10 @@ mod imp {
                 "uri" => {
                     let uri = lock_or_recover(&self.uri);
                     uri.to_value()
+                }
+                "interface" => {
+                    let iface = lock_or_recover(&self.interface);
+                    iface.clone().unwrap_or_default().to_value()
                 }
                 _ => {
                     gst::warning!(gst::CAT_DEFAULT, "Unknown pad property: {}", pspec.name());
@@ -81,5 +98,9 @@ glib::wrapper! {
 impl RsRistBondSinkPad {
     pub fn get_uri(&self) -> String {
         lock_or_recover(&self.imp().uri).clone()
+    }
+
+    pub fn get_interface(&self) -> Option<String> {
+        lock_or_recover(&self.imp().interface).clone()
     }
 }

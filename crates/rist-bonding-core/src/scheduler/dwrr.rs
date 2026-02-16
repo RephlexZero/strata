@@ -378,8 +378,12 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                     LinkPhase::Cooldown | LinkPhase::Reset | LinkPhase::Init => 0.1,
                 };
 
+                // When the OS reports the interface as down, zero out
+                // credits entirely.  The link should already be marked
+                // not-alive in Link::get_metrics, but this is belt-and-
+                // suspenders to prevent any stale traffic.
                 let os_up_factor = if matches!(metrics.os_up, Some(false)) {
-                    0.2
+                    0.0
                 } else {
                     1.0
                 };
@@ -869,5 +873,111 @@ mod tests {
         };
         dwrr.update_config(new_cfg);
         assert!(!dwrr.config().redundancy_enabled);
+    }
+
+    #[test]
+    fn os_down_zeroes_credits_completely() {
+        // When os_up=Some(false), effective_bps should be 0 (os_up_factor=0.0)
+        // so no credits accumulate at all.
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        if let Ok(mut m) = link.metrics.lock() {
+            m.os_up = Some(false);
+            m.alive = false; // Mirror what Link::get_metrics does
+        }
+
+        let mut dwrr = Dwrr::new();
+        dwrr.add_link(link.clone());
+        dwrr.refresh_metrics();
+
+        // Give time for credits to accumulate
+        for state in dwrr.links.values_mut() {
+            state.last_update -= Duration::from_secs(1);
+        }
+
+        // Try to select — should fail because link is dead and the only one
+        let _ = dwrr.select_link(100);
+        let credits = dwrr.links.get(&1).unwrap().credits;
+
+        // Credits should be ≤ 0 (the packet_cost was deducted but no credits added)
+        assert!(
+            credits <= 0.0,
+            "os_up=false link should have zero or negative credits, got {}",
+            credits
+        );
+    }
+
+    #[test]
+    fn os_down_link_skipped_when_others_alive() {
+        // Link1: os_up=false (dead), Link2: os_up=true (alive)
+        // All traffic should go to Link2.
+        let link1 = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let link2 = Arc::new(MockLink::new(2, 10_000_000.0, LinkPhase::Live));
+
+        if let Ok(mut m) = link1.metrics.lock() {
+            m.os_up = Some(false);
+            m.alive = false;
+        }
+        if let Ok(mut m) = link2.metrics.lock() {
+            m.os_up = Some(true);
+        }
+
+        let mut dwrr = Dwrr::new();
+        dwrr.add_link(link1.clone());
+        dwrr.add_link(link2.clone());
+        dwrr.refresh_metrics();
+
+        // Give time for credits
+        for state in dwrr.links.values_mut() {
+            state.last_update -= Duration::from_secs(1);
+        }
+
+        // Select 10 times — all should go to link2
+        for _ in 0..10 {
+            let selected = dwrr.select_link(100).unwrap();
+            assert_eq!(selected.id(), 2, "Only alive link (2) should be selected");
+        }
+    }
+
+    #[test]
+    fn os_down_link_excluded_from_broadcast() {
+        let link1 = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let link2 = Arc::new(MockLink::new(2, 10_000_000.0, LinkPhase::Live));
+
+        if let Ok(mut m) = link1.metrics.lock() {
+            m.os_up = Some(false);
+            m.alive = false;
+        }
+
+        let mut dwrr = Dwrr::new();
+        dwrr.add_link(link1.clone());
+        dwrr.add_link(link2.clone());
+        dwrr.refresh_metrics();
+
+        let broadcast = dwrr.broadcast_links(100);
+        assert_eq!(broadcast.len(), 1, "Only alive links should broadcast");
+        assert_eq!(broadcast[0].id(), 2);
+    }
+
+    #[test]
+    fn os_up_none_does_not_penalize() {
+        // When os_up=None (no interface monitoring), credits should
+        // accumulate normally — no penalty.
+        let link = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+
+        let mut dwrr = Dwrr::new();
+        dwrr.add_link(link.clone());
+        dwrr.refresh_metrics();
+
+        for state in dwrr.links.values_mut() {
+            state.last_update -= Duration::from_secs(1);
+        }
+
+        let _ = dwrr.select_link(0);
+        let credits = dwrr.links.get(&1).unwrap().credits;
+        assert!(
+            credits > 0.0,
+            "os_up=None should not penalize credits, got {}",
+            credits
+        );
     }
 }

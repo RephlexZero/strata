@@ -366,7 +366,14 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .request_pad_simple("link_%u")
                 .ok_or("Failed to request link pad")?;
             pad.set_property("uri", uri);
-            eprintln!("Configured link {} -> {}", idx, uri);
+
+            // Resolve which OS interface routes to this destination
+            if let Some(iface) = resolve_interface_for_uri(uri) {
+                pad.set_property("interface", &iface);
+                eprintln!("Configured link {} -> {} (via {})", idx, uri, iface);
+            } else {
+                eprintln!("Configured link {} -> {}", idx, uri);
+            }
         }
     } else {
         return Err("Failed to find rsristbondsink element".into());
@@ -469,6 +476,34 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     pipeline.set_state(gst::State::Null)?;
     let _ = std::fs::remove_file(control_sock_path);
     Ok(())
+}
+
+// ── Interface resolution ────────────────────────────────────────────
+
+/// Resolve which OS network interface routes to the host in a RIST URI.
+///
+/// Parses the host from `rist://<host>:<port>?...` and runs
+/// `ip route get <host>` to determine the outgoing interface.
+fn resolve_interface_for_uri(uri: &str) -> Option<String> {
+    // Extract host from rist://HOST:PORT?...
+    let stripped = uri.strip_prefix("rist://")?;
+    let host = stripped.split(':').next()?;
+    if host.is_empty() {
+        return None;
+    }
+
+    let output = std::process::Command::new("ip")
+        .args(["route", "get", host])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Parse: "172.30.0.20 dev eth2 src 172.30.0.10 ..."
+    for part in stdout.split_whitespace().collect::<Vec<_>>().windows(2) {
+        if part[0] == "dev" {
+            return Some(part[1].to_string());
+        }
+    }
+    None
 }
 
 // ── Stats serialization ─────────────────────────────────────────────

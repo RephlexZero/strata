@@ -679,4 +679,126 @@ mod tests {
         // Should be sent to single link, not broadcast
         assert_eq!(l1_count + l2_count, 1);
     }
+
+    #[test]
+    fn test_os_down_link_excluded_from_traffic() {
+        // When one link has os_up=false (interface down), all traffic
+        // should be routed through remaining alive links.
+        let mut scheduler = BondingScheduler::new();
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
+
+        // Mark link1 as interface-down
+        {
+            let mut m = l1.metrics.lock().unwrap();
+            m.os_up = Some(false);
+            m.alive = false;
+        }
+
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+        scheduler.refresh_metrics();
+
+        // Send 20 non-critical droppable packets
+        for _ in 0..20 {
+            let payload = Bytes::from_static(b"TestData");
+            let profile = crate::scheduler::PacketProfile {
+                is_critical: false,
+                can_drop: true,
+                size_bytes: payload.len(),
+            };
+            scheduler.send(payload, profile).unwrap();
+        }
+
+        let l1_count = l1.sent_packets.lock().unwrap().len();
+        let l2_count = l2.sent_packets.lock().unwrap().len();
+
+        // All 20 packets should go to link2 (link1 is dead)
+        assert_eq!(l1_count, 0, "Dead link should receive no traffic");
+        assert_eq!(l2_count, 20, "Alive link should receive all traffic");
+    }
+
+    #[test]
+    fn test_os_down_link_excluded_from_broadcast() {
+        // Even critical broadcast should skip links with os_up=false.
+        let mut scheduler = BondingScheduler::new();
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
+
+        {
+            let mut m = l1.metrics.lock().unwrap();
+            m.os_up = Some(false);
+            m.alive = false;
+        }
+
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+        scheduler.refresh_metrics();
+
+        let payload = Bytes::from_static(b"Keyframe");
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: true,
+            can_drop: false,
+            size_bytes: payload.len(),
+        };
+        scheduler.send(payload, profile).unwrap();
+
+        let l1_count = l1.sent_packets.lock().unwrap().len();
+        let l2_count = l2.sent_packets.lock().unwrap().len();
+
+        assert_eq!(l1_count, 0, "Dead link should not receive broadcasts");
+        assert_eq!(l2_count, 1, "Alive link should receive broadcast");
+    }
+
+    #[test]
+    fn test_os_down_recovery_resumes_traffic() {
+        // When a downed interface comes back up, traffic should resume
+        // flowing to it.
+        let mut scheduler = BondingScheduler::new();
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
+
+        // Start with link1 down
+        {
+            let mut m = l1.metrics.lock().unwrap();
+            m.os_up = Some(false);
+            m.alive = false;
+        }
+
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+        scheduler.refresh_metrics();
+
+        // Send during outage — all goes to l2
+        let payload = Bytes::from_static(b"Data");
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: false,
+            can_drop: true,
+            size_bytes: payload.len(),
+        };
+        scheduler.send(payload.clone(), profile).unwrap();
+
+        assert_eq!(l1.sent_packets.lock().unwrap().len(), 0);
+        assert_eq!(l2.sent_packets.lock().unwrap().len(), 1);
+
+        // Bring link1 back up
+        {
+            let mut m = l1.metrics.lock().unwrap();
+            m.os_up = Some(true);
+            m.alive = true;
+        }
+        scheduler.refresh_metrics();
+
+        // Send more packets — link1 should now participate
+        for _ in 0..20 {
+            scheduler.send(payload.clone(), profile).unwrap();
+        }
+
+        let l1_count = l1.sent_packets.lock().unwrap().len();
+        assert!(
+            l1_count > 0,
+            "Recovered link should receive traffic again, got {}",
+            l1_count
+        );
+    }
 }

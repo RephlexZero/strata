@@ -127,7 +127,7 @@ mod imp {
             self.send_msg(SinkMessage::AddLink {
                 id,
                 uri,
-                iface: None,
+                iface: pad.get_interface(),
             });
         }
 

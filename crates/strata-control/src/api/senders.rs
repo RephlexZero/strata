@@ -282,13 +282,11 @@ async fn unenroll_sender(
     }
 
     // Check if already unenrolled
-    let enrolled = sqlx::query_scalar::<_, bool>(
-        "SELECT enrolled FROM senders WHERE id = $1",
-    )
-    .bind(&id)
-    .fetch_one(state.pool())
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    let enrolled = sqlx::query_scalar::<_, bool>("SELECT enrolled FROM senders WHERE id = $1")
+        .bind(&id)
+        .fetch_one(state.pool())
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
 
     if !enrolled {
         return Err(ApiError::bad_request("sender is not currently enrolled"));
