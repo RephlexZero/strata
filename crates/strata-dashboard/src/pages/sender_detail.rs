@@ -776,7 +776,14 @@ pub fn SenderDetailPage() -> impl IntoView {
                                             </p>
                                         </div>
                                         {move || {
-                                            if show_unenroll_confirm.get() {
+                                            let is_enrolled = sender.get().map(|s| s.enrolled).unwrap_or(false);
+                                            if !is_enrolled && unenroll_token.get().is_none() {
+                                                view! {
+                                                    <button class="btn btn-disabled" disabled=true>
+                                                        "Not Enrolled"
+                                                    </button>
+                                                }.into_any()
+                                            } else if show_unenroll_confirm.get() {
                                                 view! {
                                                     <div class="flex gap-2">
                                                         <button class="btn btn-error" on:click=do_unenroll disabled=move || action_loading.get()>

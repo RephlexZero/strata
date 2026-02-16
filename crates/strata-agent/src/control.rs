@@ -52,12 +52,20 @@ pub async fn run(
     let max_backoff = Duration::from_secs(30);
 
     loop {
-        tracing::info!(url = %control_url, "connecting to control plane");
+        // Check for a pending enrollment token (from portal or initial CLI arg).
+        // This allows re-enrollment after unenroll without restarting the agent.
+        let active_token: Option<String> = {
+            let pending = state.pending_enrollment_token.lock().await;
+            pending.clone()
+        }
+        .or_else(|| enrollment_token.map(|s| s.to_string()));
+
+        tracing::info!(url = %control_url, has_token = active_token.is_some(), "connecting to control plane");
 
         match connect_and_run(
             &state,
             control_url,
-            enrollment_token,
+            active_token.as_deref(),
             hostname,
             heartbeat_interval,
             &mut outgoing_rx,
