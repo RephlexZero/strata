@@ -120,8 +120,12 @@ pub async fn list_streams(token: &str) -> ApiResult<Vec<StreamSummary>> {
     }
 }
 
-pub async fn start_stream(token: &str, sender_id: &str) -> ApiResult<StartStreamResponse> {
-    let body = StartStreamRequest {};
+pub async fn start_stream(
+    token: &str,
+    sender_id: &str,
+    destination_id: Option<String>,
+) -> ApiResult<StartStreamResponse> {
+    let body = StartStreamRequest { destination_id };
     let resp = Request::post(&format!("/api/streams/start/{sender_id}"))
         .header("Authorization", &auth_header(token))
         .json(&body)

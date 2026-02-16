@@ -58,6 +58,9 @@ pub fn SenderDetailPage() -> impl IntoView {
 
     // Destination picker for starting a stream
     let (show_start_modal, set_show_start_modal) = signal(false);
+    let (destinations, set_destinations) = signal(Vec::<crate::types::DestinationSummary>::new());
+    let (selected_dest, set_selected_dest) = signal(Option::<String>::None);
+    let (dests_loading, set_dests_loading) = signal(false);
 
     // Receiver URL change confirmation
     let (show_receiver_confirm, set_show_receiver_confirm) = signal(false);
@@ -158,18 +161,30 @@ pub fn SenderDetailPage() -> impl IntoView {
         }
     });
 
+    let auth_open = auth.clone();
     let open_start_modal = move |_| {
         set_show_start_modal.set(true);
+        set_selected_dest.set(None);
+        set_dests_loading.set(true);
+        let token = auth_open.token.get_untracked().unwrap_or_default();
+        leptos::task::spawn_local(async move {
+            match api::list_destinations(&token).await {
+                Ok(dests) => set_destinations.set(dests),
+                Err(_) => set_destinations.set(vec![]),
+            }
+            set_dests_loading.set(false);
+        });
     };
 
     let auth_start2 = auth.clone();
     let confirm_start_stream = move |_| {
         let id = params.get().get("id").unwrap_or_default();
         let token = auth_start2.token.get_untracked().unwrap_or_default();
+        let dest_id = selected_dest.get_untracked();
         set_action_loading.set(true);
         set_show_start_modal.set(false);
         leptos::task::spawn_local(async move {
-            match api::start_stream(&token, &id).await {
+            match api::start_stream(&token, &id, dest_id).await {
                 Ok(resp) => {
                     set_stream_state.set(resp.state);
                     set_action_loading.set(false);
@@ -290,6 +305,129 @@ pub fn SenderDetailPage() -> impl IntoView {
                 <div class="alert alert-error text-sm mb-4">{e}</div>
             })}
 
+            // ── Start Stream — Destination Picker (outside sender reactive scope) ──
+            {move || show_start_modal.get().then(|| {
+                view! {
+                    <div class="modal modal-open">
+                        <div class="modal-box">
+                            <h3 class="font-bold text-lg">"Start Stream"</h3>
+                            <p class="text-sm text-base-content/60 mt-2">
+                                "Select a destination for the stream, or start without one for bonded RIST only."
+                            </p>
+
+                            <div class="mt-4">
+                                {move || {
+                                    if dests_loading.get() {
+                                        view! { <p class="text-sm text-base-content/40">"Loading destinations…"</p> }.into_any()
+                                    } else {
+                                        let dests = destinations.get();
+                                        view! {
+                                            <div class="flex flex-col gap-2">
+                                                // "No destination" option — RIST-only
+                                                <label class="flex items-center gap-3 p-3 bg-base-300 rounded cursor-pointer hover:bg-base-content/10 border border-base-300"
+                                                    class:border-primary=move || selected_dest.get().is_none()
+                                                >
+                                                    <input
+                                                        type="radio"
+                                                        name="destination"
+                                                        class="radio radio-sm radio-primary"
+                                                        checked=move || selected_dest.get().is_none()
+                                                        on:change=move |_| set_selected_dest.set(None)
+                                                    />
+                                                    <div>
+                                                        <div class="font-medium text-sm">"Bonded RIST Only"</div>
+                                                        <div class="text-xs text-base-content/60">"Stream to the configured receiver without an RTMP relay"</div>
+                                                    </div>
+                                                </label>
+
+                                                // Destination options
+                                                {dests.iter().map(|d| {
+                                                    let d_id = d.id.clone();
+                                                    let d_id3 = d.id.clone();
+                                                    let d_id4 = d.id.clone();
+                                                    let d_name = d.name.clone();
+                                                    let d_platform = d.platform.clone();
+                                                    let d_url = d.url.clone();
+                                                    view! {
+                                                        <label class="flex items-center gap-3 p-3 bg-base-300 rounded cursor-pointer hover:bg-base-content/10 border border-base-300"
+                                                            class:border-primary=move || selected_dest.get().as_deref() == Some(&d_id3)
+                                                        >
+                                                            <input
+                                                                type="radio"
+                                                                name="destination"
+                                                                class="radio radio-sm radio-primary"
+                                                                checked=move || selected_dest.get().as_deref() == Some(&d_id4)
+                                                                on:change=move |_| set_selected_dest.set(Some(d_id.clone()))
+                                                            />
+                                                            <div>
+                                                                <div class="font-medium text-sm">{d_name}</div>
+                                                                <div class="text-xs text-base-content/60 font-mono">{d_platform} " · " {d_url}</div>
+                                                            </div>
+                                                        </label>
+                                                    }
+                                                }).collect::<Vec<_>>()}
+
+                                                {dests.is_empty().then(|| view! {
+                                                    <p class="text-xs text-base-content/40 mt-1">
+                                                        "No destinations configured. Add one from the Destinations page."
+                                                    </p>
+                                                })}
+                                            </div>
+                                        }.into_any()
+                                    }
+                                }}
+                            </div>
+
+                            <div class="modal-action">
+                                <button class="btn btn-ghost" on:click=move |_| set_show_start_modal.set(false)>
+                                    "Cancel"
+                                </button>
+                                <button
+                                    class="btn btn-primary"
+                                    on:click=confirm_start_stream
+                                    disabled=move || dests_loading.get()
+                                >
+                                    "▶ Go Live"
+                                </button>
+                            </div>
+                        </div>
+                        <div class="modal-backdrop" on:click=move |_| set_show_start_modal.set(false)>
+                            <button>"close"</button>
+                        </div>
+                    </div>
+                }
+            })}
+
+            // ── Receiver URL Change Confirmation (outside sender reactive scope) ──
+            {move || show_receiver_confirm.get().then(|| view! {
+                <div class="modal modal-open">
+                    <div class="modal-box">
+                        <h3 class="font-bold text-lg text-warning">"⚠ Change Receiver URL?"</h3>
+                        <p class="mt-3 text-sm">
+                            "This sender is currently "
+                            <strong>{if stream_state.get() == "live" { "streaming" } else { "online" }}</strong>
+                            ". Changing the receiver URL may cause a "
+                            <strong>"connection loss"</strong>
+                            " and require re-pairing."
+                        </p>
+                        <p class="mt-2 text-sm text-base-content/60">
+                            "Are you sure you want to proceed?"
+                        </p>
+                        <div class="modal-action">
+                            <button class="btn btn-ghost" on:click=move |_| set_show_receiver_confirm.set(false)>
+                                "Cancel"
+                            </button>
+                            <button class="btn btn-warning" on:click=move |_| do_save_config(())>
+                                "Yes, Change Receiver"
+                            </button>
+                        </div>
+                    </div>
+                    <div class="modal-backdrop" on:click=move |_| set_show_receiver_confirm.set(false)>
+                        <button>"close"</button>
+                    </div>
+                </div>
+            })}
+
             {move || {
                 let s = sender.get();
                 match s {
@@ -327,67 +465,6 @@ pub fn SenderDetailPage() -> impl IntoView {
                                     }}
                                 </div>
                             </div>
-
-                            // ── Start Stream Confirmation ────────────
-                            {move || show_start_modal.get().then(|| {
-                                view! {
-                                    <div class="modal modal-open">
-                                        <div class="modal-box">
-                                            <h3 class="font-bold text-lg">"Start Stream"</h3>
-                                            <p class="text-sm text-base-content/60 mt-2">
-                                                "Start broadcasting on all enabled bonded links?"
-                                            </p>
-                                            <p class="text-sm text-base-content/60 mt-1">
-                                                "The stream will use the SMPTE test source at 1 Mbps."
-                                            </p>
-                                            <div class="modal-action">
-                                                <button class="btn btn-ghost" on:click=move |_| set_show_start_modal.set(false)>
-                                                    "Cancel"
-                                                </button>
-                                                <button
-                                                    class="btn btn-primary"
-                                                    on:click=confirm_start_stream
-                                                >
-                                                    "▶ Go Live"
-                                                </button>
-                                            </div>
-                                        </div>
-                                        <div class="modal-backdrop" on:click=move |_| set_show_start_modal.set(false)>
-                                            <button>"close"</button>
-                                        </div>
-                                    </div>
-                                }
-                            })}
-
-                            // ── Receiver URL Change Confirmation ────────
-                            {move || show_receiver_confirm.get().then(|| view! {
-                                <div class="modal modal-open">
-                                    <div class="modal-box">
-                                        <h3 class="font-bold text-lg text-warning">"⚠ Change Receiver URL?"</h3>
-                                        <p class="mt-3 text-sm">
-                                            "This sender is currently "
-                                            <strong>{if stream_state.get() == "live" { "streaming" } else { "online" }}</strong>
-                                            ". Changing the receiver URL may cause a "
-                                            <strong>"connection loss"</strong>
-                                            " and require re-pairing."
-                                        </p>
-                                        <p class="mt-2 text-sm text-base-content/60">
-                                            "Are you sure you want to proceed?"
-                                        </p>
-                                        <div class="modal-action">
-                                            <button class="btn btn-ghost" on:click=move |_| set_show_receiver_confirm.set(false)>
-                                                "Cancel"
-                                            </button>
-                                            <button class="btn btn-warning" on:click=move |_| do_save_config(())>
-                                                "Yes, Change Receiver"
-                                            </button>
-                                        </div>
-                                    </div>
-                                    <div class="modal-backdrop" on:click=move |_| set_show_receiver_confirm.set(false)>
-                                        <button>"close"</button>
-                                    </div>
-                                </div>
-                            })}
 
                             // ── System Stats ────────────────────────────
                             {move || {

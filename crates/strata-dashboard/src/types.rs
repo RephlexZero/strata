@@ -156,7 +156,10 @@ pub struct StreamDetail {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct StartStreamRequest {}
+pub struct StartStreamRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_id: Option<String>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartStreamResponse {
