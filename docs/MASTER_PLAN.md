@@ -432,6 +432,54 @@ diversity:
 
 This prevents multiple modems from competing for the same tower sector resources.
 
+### Link Hotplugging
+
+USB modems can be physically plugged in or removed at runtime. Strata must
+handle dynamic link membership without interrupting the stream.
+
+#### Detection
+
+- **udev monitor**: The modem supervisor subscribes to udev events for
+  `ACTION=add` / `ACTION=remove` on `SUBSYSTEM=net` (or `SUBSYSTEM=usb`,
+  `DRIVER=qmi_wwan|cdc_mbim`)
+- **ModemManager signals**: D-Bus `InterfaceAdded` / `InterfaceRemoved` on
+  `org.freedesktop.ModemManager1`
+- **Polling fallback**: Enumerate `/sys/class/net/` every 2 seconds
+
+#### Link Join (modem plugged in)
+
+1. udev event fires → supervisor detects new network interface
+2. Wait for IP assignment (DHCP or QMI-initiated bearer)
+3. Create new DWRR queue with initial quantum = 0 (no traffic yet)
+4. Send PING probes to measure initial RTT
+5. After 3 successful PINGs, initialize Biscay CC state (Slow Start)
+6. Begin QMI/MBIM polling for RF metrics
+7. Set Thompson Sampling prior to Beta(1, 1) (uninformative — will explore)
+8. Ramp quantum up from 0 to normal over 500ms (avoid burst onto untested link)
+9. Emit `LinkJoined` event to telemetry
+
+#### Link Leave (modem unplugged / total failure)
+
+1. udev event fires OR 5 consecutive PING timeouts → declare link dead
+2. Immediately set DWRR quantum = 0 (no new packets enqueued)
+3. Drain remaining packets in that link's queue:
+   - If < 50ms of data: let it flush
+   - If > 50ms: re-enqueue packets onto other links' DWRR queues
+4. Redistribute that link's capacity proportionally to remaining links
+5. Reset Thompson Sampling state for the removed link
+6. Emit `LinkLeft` event to telemetry
+7. Cleanup: drop Biscay CC state, close socket, release slab entries
+
+#### Session Protocol Support
+
+The SESSION control packet (subtype 0x07) includes a `LINK_JOIN` and
+`LINK_LEAVE` variant so the receiver knows about membership changes:
+
+| Action | Sender → Receiver | Effect |
+|---|---|---|
+| LINK_JOIN | New link ID + capabilities | Receiver opens per-link stats tracking |
+| LINK_LEAVE | Link ID + reason code | Receiver stops expecting packets from that link |
+
 ---
 
 ## 8. Media Awareness
@@ -603,6 +651,65 @@ ipr.tc("replace", "netem", link_index, delay=50000, jitter=20000,
        loss_model="gemodel", p=5, r=95, h=0.1, k=99.9)
 ```
 
+#### Path Isolation: Policy-Based Routing (PBR)
+
+Without PBR, the Linux kernel may short-circuit the simulation by routing
+packets via the default gateway instead of through the impaired bridge. Each
+container must enforce per-link routing:
+
+```bash
+# setup_routing.sh — run inside sender container
+# Link 1: force traffic bound for receiver via bridge_1
+ip route add 172.20.0.0/24 dev eth1 table 100
+ip rule add from 172.20.0.2/32 lookup 100
+
+# Link 2: force via bridge_2
+ip route add 172.21.0.0/24 dev eth2 table 101
+ip rule add from 172.21.0.2/32 lookup 101
+
+# Link 3: force via bridge_3
+ip route add 172.22.0.0/24 dev eth3 table 102
+ip rule add from 172.22.0.2/32 lookup 102
+```
+
+#### eBPF TC Hooks (Advanced)
+
+For sub-millisecond impairment granularity beyond what `tc netem` provides
+(~1ms resolution), attach eBPF programs to the TC egress hook:
+
+- eBPF map populated with trace profile (timestamp → action)
+- Kernel-resident program checks current time against map
+- Decides drop/delay/pass with nanosecond precision, zero user-space overhead
+- Maps updated atomically from user space without reloading the qdisc
+
+Use case: simulating mmWave blockage with sub-ms transitions.
+
+#### Clock Sync & One-Way Delay Measurement
+
+Accurate OWD measurement requires tight clock synchronization between containers:
+
+- **Chrony container**: Local Stratum 1 NTP server in a dedicated container.
+  All test containers sync solely to this reference. Provides sub-ms accuracy,
+  sufficient for characterizing cellular jitter (typically 10-100ms)
+- **PTP**: Optionally run `ptp4l` on the host and map `/dev/ptp0` into
+  containers for microsecond-level sync
+- **OWAMP**: Run `perfsonar/owamp` container for background one-way delay
+  measurements parallel to the media stream — "ground truth" baseline
+
+#### Correlated Failures & Background Traffic
+
+Real cellular networks exhibit correlated failures and contention:
+
+- **Shared backhaul**: Two modems on the same tower share backhaul. Simulate
+  by applying identical impairment to bridge_1 and bridge_2 simultaneously
+  (coordinated via net_controller)
+- **Background TCP flows**: Inject `iperf3` TCP streams into the same bridges
+  to create realistic bufferbloat pressure. Forces the bonding protocol to
+  contend for queue space — tests AQM sensitivity
+- **Correlated loss bursts**: When one link enters deep fade, adjacent bands
+  on the same tower often degrade too. Model with synchronized Gilbert-Elliott
+  state transitions across bridges
+
 #### Scenarios from Real-World Data
 
 | Scenario | Source | Parameters |
@@ -612,6 +719,8 @@ ipr.tc("replace", "netem", link_index, delay=50000, jitter=20000,
 | Rural coverage | Pantheon traces | Low bandwidth, stable but slow |
 | mmWave blockage | NYU 5G | Sudden 100% loss for 200-800ms |
 | Highway handover | CellReplay | RSRP ramp-down/up pattern |
+| Shared backhaul | Synthetic | Correlated degradation on 2 links |
+| Bufferbloat | iperf3 + netem | TCP cross-traffic on all bridges |
 
 ### Tier 4: Fuzz Testing
 
