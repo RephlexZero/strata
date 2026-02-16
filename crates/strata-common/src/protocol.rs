@@ -90,8 +90,14 @@ pub struct DeviceStatusPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamStatsPayload {
     pub stream_id: String,
+    /// Sender that produced these stats (set by control plane).
+    #[serde(default)]
+    pub sender_id: String,
     pub uptime_s: u64,
     pub encoder_bitrate_kbps: u32,
+    /// Epoch milliseconds when these stats were captured.
+    #[serde(default)]
+    pub timestamp_ms: u64,
     pub links: Vec<LinkStats>,
 }
 
@@ -382,8 +388,10 @@ mod tests {
     fn agent_message_stream_stats() {
         let msg = AgentMessage::StreamStats(StreamStatsPayload {
             stream_id: "str_test".into(),
+            sender_id: "snd_abc".into(),
             uptime_s: 120,
             encoder_bitrate_kbps: 5000,
+            timestamp_ms: 1700000000000,
             links: vec![crate::models::LinkStats {
                 id: 1,
                 interface: "wwan0".into(),
@@ -392,7 +400,9 @@ mod tests {
                 loss_rate: 0.005,
                 capacity_bps: 10_000_000,
                 sent_bytes: 500_000,
+                observed_bps: 8_000_000,
                 signal_dbm: Some(-65),
+                link_kind: Some("cellular".into()),
             }],
         });
 
@@ -593,18 +603,22 @@ mod tests {
     fn dashboard_event_stream_stats() {
         let event = DashboardEvent::StreamStats(StreamStatsPayload {
             stream_id: "str_live".into(),
+            sender_id: "snd_xyz".into(),
             uptime_s: 300,
             encoder_bitrate_kbps: 4500,
+            timestamp_ms: 1700000000000,
             links: vec![],
         });
 
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("stream.stats"));
+        assert!(json.contains("snd_xyz"));
 
         let recovered: DashboardEvent = serde_json::from_str(&json).unwrap();
         match recovered {
             DashboardEvent::StreamStats(p) => {
                 assert_eq!(p.stream_id, "str_live");
+                assert_eq!(p.sender_id, "snd_xyz");
                 assert_eq!(p.encoder_bitrate_kbps, 4500);
             }
             _ => panic!("wrong variant"),

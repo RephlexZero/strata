@@ -227,7 +227,13 @@ pub struct LinkStats {
     pub loss_rate: f64,
     pub capacity_bps: u64,
     pub sent_bytes: u64,
+    /// Current observed throughput in bits per second.
+    #[serde(default)]
+    pub observed_bps: u64,
     pub signal_dbm: Option<i32>,
+    /// Link technology kind (e.g. "ethernet", "cellular", "wifi").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_kind: Option<String>,
 }
 
 #[cfg(test)]
@@ -402,13 +408,26 @@ mod tests {
             loss_rate: 0.01,
             capacity_bps: 15_000_000,
             sent_bytes: 1_048_576,
+            observed_bps: 8_000_000,
             signal_dbm: Some(-72),
+            link_kind: Some("cellular".into()),
         };
         let json = serde_json::to_string(&stats).unwrap();
         let parsed: LinkStats = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, 1);
         assert!((parsed.rtt_ms - 23.5).abs() < f64::EPSILON);
         assert_eq!(parsed.capacity_bps, 15_000_000);
+        assert_eq!(parsed.observed_bps, 8_000_000);
+        assert_eq!(parsed.link_kind.as_deref(), Some("cellular"));
+    }
+
+    #[test]
+    fn link_stats_backward_compat() {
+        // Old JSON without observed_bps or link_kind should still parse
+        let json = r#"{"id":0,"interface":"eth0","state":"Live","rtt_ms":10.0,"loss_rate":0.0,"capacity_bps":10000000,"sent_bytes":0,"signal_dbm":null}"#;
+        let parsed: LinkStats = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.observed_bps, 0);
+        assert!(parsed.link_kind.is_none());
     }
 
     #[test]

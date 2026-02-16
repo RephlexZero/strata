@@ -120,19 +120,23 @@ pub fn SenderDetailPage() -> impl IntoView {
             let sender_id = params.get().get("id").unwrap_or_default();
             match event {
                 DashboardEvent::StreamStats {
-                    stream_id: _,
+                    sender_id: stats_sender_id,
                     uptime_s,
                     encoder_bitrate_kbps,
                     links,
+                    ..
                 } => {
-                    set_live_bitrate.set(encoder_bitrate_kbps);
-                    set_live_uptime.set(uptime_s);
-                    set_live_links.set(links);
-                    // Stats flowing means the stream is live — auto-promote
-                    // from "starting" in case we missed the state change event.
-                    let st = stream_state.get_untracked();
-                    if st == "starting" {
-                        set_stream_state.set("live".into());
+                    // Only apply stats that belong to this sender
+                    if stats_sender_id == sender_id {
+                        set_live_bitrate.set(encoder_bitrate_kbps);
+                        set_live_uptime.set(uptime_s);
+                        set_live_links.set(links);
+                        // Stats flowing means the stream is live — auto-promote
+                        // from "starting" in case we missed the state change event.
+                        let st = stream_state.get_untracked();
+                        if st == "starting" {
+                            set_stream_state.set("live".into());
+                        }
                     }
                 }
                 DashboardEvent::StreamStateChanged {
@@ -662,7 +666,7 @@ pub fn SenderDetailPage() -> impl IntoView {
                                             view! {
                                                 <div class="stats stats-horizontal bg-base-300 w-full mt-3">
                                                     <div class="stat">
-                                                        <div class="stat-title">"Bitrate"</div>
+                                                        <div class="stat-title">"Throughput"</div>
                                                         <div class="stat-value text-lg font-mono">{move || live_bitrate.get()}<span class="text-sm text-base-content/60">" kbps"</span></div>
                                                     </div>
                                                     <div class="stat">
@@ -690,6 +694,7 @@ pub fn SenderDetailPage() -> impl IntoView {
                                                                             <th>"State"</th>
                                                                             <th>"RTT"</th>
                                                                             <th>"Loss"</th>
+                                                                            <th>"Throughput"</th>
                                                                             <th>"Capacity"</th>
                                                                             <th>"Sent"</th>
                                                                         </tr>
@@ -699,12 +704,29 @@ pub fn SenderDetailPage() -> impl IntoView {
                                                                             each=move || live_links.get()
                                                                             key=|l| l.id
                                                                             children=move |link| {
+                                                                                let state_cls = match link.state.as_str() {
+                                                                                    "Live" => "badge badge-success badge-sm",
+                                                                                    "Probing" => "badge badge-warning badge-sm",
+                                                                                    "Down" | "OS Down" => "badge badge-error badge-sm",
+                                                                                    _ => "badge badge-ghost badge-sm",
+                                                                                };
+                                                                                let row_cls = if link.state == "Down" || link.state == "OS Down" {
+                                                                                    "font-mono text-sm opacity-50"
+                                                                                } else {
+                                                                                    "font-mono text-sm"
+                                                                                };
                                                                                 view! {
-                                                                                    <tr class="font-mono text-sm">
-                                                                                        <td>{link.interface.clone()}</td>
-                                                                                        <td>{link.state.clone()}</td>
+                                                                                    <tr class=row_cls>
+                                                                                        <td>
+                                                                                            {link.interface.clone()}
+                                                                                            {link.link_kind.as_ref().map(|k| view! {
+                                                                                                <span class="text-xs text-base-content/40 ml-1">"(" {k.clone()} ")"</span>
+                                                                                            })}
+                                                                                        </td>
+                                                                                        <td><span class=state_cls>{link.state.clone()}</span></td>
                                                                                         <td>{format!("{:.1}ms", link.rtt_ms)}</td>
                                                                                         <td>{format!("{:.2}%", link.loss_rate * 100.0)}</td>
+                                                                                        <td>{format_bps(link.observed_bps)}</td>
                                                                                         <td>{format_bps(link.capacity_bps)}</td>
                                                                                         <td>{format_bytes(link.sent_bytes)}</td>
                                                                                     </tr>

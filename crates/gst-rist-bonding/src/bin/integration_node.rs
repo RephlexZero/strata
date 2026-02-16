@@ -590,10 +590,7 @@ fn handle_toggle_link(
                 .unwrap()
                 .insert(iface.clone(), (uri, pad_iface));
             sink.release_request_pad(&pad);
-            eprintln!(
-                "toggle-link: disabled link on {} (released pad)",
-                iface
-            );
+            eprintln!("toggle-link: disabled link on {} (released pad)", iface);
         } else {
             eprintln!("toggle-link: no pad found for interface '{}'", iface);
         }
@@ -605,15 +602,14 @@ fn handle_toggle_link(
 /// Serialize the `rist-bonding-stats` GStreamer structure into JSON
 /// that the agent telemetry module can parse.
 ///
-/// The structure has per-link fields like `link_0_rtt`, `link_0_capacity`,
-/// `link_0_loss`, etc.  We iterate alive links and build a JSON object:
-/// `{"links":[{"id":0,"rtt_us":35000,"loss_rate":0.01,...},...]}`
+/// Includes ALL links (alive and dead) with full metadata so the
+/// dashboard can show link state transitions and technology type.
 fn serialize_bonding_stats(s: &gst::StructureRef) -> String {
     let alive_links = s.get::<u64>("alive_links").unwrap_or(0);
+    let wall_time_ms = s.get::<u64>("wall_time_ms").unwrap_or(0);
     let mut links = Vec::new();
 
-    // The link IDs in the structure are not necessarily 0..N contiguous,
-    // so we probe link_<id>_rtt for ids 0..max_reasonable
+    // Probe link IDs — not necessarily 0..N contiguous
     let max_probe = alive_links.max(8) as u32;
     for id in 0..max_probe {
         let rtt_key = format!("link_{}_rtt", id);
@@ -625,29 +621,46 @@ fn serialize_bonding_stats(s: &gst::StructureRef) -> String {
             let observed_bytes = s
                 .get::<u64>(&format!("link_{}_observed_bytes", id))
                 .unwrap_or(0);
+            let observed_bps = s
+                .get::<f64>(&format!("link_{}_observed_bps", id))
+                .unwrap_or(0.0);
             let iface = s
                 .get::<&str>(&format!("link_{}_iface", id))
                 .unwrap_or("unknown");
             let alive = s
                 .get::<bool>(&format!("link_{}_alive", id))
                 .unwrap_or(false);
-
-            if !alive {
-                continue;
-            }
+            let phase = s
+                .get::<&str>(&format!("link_{}_phase", id))
+                .unwrap_or("unknown");
+            let os_up = s
+                .get::<i32>(&format!("link_{}_os_up", id))
+                .unwrap_or(-1);
+            let kind = s
+                .get::<&str>(&format!("link_{}_kind", id))
+                .unwrap_or("");
 
             links.push(serde_json::json!({
                 "id": id,
                 "rtt_us": (rtt_ms * 1000.0) as u64,
                 "loss_rate": loss,
-                "capacity_bps": capacity as u64,
+                "capacity_bps": capacity.round() as u64,
                 "sent_bytes": observed_bytes,
+                "observed_bps": observed_bps.round() as u64,
                 "interface": iface,
+                "alive": alive,
+                "phase": phase,
+                "os_up": os_up,
+                "link_kind": kind,
             }));
         }
     }
 
-    serde_json::json!({ "links": links }).to_string()
+    serde_json::json!({
+        "links": links,
+        "timestamp_ms": wall_time_ms,
+    })
+    .to_string()
 }
 
 // ── Hot-swap helpers ────────────────────────────────────────────────
@@ -914,7 +927,10 @@ fn run_control_socket(path: &str, pipeline_weak: gst::glib::WeakRef<gst::Pipelin
                         .build();
                     let msg = gst::message::Application::new(structure);
                     let _ = pipeline.post_message(msg);
-                    eprintln!("Control: queued toggle-link iface={} enabled={}", iface, enabled);
+                    eprintln!(
+                        "Control: queued toggle-link iface={} enabled={}",
+                        iface, enabled
+                    );
                 }
             } else {
                 eprintln!("Control: unknown command: {}", line);

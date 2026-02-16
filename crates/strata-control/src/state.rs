@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use sqlx::PgPool;
 use tokio::sync::{broadcast, oneshot};
 
@@ -26,6 +26,9 @@ struct Inner {
     pub pending_requests: DashMap<String, oneshot::Sender<serde_json::Value>>,
     /// Broadcast channel for dashboard WebSocket subscribers.
     pub dashboard_tx: broadcast::Sender<DashboardEvent>,
+    /// Streams that have already transitioned to 'live' (avoids repeated
+    /// UPDATE queries on every stats tick).
+    pub live_streams: DashSet<String>,
 }
 
 /// Handle to a connected sender agent.
@@ -39,7 +42,7 @@ pub struct AgentHandle {
 
 impl AppState {
     pub fn new(pool: PgPool, jwt: JwtContext) -> Self {
-        let (dashboard_tx, _) = broadcast::channel(256);
+        let (dashboard_tx, _) = broadcast::channel(1024);
         Self {
             inner: Arc::new(Inner {
                 pool,
@@ -48,6 +51,7 @@ impl AppState {
                 device_status: DashMap::new(),
                 pending_requests: DashMap::new(),
                 dashboard_tx,
+                live_streams: DashSet::new(),
             }),
         }
     }
@@ -72,6 +76,11 @@ impl AppState {
     /// Get the pending requests map (for request-response patterns to agents).
     pub fn pending_requests(&self) -> &DashMap<String, oneshot::Sender<serde_json::Value>> {
         &self.inner.pending_requests
+    }
+
+    /// Streams that have already transitioned to 'live'.
+    pub fn live_streams(&self) -> &DashSet<String> {
+        &self.inner.live_streams
     }
 
     /// Broadcast a dashboard event to all subscribed browsers.

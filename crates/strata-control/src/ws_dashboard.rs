@@ -39,7 +39,10 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                     Ok(event) => {
                         let json = match serde_json::to_string(&event) {
                             Ok(j) => j,
-                            Err(_) => continue,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to serialize dashboard event");
+                                continue;
+                            }
                         };
                         if ws_tx.send(Message::Text(json.into())).await.is_err() {
                             break;

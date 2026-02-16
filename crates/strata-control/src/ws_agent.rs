@@ -247,23 +247,36 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
             }
         }
         "stream.stats" => {
-            if let Ok(payload) = envelope.parse_payload::<StreamStatsPayload>() {
-                // Transition stream from 'starting' → 'live' on first stats message
-                let rows = sqlx::query(
-                    "UPDATE streams SET state = 'live' WHERE id = $1 AND state = 'starting'",
-                )
-                .bind(&payload.stream_id)
-                .execute(state.pool())
-                .await;
+            if let Ok(mut payload) = envelope.parse_payload::<StreamStatsPayload>() {
+                // Stamp sender_id and timestamp at the trust boundary
+                payload.sender_id = sender_id.to_string();
+                payload.timestamp_ms =
+                    chrono::Utc::now().timestamp_millis() as u64;
 
-                // Only broadcast state change on the actual transition
-                if rows.as_ref().map(|r| r.rows_affected()).unwrap_or(0) > 0 {
-                    state.broadcast_dashboard(DashboardEvent::StreamStateChanged {
-                        stream_id: payload.stream_id.clone(),
-                        sender_id: sender_id.to_string(),
-                        state: strata_common::models::StreamState::Live,
-                        error: None,
-                    });
+                // Transition stream from 'starting' → 'live' on first stats message.
+                // Only run the UPDATE if we haven't already transitioned this stream.
+                if !state.live_streams().contains(&payload.stream_id) {
+                    let rows = sqlx::query(
+                        "UPDATE streams SET state = 'live' WHERE id = $1 AND state = 'starting'",
+                    )
+                    .bind(&payload.stream_id)
+                    .execute(state.pool())
+                    .await;
+
+                    // Track the stream as live so we don't re-query every second
+                    state
+                        .live_streams()
+                        .insert(payload.stream_id.clone());
+
+                    // Only broadcast state change on the actual transition
+                    if rows.as_ref().map(|r| r.rows_affected()).unwrap_or(0) > 0 {
+                        state.broadcast_dashboard(DashboardEvent::StreamStateChanged {
+                            stream_id: payload.stream_id.clone(),
+                            sender_id: sender_id.to_string(),
+                            state: strata_common::models::StreamState::Live,
+                            error: None,
+                        });
+                    }
                 }
 
                 state.broadcast_dashboard(DashboardEvent::StreamStats(payload));
@@ -271,6 +284,9 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
         }
         "stream.ended" => {
             if let Ok(payload) = envelope.parse_payload::<StreamEndedPayload>() {
+                // Remove from live_streams tracking
+                state.live_streams().remove(&payload.stream_id);
+
                 // Update stream record
                 let _ = sqlx::query(
                     "UPDATE streams SET state = 'ended', ended_at = $1, total_bytes = $2 WHERE id = $3",

@@ -63,8 +63,13 @@ pub async fn run(state: Arc<AgentState>) {
         // We take the most recent one (in case multiple arrived in 1s).
         if let Some(ref sock) = stats_rx {
             while let Ok((n, _)) = sock.recv_from(&mut recv_buf) {
-                if let Ok(parsed) = parse_bonding_stats(&recv_buf[..n]) {
-                    last_real_stats = Some(parsed);
+                match parse_bonding_stats(&recv_buf[..n]) {
+                    Ok(parsed) => {
+                        last_real_stats = Some(parsed);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to parse bonding stats from integration_node");
+                    }
                 }
             }
         }
@@ -76,12 +81,20 @@ pub async fn run(state: Arc<AgentState>) {
             last_real_stats.clone().unwrap_or_default()
         };
 
-        let encoder_kbps = links.iter().map(|l| l.capacity_bps).sum::<u64>() / 1000;
+        // Use sum of observed_bps (actual throughput), NOT capacity
+        let encoder_kbps: u64 = links.iter().map(|l| l.observed_bps).sum::<u64>() / 1000;
+
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
 
         let stats = StreamStatsPayload {
             stream_id,
+            sender_id: String::new(), // Set by control plane at trust boundary
             uptime_s: elapsed_s,
             encoder_bitrate_kbps: encoder_kbps.max(1) as u32,
+            timestamp_ms,
             links,
         };
 
@@ -98,9 +111,13 @@ pub async fn run(state: Arc<AgentState>) {
 ///
 /// The JSON comes from the `rist-bonding-stats` GStreamer bus message
 /// and has the shape: `{"links": [{"id": 0, "rtt_us": ..., ...}, ...]}`.
-fn parse_bonding_stats(data: &[u8]) -> Result<Vec<LinkStats>, ()> {
-    let v: serde_json::Value = serde_json::from_slice(data).map_err(|_| ())?;
-    let links_arr = v.get("links").and_then(|v| v.as_array()).ok_or(())?;
+fn parse_bonding_stats(data: &[u8]) -> Result<Vec<LinkStats>, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(data).map_err(|e| format!("JSON parse error: {e}"))?;
+    let links_arr = v
+        .get("links")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "missing 'links' array".to_string())?;
 
     let mut stats = Vec::with_capacity(links_arr.len());
     for link in links_arr {
@@ -121,21 +138,53 @@ fn parse_bonding_stats(data: &[u8]) -> Result<Vec<LinkStats>, ()> {
             .or_else(|| link.get("tx_bytes"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
+        let observed_bps = link
+            .get("observed_bps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let iface = link
             .get("interface")
             .or_else(|| link.get("iface"))
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
+        let alive = link.get("alive").and_then(|v| v.as_bool()).unwrap_or(true);
+        let phase = link
+            .get("phase")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let os_up = link.get("os_up").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let link_kind = link
+            .get("link_kind")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        // Derive human-readable state from alive/phase/os_up
+        let state = if !alive {
+            if os_up == 0 {
+                "OS Down".to_string()
+            } else {
+                "Down".to_string()
+            }
+        } else {
+            match phase {
+                "probing" => "Probing".to_string(),
+                "stable" => "Live".to_string(),
+                _ => "Live".to_string(),
+            }
+        };
 
         stats.push(LinkStats {
             id,
             interface: iface.to_string(),
-            state: "Live".into(),
+            state,
             rtt_ms: rtt_us / 1000.0,
             loss_rate: loss,
             capacity_bps: capacity,
             sent_bytes: sent,
+            observed_bps,
             signal_dbm: None,
+            link_kind,
         });
     }
     Ok(stats)
@@ -155,7 +204,9 @@ fn generate_simulated_stats() -> Vec<LinkStats> {
             loss_rate: rng.random_range(0.0..0.005_f64),
             capacity_bps: 8_000_000 + rng.random_range(0..2_000_000),
             sent_bytes: rng.random_range(10_000_000..500_000_000),
+            observed_bps: 3_000_000 + rng.random_range(0..1_000_000),
             signal_dbm: Some(-65 - rng.random_range(0..15)),
+            link_kind: Some("cellular".into()),
         },
         LinkStats {
             id: 1,
@@ -165,7 +216,9 @@ fn generate_simulated_stats() -> Vec<LinkStats> {
             loss_rate: rng.random_range(0.0..0.003_f64),
             capacity_bps: 12_000_000 + rng.random_range(0..3_000_000),
             sent_bytes: rng.random_range(10_000_000..500_000_000),
+            observed_bps: 4_000_000 + rng.random_range(0..2_000_000),
             signal_dbm: Some(-58 - rng.random_range(0..12)),
+            link_kind: Some("cellular".into()),
         },
     ]
 }

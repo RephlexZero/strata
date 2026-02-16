@@ -207,8 +207,12 @@ pub enum DashboardEvent {
     #[serde(rename = "stream.stats")]
     StreamStats {
         stream_id: String,
+        #[serde(default)]
+        sender_id: String,
         uptime_s: u64,
         encoder_bitrate_kbps: u32,
+        #[serde(default)]
+        timestamp_ms: u64,
         links: Vec<LinkStats>,
     },
 
@@ -230,7 +234,13 @@ pub struct LinkStats {
     pub loss_rate: f64,
     pub capacity_bps: u64,
     pub sent_bytes: u64,
+    /// Current observed throughput in bits per second.
+    #[serde(default)]
+    pub observed_bps: u64,
     pub signal_dbm: Option<i32>,
+    /// Link technology kind (e.g. "ethernet", "cellular").
+    #[serde(default)]
+    pub link_kind: Option<String>,
 }
 
 // ── API Error Response ──────────────────────────────────────────────
