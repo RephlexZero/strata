@@ -18,7 +18,7 @@
 //!   tsdemux ! h264parse ! avdec_h264 ! autovideosink
 //! ```
 
-use rist_network_sim::topology::Namespace;
+use strata_sim::topology::Namespace;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};

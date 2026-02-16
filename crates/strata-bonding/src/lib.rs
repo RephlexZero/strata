@@ -24,7 +24,7 @@ pub mod scheduler;
 ///
 /// Installs a default `tracing` subscriber (env-filter based) if no subscriber
 /// is already set. Safe to call multiple times — subsequent calls are no-ops.
-/// Controlled by `RUST_LOG` env var (e.g., `RUST_LOG=rist_bonding_core=debug`).
+/// Controlled by `RUST_LOG` env var (e.g., `RUST_LOG=strata_bonding=debug`).
 pub fn init() {
     use std::sync::Once;
     static INIT: Once = Once::new();

@@ -90,7 +90,7 @@ EXAMPLES:
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize structured logging for production use.
     // Controlled by RUST_LOG env var (e.g., RUST_LOG=info,librist=warn).
-    rist_bonding_core::init();
+    strata_bonding::init();
 
     gst::init()?;
 

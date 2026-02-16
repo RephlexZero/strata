@@ -3,7 +3,7 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
-use rist_bonding_core::receiver::bonding::BondingReceiver;
+use strata_bonding::receiver::bonding::BondingReceiver;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -40,7 +40,7 @@ mod imp {
             if toml_str.trim().is_empty() {
                 return;
             }
-            match rist_bonding_core::config::BondingConfig::from_toml_str(toml_str) {
+            match strata_bonding::config::BondingConfig::from_toml_str(toml_str) {
                 Ok(cfg) => {
                     let mut settings = lock_or_recover(&self.settings);
                     settings.config_toml = toml_str.to_string();

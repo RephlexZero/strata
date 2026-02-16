@@ -1481,26 +1481,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gst-rist-bonding"
-version = "0.4.0"
-dependencies = [
- "arc-swap",
- "bytes",
- "crossbeam-channel",
- "ctrlc",
- "gstreamer",
- "gstreamer-app",
- "gstreamer-base",
- "once_cell",
- "plotters",
- "rist-bonding-core",
- "rist-network-sim",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
 name = "gstreamer"
 version = "0.24.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3162,35 +3142,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rist-bonding-core"
-version = "0.1.2"
-dependencies = [
- "anyhow",
- "arc-swap",
- "bytes",
- "compact_str",
- "crossbeam-channel",
- "libc",
- "librist-sys",
- "raptorq",
- "rtrb",
- "serde",
- "serde_json",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "rist-network-sim"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rand 0.10.0",
- "tracing",
-]
-
-[[package]]
 name = "rsa"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3825,6 +3776,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "strata-bonding"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "bytes",
+ "compact_str",
+ "crossbeam-channel",
+ "libc",
+ "librist-sys",
+ "raptorq",
+ "rtrb",
+ "serde",
+ "serde_json",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "strata-common"
 version = "0.1.0"
 dependencies = [
@@ -3890,6 +3861,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "strata-gst"
+version = "0.4.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "crossbeam-channel",
+ "ctrlc",
+ "gstreamer",
+ "gstreamer-app",
+ "gstreamer-base",
+ "once_cell",
+ "plotters",
+ "serde",
+ "serde_json",
+ "strata-bonding",
+ "strata-sim",
+ "tracing",
+]
+
+[[package]]
 name = "strata-portal"
 version = "0.1.0"
 dependencies = [
@@ -3905,6 +3896,26 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "strata-sim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rand 0.10.0",
+ "tracing",
+]
+
+[[package]]
+name = "strata-transport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "rand 0.10.0",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

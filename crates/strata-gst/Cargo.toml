@@ -1,5 +1,5 @@
 [package]
-name = "gst-rist-bonding"
+name = "strata-gst"
 version = "0.4.0"
 edition = "2021"
 description = "GStreamer RIST bonding sink and source elements"
@@ -9,7 +9,7 @@ repository = "https://github.com/RephlexZero/strata"
 gst = { workspace = true }
 gst-base = { workspace = true }
 gst-app = { workspace = true }
-rist-bonding-core = { path = "../rist-bonding-core" }
+strata-bonding = { path = "../strata-bonding" }
 tracing = { workspace = true }
 once_cell = { workspace = true }
 bytes.workspace = true
@@ -30,5 +30,5 @@ path = "src/bin/integration_node.rs"
 
 [dev-dependencies]
 plotters = "0.3.7"
-rist-network-sim = { path = "../rist-network-sim" }
+strata-sim = { path = "../strata-sim" }
 serde_json = { workspace = true }

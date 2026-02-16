@@ -1,7 +1,7 @@
 use plotters::prelude::*;
-use rist_network_sim::impairment::{apply_impairment, ImpairmentConfig};
-use rist_network_sim::scenario::{LinkScenarioConfig, Scenario, ScenarioConfig};
-use rist_network_sim::topology::Namespace;
+use strata_sim::impairment::{apply_impairment, ImpairmentConfig};
+use strata_sim::scenario::{LinkScenarioConfig, Scenario, ScenarioConfig};
+use strata_sim::topology::Namespace;
 use serde_json::Value;
 use std::io::Write;
 use std::net::UdpSocket;

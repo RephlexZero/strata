@@ -2,9 +2,10 @@
 resolver = "2"
 members = [
     "crates/librist-sys",
-    "crates/rist-bonding-core",
-    "crates/gst-rist-bonding",
-    "crates/rist-network-sim",
+    "crates/strata-transport",
+    "crates/strata-bonding",
+    "crates/strata-gst",
+    "crates/strata-sim",
     "crates/strata-common",
     "crates/strata-control",
     "crates/strata-agent",
