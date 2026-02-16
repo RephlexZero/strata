@@ -164,12 +164,13 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             }
 
             if state.metrics.capacity_bps < 1_000_000.0 {
-                // Use configured capacity floor for bootstrap
-                if state.measured_bps > (capacity_floor * 0.3) {
-                    state.metrics.capacity_bps = state.measured_bps * 2.0;
-                } else {
-                    state.metrics.capacity_bps = capacity_floor;
-                }
+                // librist bandwidth hasn't converged yet — use the capacity floor.
+                // Avoid using `measured_bps * 2.0` because the scheduler distributes
+                // traffic proportionally to capacity. If all links bootstrap to
+                // the same 2×throughput, a feedback loop forms and all link stats
+                // converge to identical values with no way to differentiate them.
+                // The flat floor lets RTT/loss quality factors drive divergence.
+                state.metrics.capacity_bps = capacity_floor;
             }
             let prev_capacity = state.prev_capacity_bps;
             let curr_capacity = state.metrics.capacity_bps;

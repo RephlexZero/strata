@@ -8,15 +8,11 @@ use std::time::Instant;
 /// Smoothed statistics state for a single link's stats callback.
 ///
 /// Updated by the librist stats callback at each interval (~100ms),
-/// holding the EWMA filters for RTT, bandwidth, and loss, plus
-/// counters for delta computation.
+/// holding the EWMA filters for RTT, bandwidth, and loss.
 pub struct EwmaStats {
     pub rtt: Ewma,
     pub bandwidth: Ewma,
     pub loss: Ewma,
-    pub last_sent: u64,
-    pub last_lost: u64,
-    pub last_rex: u64,
     pub last_stats_ms: u64,
 }
 
@@ -26,9 +22,6 @@ impl EwmaStats {
             rtt: Ewma::new(alpha),
             bandwidth: Ewma::new(alpha),
             loss: Ewma::new(alpha),
-            last_sent: 0,
-            last_lost: 0,
-            last_rex: 0,
             last_stats_ms: 0,
         }
     }
@@ -468,7 +461,7 @@ mod tests {
     fn ewma_stats_default_alpha() {
         let s = EwmaStats::default();
         assert!((s.rtt.value() - 0.0).abs() < f64::EPSILON);
-        assert_eq!(s.last_sent, 0);
+        assert_eq!(s.last_stats_ms, 0);
     }
 
     #[test]

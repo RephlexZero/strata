@@ -39,25 +39,29 @@ pub fn resolve_iface_ipv4(iface: &str) -> Option<IpAddr> {
     }
 }
 
-/// Modify a RIST URL to bind to a specific local IP address.
-/// e.g., "rist://1.2.3.4:5000" + iface "eth0" (IP 10.0.0.1) -> "rist://10.0.0.1@1.2.3.4:5000"
-/// This tells librist to use the specified local address for the socket,
-/// effectively binding traffic to that interface.
+/// Modify a RIST URL to bind to a specific local IP address via the `miface`
+/// query parameter. librist uses `miface` for source-address binding on
+/// sender sockets (calls `bind()` with the IP or `SO_BINDTODEVICE` with a
+/// device name).
+///
+/// e.g., "rist://1.2.3.4:5000" + iface "eth0" (IP 10.0.0.1)
+///    -> "rist://1.2.3.4:5000?miface=10.0.0.1"
+///
+/// If the URL already has query parameters the new param is appended with `&`.
 pub fn bind_url_to_iface(url: &str, iface: &str) -> Option<String> {
     let local_ip = resolve_iface_ipv4(iface)?;
 
-    // RIST URL format: rist://[local_ip@]remote_ip:port[?params]
-    // We need to insert local_ip@ before the remote address.
-    if let Some(rest) = url.strip_prefix("rist://") {
-        // Check if there's already a local binding (@)
-        if rest.contains('@') {
-            // Already has a local binding, don't override
-            return Some(url.to_string());
-        }
-        Some(format!("rist://{}@{}", local_ip, rest))
-    } else {
-        None
+    if !url.starts_with("rist://") {
+        return None;
     }
+
+    // If there's already a miface parameter, don't override.
+    if url.contains("miface=") {
+        return Some(url.to_string());
+    }
+
+    let separator = if url.contains('?') { '&' } else { '?' };
+    Some(format!("{}{}miface={}", url, separator, local_ip))
 }
 
 /// Lifecycle phase of a network link.

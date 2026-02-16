@@ -130,27 +130,20 @@ unsafe extern "C" fn stats_cb(
         if let Ok(mut ewma) = link_stats.ewma_state.lock() {
             ewma.rtt.update(sender_stats.rtt as f64);
 
+            // librist resets sent/retransmitted counters after each stats
+            // callback (memset to 0 in rist_sender_peer_statistics), so
+            // these values represent the CURRENT interval only — NOT
+            // cumulative. Use them directly instead of computing deltas.
             let sent = sender_stats.sent;
             let rex = sender_stats.retransmitted;
 
-            let delta_sent = sent.saturating_sub(ewma.last_sent);
-            let delta_rex = rex.saturating_sub(ewma.last_rex);
-
-            let dt_ms = if ewma.last_stats_ms > 0 {
-                now_ms.saturating_sub(ewma.last_stats_ms)
-            } else {
-                0
-            };
-
-            ewma.last_sent = sent;
-            ewma.last_rex = rex;
             ewma.last_stats_ms = now_ms;
 
-            // Calculate "Badness" ratio: (Retransmitted) / Sent
-            // If sent is 0 (idle), we keep previous estimate or decay?
-            // If idle, loss is 0.
-            let loss_ratio = if delta_sent > 0 {
-                delta_rex as f64 / delta_sent as f64
+            // Loss ratio: retransmissions / sent for this interval.
+            // A non-zero ratio indicates the receiver is requesting
+            // retransmits via NACK, which correlates with link loss.
+            let loss_ratio = if sent > 0 {
+                rex as f64 / sent as f64
             } else {
                 0.0
             };
@@ -158,11 +151,9 @@ unsafe extern "C" fn stats_cb(
             // Update EWMA with current loss ratio (0.0 - 1.0+)
             ewma.loss.update(loss_ratio);
 
-            // Bandwidth update (fallback if librist reports 0)
-            let mut bw_bps = sender_stats.bandwidth as f64;
-            if bw_bps <= 0.0 && dt_ms > 0 && delta_sent > 0 {
-                bw_bps = (delta_sent as f64 * 8.0 * 1000.0) / dt_ms as f64;
-            }
+            // Bandwidth: librist computes this from actual socket bytes
+            // using rist_calculate_bitrate (bits/sec).
+            let bw_bps = sender_stats.bandwidth as f64;
             ewma.bandwidth.update(bw_bps);
             link_stats
                 .bandwidth
