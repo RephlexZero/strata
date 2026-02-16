@@ -1,0 +1,41 @@
+# ── Dev Override: Mount host-built binaries into containers ────────
+#
+# Usage:
+#   cargo build -p strata-agent -p strata-control -p gst-rist-bonding
+#   docker compose -f docker-compose.yml -f dev/docker-compose.dev.yml up -d
+#
+# Or use the helper script:
+#   ./dev/fast-reload.sh
+#
+# This override mounts the host's debug-built binaries directly into
+# the running containers via bind-mounts, completely skipping the
+# multi-stage Docker build.  Changes take effect with a simple:
+#
+#   cargo build -p strata-agent && docker compose restart strata-sender-sim
+#
+# The host dev container and the Docker runtime are both Debian 12
+# (bookworm) with identical GStreamer 1.22 packages, so the binaries
+# are directly compatible.
+#
+# ⚠ For production images, use the normal `docker compose build`.
+
+services:
+  strata-control:
+    volumes:
+      - ${PWD}/target/debug/strata-control:/usr/local/bin/strata-control:ro
+      # Dashboard WASM — mount if you're iterating on the dashboard too
+      # Build with: cd crates/strata-dashboard && trunk build
+      # - ${PWD}/crates/strata-dashboard/dist:/app/dashboard:ro
+
+  strata-sender-sim:
+    volumes:
+      - ${PWD}/target/debug/strata-agent:/usr/local/bin/strata-agent:ro
+      - ${PWD}/target/debug/integration_node:/usr/local/bin/integration_node:ro
+      - ${PWD}/target/debug/libgstristbonding.so:/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstrsristbonding.so:ro
+      # Portal WASM — mount if iterating on the portal
+      # Build with: cd crates/strata-portal && trunk build
+      # - ${PWD}/crates/strata-portal/dist:/app/portal:ro
+
+  strata-receiver:
+    volumes:
+      - ${PWD}/target/debug/libgstristbonding.so:/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstrsristbonding.so:ro
