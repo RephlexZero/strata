@@ -4,12 +4,12 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
-use strata_bonding::config::{BondingConfig, LinkConfig, SchedulerConfig};
-use strata_bonding::runtime::{BondingRuntime, PacketSendError};
-use strata_bonding::scheduler::PacketProfile;
 use std::collections::HashMap;
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use strata_bonding::config::{BondingConfig, LinkConfig, SchedulerConfig};
+use strata_bonding::runtime::{BondingRuntime, PacketSendError};
+use strata_bonding::scheduler::PacketProfile;
 
 fn parse_config(config: &str) -> Result<BondingConfig, String> {
     BondingConfig::from_toml_str(config)

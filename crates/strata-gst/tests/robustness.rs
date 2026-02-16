@@ -1,11 +1,11 @@
-use strata_sim::impairment::{apply_impairment, ImpairmentConfig};
-use strata_sim::scenario::{LinkScenarioConfig, Scenario, ScenarioConfig};
-use strata_sim::topology::Namespace;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use strata_sim::impairment::{apply_impairment, ImpairmentConfig};
+use strata_sim::scenario::{LinkScenarioConfig, Scenario, ScenarioConfig};
+use strata_sim::topology::Namespace;
 
 fn check_privileges() -> bool {
     // Check if we can run sudo without password

@@ -1,5 +1,3 @@
-use strata_sim::impairment::{apply_impairment, ImpairmentConfig};
-use strata_sim::topology::Namespace;
 use serde_json::Value;
 use std::net::UdpSocket;
 use std::path::PathBuf;
@@ -7,6 +5,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use strata_sim::impairment::{apply_impairment, ImpairmentConfig};
+use strata_sim::topology::Namespace;
 
 /// Build the integration binary and return its path.
 fn build_integration_binary() -> PathBuf {

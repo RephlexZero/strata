@@ -18,12 +18,12 @@
 //!   tsdemux ! h264parse ! avdec_h264 ! autovideosink
 //! ```
 
-use strata_sim::topology::Namespace;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
+use strata_sim::topology::Namespace;
 
 /// Workspace-root-relative output directory.
 fn output_dir() -> PathBuf {

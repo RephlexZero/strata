@@ -1,11 +1,11 @@
-use strata_sim::impairment::{apply_impairment, ImpairmentConfig};
-use strata_sim::topology::Namespace;
 use serde_json::Value;
 use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use strata_sim::impairment::{apply_impairment, ImpairmentConfig};
+use strata_sim::topology::Namespace;
 
 // Helper: Spawn process in netns
 fn spawn_in_ns(ns_name: &str, cmd: &str, args: &[&str]) -> std::process::Child {

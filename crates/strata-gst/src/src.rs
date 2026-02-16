@@ -3,10 +3,10 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
-use strata_bonding::receiver::bonding::BondingReceiver;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use strata_bonding::receiver::bonding::BondingReceiver;
 
 mod imp {
     use super::*;
