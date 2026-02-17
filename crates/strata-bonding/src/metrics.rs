@@ -584,12 +584,7 @@ pub fn render_receiver_prometheus(stats: &ReassemblyStats) -> String {
     )
     .unwrap();
     writeln!(out, "# TYPE strata_receiver_loss_rate gauge").unwrap();
-    writeln!(
-        out,
-        "strata_receiver_loss_rate {:.6}",
-        stats.loss_rate
-    )
-    .unwrap();
+    writeln!(out, "strata_receiver_loss_rate {:.6}", stats.loss_rate).unwrap();
 
     writeln!(
         out,

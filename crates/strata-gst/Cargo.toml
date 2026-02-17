@@ -28,7 +28,4 @@ path = "src/lib.rs"
 name = "strata-node"
 path = "src/bin/strata_node.rs"
 
-[dev-dependencies]
-plotters = "0.3.7"
-strata-sim = { path = "../strata-sim" }
-serde_json = { workspace = true }
+

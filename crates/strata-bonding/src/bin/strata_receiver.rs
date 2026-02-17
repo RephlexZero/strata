@@ -131,11 +131,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Cleanup ─────────────────────────────────────────────────
     drop(sink);
-    tracing::info!(
-        total_packets,
-        total_bytes,
-        "strata-receiver stopped"
-    );
+    tracing::info!(total_packets, total_bytes, "strata-receiver stopped");
 
     Ok(())
 }
@@ -163,34 +159,50 @@ fn parse_args() -> anyhow::Result<Args> {
         match args[i].as_str() {
             "--bind" | "-b" => {
                 i += 1;
-                let val = args.get(i).ok_or_else(|| anyhow::anyhow!("--bind requires a value"))?;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--bind requires a value"))?;
                 for part in val.split(',') {
-                    let addr: SocketAddr = part.trim().parse()
-                        .map_err(|e| anyhow::anyhow!("invalid bind address '{}': {}", part.trim(), e))?;
+                    let addr: SocketAddr = part.trim().parse().map_err(|e| {
+                        anyhow::anyhow!("invalid bind address '{}': {}", part.trim(), e)
+                    })?;
                     bind_addrs.push(addr);
                 }
             }
             "--latency" | "-l" => {
                 i += 1;
-                let val = args.get(i).ok_or_else(|| anyhow::anyhow!("--latency requires a value"))?;
-                latency_ms = val.parse().map_err(|e| anyhow::anyhow!("invalid latency '{}': {}", val, e))?;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--latency requires a value"))?;
+                latency_ms = val
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid latency '{}': {}", val, e))?;
             }
             "--relay-url" | "-r" => {
                 i += 1;
-                relay_url = Some(args.get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--relay-url requires a value"))?
-                    .clone());
+                relay_url = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--relay-url requires a value"))?
+                        .clone(),
+                );
             }
             "--output" | "-o" => {
                 i += 1;
-                output = Some(args.get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--output requires a value"))?
-                    .clone());
+                output = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--output requires a value"))?
+                        .clone(),
+                );
             }
             "--metrics-port" | "-m" => {
                 i += 1;
-                let val = args.get(i).ok_or_else(|| anyhow::anyhow!("--metrics-port requires a value"))?;
-                metrics_port = Some(val.parse().map_err(|e| anyhow::anyhow!("invalid port '{}': {}", val, e))?);
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--metrics-port requires a value"))?;
+                metrics_port = Some(
+                    val.parse()
+                        .map_err(|e| anyhow::anyhow!("invalid port '{}': {}", val, e))?,
+                );
             }
             "--help" | "-h" => {
                 print_help();
@@ -227,12 +239,18 @@ fn parse_args() -> anyhow::Result<Args> {
         anyhow::bail!("no bind addresses specified. Use --bind or BIND_ADDRS env var.\nRun with --help for usage.");
     }
 
-    Ok(Args { bind_addrs, latency_ms, relay_url, output, metrics_port })
+    Ok(Args {
+        bind_addrs,
+        latency_ms,
+        relay_url,
+        output,
+        metrics_port,
+    })
 }
 
 fn print_help() {
     eprintln!(
-r#"strata-receiver — Standalone bonded transport cloud receiver
+        r#"strata-receiver — Standalone bonded transport cloud receiver
 
 USAGE:
   strata-receiver --bind <ADDR[,ADDR...]> [OPTIONS]
@@ -266,7 +284,8 @@ EXAMPLES:
 
   # With Prometheus metrics
   strata-receiver --bind 0.0.0.0:5000 --metrics-port 9090
-"#);
+"#
+    );
 }
 
 // ─── Output Sinks ───────────────────────────────────────────────────────────
@@ -324,14 +343,19 @@ impl FfmpegRelay {
         let mut child = Command::new("ffmpeg")
             .args([
                 "-hide_banner",
-                "-loglevel", "warning",
+                "-loglevel",
+                "warning",
                 // Input: raw MPEG-TS from stdin
-                "-f", "mpegts",
-                "-i", "pipe:0",
+                "-f",
+                "mpegts",
+                "-i",
+                "pipe:0",
                 // Copy — no re-encoding
-                "-c", "copy",
+                "-c",
+                "copy",
                 // Output: FLV over RTMP
-                "-f", "flv",
+                "-f",
+                "flv",
                 relay_url,
             ])
             .stdin(Stdio::piped())
@@ -340,10 +364,15 @@ impl FfmpegRelay {
             .spawn()
             .map_err(|e| anyhow::anyhow!("failed to start ffmpeg: {e} (is ffmpeg installed?)"))?;
 
-        let stdin = child.stdin.take()
+        let stdin = child
+            .stdin
+            .take()
             .ok_or_else(|| anyhow::anyhow!("failed to open ffmpeg stdin"))?;
 
-        Ok(FfmpegRelay { child, stdin: Some(stdin) })
+        Ok(FfmpegRelay {
+            child,
+            stdin: Some(stdin),
+        })
     }
 }
 

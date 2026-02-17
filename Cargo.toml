@@ -11,9 +11,7 @@ members = [
     "crates/strata-dashboard",
     "crates/strata-portal",
 ]
-exclude = [
-    "crates/strata-transport/fuzz",
-]
+exclude = ["crates/strata-transport/fuzz"]
 
 [workspace.dependencies]
 tracing = "0.1.44"
