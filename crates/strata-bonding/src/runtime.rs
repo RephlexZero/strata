@@ -4,12 +4,14 @@ use crate::net::transport::TransportLink;
 use crate::scheduler::bonding::BondingScheduler;
 use crate::scheduler::PacketProfile;
 use bytes::Bytes;
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, Sender};
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use quanta::Instant;
 use strata_transport::sender::SenderConfig;
 use tracing::warn;
 
@@ -20,8 +22,8 @@ pub enum PacketSendError {
     Disconnected,
 }
 
-enum RuntimeMessage {
-    Packet(Bytes, PacketProfile),
+/// Control messages for the worker thread (cold path).
+enum ControlMessage {
     ApplyConfig(Box<BondingConfig>),
     AddLink(LinkConfig),
     RemoveLink(usize),
@@ -32,12 +34,16 @@ enum RuntimeMessage {
 ///
 /// Owns a background thread that runs the [`BondingScheduler`]
 /// loop, processing packets, applying configuration changes, and refreshing
-/// link metrics. All public methods are non-blocking and communicate with
-/// the worker via a bounded channel.
+/// link metrics.
+///
+/// Packets flow through a lock-free SPSC ring buffer (`rtrb`) for minimal
+/// latency. Control messages use a crossbeam channel for reliable delivery.
 ///
 /// Dropping the runtime triggers a graceful shutdown of the worker thread.
 pub struct BondingRuntime {
-    sender: Sender<RuntimeMessage>,
+    packet_tx: rtrb::Producer<(Bytes, PacketProfile)>,
+    control_tx: Sender<ControlMessage>,
+    alive: Arc<AtomicBool>,
     metrics: Arc<Mutex<HashMap<usize, LinkMetrics>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -50,18 +56,26 @@ impl BondingRuntime {
 
     /// Creates a runtime with the given scheduler configuration.
     pub fn with_config(scheduler_config: SchedulerConfig) -> Self {
-        let channel_capacity = scheduler_config.channel_capacity;
-        let (tx, rx) = bounded(channel_capacity);
+        let ring_capacity = scheduler_config.channel_capacity.next_power_of_two();
+        let (packet_tx, packet_rx) = rtrb::RingBuffer::new(ring_capacity);
+        let (control_tx, control_rx) = crossbeam_channel::unbounded();
         let metrics = Arc::new(Mutex::new(HashMap::new()));
         let metrics_clone = metrics.clone();
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_clone = alive.clone();
 
         let handle = thread::Builder::new()
             .name("strata-worker".into())
-            .spawn(move || runtime_worker(rx, metrics_clone, scheduler_config))
+            .spawn(move || {
+                runtime_worker(packet_rx, control_rx, metrics_clone, scheduler_config);
+                alive_clone.store(false, Ordering::Relaxed);
+            })
             .expect("failed to spawn bonding runtime worker");
 
         Self {
-            sender: tx,
+            packet_tx,
+            control_tx,
+            alive,
             metrics,
             handle: Some(handle),
         }
@@ -69,38 +83,39 @@ impl BondingRuntime {
 
     /// Enqueues a packet for transmission. Returns immediately.
     ///
-    /// Returns `PacketSendError::Full` if the internal channel is saturated,
+    /// Returns `PacketSendError::Full` if the internal ring buffer is saturated,
     /// or `PacketSendError::Disconnected` if the worker thread has exited.
     pub fn try_send_packet(
-        &self,
+        &mut self,
         data: Bytes,
         profile: PacketProfile,
     ) -> Result<(), PacketSendError> {
-        match self.sender.try_send(RuntimeMessage::Packet(data, profile)) {
-            Ok(_) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(PacketSendError::Full),
-            Err(TrySendError::Disconnected(_)) => Err(PacketSendError::Disconnected),
+        if !self.alive.load(Ordering::Relaxed) {
+            return Err(PacketSendError::Disconnected);
         }
+        self.packet_tx
+            .push((data, profile))
+            .map_err(|_| PacketSendError::Full)
     }
 
     /// Sends a full configuration update to the worker thread.
     pub fn apply_config(&self, config: BondingConfig) -> anyhow::Result<()> {
-        self.sender
-            .send(RuntimeMessage::ApplyConfig(Box::new(config)))
+        self.control_tx
+            .send(ControlMessage::ApplyConfig(Box::new(config)))
             .map_err(|e| anyhow::anyhow!("Failed to send config: {}", e))
     }
 
     /// Adds a single link dynamically at runtime.
     pub fn add_link(&self, link: LinkConfig) -> anyhow::Result<()> {
-        self.sender
-            .send(RuntimeMessage::AddLink(link))
+        self.control_tx
+            .send(ControlMessage::AddLink(link))
             .map_err(|e| anyhow::anyhow!("Failed to add link: {}", e))
     }
 
     /// Removes a link by ID at runtime.
     pub fn remove_link(&self, id: usize) -> anyhow::Result<()> {
-        self.sender
-            .send(RuntimeMessage::RemoveLink(id))
+        self.control_tx
+            .send(ControlMessage::RemoveLink(id))
             .map_err(|e| anyhow::anyhow!("Failed to remove link: {}", e))
     }
 
@@ -119,7 +134,7 @@ impl BondingRuntime {
 
     /// Gracefully shuts down the worker thread. Idempotent.
     pub fn shutdown(&mut self) {
-        let _ = self.sender.send(RuntimeMessage::Shutdown);
+        let _ = self.control_tx.send(ControlMessage::Shutdown);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -139,7 +154,8 @@ impl Drop for BondingRuntime {
 }
 
 fn runtime_worker(
-    rx: Receiver<RuntimeMessage>,
+    mut packet_rx: rtrb::Consumer<(Bytes, PacketProfile)>,
+    control_rx: Receiver<ControlMessage>,
     metrics: Arc<Mutex<HashMap<usize, LinkMetrics>>>,
     scheduler_config: SchedulerConfig,
 ) {
@@ -151,26 +167,42 @@ fn runtime_worker(
     let fast_stats_interval = Duration::from_millis(100);
 
     loop {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(msg) => match msg {
-                RuntimeMessage::Packet(data, profile) => {
-                    let _ = scheduler.send(data, profile);
+        let mut did_work = false;
+
+        // Drain all available packets from the lock-free ring buffer.
+        while let Ok((data, profile)) = packet_rx.pop() {
+            let _ = scheduler.send(data, profile);
+            did_work = true;
+        }
+
+        // Process control messages (non-blocking).
+        loop {
+            match control_rx.try_recv() {
+                Ok(msg) => {
+                    did_work = true;
+                    match msg {
+                        ControlMessage::AddLink(link) => {
+                            apply_link(&mut scheduler, &mut current_links, link);
+                        }
+                        ControlMessage::RemoveLink(id) => {
+                            scheduler.remove_link(id);
+                            current_links.remove(&id);
+                        }
+                        ControlMessage::ApplyConfig(config) => {
+                            scheduler.update_config(config.scheduler.clone());
+                            apply_config(&mut scheduler, &mut current_links, *config);
+                        }
+                        ControlMessage::Shutdown => return,
+                    }
                 }
-                RuntimeMessage::AddLink(link) => {
-                    apply_link(&mut scheduler, &mut current_links, link);
-                }
-                RuntimeMessage::RemoveLink(id) => {
-                    scheduler.remove_link(id);
-                    current_links.remove(&id);
-                }
-                RuntimeMessage::ApplyConfig(config) => {
-                    scheduler.update_config(config.scheduler.clone());
-                    apply_config(&mut scheduler, &mut current_links, *config);
-                }
-                RuntimeMessage::Shutdown => break,
-            },
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+            }
+        }
+
+        if !did_work {
+            // Brief yield when idle to avoid burning CPU.
+            thread::sleep(Duration::from_micros(100));
         }
 
         if last_fast_stats.elapsed() >= fast_stats_interval {
@@ -337,7 +369,7 @@ mod tests {
             channel_capacity: 16,
             ..SchedulerConfig::default()
         };
-        let rt = BondingRuntime::with_config(cfg);
+        let mut rt = BondingRuntime::with_config(cfg);
 
         let mut got_full = false;
         for _ in 0..10_000 {
@@ -499,7 +531,7 @@ mod tests {
 
     #[test]
     fn transport_runtime_sends_packets() {
-        let rt = BondingRuntime::new();
+        let mut rt = BondingRuntime::new();
 
         // Bind a receiver socket to get a known port
         let rcv_socket = UdpSocket::bind("127.0.0.1:0").unwrap();

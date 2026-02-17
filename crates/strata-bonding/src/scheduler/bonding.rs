@@ -12,7 +12,8 @@ use rand::SeedableRng;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use quanta::Instant;
 use tracing::{error, warn};
 
 /// Top-level bonding packet scheduler.
@@ -451,6 +452,7 @@ mod tests {
                     mtu: None,
                     iface: None,
                     link_kind: None,
+                    transport: None,
                 }),
                 sent_packets: Mutex::new(Vec::new()),
             }

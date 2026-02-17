@@ -10,13 +10,16 @@ use crate::receiver::aggregator::{Packet, ReassemblyBuffer, ReassemblyConfig, Re
 use anyhow::Result;
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
+use quinn_udp::{RecvMeta, UdpSockRef, UdpSocketState, BATCH_SIZE};
+use std::io::IoSliceMut;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use quanta::Instant;
 use strata_transport::receiver::{Receiver as TransportReceiver, ReceiverConfig, ReceiverEvent};
 use tracing::{debug, warn};
 
@@ -168,6 +171,12 @@ impl TransportBondingReceiver {
         self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// Returns a shared handle to the reassembly stats for external polling
+    /// (e.g., Prometheus metrics server).
+    pub fn stats_handle(&self) -> Arc<Mutex<ReassemblyStats>> {
+        self.stats.clone()
+    }
+
     /// Check if the receiver is still running.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
@@ -187,17 +196,42 @@ impl Drop for TransportBondingReceiver {
 /// them into the shared reassembly channel.
 fn link_reader(socket: UdpSocket, input_tx: Sender<Packet>, running: Arc<AtomicBool>) {
     let mut transport_rx = TransportReceiver::new(ReceiverConfig::default());
-    let mut buf = vec![0u8; 65536];
+
+    // Initialize quinn-udp state for GRO (Generic Receive Offload).
+    // This enables the kernel to coalesce multiple same-size datagrams
+    // into a single recv call, reducing syscall overhead.
+    let udp_state = UdpSocketState::new(UdpSockRef::from(&socket))
+        .expect("failed to initialize UdpSocketState for receiver");
+
+    let mut recv_bufs = vec![vec![0u8; 65536]; BATCH_SIZE];
+    let mut recv_meta = vec![RecvMeta::default(); BATCH_SIZE];
 
     while running.load(Ordering::Relaxed) {
-        match socket.recv_from(&mut buf) {
-            Ok((n, _addr)) => {
-                let raw = Bytes::copy_from_slice(&buf[..n]);
-                transport_rx.receive(raw);
+        let mut iovs: Vec<IoSliceMut> = recv_bufs
+            .iter_mut()
+            .map(|b| IoSliceMut::new(b))
+            .collect();
+
+        match udp_state.recv(UdpSockRef::from(&socket), &mut iovs, &mut recv_meta) {
+            Ok(count) => {
+                for i in 0..count {
+                    let meta = &recv_meta[i];
+                    let total_len = meta.len;
+                    let stride = meta.stride;
+
+                    // GRO: kernel may coalesce multiple datagrams into one buffer.
+                    // stride = individual datagram size, total_len = total bytes received.
+                    let mut offset = 0;
+                    while offset < total_len {
+                        let end = (offset + stride).min(total_len);
+                        let raw = Bytes::copy_from_slice(&recv_bufs[i][offset..end]);
+                        transport_rx.receive(raw);
+                        offset = end;
+                    }
+                }
 
                 for event in transport_rx.drain_events() {
                     if let ReceiverEvent::Deliver(delivered) = event {
-                        // The delivered payload is: BondingHeader + original payload
                         if let Some((header, original_payload)) =
                             BondingHeader::unwrap(delivered.payload)
                         {
@@ -216,7 +250,8 @@ fn link_reader(socket: UdpSocket, input_tx: Sender<Packet>, running: Arc<AtomicB
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Timeout — continue loop
+                // Non-blocking socket has no data — brief sleep to avoid busy-wait
+                thread::sleep(Duration::from_micros(100));
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 // Timeout on Windows-style timeout

@@ -11,7 +11,8 @@
 //! below the encoder rate, it issues a `BitrateCmd` to reduce. When
 //! capacity recovers, it ramps the encoder back up conservatively.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use quanta::Instant;
 
 use crate::media::priority::DegradationStage;
 

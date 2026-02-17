@@ -7,6 +7,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use crossbeam_channel::Receiver;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use self::aggregator::ReassemblyStats;
@@ -45,6 +46,11 @@ impl ReceiverBackend {
     /// Get current reassembly stats.
     pub fn get_stats(&self) -> ReassemblyStats {
         self.inner.get_stats()
+    }
+
+    /// Returns a shared handle to the reassembly stats for external polling.
+    pub fn stats_handle(&self) -> Arc<Mutex<ReassemblyStats>> {
+        self.inner.stats_handle()
     }
 
     /// Shut down the receiver.

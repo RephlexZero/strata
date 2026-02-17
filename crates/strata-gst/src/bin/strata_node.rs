@@ -2,6 +2,7 @@ use gst::prelude::*;
 use gst::MessageView;
 use std::env;
 use std::sync::{Arc, Mutex};
+use strata_bonding::metrics::MetricsServer;
 
 const SENDER_HELP: &str = r#"
 USAGE: strata-node sender [OPTIONS] --dest <ADDR[,ADDR...]>
@@ -23,6 +24,8 @@ OPTIONS:
   --stats-dest <addr> UDP address to relay stats JSON (e.g. 127.0.0.1:9100)
   --relay-url <url>   RTMP/RTMPS URL to relay encoded stream to in parallel
                       (tees output: one copy goes via Strata, another via RTMP)
+  --metrics-port <port> Start Prometheus metrics endpoint on this port
+                        (serves /metrics on 0.0.0.0:<port>)
   --control <path>    Unix socket path for hot-swap commands
                       (default: /tmp/strata-pipeline.sock)
   --help              Show this help
@@ -70,6 +73,8 @@ OPTIONS:
   --relay-url <url>   RTMP/RTMPS URL to relay the received stream to
                       e.g. rtmp://a.rtmp.youtube.com/live2/STREAM_KEY
   --config <path>     Path to TOML config file (see Configuration Reference)
+  --metrics-port <port> Start Prometheus metrics endpoint on this port
+                        (serves /metrics on 0.0.0.0:<port>)
   --help              Show this help
 
 EXAMPLES:
@@ -143,6 +148,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut control_sock_path = "/tmp/strata-pipeline.sock";
     let mut resolution = "1280x720";
     let mut relay_url = "";
+    let mut metrics_port: Option<u16> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -196,6 +202,13 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--relay-url" if i + 1 < args.len() => {
                 relay_url = &args[i + 1];
+                i += 1;
+            }
+            "--metrics-port" if i + 1 < args.len() => {
+                metrics_port = Some(args[i + 1].parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid metrics port: {}", args[i + 1]);
+                    std::process::exit(1);
+                }));
                 i += 1;
             }
             other => {
@@ -413,6 +426,38 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     pipeline.set_state(gst::State::Playing)?;
     eprintln!("Sender running (source={source_mode})... Press Ctrl+C to stop.");
+
+    // ── Prometheus metrics server ──
+    let _metrics_server = if let Some(port) = metrics_port {
+        let sink_element = pipeline
+            .by_name("rsink")
+            .expect("Failed to find stratasink element");
+        let strata_sink = sink_element
+            .downcast::<gststrata::sink::StrataSink>()
+            .expect("rsink is not a StrataSink");
+        match strata_sink.metrics_handle() {
+            Some(handle) => {
+                let addr: std::net::SocketAddr =
+                    format!("0.0.0.0:{port}").parse().unwrap();
+                match MetricsServer::start(addr, handle) {
+                    Ok(server) => {
+                        eprintln!("Prometheus metrics → http://0.0.0.0:{}/metrics", port);
+                        Some(server)
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: failed to start metrics server on port {}: {}", port, e);
+                        None
+                    }
+                }
+            }
+            None => {
+                eprintln!("Warning: metrics handle not available (pipeline not started?)");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // ── Disabled link tracker (for toggle_link re-enable) ──
     let disabled_links: Mutex<std::collections::HashMap<String, (String, String)>> =
@@ -941,6 +986,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut output_file = "";
     let mut config_path = "";
     let mut relay_url = "";
+    let mut metrics_port: Option<u16> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -962,6 +1008,13 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--relay-url" if i + 1 < args.len() => {
                 relay_url = &args[i + 1];
+                i += 1;
+            }
+            "--metrics-port" if i + 1 < args.len() => {
+                metrics_port = Some(args[i + 1].parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid metrics port: {}", args[i + 1]);
+                    std::process::exit(1);
+                }));
                 i += 1;
             }
             other => {
@@ -1093,6 +1146,40 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     .expect("Error setting signal handler");
 
     pipeline.set_state(gst::State::Playing)?;
+
+    // ── Prometheus metrics server (receiver) ──
+    let _metrics_server = if let Some(port) = metrics_port {
+        let src_element = pipeline.by_name("src");
+        let stats_handle = src_element.as_ref().and_then(|el| {
+            el.downcast_ref::<gststrata::src::StrataSrc>()
+                .and_then(|src| src.stats_handle())
+        });
+        match stats_handle {
+            Some(handle) => {
+                let addr: std::net::SocketAddr =
+                    format!("0.0.0.0:{port}").parse().unwrap();
+                match strata_bonding::metrics::ReceiverMetricsServer::start(addr, handle) {
+                    Ok(server) => {
+                        eprintln!("Prometheus metrics → http://0.0.0.0:{}/metrics", port);
+                        Some(server)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed to start metrics server on port {}: {}",
+                            port, e
+                        );
+                        None
+                    }
+                }
+            }
+            None => {
+                eprintln!("Warning: receiver stats handle not available");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let bus = pipeline.bus().unwrap();
 

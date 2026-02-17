@@ -512,7 +512,7 @@ mod imp {
                 size_bytes: data.len(),
             };
 
-            if let Some(rt) = lock_or_recover(&self.runtime).as_ref() {
+            if let Some(rt) = lock_or_recover(&self.runtime).as_mut() {
                 match rt.try_send_packet(data, profile) {
                     Ok(_) => (),
                     Err(PacketSendError::Full) => {
@@ -624,6 +624,25 @@ mod tests {
 glib::wrapper! {
     pub struct StrataSink(ObjectSubclass<imp::StrataSink>)
         @extends gst_base::BaseSink, gst::Element, gst::Object;
+}
+
+impl StrataSink {
+    /// Returns a shared handle to the bonding runtime's metrics map.
+    ///
+    /// This can be passed to `MetricsServer::start()` for Prometheus scraping.
+    /// Returns `None` if the element hasn't been started yet.
+    pub fn metrics_handle(
+        &self,
+    ) -> Option<
+        Arc<
+            Mutex<
+                HashMap<usize, strata_bonding::net::interface::LinkMetrics>,
+            >,
+        >,
+    > {
+        let runtime = lock_or_recover(&self.imp().runtime);
+        runtime.as_ref().map(|rt| rt.metrics_handle())
+    }
 }
 
 pub fn register(plugin: Option<&gst::Plugin>) -> Result<(), glib::BoolError> {

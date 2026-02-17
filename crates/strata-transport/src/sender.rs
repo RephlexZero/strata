@@ -18,7 +18,8 @@
 
 use bytes::Bytes;
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use quanta::Instant;
 
 use crate::arq::RetransmitTracker;
 use crate::codec::FecEncoder;

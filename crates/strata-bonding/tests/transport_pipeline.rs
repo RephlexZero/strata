@@ -37,7 +37,7 @@ fn runtime_to_receiver_single_link() {
     let rcv_addr = rcv_socket.local_addr().unwrap();
     rcv.add_link_socket(rcv_socket).unwrap();
 
-    let rt = BondingRuntime::with_config(SchedulerConfig::default());
+    let mut rt = BondingRuntime::with_config(SchedulerConfig::default());
     rt.add_link(LinkConfig {
         id: 1,
         uri: format!("{}", rcv_addr),
@@ -83,7 +83,7 @@ fn runtime_to_receiver_multi_link() {
     rcv.add_link_socket(rcv_socket_1).unwrap();
     rcv.add_link_socket(rcv_socket_2).unwrap();
 
-    let rt = BondingRuntime::with_config(SchedulerConfig::default());
+    let mut rt = BondingRuntime::with_config(SchedulerConfig::default());
     rt.add_link(LinkConfig {
         id: 1,
         uri: format!("{}", rcv_addr_1),
@@ -180,7 +180,7 @@ fn critical_broadcast_deduplication() {
     rcv.add_link_socket(rcv_socket_1).unwrap();
     rcv.add_link_socket(rcv_socket_2).unwrap();
 
-    let rt = BondingRuntime::with_config(SchedulerConfig {
+    let mut rt = BondingRuntime::with_config(SchedulerConfig {
         critical_broadcast: true,
         ..SchedulerConfig::default()
     });

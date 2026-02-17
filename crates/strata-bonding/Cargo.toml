@@ -18,6 +18,8 @@ arc-swap = { workspace = true }
 compact_str = { workspace = true }
 rtrb = { workspace = true }
 raptorq = { workspace = true }
+quanta = { workspace = true }
 rand = { workspace = true }
+quinn-udp = "0.5.14"
 
 [dev-dependencies]

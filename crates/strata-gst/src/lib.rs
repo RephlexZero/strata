@@ -203,4 +203,80 @@ mod tests {
 
         sink.release_request_pad(&pad);
     }
+
+    /// Validates the RTMP relay pipeline graph:
+    ///   videotestsrc → x264enc → tee → queue → mpegtsmux → stratasink (Strata path)
+    ///                               └→ queue → h264parse → flvmux → fakesink (RTMP path)
+    ///   audiotestsrc → voaacenc → tee → queue → aacparse → mpegtsmux
+    ///                               └→ queue → aacparse → flvmux
+    ///
+    /// Uses fakesink in place of rtmpsink to test pipeline construction
+    /// and data flow without a real RTMP server.
+    #[test]
+    fn test_rtmp_relay_pipeline() {
+        gst::init().unwrap();
+
+        gst::Element::register(
+            None,
+            "stratasink",
+            gst::Rank::NONE,
+            sink::StrataSink::static_type(),
+        )
+        .unwrap();
+
+        // This pipeline mirrors the strata-node sender with --relay-url:
+        // - Video teed to both Strata (MPEG-TS) and RTMP (FLV) paths
+        // - Audio teed similarly
+        // - fakesink replaces rtmpsink since we have no live RTMP server
+        let pipeline_str = "\
+            videotestsrc is-live=true num-buffers=30 pattern=smpte \
+            ! video/x-raw,width=320,height=240,framerate=15/1 \
+            ! x264enc tune=zerolatency bitrate=500 key-int-max=30 \
+            ! tee name=vtee \
+            vtee. ! queue ! mux. \
+            vtee. ! queue ! h264parse ! fmux. \
+            audiotestsrc is-live=true num-buffers=30 wave=silence \
+            ! audioconvert ! audioresample ! voaacenc bitrate=64000 \
+            ! tee name=atee \
+            atee. ! queue ! aacparse ! mux. \
+            atee. ! queue ! aacparse ! fmux. \
+            mpegtsmux name=mux alignment=7 ! stratasink name=rsink \
+            flvmux name=fmux streamable=true ! fakesink sync=false";
+
+        let pipeline = gst::parse::launch(pipeline_str)
+            .expect("Failed to construct RTMP relay pipeline")
+            .downcast::<gst::Pipeline>()
+            .expect("Failed to cast to pipeline");
+
+        pipeline
+            .set_state(gst::State::Playing)
+            .expect("Failed to set pipeline to Playing");
+
+        let bus = pipeline.bus().unwrap();
+        let start = std::time::Instant::now();
+        let mut got_data = false;
+
+        while start.elapsed() < std::time::Duration::from_secs(10) {
+            if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
+                use gst::MessageView;
+                match msg.view() {
+                    MessageView::Eos(..) => {
+                        got_data = true;
+                        break;
+                    }
+                    MessageView::Error(err) => {
+                        panic!("RTMP relay pipeline error: {}", err.error());
+                    }
+                    _ => (),
+                }
+            }
+        }
+
+        assert!(
+            got_data,
+            "RTMP relay pipeline did not reach EOS within timeout"
+        );
+
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
 }

@@ -2,7 +2,7 @@ use crate::config::SchedulerConfig;
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use quanta::Instant;
 
 /// Per-link state tracked by the DWRR scheduler.
 ///
@@ -474,7 +474,8 @@ mod tests {
     use crate::net::interface::LinkMetrics;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use quanta::Instant;
 
     struct MockLink {
         id: usize,
@@ -499,6 +500,7 @@ mod tests {
                     mtu: None,
                     iface: None,
                     link_kind: None,
+                    transport: None,
                 }),
             }
         }

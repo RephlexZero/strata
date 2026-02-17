@@ -4,7 +4,7 @@
 //! All stats are designed for Prometheus export and JSON serialization.
 
 use serde::Serialize;
-use std::time::Instant;
+use quanta::Instant;
 
 // ─── Sender Stats ───────────────────────────────────────────────────────────
 

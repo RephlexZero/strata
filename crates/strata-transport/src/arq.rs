@@ -14,7 +14,8 @@
 //! - **Retry budget**: max retransmission attempts per packet (default 3)
 
 use std::collections::BTreeSet;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use quanta::Instant;
 
 use crate::wire::{NackPacket, NackRange, VarInt};
 

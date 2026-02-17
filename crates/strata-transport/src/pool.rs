@@ -8,7 +8,7 @@
 
 use bytes::Bytes;
 use slab::Slab;
-use std::time::Instant;
+use quanta::Instant;
 
 use crate::wire::{Fragment, VarInt};
 

@@ -97,6 +97,26 @@ pub struct LinkMetrics {
     pub mtu: Option<u32>,
     pub iface: Option<String>,
     pub link_kind: Option<String>,
+    /// Transport-layer statistics (FEC, ARQ, retransmissions).
+    pub transport: Option<TransportMetrics>,
+}
+
+/// Transport-layer statistics from `strata-transport`.
+///
+/// Captures FEC, ARQ, and retransmission counters that are not visible
+/// at the bonding-scheduler level.
+#[derive(Debug, Clone, Default)]
+pub struct TransportMetrics {
+    /// Total packets sent (including retransmissions and FEC repairs).
+    pub packets_sent: u64,
+    /// Packets acknowledged by the receiver.
+    pub packets_acked: u64,
+    /// NACK-triggered retransmissions.
+    pub retransmissions: u64,
+    /// FEC repair packets sent.
+    pub fec_repairs_sent: u64,
+    /// Packets expired from send buffer without ACK.
+    pub packets_expired: u64,
 }
 
 /// Abstraction for a network link capable of sending packets and reporting metrics.

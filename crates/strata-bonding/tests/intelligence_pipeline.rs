@@ -41,6 +41,7 @@ impl MockLink {
                 mtu: None,
                 iface: None,
                 link_kind: None,
+                transport: None,
             }),
             sent_packets: Mutex::new(Vec::new()),
         }
