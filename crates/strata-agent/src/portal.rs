@@ -47,6 +47,8 @@ pub async fn run(state: Arc<AgentState>, addr: SocketAddr) -> anyhow::Result<()>
             post(api_interface_disable),
         )
         .route("/api/interfaces/scan", post(api_interfaces_scan))
+        // Prometheus metrics endpoint
+        .route("/metrics", get(api_metrics))
         // Captive portal probes (redirect to /)
         .route("/hotspot-detect.html", get(captive_redirect))
         .route("/generate_204", get(captive_redirect))
@@ -314,4 +316,18 @@ async fn api_interfaces_scan(State(state): State<Arc<AgentState>>) -> Json<serde
         "total": hw.interfaces.len(),
         "interfaces": hw.interfaces,
     }))
+}
+
+// ── GET /metrics ──────────────────────────────────────────────────
+
+async fn api_metrics(State(state): State<Arc<AgentState>>) -> impl IntoResponse {
+    let links = state.latest_link_stats.read().await;
+    let body = strata_common::metrics::render_prometheus(&links);
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
 }

@@ -81,6 +81,12 @@ pub async fn run(state: Arc<AgentState>) {
             last_real_stats.clone().unwrap_or_default()
         };
 
+        // Update shared link stats for Prometheus /metrics endpoint
+        {
+            let mut latest = state.latest_link_stats.write().await;
+            *latest = links.clone();
+        }
+
         // Use sum of observed_bps (actual throughput), NOT capacity
         let encoder_kbps: u64 = links.iter().map(|l| l.observed_bps).sum::<u64>() / 1000;
 

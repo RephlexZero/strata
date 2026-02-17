@@ -10,6 +10,7 @@
 
 mod control;
 mod hardware;
+mod metrics;
 mod pipeline;
 mod portal;
 mod telemetry;
@@ -77,6 +78,8 @@ pub struct AgentState {
     pub reconnect_tx: tokio::sync::watch::Sender<()>,
     /// Receiver URL — where to send bonded traffic (set via portal or control plane).
     pub receiver_url: tokio::sync::Mutex<Option<String>>,
+    /// Latest link stats from the bonding engine (updated by telemetry loop).
+    pub latest_link_stats: tokio::sync::RwLock<Vec<strata_common::models::LinkStats>>,
 }
 
 #[tokio::main]
@@ -123,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
         pending_control_url: tokio::sync::Mutex::new(None),
         reconnect_tx,
         receiver_url: tokio::sync::Mutex::new(None),
+        latest_link_stats: tokio::sync::RwLock::new(Vec::new()),
     });
 
     // ── Task 1: Control plane WebSocket connection ──────────────
@@ -153,6 +157,17 @@ async fn main() -> anyhow::Result<()> {
     let portal_state = state.clone();
     let portal_addr: SocketAddr = cli.portal_addr.parse()?;
     let portal_handle = tokio::spawn(async move { portal::run(portal_state, portal_addr).await });
+
+    // ── Task 4: Dedicated metrics server (if --metrics_addr is set) ──
+    if !cli.metrics_addr.is_empty() {
+        let metrics_state = state.clone();
+        let metrics_addr: SocketAddr = cli.metrics_addr.parse()?;
+        tokio::spawn(async move {
+            if let Err(e) = metrics::run(metrics_state, metrics_addr).await {
+                tracing::error!(error = %e, "metrics server failed");
+            }
+        });
+    }
 
     // ── Shutdown handling ───────────────────────────────────────
     tokio::select! {
