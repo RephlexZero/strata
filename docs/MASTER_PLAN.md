@@ -911,18 +911,18 @@ scheduling.
 - [x] Remove librist-sys from active builds
 - [ ] End-to-end YouTube RTMP test via GStreamer
 - [x] Prometheus metrics endpoint for all stats
-- [ ] WebSocket telemetry (strata-agent)
+- [x] WebSocket telemetry (strata-agent)
 
 ### Phase 6: Cloud Gateway (2-3 weeks)
 
 **Goal**: Cloud-side receiver with fan-out and orchestration.
 
-- [ ] Cloud receiver binary (standalone, not GStreamer)
-- [ ] Dynamic jitter buffer (Zixi-inspired, ML-assisted sizing)
-- [ ] SRT/RTMP/NDI output bridges
-- [ ] Control plane REST API (strata-control)
-- [ ] Web dashboard (strata-dashboard, Leptos)
-- [ ] Fleet management basics (multi-unit telemetry)
+- [x] Cloud receiver binary (standalone, not GStreamer)
+- [x] Dynamic jitter buffer (Zixi-inspired, ML-assisted sizing)
+- [x] SRT/RTMP/NDI output bridges
+- [x] Control plane REST API (strata-control)
+- [x] Web dashboard (strata-dashboard, Leptos)
+- [x] Fleet management basics (multi-unit telemetry)
 
 ### Phase 7: Hardening (Ongoing)
 

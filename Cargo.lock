@@ -3846,6 +3846,7 @@ dependencies = [
  "bytes",
  "compact_str",
  "crossbeam-channel",
+ "ctrlc",
  "libc",
  "rand 0.10.0",
  "raptorq",

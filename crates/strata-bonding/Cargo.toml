@@ -3,6 +3,10 @@ name = "strata-bonding"
 version = "0.1.2"
 edition = "2021"
 
+[[bin]]
+name = "strata-receiver"
+path = "src/bin/strata_receiver.rs"
+
 [dependencies]
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
@@ -19,5 +23,6 @@ compact_str = { workspace = true }
 rtrb = { workspace = true }
 raptorq = { workspace = true }
 rand = { workspace = true }
+ctrlc = "3.5.1"
 
 [dev-dependencies]
