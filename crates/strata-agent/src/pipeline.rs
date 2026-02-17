@@ -1,10 +1,10 @@
 //! Pipeline manager — spawns and manages GStreamer sender pipelines.
 //!
-//! The agent spawns `integration_node` as a child process for clean isolation.
+//! The agent spawns `strata-node` as a child process for clean isolation.
 //! In simulation mode, it runs a lightweight fake pipeline that generates
 //! synthetic stats without actual media processing.
 //!
-//! Stats are relayed from integration_node via UDP to 127.0.0.1:9100,
+//! Stats are relayed from strata-node via UDP to 127.0.0.1:9100,
 //! where the telemetry module reads and forwards them to the control plane.
 //!
 //! Hot-swap source switching is supported via a Unix domain socket at
@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use strata_common::protocol::StreamStartPayload;
 
-/// UDP address where integration_node sends stats JSON.
+/// UDP address where strata-node sends stats JSON.
 pub const STATS_LISTEN_ADDR: &str = "127.0.0.1:9100";
 
 /// Unix socket path for pipeline control (hot-swap commands).
@@ -82,8 +82,8 @@ impl PipelineManager {
             self.total_bytes = 0;
             tracing::info!("simulated pipeline started");
         } else {
-            // Real mode — spawn integration_node
-            let child = spawn_integration_node(&payload)?;
+            // Real mode — spawn strata-node
+            let child = spawn_strata_node(&payload)?;
             self.child = Some(child);
             self.stream_id = Some(payload.stream_id);
             self.started_at = Some(Instant::now());
@@ -132,7 +132,7 @@ impl PipelineManager {
 
     /// Switch the active video source on a running pipeline.
     ///
-    /// Sends a JSON command to the integration_node's control socket.
+    /// Sends a JSON command to the strata-node's control socket.
     /// The command is fire-and-forget — errors are logged but not propagated.
     pub fn switch_source(
         &self,
@@ -177,11 +177,11 @@ impl PipelineManager {
         }
     }
 
-    /// Tell the running pipeline to enable or disable a RIST link
+    /// Tell the running pipeline to enable or disable a bonding link
     /// associated with the given OS interface name.
     ///
-    /// This sends a `toggle_link` command over the control socket so the
-    /// integration_node can add or remove the link at runtime without
+    /// This sends a `toggle_link` command over the control socket so
+    /// strata-node can add or remove the link at runtime without
     /// affecting OS-level connectivity.
     pub fn toggle_link(&self, iface: &str, enabled: bool) {
         if !self.is_running() {
@@ -222,9 +222,9 @@ impl PipelineManager {
     }
 }
 
-/// Spawn the `integration_node` binary as a child process.
-fn spawn_integration_node(payload: &StreamStartPayload) -> anyhow::Result<Child> {
-    let mut cmd = std::process::Command::new("integration_node");
+/// Spawn the `strata-node` binary as a child process.
+fn spawn_strata_node(payload: &StreamStartPayload) -> anyhow::Result<Child> {
+    let mut cmd = std::process::Command::new("strata-node");
     cmd.arg("sender");
 
     // Source flags
@@ -269,7 +269,7 @@ fn spawn_integration_node(payload: &StreamStartPayload) -> anyhow::Result<Child>
     // Control socket for hot-swap
     cmd.arg("--control").arg(CONTROL_SOCK_PATH);
 
-    // Destinations (RIST URLs)
+    // Destinations
     if !payload.destinations.is_empty() {
         let dest_str = payload.destinations.join(",");
         cmd.arg("--dest").arg(&dest_str);
@@ -291,7 +291,7 @@ fn spawn_integration_node(payload: &StreamStartPayload) -> anyhow::Result<Child>
         }
     }
 
-    tracing::info!(cmd = ?cmd, "spawning integration_node");
+    tracing::info!(cmd = ?cmd, "spawning strata-node");
     let child = cmd.spawn()?;
     Ok(child)
 }

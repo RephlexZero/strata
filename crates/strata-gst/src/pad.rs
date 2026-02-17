@@ -8,19 +8,19 @@ mod imp {
     use super::*;
 
     #[derive(Default)]
-    pub struct RsRistBondSinkPad {
+    pub struct StrataSinkPad {
         pub uri: Mutex<String>,
         pub interface: Mutex<Option<String>>,
     }
 
     #[glib::object_subclass]
-    impl ObjectSubclass for RsRistBondSinkPad {
-        const NAME: &'static str = "RsRistBondSinkPad";
-        type Type = super::RsRistBondSinkPad;
+    impl ObjectSubclass for StrataSinkPad {
+        const NAME: &'static str = "StrataSinkPad";
+        type Type = super::StrataSinkPad;
         type ParentType = gst::Pad;
     }
 
-    impl ObjectImpl for RsRistBondSinkPad {
+    impl ObjectImpl for StrataSinkPad {
         fn properties() -> &'static [glib::ParamSpec] {
             static PROPERTIES: std::sync::OnceLock<Vec<glib::ParamSpec>> =
                 std::sync::OnceLock::new();
@@ -28,7 +28,7 @@ mod imp {
                 vec![
                     glib::ParamSpecString::builder("uri")
                         .nick("URI")
-                        .blurb("RIST URI for this link (e.g. rist://1.2.3.4:5000)")
+                        .blurb("Destination address for this link (host:port)")
                         .mutable_ready()
                         .build(),
                     glib::ParamSpecString::builder("interface")
@@ -50,7 +50,7 @@ mod imp {
                     drop(uri);
                     if should_notify {
                         if let Some(parent) = self.obj().parent() {
-                            if let Ok(sink) = parent.downcast::<crate::sink::RsRistBondSink>() {
+                            if let Ok(sink) = parent.downcast::<crate::sink::StrataSink>() {
                                 sink.imp().add_link_from_pad(&self.obj());
                             }
                         }
@@ -86,16 +86,16 @@ mod imp {
         }
     }
 
-    impl GstObjectImpl for RsRistBondSinkPad {}
-    impl PadImpl for RsRistBondSinkPad {}
+    impl GstObjectImpl for StrataSinkPad {}
+    impl PadImpl for StrataSinkPad {}
 }
 
 glib::wrapper! {
-    pub struct RsRistBondSinkPad(ObjectSubclass<imp::RsRistBondSinkPad>)
+    pub struct StrataSinkPad(ObjectSubclass<imp::StrataSinkPad>)
         @extends gst::Pad, gst::Object;
 }
 
-impl RsRistBondSinkPad {
+impl StrataSinkPad {
     pub fn get_uri(&self) -> String {
         lock_or_recover(&self.imp().uri).clone()
     }

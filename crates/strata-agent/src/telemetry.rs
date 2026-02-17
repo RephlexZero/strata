@@ -1,7 +1,7 @@
 //! Telemetry — collects pipeline stats and sends them to the control plane.
 //!
 //! In simulation mode, generates synthetic link stats that look realistic.
-//! In production mode, reads stats from integration_node's UDP relay on
+//! In production mode, reads stats from strata-node's UDP relay on
 //! 127.0.0.1:9100 (bonding stats JSON forwarded from the GStreamer bus).
 
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use crate::AgentState;
 pub async fn run(state: Arc<AgentState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
 
-    // Set up a non-blocking UDP socket to receive stats from integration_node.
+    // Set up a non-blocking UDP socket to receive stats from strata-node.
     // The socket is bound once and reused across the lifetime of the agent.
     let stats_rx = std::net::UdpSocket::bind(pipeline::STATS_LISTEN_ADDR).ok();
     if let Some(ref sock) = stats_rx {
@@ -28,7 +28,7 @@ pub async fn run(state: Arc<AgentState>) {
         );
     }
 
-    // Buffer for incoming stats JSON from integration_node
+    // Buffer for incoming stats JSON from strata-node
     let mut last_real_stats: Option<Vec<LinkStats>> = None;
     let mut recv_buf = [0u8; 8192];
 
@@ -59,7 +59,7 @@ pub async fn run(state: Arc<AgentState>) {
         let elapsed_s = pipeline.elapsed_s();
         drop(pipeline); // Release lock before doing I/O
 
-        // Drain any pending stats from integration_node's UDP relay.
+        // Drain any pending stats from strata-node's UDP relay.
         // We take the most recent one (in case multiple arrived in 1s).
         if let Some(ref sock) = stats_rx {
             while let Ok((n, _)) = sock.recv_from(&mut recv_buf) {
@@ -68,7 +68,7 @@ pub async fn run(state: Arc<AgentState>) {
                         last_real_stats = Some(parsed);
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "failed to parse bonding stats from integration_node");
+                        tracing::warn!(error = %e, "failed to parse bonding stats from strata-node");
                     }
                 }
             }
@@ -107,9 +107,9 @@ pub async fn run(state: Arc<AgentState>) {
     }
 }
 
-/// Parse the bonding stats JSON relayed by integration_node.
+/// Parse the bonding stats JSON relayed by strata-node.
 ///
-/// The JSON comes from the `rist-bonding-stats` GStreamer bus message
+/// The JSON comes from the `strata-stats` GStreamer bus message
 /// and has the shape: `{"links": [{"id": 0, "rtt_us": ..., ...}, ...]}`.
 fn parse_bonding_stats(data: &[u8]) -> Result<Vec<LinkStats>, String> {
     let v: serde_json::Value =

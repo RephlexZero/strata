@@ -4,7 +4,7 @@
 //! gitignored.  Run these tests to visually inspect bonding quality:
 //!
 //! ```bash
-//! sudo cargo test -p gst-rist-bonding --test video_output -- --nocapture
+//! sudo cargo test -p strata-gst --test video_output -- --nocapture
 //! ```
 //!
 //! After a successful run, inspect the files in `test_output/`:
@@ -36,25 +36,25 @@ fn output_dir() -> PathBuf {
     dir
 }
 
-/// Build integration_node if it doesn't exist yet.
+/// Build strata-node if it doesn't exist yet.
 fn build_integration_binary() -> PathBuf {
     let status = Command::new("cargo")
         .args([
             "build",
             "-p",
-            "gst-rist-bonding",
+            "strata-gst",
             "--bin",
-            "integration_node",
+            "strata-node",
         ])
         .status()
         .expect("Failed to invoke cargo build");
-    assert!(status.success(), "cargo build integration_node failed");
+    assert!(status.success(), "cargo build strata-node failed");
 
     let mut path = std::env::current_exe().expect("current_exe");
     path.pop(); // deps
     path.pop(); // debug
-    path.push("integration_node");
-    assert!(path.exists(), "integration_node not found at {:?}", path);
+    path.push("strata-node");
+    assert!(path.exists(), "strata-node not found at {:?}", path);
     path
 }
 
@@ -78,7 +78,7 @@ fn video_loopback_clean() {
     // Remove stale output
     let _ = fs::remove_file(&ts_path);
 
-    // Note: GStreamer type registration is handled by integration_node
+    // Note: GStreamer type registration is handled by strata-node
     // internally. Registering types here without gst::init() causes
     // GLib GObject-CRITICAL assertions when tests run in parallel.
 
@@ -90,7 +90,7 @@ fn video_loopback_clean() {
         .args([
             "receiver",
             "--bind",
-            "rist://@127.0.0.1:17000",
+            "127.0.0.1:17000",
             "--output",
             &ts_str,
         ])
@@ -106,13 +106,13 @@ fn video_loopback_clean() {
         .args([
             "sender",
             "--dest",
-            "rist://127.0.0.1:17000",
+            "127.0.0.1:17000",
             "--bitrate",
             "1500",
         ])
         .env(
             "GST_LAUNCH_LINE_OVERRIDE",
-            "videotestsrc num-buffers=150 is-live=true pattern=smpte ! video/x-raw,width=1280,height=720,framerate=30/1 ! x264enc tune=zerolatency bitrate=1500 ! mpegtsmux ! rsristbondsink name=rsink",
+            "videotestsrc num-buffers=150 is-live=true pattern=smpte ! video/x-raw,width=1280,height=720,framerate=30/1 ! x264enc tune=zerolatency bitrate=1500 ! mpegtsmux ! stratasink name=rsink",
         )
         .status()
         .expect("Failed to run sender");
@@ -121,7 +121,7 @@ fn video_loopback_clean() {
 
     // Graceful receiver shutdown
     let _ = Command::new("pkill")
-        .args(["-SIGINT", "-f", "integration_node.*receiver.*17000"])
+        .args(["-SIGINT", "-f", "strata-node.*receiver.*17000"])
         .status();
 
     let mut finished = false;
@@ -204,7 +204,7 @@ fn video_bonded_two_link() {
             &bin_str,
             "receiver",
             "--bind",
-            "rist://@10.20.1.2:5000,rist://@10.20.2.2:5002",
+            "10.20.1.2:5000,10.20.2.2:5002",
             "--output",
             &ts_str,
         ])
@@ -225,7 +225,7 @@ fn video_bonded_two_link() {
             &bin_str,
             "sender",
             "--dest",
-            "rist://10.20.1.2:5000,rist://10.20.2.2:5002",
+            "10.20.1.2:5000,10.20.2.2:5002",
             "--bitrate",
             "2000",
         ])
@@ -244,7 +244,7 @@ fn video_bonded_two_link() {
             "pkill",
             "-SIGINT",
             "-f",
-            "integration_node",
+            "strata-node",
         ])
         .status();
 
@@ -355,7 +355,7 @@ fn video_bonded_impaired() {
             &bin_str,
             "receiver",
             "--bind",
-            "rist://@10.30.1.2:5000,rist://@10.30.2.2:5002",
+            "10.30.1.2:5000,10.30.2.2:5002",
             "--output",
             &ts_str,
         ])
@@ -376,7 +376,7 @@ fn video_bonded_impaired() {
             &bin_str,
             "sender",
             "--dest",
-            "rist://10.30.1.2:5000,rist://10.30.2.2:5002",
+            "10.30.1.2:5000,10.30.2.2:5002",
             "--bitrate",
             "2000",
         ])
@@ -395,7 +395,7 @@ fn video_bonded_impaired() {
             "pkill",
             "-SIGINT",
             "-f",
-            "integration_node",
+            "strata-node",
         ])
         .status();
 

@@ -249,7 +249,7 @@ impl Default for BondingConfig {
             receiver: ReceiverConfig::default(),
             lifecycle: LinkLifecycleConfig::default(),
             scheduler: SchedulerConfig::default(),
-            use_transport: false,
+            use_transport: true,
         }
     }
 }
@@ -407,7 +407,7 @@ impl BondingConfigInput {
             receiver,
             lifecycle,
             scheduler,
-            use_transport: self.use_transport.unwrap_or(false),
+            use_transport: self.use_transport.unwrap_or(true),
         })
     }
 }

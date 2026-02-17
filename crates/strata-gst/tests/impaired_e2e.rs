@@ -24,21 +24,21 @@ fn spawn_in_ns(ns_name: &str, cmd: &str, args: &[&str]) -> std::process::Child {
 
 #[test]
 fn test_impaired_bonding_visualization() {
-    // 0. Ensure integration_node is built
+    // 0. Ensure strata-node is built
     let pkg_root = std::env::current_dir().unwrap();
     // Assuming we are in workspace root or crate root.
-    // Let's rely on CARGO_BIN_EXE_integration_node if available, else derive it.
-    let bin_path = if let Ok(p) = std::env::var("CARGO_BIN_EXE_integration_node") {
+    // Let's rely on CARGO_BIN_EXE_strata-node if available, else derive it.
+    let bin_path = if let Ok(p) = std::env::var("CARGO_BIN_EXE_strata-node") {
         std::path::PathBuf::from(p)
     } else {
         // Fallback for when running via cargo test in dev container
-        pkg_root.join("../../target/debug/integration_node")
+        pkg_root.join("../../target/debug/strata-node")
     };
 
     if !bin_path.exists() {
         // Fallback: build it
         let _ = std::process::Command::new("cargo")
-            .args(["build", "--bin", "integration_node"])
+            .args(["build", "--bin", "strata-node"])
             .status();
     }
 
@@ -112,7 +112,7 @@ fn test_impaired_bonding_visualization() {
     let mut recv_child = spawn_in_ns(
         &ns_rcv.name,
         bin_path.to_str().unwrap(),
-        &["receiver", "--bind", "rist://0.0.0.0:5000"],
+        &["receiver", "--bind", "0.0.0.0:5000"],
     );
 
     // 3. Start Stats Collector (Thread)
@@ -147,7 +147,7 @@ fn test_impaired_bonding_visualization() {
         &[
             "sender",
             "--dest",
-            "rist://10.0.1.2:5000,rist://10.0.2.2:5000",
+            "10.0.1.2:5000,10.0.2.2:5000",
             "--stats-dest",
             "192.168.100.1:9000",
             "--bitrate",
@@ -491,17 +491,17 @@ fn plot_results_to_file(data: &[Value], truth: &[TruthPoint], filename: &str, cs
 
 #[test]
 fn test_step_change_convergence_visualization() {
-    // 0. Ensure integration_node is built
+    // 0. Ensure strata-node is built
     let pkg_root = std::env::current_dir().unwrap();
-    let bin_path = if let Ok(p) = std::env::var("CARGO_BIN_EXE_integration_node") {
+    let bin_path = if let Ok(p) = std::env::var("CARGO_BIN_EXE_strata-node") {
         std::path::PathBuf::from(p)
     } else {
-        pkg_root.join("../../target/debug/integration_node")
+        pkg_root.join("../../target/debug/strata-node")
     };
 
     if !bin_path.exists() {
         let _ = std::process::Command::new("cargo")
-            .args(["build", "--bin", "integration_node"])
+            .args(["build", "--bin", "strata-node"])
             .status();
     }
 
@@ -581,7 +581,7 @@ fn test_step_change_convergence_visualization() {
     let mut recv_child = spawn_in_ns(
         &ns_rcv.name,
         bin_path.to_str().unwrap(),
-        &["receiver", "--bind", "rist://0.0.0.0:5001"],
+        &["receiver", "--bind", "0.0.0.0:5001"],
     );
 
     let stats_socket = UdpSocket::bind("192.168.101.1:9100").expect("Failed to bind stats socket");
@@ -612,7 +612,7 @@ fn test_step_change_convergence_visualization() {
         &[
             "sender",
             "--dest",
-            "rist://10.10.1.2:5001,rist://10.10.2.2:5001",
+            "10.10.1.2:5001,10.10.2.2:5001",
             "--stats-dest",
             "192.168.101.1:9100",
             "--bitrate",
@@ -814,17 +814,17 @@ fn test_step_change_convergence_visualization() {
 ///   D) Throughput ordering matches link bandwidth ordering
 #[test]
 fn test_three_link_bandwidth_differentiation() {
-    // 0. Build integration_node if needed
+    // 0. Build strata-node if needed
     let pkg_root = std::env::current_dir().unwrap();
-    let bin_path = if let Ok(p) = std::env::var("CARGO_BIN_EXE_integration_node") {
+    let bin_path = if let Ok(p) = std::env::var("CARGO_BIN_EXE_strata-node") {
         std::path::PathBuf::from(p)
     } else {
-        pkg_root.join("../../target/debug/integration_node")
+        pkg_root.join("../../target/debug/strata-node")
     };
 
     if !bin_path.exists() {
         let _ = std::process::Command::new("cargo")
-            .args(["build", "--bin", "integration_node"])
+            .args(["build", "--bin", "strata-node"])
             .status();
     }
 
@@ -962,7 +962,7 @@ fn test_three_link_bandwidth_differentiation() {
     let mut recv_child = spawn_in_ns(
         &ns_rcv.name,
         bin_path.to_str().unwrap(),
-        &["receiver", "--bind", "rist://0.0.0.0:5002"],
+        &["receiver", "--bind", "0.0.0.0:5002"],
     );
 
     // 7. Start stats collector
@@ -997,7 +997,7 @@ fn test_three_link_bandwidth_differentiation() {
         &[
             "sender",
             "--dest",
-            "rist://10.30.1.2:5002,rist://10.30.2.2:5002,rist://10.30.3.2:5002",
+            "10.30.1.2:5002,10.30.2.2:5002,10.30.3.2:5002",
             "--stats-dest",
             "192.168.102.1:9200",
             "--bitrate",
@@ -1148,17 +1148,17 @@ fn test_three_link_bandwidth_differentiation() {
 ///   D) The capacity ratio roughly tracks the bandwidth ratio (3:9 = 1:3)
 #[test]
 fn test_aimd_convergence_two_links() {
-    // 0. Build integration_node if needed
+    // 0. Build strata-node if needed
     let pkg_root = std::env::current_dir().unwrap();
-    let bin_path = if let Ok(p) = std::env::var("CARGO_BIN_EXE_integration_node") {
+    let bin_path = if let Ok(p) = std::env::var("CARGO_BIN_EXE_strata-node") {
         std::path::PathBuf::from(p)
     } else {
-        pkg_root.join("../../target/debug/integration_node")
+        pkg_root.join("../../target/debug/strata-node")
     };
 
     if !bin_path.exists() {
         let _ = std::process::Command::new("cargo")
-            .args(["build", "--bin", "integration_node"])
+            .args(["build", "--bin", "strata-node"])
             .status();
     }
 
@@ -1272,7 +1272,7 @@ fn test_aimd_convergence_two_links() {
     let mut recv_child = spawn_in_ns(
         &ns_rcv.name,
         bin_path.to_str().unwrap(),
-        &["receiver", "--bind", "rist://0.0.0.0:5003"],
+        &["receiver", "--bind", "0.0.0.0:5003"],
     );
 
     // 6. Stats collector
@@ -1306,7 +1306,7 @@ fn test_aimd_convergence_two_links() {
         &[
             "sender",
             "--dest",
-            "rist://10.40.1.2:5003,rist://10.40.2.2:5003",
+            "10.40.1.2:5003,10.40.2.2:5003",
             "--stats-dest",
             "192.168.104.1:9300",
             "--bitrate",

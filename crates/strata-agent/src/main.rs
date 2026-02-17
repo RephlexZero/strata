@@ -71,7 +71,7 @@ pub struct AgentState {
     pub pending_control_url: tokio::sync::Mutex<Option<String>>,
     /// Notify the control loop to reconnect (e.g. after portal enrollment).
     pub reconnect_tx: tokio::sync::watch::Sender<()>,
-    /// Receiver URL — where to send RIST/SRT traffic (set via portal or control plane).
+    /// Receiver URL — where to send bonded traffic (set via portal or control plane).
     pub receiver_url: tokio::sync::Mutex<Option<String>>,
 }
 

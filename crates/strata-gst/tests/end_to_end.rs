@@ -14,32 +14,32 @@ fn build_integration_binary() -> PathBuf {
     command.args([
         "build",
         "-p",
-        "gst-rist-bonding",
+        "strata-gst",
         "--bin",
-        "integration_node",
+        "strata-node",
     ]);
 
     let status = command.status().expect("Failed to execute cargo build");
 
-    assert!(status.success(), "Failed to build integration_node binary");
+    assert!(status.success(), "Failed to build strata-node binary");
 
     // The test binary is usually in target/debug/deps/end_to_end-<hash>
-    // The integration_node binary is in target/debug/integration_node
+    // The strata-node binary is in target/debug/strata-node
     // We can use the current executable path to find the target/debug directory.
     let mut path = std::env::current_exe().expect("Failed to get current executable path");
     path.pop(); // deps
     path.pop(); // debug (or release)
-    path.push("integration_node");
+    path.push("strata-node");
 
     if !path.exists() {
         // Fallback just in case directory structure is weird (e.g. running from IDE vs CLI)
         // Try to use fallback logic if available, or just panic nicely
         eprintln!(
-            "Warning: Did not find integration_node at {:?}, checking relative to CWD",
+            "Warning: Did not find strata-node at {:?}, checking relative to CWD",
             path
         );
         let cwd = std::env::current_dir().unwrap();
-        let try_path = cwd.join("target/debug/integration_node");
+        let try_path = cwd.join("target/debug/strata-node");
         if try_path.exists() {
             return try_path;
         }
@@ -56,7 +56,7 @@ fn test_bonded_transmission() {
     let binary_path_str = binary_path.to_str().expect("Valid binary path");
 
     // Compute absolute output path in target root
-    // binary_path is .../target/debug/integration_node
+    // binary_path is .../target/debug/strata-node
     // we want .../target/bonding_rcv.ts
     let output_path = binary_path
         .parent()
@@ -145,7 +145,7 @@ fn test_bonded_transmission() {
         binary_path_str,
         "receiver",
         "--bind",
-        "rist://@10.10.1.2:5000,rist://@10.10.2.2:5002",
+        "10.10.1.2:5000,10.10.2.2:5002",
         "--output",
         output_path_str, // Output TS file (absolute path)
     ];
@@ -171,7 +171,7 @@ fn test_bonded_transmission() {
         binary_path_str,
         "sender",
         "--dest",
-        "rist://10.10.1.2:5000,rist://10.10.2.2:5002",
+        "10.10.1.2:5000,10.10.2.2:5002",
     ];
 
     let sender_status = Command::new("sudo")
@@ -196,7 +196,7 @@ fn test_bonded_transmission() {
             "pkill",
             "-SIGINT",
             "-f",
-            "integration_node",
+            "strata-node",
         ])
         .status()
         .expect("Failed to send pkill");
@@ -249,7 +249,7 @@ fn test_bonded_transmission() {
             "Success: Output file created at {:?} and has data.",
             output_path
         );
-    } else if !stderr.contains("rist-bonding-stats") {
+    } else if !stderr.contains("strata-stats") {
         println!("Receiver Stderr Dump:\n{}", stderr);
         panic!(
             "Data flow verification failed (No stats in stderr and no output file at {:?})",
@@ -281,16 +281,16 @@ fn setup_env_e2e() -> Option<PathBuf> {
         return None;
     }
 
-    let bin = if let Ok(p) = std::env::var("CARGO_BIN_EXE_integration_node") {
+    let bin = if let Ok(p) = std::env::var("CARGO_BIN_EXE_strata-node") {
         PathBuf::from(p)
     } else {
         let pkg_root = std::env::current_dir().unwrap();
-        pkg_root.join("../../target/debug/integration_node")
+        pkg_root.join("../../target/debug/strata-node")
     };
 
     if !bin.exists() {
         let _ = Command::new("cargo")
-            .args(["build", "--bin", "integration_node"])
+            .args(["build", "--bin", "strata-node"])
             .status();
     }
     Some(bin)
@@ -438,7 +438,7 @@ fn test_encoder_adaptation_loop() {
     let mut recv_child = spawn_in_ns_e2e(
         &ns_rcv.name,
         bin_path.to_str().unwrap(),
-        &["receiver", "--bind", "rist://0.0.0.0:6100"],
+        &["receiver", "--bind", "0.0.0.0:6100"],
     );
 
     let stats_port = 9400;
@@ -451,7 +451,7 @@ fn test_encoder_adaptation_loop() {
         &[
             "sender",
             "--dest",
-            "rist://10.40.1.2:6100?rtt-min=60&buffer=2000",
+            "10.40.1.2:6100?rtt-min=60&buffer=2000",
             "--stats-dest",
             &format!("192.168.110.1:{}", stats_port),
             "--bitrate",
@@ -588,7 +588,7 @@ fn test_asymmetric_rtt() {
     let mut recv_child = spawn_in_ns_e2e(
         &ns_rcv.name,
         bin_path.to_str().unwrap(),
-        &["receiver", "--bind", "rist://0.0.0.0:6200"],
+        &["receiver", "--bind", "0.0.0.0:6200"],
     );
 
     let stats_port = 9500;
@@ -600,7 +600,7 @@ fn test_asymmetric_rtt() {
         &[
             "sender",
             "--dest",
-            "rist://10.41.1.2:6200?rtt-min=40&buffer=2000,rist://10.41.2.2:6200?rtt-min=300&buffer=2000",
+            "10.41.1.2:6200?rtt-min=40&buffer=2000,10.41.2.2:6200?rtt-min=300&buffer=2000",
             "--stats-dest",
             &format!("192.168.111.1:{}", stats_port),
             "--bitrate",
@@ -726,7 +726,7 @@ fn test_sudden_capacity_drop() {
     let mut recv_child = spawn_in_ns_e2e(
         &ns_rcv.name,
         bin_path.to_str().unwrap(),
-        &["receiver", "--bind", "rist://0.0.0.0:6300"],
+        &["receiver", "--bind", "0.0.0.0:6300"],
     );
 
     let stats_port = 9600;
@@ -738,7 +738,7 @@ fn test_sudden_capacity_drop() {
         &[
             "sender",
             "--dest",
-            "rist://10.42.1.2:6300?rtt-min=60&buffer=2000,rist://10.42.2.2:6300?rtt-min=60&buffer=2000",
+            "10.42.1.2:6300?rtt-min=60&buffer=2000,10.42.2.2:6300?rtt-min=60&buffer=2000",
             "--stats-dest",
             &format!("192.168.112.1:{}", stats_port),
             "--bitrate",
@@ -857,7 +857,7 @@ fn test_link_hotplug() {
     let mut recv_child = spawn_in_ns_e2e(
         &ns_rcv.name,
         bin_path.to_str().unwrap(),
-        &["receiver", "--bind", "rist://0.0.0.0:6400"],
+        &["receiver", "--bind", "0.0.0.0:6400"],
     );
 
     let stats_port = 9700;
@@ -869,7 +869,7 @@ fn test_link_hotplug() {
         &[
             "sender",
             "--dest",
-            "rist://10.43.1.2:6400?rtt-min=60&buffer=2000,rist://10.43.2.2:6400?rtt-min=60&buffer=2000",
+            "10.43.1.2:6400?rtt-min=60&buffer=2000,10.43.2.2:6400?rtt-min=60&buffer=2000",
             "--stats-dest",
             &format!("192.168.113.1:{}", stats_port),
             "--bitrate",

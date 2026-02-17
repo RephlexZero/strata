@@ -31,15 +31,15 @@ fn setup_env() -> Option<PathBuf> {
     }
 
     let pkg_root = std::env::current_dir().unwrap();
-    let bin_path = if let Ok(p) = std::env::var("CARGO_BIN_EXE_integration_node") {
+    let bin_path = if let Ok(p) = std::env::var("CARGO_BIN_EXE_strata-node") {
         PathBuf::from(p)
     } else {
-        pkg_root.join("../../target/debug/integration_node")
+        pkg_root.join("../../target/debug/strata-node")
     };
 
     if !bin_path.exists() {
         let _ = std::process::Command::new("cargo")
-            .args(["build", "--bin", "integration_node"])
+            .args(["build", "--bin", "strata-node"])
             .status();
     }
     Some(bin_path)
@@ -89,7 +89,7 @@ fn test_cellular_single_link_accuracy() {
     let mut recv_child = spawn_in_ns(
         &ns_rcv.name,
         bin_path.to_str().unwrap(),
-        &["receiver", "--bind", "rist://0.0.0.0:6000"],
+        &["receiver", "--bind", "0.0.0.0:6000"],
     );
 
     let stats_port = 9200;
@@ -102,7 +102,7 @@ fn test_cellular_single_link_accuracy() {
         &[
             "sender",
             "--dest",
-            "rist://10.20.1.2:6000?rtt-min=100&buffer=2000",
+            "10.20.1.2:6000?rtt-min=100&buffer=2000",
             "--stats-dest",
             &format!("192.168.102.1:{}", stats_port),
             "--bitrate",
@@ -224,7 +224,7 @@ fn test_dual_link_load_balance() {
     let mut recv_child = spawn_in_ns(
         &ns_rcv.name,
         bin_path.to_str().unwrap(),
-        &["receiver", "--bind", "rist://0.0.0.0:6001"],
+        &["receiver", "--bind", "0.0.0.0:6001"],
     );
 
     let stats_port = 9300;
@@ -237,7 +237,7 @@ fn test_dual_link_load_balance() {
         &[
             "sender",
             "--dest",
-            "rist://10.30.1.2:6001?rtt-min=120&buffer=2000,rist://10.30.2.2:6001?rtt-min=120&buffer=2000",
+            "10.30.1.2:6001?rtt-min=120&buffer=2000,10.30.2.2:6001?rtt-min=120&buffer=2000",
             "--stats-dest",
             &format!("192.168.103.1:{}", stats_port),
             "--bitrate",
@@ -484,7 +484,7 @@ fn test_nada_rate_signal_accuracy() {
     let mut recv_child = spawn_in_ns(
         &ns_rcv.name,
         bin_path.to_str().unwrap(),
-        &["receiver", "--bind", "rist://0.0.0.0:6500"],
+        &["receiver", "--bind", "0.0.0.0:6500"],
     );
 
     let stats_port = 9800;
@@ -496,7 +496,7 @@ fn test_nada_rate_signal_accuracy() {
         &[
             "sender",
             "--dest",
-            "rist://10.50.1.2:6500?rtt-min=80&buffer=2000,rist://10.50.2.2:6500?rtt-min=80&buffer=2000",
+            "10.50.1.2:6500?rtt-min=80&buffer=2000,10.50.2.2:6500?rtt-min=80&buffer=2000",
             "--stats-dest",
             &format!("192.168.114.1:{}", stats_port),
             "--bitrate",

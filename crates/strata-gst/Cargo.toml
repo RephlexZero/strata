@@ -1,8 +1,8 @@
 [package]
 name = "strata-gst"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
-description = "GStreamer RIST bonding sink and source elements"
+description = "GStreamer plugin for Strata bonded transport"
 repository = "https://github.com/RephlexZero/strata"
 
 [dependencies]
@@ -20,13 +20,13 @@ serde.workspace = true
 serde_json.workspace = true
 
 [lib]
-name = "gstristbonding"
+name = "gststrata"
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [[bin]]
-name = "integration_node"
-path = "src/bin/integration_node.rs"
+name = "strata-node"
+path = "src/bin/strata_node.rs"
 
 [dev-dependencies]
 plotters = "0.3.7"

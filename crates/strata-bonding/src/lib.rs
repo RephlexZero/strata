@@ -16,6 +16,7 @@
 pub mod adaptation;
 pub mod config;
 pub mod media;
+pub mod metrics;
 pub mod modem;
 pub mod net;
 pub mod protocol;

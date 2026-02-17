@@ -6,7 +6,7 @@ use gst_base::subclass::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use strata_bonding::receiver::bonding::BondingReceiver;
+use strata_bonding::receiver::ReceiverBackend;
 
 mod imp {
     use super::*;
@@ -21,21 +21,21 @@ mod imp {
         fn default() -> Self {
             Self {
                 links: String::new(),
-                latency: 100, // Default 100ms
+                latency: 100,
                 config_toml: String::new(),
             }
         }
     }
 
     #[derive(Default)]
-    pub struct RsRistBondSrc {
+    pub struct StrataSrc {
         settings: Mutex<Settings>,
-        receiver: Mutex<Option<BondingReceiver>>,
+        receiver: Mutex<Option<ReceiverBackend>>,
         stats_running: Arc<AtomicBool>,
         stats_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     }
 
-    impl RsRistBondSrc {
+    impl StrataSrc {
         fn apply_config_toml(&self, toml_str: &str) {
             if toml_str.trim().is_empty() {
                 return;
@@ -44,9 +44,7 @@ mod imp {
                 Ok(cfg) => {
                     let mut settings = lock_or_recover(&self.settings);
                     settings.config_toml = toml_str.to_string();
-                    // Apply receiver config: override latency and links if specified
                     settings.latency = cfg.receiver.start_latency.as_millis() as u32;
-                    // If links are specified in config, override the links property
                     if !cfg.links.is_empty() {
                         settings.links = cfg
                             .links
@@ -59,7 +57,7 @@ mod imp {
                 Err(e) => {
                     gst::warning!(
                         gst::CAT_DEFAULT,
-                        "RsRistBondSrc: Invalid config TOML: {}",
+                        "StrataSrc: Invalid config TOML: {}",
                         e
                     );
                 }
@@ -68,13 +66,13 @@ mod imp {
     }
 
     #[glib::object_subclass]
-    impl ObjectSubclass for RsRistBondSrc {
-        const NAME: &'static str = "RsRistBondSrc";
-        type Type = super::RsRistBondSrc;
+    impl ObjectSubclass for StrataSrc {
+        const NAME: &'static str = "StrataSrc";
+        type Type = super::StrataSrc;
         type ParentType = gst_base::PushSrc;
     }
 
-    impl ObjectImpl for RsRistBondSrc {
+    impl ObjectImpl for StrataSrc {
         fn properties() -> &'static [glib::ParamSpec] {
             static PROPERTIES: std::sync::OnceLock<Vec<glib::ParamSpec>> =
                 std::sync::OnceLock::new();
@@ -83,7 +81,7 @@ mod imp {
                 vec![
                     glib::ParamSpecString::builder("links")
                         .nick("Links")
-                        .blurb("Comma-separated list of RIST URLs to bind to (e.g. 'rist://@0.0.0.0:5000')")
+                        .blurb("Comma-separated list of bind addresses (e.g. '0.0.0.0:5000')")
                         .build(),
                     glib::ParamSpecUInt::builder("latency")
                         .nick("Latency")
@@ -138,7 +136,7 @@ mod imp {
                         Err(e) => {
                             gst::warning!(
                                 gst::CAT_DEFAULT,
-                                "RsRistBondSrc: Failed to read config file '{}': {}",
+                                "StrataSrc: Failed to read config file '{}': {}",
                                 path,
                                 e
                             );
@@ -173,19 +171,19 @@ mod imp {
         }
     }
 
-    impl GstObjectImpl for RsRistBondSrc {}
+    impl GstObjectImpl for StrataSrc {}
 
-    impl ElementImpl for RsRistBondSrc {
+    impl ElementImpl for StrataSrc {
         fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
             static ELEMENT_METADATA: std::sync::OnceLock<gst::subclass::ElementMetadata> =
                 std::sync::OnceLock::new();
 
             ELEMENT_METADATA.get_or_init(|| {
                 gst::subclass::ElementMetadata::new(
-                    "RIST Bonding Source",
+                    "Strata Bonding Source",
                     "Source/Network",
-                    "Receives packets via bonded RIST links",
-                    "Strata Contributors <https://github.com/rist-bonding>",
+                    "Receives packets via bonded Strata transport links",
+                    "Strata Contributors <https://github.com/RephlexZero/strata>",
                 )
             });
             Some(ELEMENT_METADATA.get().unwrap())
@@ -209,7 +207,7 @@ mod imp {
         }
     }
 
-    impl BaseSrcImpl for RsRistBondSrc {
+    impl BaseSrcImpl for StrataSrc {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
             let settings = lock_or_recover(&self.settings);
             let mut receiver_guard = lock_or_recover(&self.receiver);
@@ -219,7 +217,7 @@ mod imp {
             }
 
             let latency_duration = Duration::from_millis(settings.latency as u64);
-            let receiver = BondingReceiver::new(latency_duration);
+            let receiver = ReceiverBackend::new(latency_duration, true);
 
             for link in settings.links.split(',') {
                 let link = link.trim();
@@ -229,20 +227,19 @@ mod imp {
 
                 receiver.add_link(link).map_err(|e| {
                     let err_msg = format!("Failed to bind link {}: {}", link, e);
-                    gst::error!(gst::CAT_DEFAULT, "RsRistBondSrc Error: {}", err_msg);
+                    gst::error!(gst::CAT_DEFAULT, "StrataSrc Error: {}", err_msg);
                     gst::error_msg!(gst::ResourceError::OpenRead, ["{}", err_msg])
                 })?;
             }
 
             *receiver_guard = Some(receiver);
 
-            // Setup stats thread
             self.stats_running.store(true, Ordering::Relaxed);
             let running = self.stats_running.clone();
             let element_weak = self.obj().downgrade();
 
             let handle = std::thread::Builder::new()
-                .name("rist-rcv-stats".into())
+                .name("strata-rcv-stats".into())
                 .spawn(move || {
                     let start = Instant::now();
                     let mut stats_seq: u64 = 0;
@@ -257,7 +254,7 @@ mod imp {
                                         .duration_since(UNIX_EPOCH)
                                         .map(|d| d.as_millis() as u64)
                                         .unwrap_or(0);
-                                    let msg = gst::Structure::builder("rist-bonding-stats")
+                                    let msg = gst::Structure::builder("strata-stats")
                                         .field("schema_version", 1i32)
                                         .field("stats_seq", stats_seq)
                                         .field("heartbeat", true)
@@ -269,7 +266,7 @@ mod imp {
                                         .field("next_seq", stats.next_seq)
                                         .field("lost_packets", stats.lost_packets)
                                         .field("late_packets", stats.late_packets)
-                                        .field("current_latency_ms", stats.current_latency_ms) // Added
+                                        .field("current_latency_ms", stats.current_latency_ms)
                                         .build();
                                     let _ = element.post_message(gst::message::Element::new(msg));
                                     stats_seq = stats_seq.wrapping_add(1);
@@ -297,7 +294,6 @@ mod imp {
             let mut receiver_guard = lock_or_recover(&self.receiver);
             if let Some(mut receiver) = receiver_guard.take() {
                 receiver.shutdown();
-                // We leave flushing/closing to Drop?
             }
             Ok(())
         }
@@ -311,7 +307,7 @@ mod imp {
         }
     }
 
-    impl PushSrcImpl for RsRistBondSrc {
+    impl PushSrcImpl for StrataSrc {
         fn create(
             &self,
             _buf: Option<&mut gst::BufferRef>,
@@ -319,7 +315,7 @@ mod imp {
             let receiver_guard = lock_or_recover(&self.receiver);
 
             let rx = if let Some(receiver) = &*receiver_guard {
-                receiver.output_rx.clone()
+                receiver.output_rx().clone()
             } else {
                 return Err(gst::FlowError::Eos);
             };
@@ -339,15 +335,15 @@ mod imp {
 }
 
 glib::wrapper! {
-    pub struct RsRistBondSrc(ObjectSubclass<imp::RsRistBondSrc>)
+    pub struct StrataSrc(ObjectSubclass<imp::StrataSrc>)
         @extends gst_base::PushSrc, gst_base::BaseSrc, gst::Element, gst::Object;
 }
 
 pub fn register(plugin: Option<&gst::Plugin>) -> Result<(), glib::BoolError> {
     gst::Element::register(
         plugin,
-        "rsristbondsrc",
+        "stratasrc",
         gst::Rank::NONE,
-        RsRistBondSrc::static_type(),
+        StrataSrc::static_type(),
     )
 }

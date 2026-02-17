@@ -65,7 +65,7 @@ fn test_race_car_scenarios() {
     apply_impairment(&sender_ns, "race_veth2_a", clean_config_2.clone()).unwrap();
 
     // 2. Start Receiver
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_integration_node"));
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_strata-node"));
 
     let receiver_ns_clone = receiver_ns.clone();
     let exec_recv = executable.clone();
@@ -77,7 +77,7 @@ fn test_race_car_scenarios() {
                 &[
                     "receiver",
                     "--bind",
-                    "rist://10.0.30.2:1234,rist://10.0.40.2:1235",
+                    "10.0.30.2:1234,10.0.40.2:1235",
                 ],
             )
             .expect("Failed to run receiver");
@@ -99,7 +99,7 @@ fn test_race_car_scenarios() {
                 &[
                     "sender",
                     "--dest",
-                    "rist://10.0.30.2:1234,rist://10.0.40.2:1235",
+                    "10.0.30.2:1234,10.0.40.2:1235",
                     "--bitrate",
                     "4000", // 4Mbps target.
                 ],
@@ -250,7 +250,7 @@ fn test_long_running_stability() {
         "192.168.115.2/24",
     );
 
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_integration_node"));
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_strata-node"));
 
     let recv_ns_clone = receiver_ns.clone();
     let exec_recv = executable.clone();
@@ -258,7 +258,7 @@ fn test_long_running_stability() {
         let output = recv_ns_clone
             .exec(
                 exec_recv.to_str().unwrap(),
-                &["receiver", "--bind", "rist://10.0.50.2:1240"],
+                &["receiver", "--bind", "10.0.50.2:1240"],
             )
             .expect("Failed to run receiver");
         eprintln!(
@@ -312,7 +312,7 @@ fn test_long_running_stability() {
                 &[
                     "sender",
                     "--dest",
-                    "rist://10.0.50.2:1240?rtt-min=60&buffer=2000",
+                    "10.0.50.2:1240?rtt-min=60&buffer=2000",
                     "--stats-dest",
                     &format!("192.168.115.1:{}", stats_port),
                     "--bitrate",

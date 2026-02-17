@@ -67,7 +67,7 @@ impl BondingRuntime {
         let metrics_clone = metrics.clone();
 
         let handle = thread::Builder::new()
-            .name("rist-bond-worker".into())
+            .name("strata-worker".into())
             .spawn(move || runtime_worker(rx, metrics_clone, scheduler_config, use_transport))
             .expect("failed to spawn bonding runtime worker");
 

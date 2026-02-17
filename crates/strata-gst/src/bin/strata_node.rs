@@ -4,11 +4,11 @@ use std::env;
 use std::sync::{Arc, Mutex};
 
 const SENDER_HELP: &str = r#"
-USAGE: integration_node sender [OPTIONS] --dest <URL[,URL...]>
+USAGE: strata-node sender [OPTIONS] --dest <ADDR[,ADDR...]>
 
 OPTIONS:
-  --dest <urls>       Comma-separated RIST destination URLs (required)
-                      e.g. rist://192.168.1.100:5000,rist://10.0.0.100:5000
+  --dest <addrs>      Comma-separated destination addresses (required)
+                      e.g. 192.168.1.100:5000,10.0.0.100:5000
   --source <mode>     Initial video source mode (default: test)
                         test   - SMPTE colour bars (videotestsrc)
                         v4l2   - Camera / HDMI capture card (v4l2src)
@@ -22,7 +22,7 @@ OPTIONS:
   --config <path>     Path to TOML config file (see Configuration Reference)
   --stats-dest <addr> UDP address to relay stats JSON (e.g. 127.0.0.1:9100)
   --relay-url <url>   RTMP/RTMPS URL to relay encoded stream to in parallel
-                      (tees output: one copy goes via RIST, another via RTMP)
+                      (tees output: one copy goes via Strata, another via RTMP)
   --control <path>    Unix socket path for hot-swap commands
                       (default: /tmp/strata-pipeline.sock)
   --help              Show this help
@@ -42,30 +42,30 @@ SOURCE HOT-SWAP:
 
 EXAMPLES:
   # Test pattern over two cellular links
-  integration_node sender --dest rist://server:5000,rist://server:5002 \
+  strata-node sender --dest server:5000,server:5002 \
     --config sender.toml
 
   # 1080p30 with audio for YouTube relay via receiver
-  integration_node sender --source test --framerate 30 --audio --bitrate 2000 \
-    --dest rist://receiver:5000,rist://receiver:5002,rist://receiver:5004
+  strata-node sender --source test --framerate 30 --audio --bitrate 2000 \
+    --dest receiver:5000,receiver:5002,receiver:5004
 
-  # Direct RTMP relay to YouTube (sender tees output: RIST + RTMP)
-  integration_node sender --source test --bitrate 2000 \
-    --dest rist://receiver:5000,rist://receiver:5002 \
+  # Direct RTMP relay to YouTube (sender tees output to Strata + RTMP)
+  strata-node sender --source test --bitrate 2000 \
+    --dest receiver:5000,receiver:5002 \
     --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
 
   # HDMI capture card to cloud receiver
-  integration_node sender --source v4l2 --device /dev/video0 \
-    --dest rist://cloud.example.com:5000,rist://cloud.example.com:5002 \
+  strata-node sender --source v4l2 --device /dev/video0 \
+    --dest cloud.example.com:5000,cloud.example.com:5002 \
     --bitrate 2000 --config sender.toml
 "#;
 
 const RECEIVER_HELP: &str = r#"
-USAGE: integration_node receiver [OPTIONS] --bind <URL>
+USAGE: strata-node receiver [OPTIONS] --bind <ADDR>
 
 OPTIONS:
-  --bind <url>        RIST bind URL (required), e.g. rist://@0.0.0.0:5000
-                      Multiple bind addresses: rist://@0.0.0.0:5000,rist://@0.0.0.0:5002
+  --bind <addr>       Bind address (required), e.g. 0.0.0.0:5000
+                      Multiple bind addresses: 0.0.0.0:5000,0.0.0.0:5002
   --output <path>     Record to file (.ts = raw MPEG-TS, .mp4 = remuxed)
   --relay-url <url>   RTMP/RTMPS URL to relay the received stream to
                       e.g. rtmp://a.rtmp.youtube.com/live2/STREAM_KEY
@@ -74,22 +74,22 @@ OPTIONS:
 
 EXAMPLES:
   # Receive and monitor (no file output)
-  integration_node receiver --bind rist://@0.0.0.0:5000
+  strata-node receiver --bind 0.0.0.0:5000
 
   # Receive bonded stream and relay to YouTube
-  integration_node receiver --bind rist://@0.0.0.0:5000,rist://@0.0.0.0:5002,rist://@0.0.0.0:5004 \
+  strata-node receiver --bind 0.0.0.0:5000,0.0.0.0:5002,0.0.0.0:5004 \
     --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
 
   # Receive and record to MPEG-TS file
-  integration_node receiver --bind rist://@0.0.0.0:5000 --output capture.ts
+  strata-node receiver --bind 0.0.0.0:5000 --output capture.ts
 
   # Receive with config
-  integration_node receiver --bind rist://@0.0.0.0:5000 --config receiver.toml
+  strata-node receiver --bind 0.0.0.0:5000 --config receiver.toml
 "#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize structured logging for production use.
-    // Controlled by RUST_LOG env var (e.g., RUST_LOG=info,librist=warn).
+    // Controlled by RUST_LOG env var (e.g., RUST_LOG=info,strata_bonding=debug).
     strata_bonding::init();
 
     gst::init()?;
@@ -109,8 +109,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "--help" | "-h" | "help" => {
             eprintln!("Usage: {} <sender|receiver> [args]\n", args[0]);
             eprintln!("Modes:");
-            eprintln!("  sender    Encode and transmit video over bonded RIST links");
-            eprintln!("  receiver  Receive and reassemble bonded RIST stream\n");
+            eprintln!("  sender    Encode and transmit video over bonded Strata links");
+            eprintln!("  receiver  Receive and reassemble bonded Strata stream\n");
             eprintln!(
                 "Run `{} sender --help` or `{} receiver --help` for mode-specific options.",
                 args[0], args[0]
@@ -125,8 +125,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn register_plugins() -> Result<(), gst::glib::BoolError> {
-    gstristbonding::sink::register(None)?;
-    gstristbonding::src::register(None)?;
+    gststrata::sink::register(None)?;
+    gststrata::src::register(None)?;
     Ok(())
 }
 
@@ -232,7 +232,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     //
     // Pipeline structure:
     //   videotestsrc ! capsfilter ! queue ─┐
-    //                                      ├─ input-selector ! x264enc ! [audio] ! mux ! rsristbondsink
+    //                                      ├─ input-selector ! x264enc ! [audio] ! mux ! stratasink
     //   [dynamic v4l2/uri sources] ────────┘
     //
     // The initial source (--source flag) determines which branch is active.
@@ -243,9 +243,9 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // The test source is always available as the fallback.
     //
     // When --relay-url is set, the encoded video and audio are teed:
-    //   x264enc → tee → queue → mpegtsmux → rsristbondsink   (RIST)
+    //   x264enc → tee → queue → mpegtsmux → stratasink   (Strata)
     //                 └→ queue → h264parse → flvmux → rtmpsink (RTMP)
-    //   voaacenc → tee → aacparse → queue → mpegtsmux         (RIST)
+    //   voaacenc → tee → aacparse → queue → mpegtsmux         (Strata)
     //                 └→ queue → aacparse → flvmux             (RTMP)
     let use_relay = !relay_url.is_empty();
 
@@ -255,7 +255,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (audio_fragment, rtmp_fragment) = if use_relay {
-        // Audio with tee — one path to RIST mux, another to FLV mux
+        // Audio with tee — one path to Strata mux, another to FLV mux
         let audio = " audiotestsrc is-live=true wave=silence \
             ! audioconvert ! audioresample ! voaacenc bitrate=128000 \
             ! tee name=atee \
@@ -293,7 +293,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
          ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps} key-int-max={ki} \
          {video_to_mux}{audio} \
          mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 \
-         ! rsristbondsink name=rsink{rtmp}",
+         ! stratasink name=rsink{rtmp}",
         w = res_w,
         h = res_h,
         fps = framerate,
@@ -348,7 +348,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // ── Configure RIST destinations ──
+    // ── Configure destinations ──
     if let Some(sink) = pipeline.by_name("rsink") {
         if !config_path.is_empty() {
             let config_toml = std::fs::read_to_string(config_path)
@@ -376,7 +376,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        return Err("Failed to find rsristbondsink element".into());
+        return Err("Failed to find stratasink element".into());
     }
 
     // ── Stats relay (always if stats-dest is configured) ──
@@ -467,10 +467,8 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             let ceiling = ((max_bps / 1000) as u32).min(bitrate_kbps);
                             *nada_ceiling_kbps.lock().unwrap() = ceiling;
                         }
-                    } else if s.name() == "rist-bonding-stats" {
+                    } else if s.name() == "strata-stats" {
                         if let Some(sock) = &stats_socket {
-                            // Serialize the per-link fields into a JSON
-                            // object that the agent telemetry can parse.
                             let json = serialize_bonding_stats(s);
                             let _ = sock.send_to(json.as_bytes(), stats_dest);
                         }
@@ -488,13 +486,16 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 // ── Interface resolution ────────────────────────────────────────────
 
-/// Resolve which OS network interface routes to the host in a RIST URI.
+/// Resolve which OS network interface routes to the host in an address.
 ///
-/// Parses the host from `rist://<host>:<port>?...` and runs
+/// Parses the host from `host:port` and runs
 /// `ip route get <host>` to determine the outgoing interface.
 fn resolve_interface_for_uri(uri: &str) -> Option<String> {
-    // Extract host from rist://HOST:PORT?...
-    let stripped = uri.strip_prefix("rist://")?;
+    // Strip any legacy rist:// prefix for backwards compat
+    let stripped = uri
+        .strip_prefix("rist://")
+        .or_else(|| uri.strip_prefix("rist://@"))
+        .unwrap_or(uri);
     let host = stripped.split(':').next()?;
     if host.is_empty() {
         return None;
@@ -519,7 +520,7 @@ fn resolve_interface_for_uri(uri: &str) -> Option<String> {
 /// Handle a `toggle-link` command from the control socket.
 ///
 /// Finds the sink pad whose `interface` property matches the requested
-/// interface name and either removes or re-adds the corresponding RIST
+/// interface name and either removes or re-adds the corresponding
 /// link in the bonding runtime.
 ///
 /// **Disable:** releases the pad from the element, which triggers
@@ -599,7 +600,7 @@ fn handle_toggle_link(
 
 // ── Stats serialization ─────────────────────────────────────────────
 
-/// Serialize the `rist-bonding-stats` GStreamer structure into JSON
+/// Serialize the `strata-stats` GStreamer structure into JSON
 /// that the agent telemetry module can parse.
 ///
 /// Includes ALL links (alive and dead) with full metadata so the
@@ -983,14 +984,14 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // Pipeline construction:
     //
     // --relay-url (RTMP relay):
-    //   rsristbondsrc ! tsdemux ! h264parse ! flvmux streamable=true ! rtmpsink
+    //   stratasrc ! tsdemux ! h264parse ! flvmux streamable=true ! rtmpsink
     //   (audio pads are connected dynamically via pad-added signal)
     //
     // --output (recording):
-    //   rsristbondsrc ! tee ! appsink + filesink (or tsdemux ! mp4mux ! filesink)
+    //   stratasrc ! tee ! appsink + filesink (or tsdemux ! mp4mux ! filesink)
     //
     // Default (monitor only):
-    //   rsristbondsrc ! appsink
+    //   stratasrc ! appsink
 
     let use_relay = !relay_url.is_empty();
 
@@ -999,7 +1000,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // The gst_parse syntax `d. !` auto-links pads by type.
         // This handles both video-only and video+audio MPEG-TS inputs.
         format!(
-            "rsristbondsrc links=\"{bind}\" name=src latency=200 ! \
+            "stratasrc links=\"{bind}\" name=src latency=200 ! \
              queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
              tsdemux name=d \
              d. ! queue ! h264parse ! flvmux name=mux streamable=true ! \
@@ -1012,7 +1013,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         if output_file.ends_with(".ts") {
             // Raw dump
             format!(
-                "rsristbondsrc links=\"{}\" name=src ! tee name=t ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! appsink name=sink emit-signals=true sync=false t. ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! filesink location=\"{}\" sync=false",
+                "stratasrc links=\"{}\" name=src ! tee name=t ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! appsink name=sink emit-signals=true sync=false t. ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! filesink location=\"{}\" sync=false",
                 bind_str, output_file
             )
         } else {
@@ -1020,13 +1021,13 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             // Use faststart=true to move MOOV atom to front (requires rewriting file at end).
             // Use queues to prevent blocking.
             format!(
-                "rsristbondsrc links=\"{}\" name=src ! tee name=t ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! appsink name=sink emit-signals=true sync=false t. ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! tsdemux ! h264parse ! mp4mux faststart=true ! filesink location=\"{}\" sync=false",
+                "stratasrc links=\"{}\" name=src ! tee name=t ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! appsink name=sink emit-signals=true sync=false t. ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! tsdemux ! h264parse ! mp4mux faststart=true ! filesink location=\"{}\" sync=false",
                 bind_str, output_file
             )
         }
     } else {
         format!(
-            "rsristbondsrc links=\"{}\" ! appsink name=sink emit-signals=true sync=false",
+            "stratasrc links=\"{}\" ! appsink name=sink emit-signals=true sync=false",
             bind_str
         )
     };
@@ -1119,7 +1120,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             MessageView::Element(element) => {
                 if let Some(s) = element.structure() {
                     // Filter spammy stats if needed, or keep for visualization
-                    if s.name() == "rist-bonding-stats" {
+                    if s.name() == "strata-stats" {
                         eprintln!("Element Message: {}", s);
                     }
                 }

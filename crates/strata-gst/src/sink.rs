@@ -1,4 +1,4 @@
-use crate::pad::RsRistBondSinkPad;
+use crate::pad::StrataSinkPad;
 use crate::util::lock_or_recover;
 use gst::glib;
 use gst::prelude::*;
@@ -46,26 +46,25 @@ mod imp {
         },
     }
 
-    pub struct RsRistBondSink {
+    pub struct StrataSink {
         pub(crate) runtime: Mutex<Option<BondingRuntime>>,
         pub(crate) stats_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
         pub(crate) stats_running: Arc<AtomicBool>,
 
-        // Configuration state management
-        pub(crate) links_config: Mutex<String>,
+        pub(crate) destinations_config: Mutex<String>,
         pub(crate) config_toml: Mutex<String>,
         pub(crate) pad_map: Mutex<HashMap<String, usize>>,
         pub(crate) pending_links: Mutex<HashMap<usize, LinkConfig>>,
         pub(crate) scheduler_config: Mutex<SchedulerConfig>,
     }
 
-    impl Default for RsRistBondSink {
+    impl Default for StrataSink {
         fn default() -> Self {
             Self {
                 runtime: Mutex::new(None),
                 stats_thread: Mutex::new(None),
                 stats_running: Arc::new(AtomicBool::new(false)),
-                links_config: Mutex::new(String::new()),
+                destinations_config: Mutex::new(String::new()),
                 config_toml: Mutex::new(String::new()),
                 pad_map: Mutex::new(HashMap::new()),
                 pending_links: Mutex::new(HashMap::new()),
@@ -74,7 +73,7 @@ mod imp {
         }
     }
 
-    impl RsRistBondSink {
+    impl StrataSink {
         pub(crate) fn send_msg(&self, msg: SinkMessage) {
             let runtime = lock_or_recover(&self.runtime);
             if let Some(rt) = &*runtime {
@@ -115,7 +114,7 @@ mod imp {
             }
         }
 
-        pub(crate) fn add_link_from_pad(&self, pad: &RsRistBondSinkPad) {
+        pub(crate) fn add_link_from_pad(&self, pad: &StrataSinkPad) {
             let pad_name = pad.name().to_string();
             let uri = pad.get_uri();
 
@@ -138,7 +137,6 @@ mod imp {
         }
 
         fn get_id_for_pad(&self, pad_name: &str) -> usize {
-            // Find existing or create ID
             let mut map = lock_or_recover(&self.pad_map);
             if let Some(&id) = map.get(pad_name) {
                 return id;
@@ -174,17 +172,17 @@ mod imp {
             }
         }
 
-        fn reconfigure_legacy(&self) {
-            let config = lock_or_recover(&self.links_config).clone();
+        fn reconfigure_destinations(&self) {
+            let config = lock_or_recover(&self.destinations_config).clone();
             if config.is_empty() {
                 return;
             }
-            for (idx, url) in config.split(',').enumerate() {
-                let url = url.trim();
-                if !url.is_empty() {
+            for (idx, addr) in config.split(',').enumerate() {
+                let addr = addr.trim();
+                if !addr.is_empty() {
                     self.send_msg(SinkMessage::AddLink {
                         id: idx,
-                        uri: url.to_string(),
+                        uri: addr.to_string(),
                         iface: None,
                     });
                 }
@@ -193,21 +191,21 @@ mod imp {
     }
 
     #[glib::object_subclass]
-    impl ObjectSubclass for RsRistBondSink {
-        const NAME: &'static str = "RsRistBondSink";
-        type Type = super::RsRistBondSink;
+    impl ObjectSubclass for StrataSink {
+        const NAME: &'static str = "StrataSink";
+        type Type = super::StrataSink;
         type ParentType = gst_base::BaseSink;
     }
 
-    impl ObjectImpl for RsRistBondSink {
+    impl ObjectImpl for StrataSink {
         fn properties() -> &'static [glib::ParamSpec] {
             static PROPERTIES: std::sync::OnceLock<Vec<glib::ParamSpec>> =
                 std::sync::OnceLock::new();
             PROPERTIES.get_or_init(|| {
                 vec![
-                    glib::ParamSpecString::builder("links")
-                        .nick("Links (Deprecated)")
-                        .blurb("Comma-separated list of links configuration")
+                    glib::ParamSpecString::builder("destinations")
+                        .nick("Destinations")
+                        .blurb("Comma-separated list of destination addresses (host:port)")
                         .mutable_ready()
                         .build(),
                     glib::ParamSpecString::builder("config")
@@ -226,10 +224,10 @@ mod imp {
 
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
             match pspec.name() {
-                "links" => {
-                    *lock_or_recover(&self.links_config) =
+                "destinations" => {
+                    *lock_or_recover(&self.destinations_config) =
                         value.get().expect("type checked upstream");
-                    self.reconfigure_legacy();
+                    self.reconfigure_destinations();
                 }
                 "config" => {
                     let cfg: String = value.get().expect("type checked upstream");
@@ -241,8 +239,6 @@ mod imp {
                     if path.is_empty() {
                         return;
                     }
-                    // Validate path: reject absolute paths outside expected directories
-                    // to mitigate path traversal when set from untrusted input.
                     if path.contains("..") {
                         gst::warning!(
                             gst::CAT_DEFAULT,
@@ -274,7 +270,7 @@ mod imp {
 
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
             match pspec.name() {
-                "links" => lock_or_recover(&self.links_config).to_value(),
+                "destinations" => lock_or_recover(&self.destinations_config).to_value(),
                 "config" | "config-file" => lock_or_recover(&self.config_toml).to_value(),
                 _ => {
                     gst::warning!(gst::CAT_DEFAULT, "Unknown property: {}", pspec.name());
@@ -284,18 +280,18 @@ mod imp {
         }
     }
 
-    impl GstObjectImpl for RsRistBondSink {}
+    impl GstObjectImpl for StrataSink {}
 
-    impl ElementImpl for RsRistBondSink {
+    impl ElementImpl for StrataSink {
         fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
             static ELEMENT_METADATA: std::sync::OnceLock<gst::subclass::ElementMetadata> =
                 std::sync::OnceLock::new();
             ELEMENT_METADATA.get_or_init(|| {
                 gst::subclass::ElementMetadata::new(
-                    "RIST Bonding Sink",
+                    "Strata Bonding Sink",
                     "Sink/Network",
-                    "Sends packets via bonded RIST links",
-                    "Strata Contributors <https://github.com/rist-bonding>",
+                    "Sends packets via bonded Strata transport links",
+                    "Strata Contributors <https://github.com/RephlexZero/strata>",
                 )
             });
             Some(ELEMENT_METADATA.get().unwrap())
@@ -318,7 +314,7 @@ mod imp {
                         "link_%u",
                         gst::PadDirection::Src,
                         gst::PadPresence::Request,
-                        &gst::Caps::new_empty_simple("meta/x-rist-config"),
+                        &gst::Caps::new_empty_simple("meta/x-strata-link"),
                     )
                     .unwrap(),
                 ]
@@ -346,7 +342,7 @@ mod imp {
                     }
                 };
 
-                let pad = glib::Object::builder::<RsRistBondSinkPad>()
+                let pad = glib::Object::builder::<StrataSinkPad>()
                     .property("name", &name)
                     .property("direction", gst::PadDirection::Src)
                     .property("template", templ)
@@ -368,22 +364,22 @@ mod imp {
         }
 
         fn release_pad(&self, pad: &gst::Pad) {
-            if let Some(bond_pad) = pad.downcast_ref::<RsRistBondSinkPad>() {
+            if let Some(bond_pad) = pad.downcast_ref::<StrataSinkPad>() {
                 self.remove_link_by_pad_name(&bond_pad.name());
             }
             self.obj().remove_pad(pad).unwrap();
         }
     }
 
-    impl BaseSinkImpl for RsRistBondSink {
+    impl BaseSinkImpl for StrataSink {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
             let sched_cfg = lock_or_recover(&self.scheduler_config).clone();
-            let runtime = BondingRuntime::with_config(sched_cfg.clone());
+            let runtime = BondingRuntime::with_transport(sched_cfg.clone());
             let metrics_handle = runtime.metrics_handle();
             *lock_or_recover(&self.runtime) = Some(runtime);
 
             for pad in self.obj().pads() {
-                if let Some(bond_pad) = pad.downcast_ref::<RsRistBondSinkPad>() {
+                if let Some(bond_pad) = pad.downcast_ref::<StrataSinkPad>() {
                     self.add_link_from_pad(bond_pad);
                 }
             }
@@ -398,7 +394,7 @@ mod imp {
                 }
             }
 
-            self.reconfigure_legacy();
+            self.reconfigure_destinations();
             self.apply_config(&lock_or_recover(&self.config_toml));
 
             let element_weak = self.obj().downgrade();
@@ -408,7 +404,7 @@ mod imp {
             let congestion_trigger = sched_cfg.congestion_trigger_ratio;
 
             let handle = std::thread::Builder::new()
-                .name("rist-bond-stats".into())
+                .name("strata-stats".into())
                 .spawn(move || {
                     let stats_interval = Duration::from_millis(sched_cfg.stats_interval_ms);
                     let mut last_stats = Instant::now();
@@ -436,7 +432,7 @@ mod imp {
                                     }
                                 }
 
-                                let mut msg_struct = gst::Structure::builder("rist-bonding-stats")
+                                let mut msg_struct = gst::Structure::builder("strata-stats")
                                     .field("schema_version", 1i32)
                                     .field("stats_seq", stats_seq)
                                     .field("heartbeat", true)
@@ -512,9 +508,6 @@ mod imp {
             let data = bytes::Bytes::copy_from_slice(&map);
 
             let flags = buffer.flags();
-            // Content-Aware Bonding:
-            // 1. Critical: Broadcast Keyframes (IDR), Headers, and non-Delta (Audio) for reliability.
-            // 2. Droppable: Allow dropping non-ref B-frames during congestion to preserve latency.
             let is_critical = !flags.contains(gst::BufferFlags::DELTA_UNIT)
                 || flags.contains(gst::BufferFlags::HEADER);
             let can_drop = flags.contains(gst::BufferFlags::DROPPABLE);
@@ -558,19 +551,19 @@ mod tests {
 
             [[links]]
             id = 10
-            uri = "rist://1.2.3.4:5000"
+            uri = "192.168.1.100:5000"
 
             [[links]]
-            uri = "rist://5.6.7.8:5000"
+            uri = "10.0.0.1:5000"
         "#;
 
         let cfg = parse_config(toml).unwrap();
         assert_eq!(cfg.links.len(), 2);
         assert_eq!(cfg.links[0].id, 10);
-        assert_eq!(cfg.links[0].uri, "rist://1.2.3.4:5000");
+        assert_eq!(cfg.links[0].uri, "192.168.1.100:5000");
         assert!(cfg.links[0].interface.is_none());
-        assert_eq!(cfg.links[1].id, 1); // idx fallback
-        assert_eq!(cfg.links[1].uri, "rist://5.6.7.8:5000");
+        assert_eq!(cfg.links[1].id, 1);
+        assert_eq!(cfg.links[1].uri, "10.0.0.1:5000");
         assert!(cfg.links[1].interface.is_none());
     }
 
@@ -596,22 +589,22 @@ mod tests {
             version = 1
             [[links]]
             id = 2
-            uri = "rist://9.9.9.9:5000"
+            uri = "10.0.0.1:5000"
             interface = "eth0"
 
             [[links]]
             id = 3
-            uri = "rist://9.9.9.10:5000"
+            uri = "10.0.0.2:5000"
             interface = ""
         "#;
 
         let cfg = parse_config(toml).unwrap();
         assert_eq!(cfg.links.len(), 2);
         assert_eq!(cfg.links[0].id, 2);
-        assert_eq!(cfg.links[0].uri, "rist://9.9.9.9:5000");
+        assert_eq!(cfg.links[0].uri, "10.0.0.1:5000");
         assert_eq!(cfg.links[0].interface.as_deref(), Some("eth0"));
         assert_eq!(cfg.links[1].id, 3);
-        assert_eq!(cfg.links[1].uri, "rist://9.9.9.10:5000");
+        assert_eq!(cfg.links[1].uri, "10.0.0.2:5000");
         assert!(cfg.links[1].interface.is_none());
     }
 
@@ -635,15 +628,15 @@ mod tests {
 }
 
 glib::wrapper! {
-    pub struct RsRistBondSink(ObjectSubclass<imp::RsRistBondSink>)
+    pub struct StrataSink(ObjectSubclass<imp::StrataSink>)
         @extends gst_base::BaseSink, gst::Element, gst::Object;
 }
 
 pub fn register(plugin: Option<&gst::Plugin>) -> Result<(), glib::BoolError> {
     gst::Element::register(
         plugin,
-        "rsristbondsink",
+        "stratasink",
         gst::Rank::NONE,
-        RsRistBondSink::static_type(),
+        StrataSink::static_type(),
     )
 }
