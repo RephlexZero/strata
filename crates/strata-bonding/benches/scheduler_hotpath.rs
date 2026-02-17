@@ -76,7 +76,7 @@ fn bench_scheduler_send_2_links(c: &mut Criterion) {
             };
             b.iter(|| {
                 let payload = Bytes::from(vec![0u8; size]);
-                black_box(scheduler.send(payload, profile).unwrap());
+                scheduler.send(payload, profile).unwrap();
             });
         });
     }
@@ -102,7 +102,7 @@ fn bench_scheduler_send_3_links_hetero(c: &mut Criterion) {
         };
         b.iter(|| {
             let payload = Bytes::from(vec![0u8; 1200]);
-            black_box(scheduler.send(payload, profile).unwrap());
+            scheduler.send(payload, profile).unwrap();
         });
     });
 }
@@ -142,7 +142,7 @@ fn bench_scheduler_critical_broadcast(c: &mut Criterion) {
         };
         b.iter(|| {
             let payload = Bytes::from(vec![0u8; 1200]);
-            black_box(scheduler.send(payload, profile).unwrap());
+            scheduler.send(payload, profile).unwrap();
         });
     });
 }
