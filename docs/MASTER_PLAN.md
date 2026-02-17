@@ -917,7 +917,7 @@ scheduling.
 
 **Goal**: Cloud-side receiver with fan-out and orchestration.
 
-- [ ] Cloud receiver binary (standalone, not GStreamer)
+- [x] Cloud receiver binary (standalone, not GStreamer)
 - [ ] Dynamic jitter buffer (Zixi-inspired, ML-assisted sizing)
 - [ ] SRT/RTMP/NDI output bridges
 - [x] Control plane REST API (strata-control)
@@ -926,7 +926,7 @@ scheduling.
 
 ### Phase 7: Hardening (Ongoing)
 
-- [ ] Fuzz testing (cargo-fuzz on wire parser)
+- [x] Fuzz testing (cargo-fuzz on wire parser)
 - [ ] Sliding-window RLNC (replace block RS)
 - [x] Upgrade to monoio with io_uring SQPOLL
 - [ ] AV1-SVC support

@@ -1,0 +1,31 @@
+[package]
+name = "strata-transport-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.strata-transport]
+path = ".."
+
+[[bin]]
+name = "fuzz_packet_decode"
+path = "fuzz_targets/fuzz_packet_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_receiver"
+path = "fuzz_targets/fuzz_receiver.rs"
+test = false
+doc = false
+bench = false

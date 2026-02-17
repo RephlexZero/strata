@@ -26,4 +26,8 @@ monoio = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.6"
 
+[[bin]]
+name = "strata-receiver"
+path = "src/bin/strata_receiver.rs"
+
 [dev-dependencies]
