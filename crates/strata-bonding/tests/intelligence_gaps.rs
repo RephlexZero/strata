@@ -4,7 +4,8 @@
 //! 2. BitrateCmd wire format round-trip
 //! 3. Supervisor → Adapter → BitrateCmd wire encoding pipeline
 
-use std::time::{Duration, Instant};
+use quanta::Instant;
+use std::time::Duration;
 
 use strata_transport::congestion::{BiscayController, BiscayState, RadioMetrics};
 use strata_transport::wire::{BitrateCmd, BitrateReason};

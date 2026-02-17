@@ -112,7 +112,7 @@ fn setup_websocket(
 
     // onmessage
     let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-        if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
+        if let Ok(text) = e.data().dyn_into::<web_sys::js_sys::JsString>() {
             let s: String = text.into();
             match serde_json::from_str::<DashboardEvent>(&s) {
                 Ok(event) => {

@@ -3,8 +3,8 @@
 //! Per-link and aggregate statistics for the Strata transport layer.
 //! All stats are designed for Prometheus export and JSON serialization.
 
+use quanta::Instant;
 use serde::Serialize;
-use std::time::Instant;
 
 // ─── Sender Stats ───────────────────────────────────────────────────────────
 

@@ -16,7 +16,8 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use quanta::Instant;
+use std::time::Duration;
 use strata_transport::receiver::{Receiver as TransportReceiver, ReceiverConfig, ReceiverEvent};
 use tracing::{debug, warn};
 
@@ -108,6 +109,23 @@ impl TransportBondingReceiver {
     pub fn add_link(&self, bind_addr: SocketAddr) -> Result<()> {
         let socket = UdpSocket::bind(bind_addr)?;
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+
+        // Enable SO_BUSY_POLL for reduced receive latency
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = socket.as_raw_fd();
+            let poll_us: libc::c_int = 50; // 50µs busy-poll budget
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_BUSY_POLL,
+                    &poll_us as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
 
         let input_tx = self
             .input_tx

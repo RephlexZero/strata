@@ -13,8 +13,9 @@
 //! - **NACK suppression**: don't NACK packets past playout deadline
 //! - **Retry budget**: max retransmission attempts per packet (default 3)
 
+use quanta::Instant;
 use std::collections::BTreeSet;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::wire::{NackPacket, NackRange, VarInt};
 

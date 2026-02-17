@@ -3,6 +3,9 @@
 //! Bridges `strata-transport`'s Sender/Receiver with the bonding crate's
 //! `LinkSender` trait. This adapter encapsulates the wire-format encode/decode
 //! and reliability layer (FEC + ARQ) behind the existing scheduling interface.
+//!
+//! Uses `quinn-udp` for GSO (Generic Segmentation Offload) batched sends,
+//! reducing per-packet syscall overhead.
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -11,11 +14,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
+use quinn_udp::{Transmit, UdpSocketState};
 use strata_transport::pool::Priority;
 use strata_transport::sender::{Sender, SenderConfig};
 use strata_transport::session::RttTracker;
 
 /// A link backed by `strata-transport::Sender`.
+///
+/// Uses `quinn-udp` for GSO-enabled batched UDP sends when the kernel supports
+/// it, falling back to individual sends otherwise.
 pub struct TransportLink {
     /// Unique link ID.
     id: usize,
@@ -25,6 +32,8 @@ pub struct TransportLink {
     rtt: Mutex<RttTracker>,
     /// UDP socket for this link.
     socket: UdpSocket,
+    /// quinn-udp socket state for GSO/GRO.
+    udp_state: UdpSocketState,
     /// Total bytes sent through this link.
     bytes_sent: AtomicU64,
     /// Total packets sent.
@@ -36,24 +45,139 @@ impl TransportLink {
     ///
     /// `socket` should be bound and connected to the remote peer.
     pub fn new(id: usize, socket: UdpSocket, config: SenderConfig) -> Self {
+        let udp_state = UdpSocketState::new((&socket).into())
+            .expect("failed to initialize quinn-udp socket state");
         TransportLink {
             id,
             sender: Mutex::new(Sender::new(config)),
             rtt: Mutex::new(RttTracker::new()),
             socket,
+            udp_state,
             bytes_sent: AtomicU64::new(0),
             packets_sent: AtomicU64::new(0),
         }
     }
 
     /// Send data through the transport layer (encode → wire → socket).
+    ///
+    /// Uses GSO to batch multiple wire packets into a single sendmsg syscall
+    /// when the kernel supports it.
     fn transport_send(&self, data: &[u8], priority: Priority) -> Result<usize> {
         let mut sender = self.sender.lock().unwrap();
 
         sender.send(Bytes::copy_from_slice(data), priority);
 
-        let mut total_bytes = 0;
         let outputs: Vec<_> = sender.drain_output().collect();
+        let total_bytes = self.send_batch(&outputs);
+
+        self.bytes_sent
+            .fetch_add(total_bytes as u64, Ordering::Relaxed);
+        self.packets_sent.fetch_add(1, Ordering::Relaxed);
+
+        Ok(total_bytes)
+    }
+
+    /// Send a batch of output packets, using GSO when possible.
+    fn send_batch(&self, outputs: &[strata_transport::sender::OutputPacket]) -> usize {
+        if outputs.is_empty() {
+            return 0;
+        }
+
+        let dest = match self.socket.peer_addr() {
+            Ok(addr) => addr,
+            Err(_) => {
+                // Fallback: send individually
+                return self.send_individual(outputs);
+            }
+        };
+
+        let max_gso = self.udp_state.max_gso_segments();
+
+        if max_gso > 1 && outputs.len() > 1 {
+            // GSO path: concatenate same-size segments into one transmit
+            self.send_gso(outputs, dest, max_gso)
+        } else {
+            self.send_individual_to(outputs, dest)
+        }
+    }
+
+    /// GSO batched send: group equal-size segments and send as one transmit.
+    fn send_gso(
+        &self,
+        outputs: &[strata_transport::sender::OutputPacket],
+        dest: std::net::SocketAddr,
+        max_gso: usize,
+    ) -> usize {
+        let mut total_bytes = 0;
+        let mut i = 0;
+
+        while i < outputs.len() {
+            let segment_size = outputs[i].data.len();
+            let mut batch_buf = Vec::with_capacity(segment_size * max_gso.min(outputs.len() - i));
+            let mut count = 0;
+
+            // Accumulate segments of the same size
+            while i < outputs.len() && count < max_gso && outputs[i].data.len() == segment_size {
+                batch_buf.extend_from_slice(&outputs[i].data);
+                count += 1;
+                i += 1;
+            }
+
+            let transmit = Transmit {
+                destination: dest,
+                ecn: None,
+                contents: &batch_buf,
+                segment_size: if count > 1 {
+                    Some(segment_size)
+                } else {
+                    None
+                },
+                src_ip: None,
+            };
+
+            match self.udp_state.send((&self.socket).into(), &transmit) {
+                Ok(()) => {
+                    total_bytes += batch_buf.len();
+                }
+                Err(e) => {
+                    tracing::warn!(link_id = self.id, error = %e, "GSO send failed");
+                }
+            }
+        }
+
+        total_bytes
+    }
+
+    /// Fallback: send each packet individually via quinn-udp.
+    fn send_individual_to(
+        &self,
+        outputs: &[strata_transport::sender::OutputPacket],
+        dest: std::net::SocketAddr,
+    ) -> usize {
+        let mut total_bytes = 0;
+        for output in outputs {
+            let transmit = Transmit {
+                destination: dest,
+                ecn: None,
+                contents: &output.data,
+                segment_size: None,
+                src_ip: None,
+            };
+            match self.udp_state.send((&self.socket).into(), &transmit) {
+                Ok(()) => {
+                    total_bytes += output.data.len();
+                }
+                Err(e) => {
+                    tracing::warn!(link_id = self.id, error = %e, "send failed");
+                }
+            }
+        }
+        total_bytes
+    }
+
+    /// Fallback: send individually without known peer address.
+    fn send_individual(&self, outputs: &[strata_transport::sender::OutputPacket]) -> usize {
+        let mut total_bytes = 0;
         for output in outputs {
             match self.socket.send(&output.data) {
                 Ok(n) => {
@@ -64,12 +188,7 @@ impl TransportLink {
                 }
             }
         }
-
-        self.bytes_sent
-            .fetch_add(total_bytes as u64, Ordering::Relaxed);
-        self.packets_sent.fetch_add(1, Ordering::Relaxed);
-
-        Ok(total_bytes)
+        total_bytes
     }
 
     /// Process an incoming ACK/NACK packet from the receiver.

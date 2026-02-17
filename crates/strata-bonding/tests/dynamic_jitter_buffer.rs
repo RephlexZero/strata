@@ -5,7 +5,8 @@
 //! and the adaptive sizing algorithm that replaces static buffers.
 
 use bytes::Bytes;
-use std::time::{Duration, Instant};
+use quanta::Instant;
+use std::time::Duration;
 
 use strata_bonding::receiver::aggregator::{ReassemblyBuffer, ReassemblyConfig};
 

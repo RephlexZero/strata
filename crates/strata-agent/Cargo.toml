@@ -25,13 +25,11 @@ tower-http = { version = "0.6", features = ["cors", "fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
-chrono = { version = "0.4", features = ["serde"] }
 
 # Observability
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
-thiserror = "2"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

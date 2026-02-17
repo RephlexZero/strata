@@ -557,7 +557,7 @@ mod imp {
                 size_bytes: data.len(),
             };
 
-            if let Some(rt) = lock_or_recover(&self.runtime).as_ref() {
+            if let Some(rt) = lock_or_recover(&self.runtime).as_mut() {
                 match rt.try_send_packet(data, profile) {
                     Ok(_) => (),
                     Err(PacketSendError::Full) => {

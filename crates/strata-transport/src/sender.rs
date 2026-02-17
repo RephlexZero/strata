@@ -17,8 +17,9 @@
 //! owns those.
 
 use bytes::Bytes;
+use quanta::Instant;
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::arq::RetransmitTracker;
 use crate::codec::FecEncoder;

@@ -3,7 +3,7 @@ use crate::net::interface::LinkPhase;
 use crate::scheduler::ewma::Ewma;
 use std::sync::atomic::{AtomicI32, AtomicU64};
 use std::sync::Mutex;
-use std::time::Instant;
+use quanta::Instant;
 
 /// Smoothed statistics state for a single link's stats callback.
 ///

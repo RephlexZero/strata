@@ -902,11 +902,12 @@ loss, < 50ms added latency.
   - If using monoio: use `CancelableIO` API for any required cancellation
   - Test for socket/fd leaks under error paths (use `lsof` sampling)
   - Fallback to `tokio` + `SO_BUSY_POLL` if monoio proves problematic
-- [ ] Integrate quinn-udp for GSO/GRO
-- [ ] Replace channels with rtrb SPSC ring buffers
-- [ ] quanta for all timing (replace std::time::Instant)
+- [x] Integrate quinn-udp for GSO/GRO
+- [x] Replace channels with rtrb SPSC ring buffers
+- [x] quanta for all timing (replace std::time::Instant)
+- [x] SO_BUSY_POLL on send/receive sockets (50µs budget)
 - [x] Benchmark: measure P50/P99 processing latency
-- [ ] Verify < 100µs processing latency per packet
+- [x] Verify < 100µs processing latency per packet
 
 ### Phase 3: Bonding (3-4 weeks)
 
@@ -968,7 +969,7 @@ scheduling.
 ### Phase 7: Hardening (Ongoing)
 
 - [x] Fuzz testing (cargo-fuzz on wire parser)
-- [ ] Sliding-window RLNC (replace block RS)
+- [x] Sliding-window RLNC (replace block RS)
 - [ ] Upgrade to monoio with io_uring SQPOLL
 - [ ] AV1-SVC support
 - [ ] LSTM link quality prediction (1-2s horizon)

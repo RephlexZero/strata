@@ -12,7 +12,8 @@ use rand::SeedableRng;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use quanta::Instant;
+use std::time::Duration;
 use tracing::{error, warn};
 
 /// Top-level bonding packet scheduler.

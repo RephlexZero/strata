@@ -185,7 +185,7 @@ fn bench_fec_generation_complete(c: &mut Criterion) {
                     seq += 1;
                 }
                 // Benchmark the 32nd (completing) symbol
-                let start = std::time::Instant::now();
+                let start = quanta::Instant::now();
                 let repairs = enc.add_source_symbol(seq, Bytes::from(vec![seq as u8; 1200]));
                 total += start.elapsed();
                 black_box(repairs);

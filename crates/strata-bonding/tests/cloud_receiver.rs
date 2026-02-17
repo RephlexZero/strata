@@ -91,7 +91,7 @@ fn jitter_buffer_adapts_to_high_jitter_then_recovers() {
         max_latency_ms: 300,
     };
     let mut buf = ReassemblyBuffer::with_config(0, config);
-    let start = std::time::Instant::now();
+    let start = quanta::Instant::now();
 
     // Phase 1: constant IAT (10ms) — low jitter
     for i in 0u64..30 {
@@ -142,7 +142,7 @@ fn receiver_stats_reflect_impairments() {
         max_latency_ms: 500,
     };
     let mut buf = ReassemblyBuffer::with_config(0, config);
-    let start = std::time::Instant::now();
+    let start = quanta::Instant::now();
 
     // Send packets 0, 1, 2, then SKIP 3, send 4, 5
     buf.push(0, Bytes::from_static(b"A"), start);
