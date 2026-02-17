@@ -315,7 +315,7 @@ fn handle_connection(mut stream: TcpStream, metrics: &HashMap<usize, LinkMetrics
 /// Serialize link metrics to the same JSON shape the agent telemetry expects.
 ///
 /// Produces `{"links": [...], "timestamp_ms": ...}` — identical to what
-/// `integration_node` emits from GStreamer bus messages.  Useful for
+/// `strata-node` emits from GStreamer bus messages.  Useful for
 /// standalone (non-GStreamer) deployments that need to feed the agent
 /// telemetry loop directly.
 pub fn to_telemetry_json(links: &HashMap<usize, LinkMetrics>) -> String {

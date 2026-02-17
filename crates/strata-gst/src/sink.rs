@@ -53,6 +53,7 @@ mod imp {
 
         pub(crate) destinations_config: Mutex<String>,
         pub(crate) config_toml: Mutex<String>,
+        pub(crate) metrics_addr: Mutex<String>,
         pub(crate) pad_map: Mutex<HashMap<String, usize>>,
         pub(crate) pending_links: Mutex<HashMap<usize, LinkConfig>>,
         pub(crate) scheduler_config: Mutex<SchedulerConfig>,
@@ -66,6 +67,7 @@ mod imp {
                 stats_running: Arc::new(AtomicBool::new(false)),
                 destinations_config: Mutex::new(String::new()),
                 config_toml: Mutex::new(String::new()),
+                metrics_addr: Mutex::new(String::new()),
                 pad_map: Mutex::new(HashMap::new()),
                 pending_links: Mutex::new(HashMap::new()),
                 scheduler_config: Mutex::new(SchedulerConfig::default()),
@@ -212,6 +214,11 @@ mod imp {
                         .blurb("Path to TOML config file (alternative to inline config property)")
                         .mutable_ready()
                         .build(),
+                    glib::ParamSpecString::builder("metrics-addr")
+                        .nick("Metrics Address")
+                        .blurb("Prometheus metrics server address (e.g. 0.0.0.0:9090). Empty to disable.")
+                        .mutable_ready()
+                        .build(),
                 ]
             })
         }
@@ -227,6 +234,10 @@ mod imp {
                     let cfg: String = value.get().expect("type checked upstream");
                     *lock_or_recover(&self.config_toml) = cfg.clone();
                     self.apply_config(&cfg);
+                }
+                "metrics-addr" => {
+                    *lock_or_recover(&self.metrics_addr) =
+                        value.get().expect("type checked upstream");
                 }
                 "config-file" => {
                     let path: String = value.get().expect("type checked upstream");
@@ -266,6 +277,7 @@ mod imp {
             match pspec.name() {
                 "destinations" => lock_or_recover(&self.destinations_config).to_value(),
                 "config" | "config-file" => lock_or_recover(&self.config_toml).to_value(),
+                "metrics-addr" => lock_or_recover(&self.metrics_addr).to_value(),
                 _ => {
                     gst::warning!(gst::CAT_DEFAULT, "Unknown property: {}", pspec.name());
                     "".to_value()
@@ -368,7 +380,40 @@ mod imp {
     impl BaseSinkImpl for StrataSink {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
             let sched_cfg = lock_or_recover(&self.scheduler_config).clone();
-            let runtime = BondingRuntime::with_config(sched_cfg.clone());
+            let mut runtime = BondingRuntime::with_config(sched_cfg.clone());
+
+            // Start Prometheus metrics server if configured
+            let metrics_addr_str = lock_or_recover(&self.metrics_addr).clone();
+            if !metrics_addr_str.is_empty() {
+                match metrics_addr_str.parse::<std::net::SocketAddr>() {
+                    Ok(addr) => match runtime.start_metrics_server(addr) {
+                        Ok(bound) => {
+                            gst::info!(
+                                gst::CAT_DEFAULT,
+                                "Prometheus metrics server listening on {}",
+                                bound
+                            );
+                        }
+                        Err(e) => {
+                            gst::warning!(
+                                gst::CAT_DEFAULT,
+                                "Failed to start metrics server on {}: {}",
+                                metrics_addr_str,
+                                e
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        gst::warning!(
+                            gst::CAT_DEFAULT,
+                            "Invalid metrics-addr '{}': {}",
+                            metrics_addr_str,
+                            e
+                        );
+                    }
+                }
+            }
+
             let metrics_handle = runtime.metrics_handle();
             *lock_or_recover(&self.runtime) = Some(runtime);
 

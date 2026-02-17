@@ -50,6 +50,10 @@ struct Cli {
     /// Heartbeat interval in seconds.
     #[arg(long, default_value_t = 10)]
     heartbeat_interval: u64,
+
+    /// Prometheus metrics server address (e.g. 0.0.0.0:9090). Disabled if empty.
+    #[arg(long, default_value = "")]
+    metrics_addr: String,
 }
 
 /// Shared agent state accessible from all tasks.

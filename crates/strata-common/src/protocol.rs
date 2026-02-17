@@ -368,7 +368,7 @@ mod tests {
             cpu_percent: 25.0,
             mem_used_mb: 512,
             uptime_s: 3600,
-            receiver_url: Some("rist://rcv.example.com:5000".into()),
+            receiver_url: Some("rcv.example.com:5000".into()),
         });
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -379,7 +379,7 @@ mod tests {
             AgentMessage::DeviceStatus(p) => {
                 assert!((p.cpu_percent - 25.0).abs() < f32::EPSILON);
                 assert_eq!(p.mem_used_mb, 512);
-                assert_eq!(p.receiver_url.unwrap(), "rist://rcv.example.com:5000");
+                assert_eq!(p.receiver_url.unwrap(), "rcv.example.com:5000");
             }
             _ => panic!("wrong variant"),
         }

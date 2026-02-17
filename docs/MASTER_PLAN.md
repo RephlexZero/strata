@@ -784,8 +784,8 @@ crates/
 ├── strata-control/        # Axum REST API
 ├── strata-agent/          # Edge node agent (WebSocket telemetry)
 ├── strata-dashboard/      # Leptos WASM web UI
-├── strata-portal/         # Cloud portal
-└── librist-sys/           # Legacy C bindings (archived)
+├── strata-portal/         # Agent portal UI
+└── strata-stats/          # Stats collection CLI
 ```
 
 ### Dependency Graph
@@ -827,13 +827,13 @@ strata-dashboard ──▶ strata-control (REST API)
 
 **Goal**: Core UDP event loop — send and receive packets with the custom header.
 
-- [ ] Define `wire.rs`: header serialization/deserialization with VarInt seqnos
-- [ ] Implement packet pool (`slab` + `bytes`)
-- [ ] Build single-link sender: enqueue packets → serialize → UDP send
-- [ ] Build single-link receiver: UDP recv → deserialize → deliver
-- [ ] PING/PONG RTT measurement
-- [ ] Session handshake (SESSION control packet)
-- [ ] Basic stats: packets sent/received/lost, RTT
+- [x] Define `wire.rs`: header serialization/deserialization with VarInt seqnos
+- [x] Implement packet pool (`slab` + `bytes`)
+- [x] Build single-link sender: enqueue packets → serialize → UDP send
+- [x] Build single-link receiver: UDP recv → deserialize → deliver
+- [x] PING/PONG RTT measurement
+- [x] Session handshake (SESSION control packet)
+- [x] Basic stats: packets sent/received/lost, RTT
 - [ ] turmoil test: send 10,000 packets, verify delivery
 - [ ] proptest: VarInt encode/decode roundtrip for all boundary values
 
@@ -844,11 +844,11 @@ strata-dashboard ──▶ strata-control (REST API)
 
 **Goal**: Survive 10% random loss with zero application-visible loss.
 
-- [ ] NACK tracking: receiver detects gaps, sends NACK control packets
-- [ ] NACK processing: sender retransmits on NACK (plain ARQ first)
-- [ ] Reed-Solomon FEC: systematic encoding (K source + R repair)
-- [ ] FEC decode: receiver reconstructs from any K-of-N received
-- [ ] TAROT cost function: adaptive FEC rate per link
+- [x] NACK tracking: receiver detects gaps, sends NACK control packets
+- [x] NACK processing: sender retransmits on NACK (plain ARQ first)
+- [x] Reed-Solomon FEC: systematic encoding (K source + R repair)
+- [x] FEC decode: receiver reconstructs from any K-of-N received
+- [x] TAROT cost function: adaptive FEC rate per link
 - [ ] turmoil tests: 5%, 10%, 20% random loss — verify zero application loss
 - [ ] turmoil tests: burst loss (Gilbert-Elliott model)
 - [ ] proptest: FEC decode correctness for all combinations of K losses
@@ -871,13 +871,13 @@ loss, < 50ms added latency.
 
 **Goal**: 3-link bonding that outperforms SRT balancing mode.
 
-- [ ] DWRR per-link queues with configurable weights
-- [ ] IoDS scheduling: monotonic arrival constraint
-- [ ] BLEST blocking guard
-- [ ] Thompson Sampling link selector
-- [ ] Multi-link session management (one session, N links)
-- [ ] Per-link Biscay congestion control (BBRv3 base)
-- [ ] Kalman filter for RTT/capacity smoothing
+- [x] DWRR per-link queues with configurable weights
+- [x] IoDS scheduling: monotonic arrival constraint
+- [x] BLEST blocking guard
+- [x] Thompson Sampling link selector
+- [x] Multi-link session management (one session, N links)
+- [x] Per-link Biscay congestion control (BBRv3 base)
+- [x] Kalman filter for RTT/capacity smoothing
 - [ ] turmoil tests: 3 links, heterogeneous RTTs, verify in-order delivery
 - [ ] turmoil tests: link failure mid-stream — seamless failover
 - [ ] Docker simulation: 3 bridge networks, tc netem impairment
@@ -889,14 +889,14 @@ seamless link failover.
 
 **Goal**: Radio-aware scheduling and media-aware prioritization.
 
-- [ ] Modem supervisor daemon (QMI/MBIM polling via ModemManager)
-- [ ] SINR → capacity ceiling feed-forward to Biscay
-- [ ] CQI derivative tracking → CAUTIOUS state
-- [ ] Handover detection (RSRP slope) → PRE_HANDOVER state
-- [ ] Link health score computation and export
-- [ ] NAL unit parser (H.264 first, then H.265, AV1)
-- [ ] Priority classification → scheduler weight adjustment
-- [ ] Encoder bitrate feedback loop (BITRATE_CMD)
+- [x] Modem supervisor daemon (QMI/MBIM polling via ModemManager)
+- [x] SINR → capacity ceiling feed-forward to Biscay
+- [x] CQI derivative tracking → CAUTIOUS state
+- [x] Handover detection (RSRP slope) → PRE_HANDOVER state
+- [x] Link health score computation and export
+- [x] NAL unit parser (H.264 first, then H.265, AV1)
+- [x] Priority classification → scheduler weight adjustment
+- [x] Encoder bitrate feedback loop (BITRATE_CMD)
 - [ ] Docker simulation with Mahimahi cellular traces
 
 **Milestone**: Radio-aware routing, predictive handover, media-prioritized
@@ -907,10 +907,10 @@ scheduling.
 **Goal**: GStreamer plugin and full system integration.
 
 - [x] Wire strata-bonding into strata-gst (replace librist-sys dependency)
-- [ ] Integration test: GStreamer → Strata → receiver → GStreamer
+- [x] Integration test: GStreamer → Strata → receiver → GStreamer
 - [x] Remove librist-sys from active builds
 - [ ] End-to-end YouTube RTMP test via GStreamer
-- [ ] Prometheus metrics endpoint for all stats
+- [x] Prometheus metrics endpoint for all stats
 - [ ] WebSocket telemetry (strata-agent)
 
 ### Phase 6: Cloud Gateway (2-3 weeks)

@@ -1,4 +1,5 @@
 use crate::config::{BondingConfig, LinkConfig, SchedulerConfig};
+use crate::metrics::MetricsServer;
 use crate::net::interface::{LinkMetrics, LinkSender};
 use crate::net::transport::TransportLink;
 use crate::scheduler::bonding::BondingScheduler;
@@ -40,6 +41,7 @@ pub struct BondingRuntime {
     sender: Sender<RuntimeMessage>,
     metrics: Arc<Mutex<HashMap<usize, LinkMetrics>>>,
     handle: Option<thread::JoinHandle<()>>,
+    metrics_server: Option<MetricsServer>,
 }
 
 impl BondingRuntime {
@@ -64,6 +66,7 @@ impl BondingRuntime {
             sender: tx,
             metrics,
             handle: Some(handle),
+            metrics_server: None,
         }
     }
 
@@ -117,8 +120,29 @@ impl BondingRuntime {
         self.metrics.clone()
     }
 
+    /// Start a Prometheus-compatible HTTP metrics server on the given address.
+    ///
+    /// The server responds to `GET /metrics` with Prometheus text exposition
+    /// format containing all link metrics. Calling this multiple times replaces
+    /// the previous server.
+    ///
+    /// Returns the actual bound address (useful when binding to port 0).
+    pub fn start_metrics_server(&mut self, addr: SocketAddr) -> std::io::Result<SocketAddr> {
+        // Stop existing server if any
+        if let Some(mut old) = self.metrics_server.take() {
+            old.stop();
+        }
+        let server = MetricsServer::start(addr, self.metrics.clone())?;
+        let bound = server.addr();
+        self.metrics_server = Some(server);
+        Ok(bound)
+    }
+
     /// Gracefully shuts down the worker thread. Idempotent.
     pub fn shutdown(&mut self) {
+        if let Some(mut server) = self.metrics_server.take() {
+            server.stop();
+        }
         let _ = self.sender.send(RuntimeMessage::Shutdown);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -448,6 +472,16 @@ mod tests {
         let handle = rt.metrics_handle();
         let m = handle.lock().unwrap();
         assert!(m.is_empty());
+    }
+
+    #[test]
+    fn start_metrics_server_binds_and_serves() {
+        let mut rt = BondingRuntime::new();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let bound = rt.start_metrics_server(addr).expect("should bind");
+        assert_ne!(bound.port(), 0, "should assign a real port");
+        // Clean shutdown should stop the server
+        rt.shutdown();
     }
 
     #[test]

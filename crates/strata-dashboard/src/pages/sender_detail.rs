@@ -550,7 +550,7 @@ pub fn SenderDetailPage() -> impl IntoView {
                                             <input
                                                 class="input input-bordered w-full"
                                                 type="text"
-                                                placeholder="rist://receiver.example.com:5000"
+                                                placeholder="receiver.example.com:5000"
                                                 prop:value=move || receiver_input.get()
                                                 disabled=!is_online
                                                 on:input=move |ev| {
