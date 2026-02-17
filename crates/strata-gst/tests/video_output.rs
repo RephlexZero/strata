@@ -39,13 +39,7 @@ fn output_dir() -> PathBuf {
 /// Build strata-node if it doesn't exist yet.
 fn build_integration_binary() -> PathBuf {
     let status = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            "strata-gst",
-            "--bin",
-            "strata-node",
-        ])
+        .args(["build", "-p", "strata-gst", "--bin", "strata-node"])
         .status()
         .expect("Failed to invoke cargo build");
     assert!(status.success(), "cargo build strata-node failed");
@@ -87,13 +81,7 @@ fn video_loopback_clean() {
 
     // Start receiver (background)
     let mut receiver = Command::new(&bin_str)
-        .args([
-            "receiver",
-            "--bind",
-            "127.0.0.1:17000",
-            "--output",
-            &ts_str,
-        ])
+        .args(["receiver", "--bind", "127.0.0.1:17000", "--output", &ts_str])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

@@ -11,13 +11,7 @@ use strata_sim::topology::Namespace;
 /// Build the integration binary and return its path.
 fn build_integration_binary() -> PathBuf {
     let mut command = Command::new("cargo");
-    command.args([
-        "build",
-        "-p",
-        "strata-gst",
-        "--bin",
-        "strata-node",
-    ]);
+    command.args(["build", "-p", "strata-gst", "--bin", "strata-node"]);
 
     let status = command.status().expect("Failed to execute cargo build");
 

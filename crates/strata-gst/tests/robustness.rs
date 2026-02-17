@@ -74,11 +74,7 @@ fn test_race_car_scenarios() {
         let output = receiver_ns_clone
             .exec(
                 exec_recv.to_str().unwrap(),
-                &[
-                    "receiver",
-                    "--bind",
-                    "10.0.30.2:1234,10.0.40.2:1235",
-                ],
+                &["receiver", "--bind", "10.0.30.2:1234,10.0.40.2:1235"],
             )
             .expect("Failed to run receiver");
         println!(

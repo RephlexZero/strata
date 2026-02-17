@@ -55,11 +55,7 @@ mod imp {
                     }
                 }
                 Err(e) => {
-                    gst::warning!(
-                        gst::CAT_DEFAULT,
-                        "StrataSrc: Invalid config TOML: {}",
-                        e
-                    );
+                    gst::warning!(gst::CAT_DEFAULT, "StrataSrc: Invalid config TOML: {}", e);
                 }
             }
         }
