@@ -532,6 +532,41 @@ Research is unanimous: for sub-millisecond timing on 3-6 links, the
 **If monoio proves too immature**, fallback plan: `tokio` with
 `current_thread` runtime, pinned to cores, with `SO_BUSY_POLL` via `socket2`.
 
+### io_uring Safety Constraints (Phase 2 Implementation Notes)
+
+io_uring breaks two key assumptions that epoll-based async Rust relies on:
+
+1. **Syscalls are asynchronous, not synchronous.** The kernel may complete an
+   operation (e.g., `recv`, `accept`) without the future being polled. This
+   means dropping a future does NOT cancel the kernel operation.
+
+2. **Cancellation via `select!` is unsafe.** Using `tokio::select!` to cancel
+   an io_uring future (e.g., timeout a recv) can leak connections or buffers if
+   the kernel completes the operation while the future is dropped. See:
+   [Async Rust is not safe with io_uring](https://tonbo.io/blog/async-rust-is-not-safe-with-io-uring/)
+   (Tonbo IO, Oct 2024).
+
+**Mitigation strategies for Phase 2:**
+
+- **Prefer tight event loops over `select!`.** Strata's network architecture
+  (dedicated pinned threads, tight recv loops) naturally avoids the hazard. Do
+  not introduce `select!`-based cancellation on the hot path.
+
+- **If cancellation is necessary, use monoio's `CancelableIO` API** (e.g.,
+  `cancelable_accept()` + explicit `canceler.cancel()` + re-await to consume
+  the completed operation). Standard `.await` drops are unsafe for io_uring.
+
+- **Use `AsyncReadRent`/`AsyncWriteRent` (ownership-passing) instead of
+  borrowing async APIs.** monoio's "Rent" API ensures buffers cannot be freed
+  while the kernel is writing to them. Strata's slab allocator design is
+  compatible with this.
+
+- **Test for file descriptor leaks.** Under cancellation or error paths, verify
+  that sockets/fds are properly closed (e.g., with `lsof` sampling in tests).
+
+- **Fallback is always available.** If monoio matures slowly or surprises appear,
+  switch to `tokio` + `SO_BUSY_POLL` (epoll is safe and proven).
+
 ### I/O Strategy
 
 - **UDP socket**: `quinn-udp` for GSO/GRO batching and ECN support
@@ -861,6 +896,12 @@ loss, < 50ms added latency.
 **Goal**: Sub-millisecond processing latency, production I/O.
 
 - [ ] Migrate to monoio (or tokio current_thread + SO_BUSY_POLL)
+  - **Safety note**: Avoid `select!`-based cancellation on recv/accept futures
+    (io_uring can leak connections). Prefer tight loops with explicit timeouts.
+    Refer to the "io_uring Safety Constraints" section above.
+  - If using monoio: use `CancelableIO` API for any required cancellation
+  - Test for socket/fd leaks under error paths (use `lsof` sampling)
+  - Fallback to `tokio` + `SO_BUSY_POLL` if monoio proves problematic
 - [ ] Integrate quinn-udp for GSO/GRO
 - [ ] Replace channels with rtrb SPSC ring buffers
 - [ ] quanta for all timing (replace std::time::Instant)

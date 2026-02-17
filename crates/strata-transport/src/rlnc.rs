@@ -339,10 +339,10 @@ impl RlncDecoder {
     /// Attempt to recover missing symbols via Gaussian elimination.
     ///
     /// Returns a list of (seq, data) pairs for newly recovered symbols.
-    #[allow(unused_variables)]
+    #[allow(clippy::needless_range_loop)]
     pub fn try_recover(&mut self) -> Vec<(u64, Vec<u8>)> {
         // First, reduce all rows with known source symbols
-        for (ri, row) in self.rows.iter_mut().enumerate() {
+        for row in self.rows.iter_mut() {
             let mut data = row.data.clone();
             Self::reduce_with_known_static(
                 &self.received,
@@ -362,11 +362,6 @@ impl RlncDecoder {
                     *c = 0;
                 }
             }
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "try_recover: row {} coeffs={:?} data={:?}",
-                ri, row.coeffs, row.data
-            );
         }
 
         // Perform Gaussian elimination on the coefficient matrix
@@ -389,7 +384,6 @@ impl RlncDecoder {
         let mut pivot_row = 0;
         let mut pivot_cols = vec![None; n]; // column → row mapping
 
-        #[allow(clippy::needless_range_loop)]
         for col in 0..n {
             let seq = self.window_start + col as u64;
             if self.received.contains_key(&seq) || self.recovered.contains_key(&seq) {
@@ -407,11 +401,7 @@ impl RlncDecoder {
 
             let row_idx = match found {
                 Some(r) => r,
-                None => {
-                    #[cfg(debug_assertions)]
-                    eprintln!("  col {}: no pivot found", col);
-                    continue;
-                }
+                None => continue,
             };
 
             // Swap to pivot position
@@ -420,23 +410,12 @@ impl RlncDecoder {
             // Scale pivot row so the pivot element becomes 1
             let pivot_val = matrix[pivot_row].coeffs[col];
             let inv = gf256::inv(pivot_val);
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "  col {}: pivot_row={}, pivot_val={}, inv={}",
-                col, pivot_row, pivot_val, inv
-            );
             for c in &mut matrix[pivot_row].coeffs {
                 *c = gf256::mul(*c, inv);
             }
             for d in &mut matrix[pivot_row].data {
                 *d = gf256::mul(*d, inv);
             }
-
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "  after scale: coeffs={:?} data={:?}",
-                matrix[pivot_row].coeffs, matrix[pivot_row].data
-            );
 
             // Eliminate this column from all other rows
             for other in 0..matrix.len() {
@@ -456,31 +435,14 @@ impl RlncDecoder {
                 for (j, pd) in pivot_data.iter().enumerate() {
                     matrix[other].data[j] ^= gf256::mul(factor, *pd);
                 }
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "  eliminated row {}: factor={} coeffs={:?} data={:?}",
-                    other, factor, matrix[other].coeffs, matrix[other].data
-                );
             }
 
             pivot_cols[col] = Some(pivot_row);
             pivot_row += 1;
         }
 
-        #[cfg(debug_assertions)]
-        {
-            eprintln!("  pivot_cols={:?}", pivot_cols);
-            for (i, row) in matrix.iter().enumerate() {
-                eprintln!(
-                    "  final row {}: coeffs={:?} data={:?}",
-                    i, row.coeffs, row.data
-                );
-            }
-        }
-
         // Extract recovered symbols from pivot rows
         let mut newly_recovered = Vec::new();
-        #[allow(clippy::needless_range_loop)]
         for col in 0..n {
             let seq = self.window_start + col as u64;
             if self.received.contains_key(&seq) || self.recovered.contains_key(&seq) {
