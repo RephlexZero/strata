@@ -1,7 +1,7 @@
 use bytes::Bytes;
+use quanta::Instant;
 use std::collections::VecDeque;
 use std::time::Duration;
-use quanta::Instant;
 
 /// An incoming packet with its bonding sequence ID and arrival timestamp.
 pub struct Packet {

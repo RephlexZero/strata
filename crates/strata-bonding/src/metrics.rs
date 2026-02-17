@@ -527,7 +527,11 @@ pub fn render_receiver_prometheus(stats: &ReassemblyStats) -> String {
         "# HELP strata_receiver_duplicate_packets_total Duplicate packets received."
     )
     .unwrap();
-    writeln!(out, "# TYPE strata_receiver_duplicate_packets_total counter").unwrap();
+    writeln!(
+        out,
+        "# TYPE strata_receiver_duplicate_packets_total counter"
+    )
+    .unwrap();
     writeln!(
         out,
         "strata_receiver_duplicate_packets_total {}",

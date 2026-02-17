@@ -9,9 +9,9 @@
 //!                    Timeout                LinkJoin/LinkLeave
 //! ```
 
+use quanta::Instant;
 use std::collections::HashMap;
 use std::time::Duration;
-use quanta::Instant;
 
 use crate::wire::{PingPacket, PongPacket, SessionAction, SessionPacket};
 

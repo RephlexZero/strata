@@ -343,9 +343,7 @@ impl StrataSrc {
     pub fn stats_handle(
         &self,
     ) -> Option<
-        std::sync::Arc<
-            std::sync::Mutex<strata_bonding::receiver::aggregator::ReassemblyStats>,
-        >,
+        std::sync::Arc<std::sync::Mutex<strata_bonding::receiver::aggregator::ReassemblyStats>>,
     > {
         let receiver: std::sync::MutexGuard<'_, Option<ReceiverBackend>> =
             lock_or_recover(&self.imp().receiver);

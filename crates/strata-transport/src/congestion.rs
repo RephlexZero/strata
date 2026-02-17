@@ -30,8 +30,8 @@
 //! Per-link: models bottleneck bandwidth (BtlBw) and min RTT (RTprop).
 //! Radio feed-forward adds SINR→capacity ceiling and CQI derivative tracking.
 
-use std::time::Duration;
 use quanta::Instant;
+use std::time::Duration;
 
 // ─── Biscay State ───────────────────────────────────────────────────────────
 

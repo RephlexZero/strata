@@ -1,8 +1,8 @@
 use crate::config::SchedulerConfig;
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
+use quanta::Instant;
 use std::collections::HashMap;
 use std::sync::Arc;
-use quanta::Instant;
 
 /// Per-link state tracked by the DWRR scheduler.
 ///
@@ -472,10 +472,10 @@ impl<L: LinkSender + ?Sized> Default for Dwrr<L> {
 mod tests {
     use super::*;
     use crate::net::interface::LinkMetrics;
+    use quanta::Instant;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::Duration;
-    use quanta::Instant;
 
     struct MockLink {
         id: usize,

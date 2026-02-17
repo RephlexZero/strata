@@ -860,7 +860,7 @@ loss, < 50ms added latency.
 
 **Goal**: Sub-millisecond processing latency, production I/O.
 
-- [ ] Migrate to monoio (or tokio current_thread + SO_BUSY_POLL)
+- [x] Migrate to monoio (or tokio current_thread + SO_BUSY_POLL)
 - [x] Integrate quinn-udp for GSO/GRO
 - [x] Replace channels with rtrb SPSC ring buffers
 - [x] quanta for all timing (replace std::time::Instant)

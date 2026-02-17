@@ -118,7 +118,10 @@ impl TransportLink {
                         src_ip: None,
                     };
 
-                    match self.udp_state.send(UdpSockRef::from(&self.socket), &transmit) {
+                    match self
+                        .udp_state
+                        .send(UdpSockRef::from(&self.socket), &transmit)
+                    {
                         Ok(()) => total_bytes += buf.len(),
                         Err(e) => {
                             tracing::warn!(link_id = self.id, error = %e, "GSO send failed, falling back");
@@ -154,7 +157,10 @@ impl TransportLink {
             src_ip: None,
         };
 
-        match self.udp_state.send(UdpSockRef::from(&self.socket), &transmit) {
+        match self
+            .udp_state
+            .send(UdpSockRef::from(&self.socket), &transmit)
+        {
             Ok(()) => data.len(),
             Err(e) => {
                 tracing::warn!(link_id = self.id, error = %e, "send failed");

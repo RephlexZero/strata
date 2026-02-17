@@ -437,15 +437,17 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .expect("rsink is not a StrataSink");
         match strata_sink.metrics_handle() {
             Some(handle) => {
-                let addr: std::net::SocketAddr =
-                    format!("0.0.0.0:{port}").parse().unwrap();
+                let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
                 match MetricsServer::start(addr, handle) {
                     Ok(server) => {
                         eprintln!("Prometheus metrics → http://0.0.0.0:{}/metrics", port);
                         Some(server)
                     }
                     Err(e) => {
-                        eprintln!("Warning: failed to start metrics server on port {}: {}", port, e);
+                        eprintln!(
+                            "Warning: failed to start metrics server on port {}: {}",
+                            port, e
+                        );
                         None
                     }
                 }
@@ -1156,8 +1158,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         });
         match stats_handle {
             Some(handle) => {
-                let addr: std::net::SocketAddr =
-                    format!("0.0.0.0:{port}").parse().unwrap();
+                let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
                 match strata_bonding::metrics::ReceiverMetricsServer::start(addr, handle) {
                     Ok(server) => {
                         eprintln!("Prometheus metrics → http://0.0.0.0:{}/metrics", port);

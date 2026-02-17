@@ -633,13 +633,7 @@ impl StrataSink {
     /// Returns `None` if the element hasn't been started yet.
     pub fn metrics_handle(
         &self,
-    ) -> Option<
-        Arc<
-            Mutex<
-                HashMap<usize, strata_bonding::net::interface::LinkMetrics>,
-            >,
-        >,
-    > {
+    ) -> Option<Arc<Mutex<HashMap<usize, strata_bonding::net::interface::LinkMetrics>>>> {
         let runtime = lock_or_recover(&self.imp().runtime);
         runtime.as_ref().map(|rt| rt.metrics_handle())
     }

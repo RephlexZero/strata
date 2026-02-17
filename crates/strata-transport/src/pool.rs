@@ -7,8 +7,8 @@
 //! (6 MB) provides ~5 seconds of buffer — trivial memory footprint.
 
 use bytes::Bytes;
-use slab::Slab;
 use quanta::Instant;
+use slab::Slab;
 
 use crate::wire::{Fragment, VarInt};
 

@@ -10,8 +10,7 @@ use crate::receiver::aggregator::{Packet, ReassemblyBuffer, ReassemblyConfig, Re
 use anyhow::Result;
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use quinn_udp::{RecvMeta, UdpSockRef, UdpSocketState, BATCH_SIZE};
-use std::io::IoSliceMut;
+use quanta::Instant;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -19,7 +18,6 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
-use quanta::Instant;
 use strata_transport::receiver::{Receiver as TransportReceiver, ReceiverConfig, ReceiverEvent};
 use tracing::{debug, warn};
 
@@ -104,37 +102,18 @@ impl TransportBondingReceiver {
 
     /// Add a link by binding a UDP socket to `bind_addr`.
     ///
-    /// Spawns a reader thread that receives strata-transport wire-format
-    /// packets, decodes them through the transport receiver (FEC + reorder),
-    /// extracts application data, strips the bonding header, and feeds the
-    /// result into the shared reassembly buffer.
+    /// Spawns a reader thread running a monoio event loop (io_uring on
+    /// Linux ≥5.1, epoll fallback) that asynchronously receives datagrams,
+    /// decodes them through the transport receiver, and feeds results into
+    /// the shared reassembly buffer.
     pub fn add_link(&self, bind_addr: SocketAddr) -> Result<()> {
         let socket = UdpSocket::bind(bind_addr)?;
-        socket.set_read_timeout(Some(Duration::from_millis(50)))?;
-
-        let input_tx = self
-            .input_tx
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Receiver shut down"))?
-            .clone();
-        let running = self.running.clone();
-
-        let handle = thread::Builder::new()
-            .name(format!("strata-rcv-{}", bind_addr))
-            .spawn(move || {
-                link_reader(socket, input_tx, running);
-            })?;
-
-        if let Ok(mut handles) = self.thread_handles.lock() {
-            handles.push(handle);
-        }
-
-        Ok(())
+        self.add_link_socket(socket)
     }
 
     /// Add a link from an already-bound UDP socket.
     pub fn add_link_socket(&self, socket: UdpSocket) -> Result<()> {
-        socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+        let local_addr = socket.local_addr()?;
 
         let input_tx = self
             .input_tx
@@ -144,9 +123,17 @@ impl TransportBondingReceiver {
         let running = self.running.clone();
 
         let handle = thread::Builder::new()
-            .name("strata-rcv-link".into())
+            .name(format!("strata-rcv-{}", local_addr))
             .spawn(move || {
-                link_reader(socket, input_tx, running);
+                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_timer()
+                    .build()
+                    .expect("failed to create monoio runtime for link reader");
+                rt.block_on(async move {
+                    let mono_socket = monoio::net::udp::UdpSocket::from_std(socket)
+                        .expect("failed to convert socket for monoio");
+                    link_reader_async(mono_socket, input_tx, running).await;
+                });
             })?;
 
         if let Ok(mut handles) = self.thread_handles.lock() {
@@ -189,46 +176,27 @@ impl Drop for TransportBondingReceiver {
     }
 }
 
-/// Per-link reader loop.
+/// Per-link reader loop (async, runs on a monoio event loop).
 ///
-/// Reads raw UDP datagrams, feeds them to a `strata_transport::Receiver`,
-/// then processes delivered packets: strips the bonding header and pushes
-/// them into the shared reassembly channel.
-fn link_reader(socket: UdpSocket, input_tx: Sender<Packet>, running: Arc<AtomicBool>) {
+/// Uses io_uring (or epoll fallback) for async UDP receives, feeding
+/// datagrams into a `strata_transport::Receiver` for FEC decoding
+/// and reorder. Delivered payloads have the bonding header stripped
+/// and are pushed into the shared reassembly channel.
+async fn link_reader_async(
+    socket: monoio::net::udp::UdpSocket,
+    input_tx: Sender<Packet>,
+    running: Arc<AtomicBool>,
+) {
     let mut transport_rx = TransportReceiver::new(ReceiverConfig::default());
-
-    // Initialize quinn-udp state for GRO (Generic Receive Offload).
-    // This enables the kernel to coalesce multiple same-size datagrams
-    // into a single recv call, reducing syscall overhead.
-    let udp_state = UdpSocketState::new(UdpSockRef::from(&socket))
-        .expect("failed to initialize UdpSocketState for receiver");
-
-    let mut recv_bufs = vec![vec![0u8; 65536]; BATCH_SIZE];
-    let mut recv_meta = vec![RecvMeta::default(); BATCH_SIZE];
+    let mut buf = vec![0u8; 65536];
 
     while running.load(Ordering::Relaxed) {
-        let mut iovs: Vec<IoSliceMut> = recv_bufs
-            .iter_mut()
-            .map(|b| IoSliceMut::new(b))
-            .collect();
-
-        match udp_state.recv(UdpSockRef::from(&socket), &mut iovs, &mut recv_meta) {
-            Ok(count) => {
-                for i in 0..count {
-                    let meta = &recv_meta[i];
-                    let total_len = meta.len;
-                    let stride = meta.stride;
-
-                    // GRO: kernel may coalesce multiple datagrams into one buffer.
-                    // stride = individual datagram size, total_len = total bytes received.
-                    let mut offset = 0;
-                    while offset < total_len {
-                        let end = (offset + stride).min(total_len);
-                        let raw = Bytes::copy_from_slice(&recv_bufs[i][offset..end]);
-                        transport_rx.receive(raw);
-                        offset = end;
-                    }
-                }
+        // Await next datagram with a timeout so we can check the running flag.
+        match monoio::time::timeout(Duration::from_millis(50), socket.recv_from(buf)).await {
+            Ok((Ok((n, _addr)), returned_buf)) => {
+                let raw = Bytes::copy_from_slice(&returned_buf[..n]);
+                transport_rx.receive(raw);
+                buf = returned_buf;
 
                 for event in transport_rx.drain_events() {
                     if let ReceiverEvent::Deliver(delivered) = event {
@@ -249,16 +217,15 @@ fn link_reader(socket: UdpSocket, input_tx: Sender<Packet>, running: Arc<AtomicB
                     }
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Non-blocking socket has no data — brief sleep to avoid busy-wait
-                thread::sleep(Duration::from_micros(100));
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                // Timeout on Windows-style timeout
-            }
-            Err(e) => {
+            Ok((Err(e), returned_buf)) => {
+                buf = returned_buf;
                 warn!("Link reader recv error: {}", e);
-                thread::sleep(Duration::from_millis(10));
+                monoio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_elapsed) => {
+                // Timeout — re-check running flag. Buffer ownership was consumed
+                // by the cancelled io_uring op; allocate a fresh one.
+                buf = vec![0u8; 65536];
             }
         }
     }

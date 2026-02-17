@@ -5,13 +5,13 @@ use crate::scheduler::bonding::BondingScheduler;
 use crate::scheduler::PacketProfile;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
+use quanta::Instant;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use quanta::Instant;
 use strata_transport::sender::SenderConfig;
 use tracing::warn;
 
@@ -55,6 +55,11 @@ impl BondingRuntime {
     }
 
     /// Creates a runtime with the given scheduler configuration.
+    ///
+    /// The worker thread runs a monoio event loop (io_uring on Linux ≥5.1,
+    /// epoll fallback otherwise). Packets flow via a lock-free SPSC ring
+    /// buffer; control messages use a crossbeam channel. The monoio reactor
+    /// drives the idle/wake cycle, replacing the old busy-poll `thread::sleep`.
     pub fn with_config(scheduler_config: SchedulerConfig) -> Self {
         let ring_capacity = scheduler_config.channel_capacity.next_power_of_two();
         let (packet_tx, packet_rx) = rtrb::RingBuffer::new(ring_capacity);
@@ -67,7 +72,14 @@ impl BondingRuntime {
         let handle = thread::Builder::new()
             .name("strata-worker".into())
             .spawn(move || {
-                runtime_worker(packet_rx, control_rx, metrics_clone, scheduler_config);
+                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_timer()
+                    .build()
+                    .expect("failed to create monoio runtime for sender worker");
+                rt.block_on(async move {
+                    runtime_worker_async(packet_rx, control_rx, metrics_clone, scheduler_config)
+                        .await;
+                });
                 alive_clone.store(false, Ordering::Relaxed);
             })
             .expect("failed to spawn bonding runtime worker");
@@ -153,7 +165,7 @@ impl Drop for BondingRuntime {
     }
 }
 
-fn runtime_worker(
+async fn runtime_worker_async(
     mut packet_rx: rtrb::Consumer<(Bytes, PacketProfile)>,
     control_rx: Receiver<ControlMessage>,
     metrics: Arc<Mutex<HashMap<usize, LinkMetrics>>>,
@@ -201,8 +213,8 @@ fn runtime_worker(
         }
 
         if !did_work {
-            // Brief yield when idle to avoid burning CPU.
-            thread::sleep(Duration::from_micros(100));
+            // Yield to monoio reactor instead of blocking the thread.
+            monoio::time::sleep(Duration::from_micros(50)).await;
         }
 
         if last_fast_stats.elapsed() >= fast_stats_interval {
@@ -322,8 +334,32 @@ fn create_transport_link(link: &LinkConfig) -> anyhow::Result<TransportLink> {
     };
 
     socket.connect(addr)?;
+    set_busy_poll(&socket);
     Ok(TransportLink::new(link.id, socket, SenderConfig::default()))
 }
+
+/// Enable SO_BUSY_POLL on a socket for reduced NIC-to-application latency.
+///
+/// The kernel will busy-poll the NIC driver queue for up to 50µs before
+/// sleeping, eliminating interrupt-driven wakeup overhead on the receive path.
+#[cfg(target_os = "linux")]
+fn set_busy_poll(socket: &UdpSocket) {
+    use std::os::unix::io::AsRawFd;
+    let fd = socket.as_raw_fd();
+    let busy_poll_us: libc::c_int = 50;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BUSY_POLL,
+            &busy_poll_us as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&busy_poll_us) as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_busy_poll(_socket: &UdpSocket) {}
 
 #[cfg(test)]
 mod tests {
