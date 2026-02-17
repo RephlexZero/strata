@@ -26,15 +26,28 @@ pub struct ReassemblyBuffer {
     skip_after: Option<Duration>,
     jitter_latency_multiplier: f64,
     max_latency: Duration,
+    min_latency: Duration,
     pub lost_packets: u64,
     pub late_packets: u64,
     pub duplicate_packets: u64,
+    pub packets_delivered: u64,
 
-    // Adaptive Latency Calculation
+    // Adaptive latency — jitter tracking
     last_arrival: Option<Instant>,
     avg_iat: f64,
     jitter_smoothed: f64,
     jitter_samples: VecDeque<f64>,
+
+    // Adaptive latency — bidirectional smoothing
+    target_latency: Duration,
+    ramp_up_alpha: f64,
+    ramp_down_alpha: f64,
+    stable_since: Option<Instant>,
+    stability_threshold: Duration,
+
+    // Adaptive latency — loss-aware sizing
+    loss_rate_smoothed: f64,
+    loss_penalty_ms: f64,
 }
 
 /// Configuration for the reassembly jitter buffer.
@@ -47,6 +60,16 @@ pub struct ReassemblyConfig {
     pub jitter_latency_multiplier: f64,
     /// Hard ceiling on adaptive reassembly latency (default: 500ms)
     pub max_latency_ms: u64,
+    /// Floor for adaptive latency in ms (default: 10). Can be below start_latency.
+    pub min_latency_ms: u64,
+    /// Smoothing factor for upward adaptation (default: 0.3 = fast ramp-up).
+    pub ramp_up_alpha: f64,
+    /// Smoothing factor for downward adaptation (default: 0.02 = slow ramp-down).
+    pub ramp_down_alpha: f64,
+    /// Stable period (ms) before allowing ramp-down (default: 2000).
+    pub stability_threshold_ms: u64,
+    /// Extra latency (ms) added at 100% loss rate (default: 500). Scaled linearly.
+    pub loss_penalty_ms: f64,
 }
 
 impl Default for ReassemblyConfig {
@@ -57,6 +80,11 @@ impl Default for ReassemblyConfig {
             skip_after: None,
             jitter_latency_multiplier: 4.0,
             max_latency_ms: 500,
+            min_latency_ms: 10,
+            ramp_up_alpha: 0.3,
+            ramp_down_alpha: 0.02,
+            stability_threshold_ms: 2000,
+            loss_penalty_ms: 500.0,
         }
     }
 }
@@ -70,6 +98,14 @@ pub struct ReassemblyStats {
     pub late_packets: u64,
     pub duplicate_packets: u64,
     pub current_latency_ms: u64,
+    /// The computed ideal latency the buffer is tracking toward.
+    pub target_latency_ms: u64,
+    /// Current smoothed jitter estimate in milliseconds.
+    pub jitter_estimate_ms: f64,
+    /// Recent smoothed loss rate (0.0–1.0).
+    pub loss_rate: f64,
+    /// Packets successfully delivered.
+    pub packets_delivered: u64,
 }
 
 fn percentile(samples: &VecDeque<f64>, pct: f64) -> f64 {
@@ -105,13 +141,22 @@ impl ReassemblyBuffer {
             skip_after: config.skip_after,
             jitter_latency_multiplier: config.jitter_latency_multiplier,
             max_latency: Duration::from_millis(config.max_latency_ms),
+            min_latency: Duration::from_millis(config.min_latency_ms),
             lost_packets: 0,
             late_packets: 0,
             duplicate_packets: 0,
+            packets_delivered: 0,
             last_arrival: None,
             avg_iat: 0.0,
             jitter_smoothed: 0.0,
             jitter_samples: VecDeque::with_capacity(128),
+            target_latency: config.start_latency,
+            ramp_up_alpha: config.ramp_up_alpha,
+            ramp_down_alpha: config.ramp_down_alpha,
+            stable_since: None,
+            stability_threshold: Duration::from_millis(config.stability_threshold_ms),
+            loss_rate_smoothed: 0.0,
+            loss_penalty_ms: config.loss_penalty_ms,
         }
     }
 
@@ -123,6 +168,10 @@ impl ReassemblyBuffer {
             late_packets: self.late_packets,
             duplicate_packets: self.duplicate_packets,
             current_latency_ms: self.latency.as_millis() as u64,
+            target_latency_ms: self.target_latency.as_millis() as u64,
+            jitter_estimate_ms: self.jitter_smoothed * 1000.0,
+            loss_rate: self.loss_rate_smoothed,
+            packets_delivered: self.packets_delivered,
         }
     }
 
@@ -147,17 +196,48 @@ impl ReassemblyBuffer {
                 self.jitter_samples.pop_front();
             }
 
-            // Update target latency: Start Latency + multiplier * p95(Jitter)
+            // Compute jitter component of target latency
             let jitter_est = if self.jitter_samples.len() >= 5 {
                 percentile(&self.jitter_samples, 0.95)
             } else {
                 self.jitter_smoothed
             };
             let jitter_ms = jitter_est * 1000.0;
-            let additional_latency =
-                Duration::from_millis((self.jitter_latency_multiplier * jitter_ms) as u64);
+            let jitter_component = self.jitter_latency_multiplier * jitter_ms;
 
-            self.latency = (self.start_latency + additional_latency).min(self.max_latency);
+            // Loss-aware component: more buffer when losing packets
+            let loss_component = self.loss_rate_smoothed * self.loss_penalty_ms;
+
+            // Compute target latency
+            let target_ms =
+                self.start_latency.as_millis() as f64 + jitter_component + loss_component;
+            self.target_latency = Duration::from_millis(target_ms as u64)
+                .max(self.min_latency)
+                .min(self.max_latency);
+
+            // Bidirectional smoothing: fast up, slow down
+            let current_ms = self.latency.as_secs_f64() * 1000.0;
+            let target_ms = self.target_latency.as_secs_f64() * 1000.0;
+
+            if target_ms > current_ms + 0.5 {
+                // Fast ramp-up
+                let new_ms = current_ms + self.ramp_up_alpha * (target_ms - current_ms);
+                self.latency = Duration::from_secs_f64(new_ms / 1000.0);
+                self.stable_since = None;
+            } else if target_ms < current_ms - 0.5 {
+                // Slow ramp-down, only after stability period
+                match self.stable_since {
+                    Some(since) if now.duration_since(since) >= self.stability_threshold => {
+                        let new_ms = current_ms + self.ramp_down_alpha * (target_ms - current_ms);
+                        self.latency =
+                            Duration::from_secs_f64(new_ms / 1000.0).max(self.min_latency);
+                    }
+                    None => {
+                        self.stable_since = Some(now);
+                    }
+                    _ => {} // Waiting for stability threshold
+                }
+            }
         }
         self.last_arrival = Some(now);
 
@@ -199,6 +279,7 @@ impl ReassemblyBuffer {
     }
 
     pub fn tick(&mut self, now: Instant) -> Vec<Bytes> {
+        let loss_before = self.lost_packets;
         let mut released = Vec::new();
         let skip_after = self.skip_after.unwrap_or(self.latency);
         let release_after = self
@@ -237,6 +318,18 @@ impl ReassemblyBuffer {
 
             // No packets or waiting for gap to fill
             break;
+        }
+
+        // Track delivery + loss for adaptive sizing
+        self.packets_delivered += released.len() as u64;
+        let new_losses = self.lost_packets - loss_before;
+        let total_events = released.len() as u64 + new_losses;
+        if total_events > 0 {
+            let instant_loss = new_losses as f64 / total_events as f64;
+            self.loss_rate_smoothed = 0.95 * self.loss_rate_smoothed + 0.05 * instant_loss;
+        }
+        if new_losses > 0 {
+            self.stable_since = None;
         }
 
         released
@@ -407,8 +500,7 @@ mod tests {
             start_latency: Duration::from_millis(100),
             buffer_capacity: 64,
             skip_after: Some(Duration::from_millis(30)),
-            jitter_latency_multiplier: 4.0,
-            max_latency_ms: 500,
+            ..Default::default()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -427,9 +519,7 @@ mod tests {
         let config = ReassemblyConfig {
             start_latency: Duration::from_millis(10),
             buffer_capacity: 8,
-            skip_after: None,
-            jitter_latency_multiplier: 4.0,
-            max_latency_ms: 500,
+            ..Default::default()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -497,10 +587,9 @@ mod tests {
     fn test_latency_max_capping() {
         let config = ReassemblyConfig {
             start_latency: Duration::from_millis(10),
-            buffer_capacity: 64,
-            skip_after: None,
             jitter_latency_multiplier: 100.0,
             max_latency_ms: 200,
+            ..Default::default()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -539,9 +628,7 @@ mod tests {
         let config = ReassemblyConfig {
             start_latency: Duration::from_millis(10),
             buffer_capacity: 16,
-            skip_after: None,
-            jitter_latency_multiplier: 4.0,
-            max_latency_ms: 500,
+            ..Default::default()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -601,5 +688,194 @@ mod tests {
         assert_eq!(out.len(), 1000);
         assert_eq!(buf.lost_packets, 0);
         assert_eq!(buf.duplicate_packets, 0);
+    }
+
+    // ─── Dynamic Jitter Buffer Tests ────────────────────────────────────
+
+    #[test]
+    fn test_dynamic_ramp_down() {
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(10),
+            stability_threshold_ms: 0, // Immediate ramp-down for testing
+            ramp_down_alpha: 0.5,
+            ramp_up_alpha: 1.0, // Instant ramp-up
+            ..Default::default()
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        // Phase 1: heavy jitter (alternating fast/slow arrivals)
+        buf.push(0, Bytes::from(vec![0; 100]), start);
+        buf.push(
+            1,
+            Bytes::from(vec![0; 100]),
+            start + Duration::from_millis(5),
+        );
+        buf.push(
+            2,
+            Bytes::from(vec![0; 100]),
+            start + Duration::from_millis(55),
+        );
+        buf.push(
+            3,
+            Bytes::from(vec![0; 100]),
+            start + Duration::from_millis(60),
+        );
+        buf.push(
+            4,
+            Bytes::from(vec![0; 100]),
+            start + Duration::from_millis(110),
+        );
+        buf.push(
+            5,
+            Bytes::from(vec![0; 100]),
+            start + Duration::from_millis(115),
+        );
+
+        let high_latency = buf.latency;
+        assert!(
+            high_latency > Duration::from_millis(15),
+            "Latency should increase from jitter: {:?}",
+            high_latency
+        );
+
+        // Phase 2: steady arrivals (150+ pushes to flush jitter window)
+        for i in 6u64..200 {
+            buf.push(
+                i,
+                Bytes::from(vec![0; 100]),
+                start + Duration::from_millis(120 + (i - 6) * 10),
+            );
+        }
+
+        let lower_latency = buf.latency;
+        assert!(
+            lower_latency < high_latency,
+            "Latency should ramp down with stable conditions: high={:?}, low={:?}",
+            high_latency,
+            lower_latency
+        );
+    }
+
+    #[test]
+    fn test_loss_increases_latency() {
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(10),
+            skip_after: Some(Duration::from_millis(5)),
+            ramp_up_alpha: 1.0, // Instant ramp-up
+            loss_penalty_ms: 1000.0,
+            ..Default::default()
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        // Push seq 0 then skip seq 1, push seq 2-5
+        buf.push(0, Bytes::from_static(b"P0"), start);
+        buf.push(
+            2,
+            Bytes::from_static(b"P2"),
+            start + Duration::from_millis(1),
+        );
+        buf.push(
+            3,
+            Bytes::from_static(b"P3"),
+            start + Duration::from_millis(2),
+        );
+        buf.push(
+            4,
+            Bytes::from_static(b"P4"),
+            start + Duration::from_millis(3),
+        );
+        buf.push(
+            5,
+            Bytes::from_static(b"P5"),
+            start + Duration::from_millis(4),
+        );
+
+        // Tick to skip gap (seq 1 missing, skip_after=5ms)
+        let _ = buf.tick(start + Duration::from_millis(20));
+        assert!(buf.lost_packets > 0, "Should have recorded a loss");
+        assert!(buf.loss_rate_smoothed > 0.0, "Loss rate should be non-zero");
+
+        // Push more packets — latency should incorporate loss penalty
+        for i in 6..10 {
+            buf.push(
+                i,
+                Bytes::from(vec![0; 100]),
+                start + Duration::from_millis(20 + (i - 6) * 10),
+            );
+        }
+
+        let stats = buf.get_stats();
+        assert!(
+            stats.loss_rate > 0.0,
+            "Stats should report non-zero loss rate"
+        );
+    }
+
+    #[test]
+    fn test_min_latency_floor() {
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(5),
+            min_latency_ms: 20,
+            ramp_up_alpha: 1.0,
+            ..Default::default()
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        // Push steady packets — target = max(20, 5 + jitter) = 20 when jitter is small
+        for i in 0..10 {
+            buf.push(
+                i,
+                Bytes::from(vec![0; 100]),
+                start + Duration::from_millis(i * 10),
+            );
+        }
+
+        assert!(
+            buf.latency >= Duration::from_millis(20),
+            "Latency should not go below min_latency (20ms): {:?}",
+            buf.latency
+        );
+    }
+
+    #[test]
+    fn test_stats_target_and_jitter() {
+        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(10));
+        let start = Instant::now();
+
+        buf.push(0, Bytes::from_static(b"P0"), start);
+        buf.push(
+            1,
+            Bytes::from_static(b"P1"),
+            start + Duration::from_millis(20),
+        );
+        buf.push(
+            2,
+            Bytes::from_static(b"P2"),
+            start + Duration::from_millis(30),
+        );
+
+        let stats = buf.get_stats();
+        assert!(stats.target_latency_ms >= 10);
+        assert!(stats.jitter_estimate_ms >= 0.0);
+    }
+
+    #[test]
+    fn test_delivered_packets_counted() {
+        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(10));
+        let start = Instant::now();
+
+        for i in 0..5u64 {
+            buf.push(i, Bytes::from(vec![0; 100]), start);
+        }
+
+        let out = buf.tick(start + Duration::from_millis(10));
+        assert_eq!(out.len(), 5);
+        assert_eq!(buf.packets_delivered, 5);
+
+        let stats = buf.get_stats();
+        assert_eq!(stats.packets_delivered, 5);
     }
 }

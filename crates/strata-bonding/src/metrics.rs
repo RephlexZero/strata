@@ -552,6 +552,62 @@ pub fn render_receiver_prometheus(stats: &ReassemblyStats) -> String {
     )
     .unwrap();
 
+    writeln!(
+        out,
+        "# HELP strata_receiver_target_latency_ms Target adaptive latency in milliseconds."
+    )
+    .unwrap();
+    writeln!(out, "# TYPE strata_receiver_target_latency_ms gauge").unwrap();
+    writeln!(
+        out,
+        "strata_receiver_target_latency_ms {}",
+        stats.target_latency_ms
+    )
+    .unwrap();
+
+    writeln!(
+        out,
+        "# HELP strata_receiver_jitter_estimate_ms Smoothed jitter estimate in milliseconds."
+    )
+    .unwrap();
+    writeln!(out, "# TYPE strata_receiver_jitter_estimate_ms gauge").unwrap();
+    writeln!(
+        out,
+        "strata_receiver_jitter_estimate_ms {:.3}",
+        stats.jitter_estimate_ms
+    )
+    .unwrap();
+
+    writeln!(
+        out,
+        "# HELP strata_receiver_loss_rate Smoothed loss rate (0-1)."
+    )
+    .unwrap();
+    writeln!(out, "# TYPE strata_receiver_loss_rate gauge").unwrap();
+    writeln!(
+        out,
+        "strata_receiver_loss_rate {:.6}",
+        stats.loss_rate
+    )
+    .unwrap();
+
+    writeln!(
+        out,
+        "# HELP strata_receiver_packets_delivered_total Packets delivered to application."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "# TYPE strata_receiver_packets_delivered_total counter"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "strata_receiver_packets_delivered_total {}",
+        stats.packets_delivered
+    )
+    .unwrap();
+
     out
 }
 

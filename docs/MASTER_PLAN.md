@@ -918,22 +918,19 @@ scheduling.
 **Goal**: Cloud-side receiver with fan-out and orchestration.
 
 - [x] Cloud receiver binary (standalone, not GStreamer)
-- [ ] Dynamic jitter buffer (Zixi-inspired, ML-assisted sizing)
-- [ ] SRT/RTMP/NDI output bridges
+- [x] Dynamic jitter buffer (adaptive sizing based on network conditions)
+- ~~SRT/RTMP/NDI output bridges~~ *(GStreamer handles output conversion)*
 - [x] Control plane REST API (strata-control)
 - [x] Web dashboard (strata-dashboard, Leptos)
-- [ ] Fleet management basics (multi-unit telemetry)
+- [ ] Fleet management basics (multi-unit telemetry, web UI)
 
 ### Phase 7: Hardening (Ongoing)
 
 - [x] Fuzz testing (cargo-fuzz on wire parser)
 - [ ] Sliding-window RLNC (replace block RS)
 - [x] Upgrade to monoio with io_uring SQPOLL
-- [ ] AV1-SVC support
-- [ ] LSTM link quality prediction (1-2s horizon)
-- [ ] Band locking automation
-- [ ] Kubernetes autoscaling for cloud gateway
-- [ ] MoQ relay integration for web-based monitoring
+- [x] Band locking automation
+- [ ] Mahimahi network simulation traces (Docker-based)
 
 ---
 
