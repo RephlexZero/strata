@@ -17,6 +17,8 @@ pub struct BondingConfigInput {
     pub receiver: ReceiverConfigInput,
     pub lifecycle: LinkLifecycleConfigInput,
     pub scheduler: SchedulerConfigInput,
+    /// Use strata-transport (pure Rust) instead of librist for link I/O.
+    pub use_transport: Option<bool>,
 }
 
 /// Raw link configuration from TOML input.
@@ -234,6 +236,9 @@ pub struct BondingConfig {
     pub receiver: ReceiverConfig,
     pub lifecycle: LinkLifecycleConfig,
     pub scheduler: SchedulerConfig,
+    /// When true, use `strata-transport` (pure Rust) instead of librist for
+    /// link I/O. Enables the custom wire format, FEC, ARQ, and Biscay CC.
+    pub use_transport: bool,
 }
 
 impl Default for BondingConfig {
@@ -244,6 +249,7 @@ impl Default for BondingConfig {
             receiver: ReceiverConfig::default(),
             lifecycle: LinkLifecycleConfig::default(),
             scheduler: SchedulerConfig::default(),
+            use_transport: false,
         }
     }
 }
@@ -401,6 +407,7 @@ impl BondingConfigInput {
             receiver,
             lifecycle,
             scheduler,
+            use_transport: self.use_transport.unwrap_or(false),
         })
     }
 }
