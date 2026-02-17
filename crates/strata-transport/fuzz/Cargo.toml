@@ -1,0 +1,38 @@
+[package]
+name = "strata-transport-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.strata-transport]
+path = ".."
+
+[[bin]]
+name = "fuzz_wire_parser"
+path = "fuzz_targets/fuzz_wire_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_varint"
+path = "fuzz_targets/fuzz_varint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_control"
+path = "fuzz_targets/fuzz_control.rs"
+test = false
+doc = false
+bench = false
