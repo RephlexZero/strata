@@ -37,14 +37,11 @@ fn runtime_to_receiver_single_link() {
     let rcv_addr = rcv_socket.local_addr().unwrap();
     rcv.add_link_socket(rcv_socket).unwrap();
 
-    let rt = BondingRuntime::with_transport(SchedulerConfig::default());
+    let rt = BondingRuntime::with_config(SchedulerConfig::default());
     rt.add_link(LinkConfig {
         id: 1,
-        uri: format!("rist://{}", rcv_addr),
+        uri: format!("{}", rcv_addr),
         interface: None,
-        recovery_maxbitrate: None,
-        recovery_rtt_max: None,
-        recovery_reorder_buffer: None,
     })
     .unwrap();
     std::thread::sleep(Duration::from_millis(200));
@@ -86,23 +83,17 @@ fn runtime_to_receiver_multi_link() {
     rcv.add_link_socket(rcv_socket_1).unwrap();
     rcv.add_link_socket(rcv_socket_2).unwrap();
 
-    let rt = BondingRuntime::with_transport(SchedulerConfig::default());
+    let rt = BondingRuntime::with_config(SchedulerConfig::default());
     rt.add_link(LinkConfig {
         id: 1,
-        uri: format!("rist://{}", rcv_addr_1),
+        uri: format!("{}", rcv_addr_1),
         interface: None,
-        recovery_maxbitrate: None,
-        recovery_rtt_max: None,
-        recovery_reorder_buffer: None,
     })
     .unwrap();
     rt.add_link(LinkConfig {
         id: 2,
-        uri: format!("rist://{}", rcv_addr_2),
+        uri: format!("{}", rcv_addr_2),
         interface: None,
-        recovery_maxbitrate: None,
-        recovery_rtt_max: None,
-        recovery_reorder_buffer: None,
     })
     .unwrap();
     std::thread::sleep(Duration::from_millis(200));
@@ -189,26 +180,20 @@ fn critical_broadcast_deduplication() {
     rcv.add_link_socket(rcv_socket_1).unwrap();
     rcv.add_link_socket(rcv_socket_2).unwrap();
 
-    let rt = BondingRuntime::with_transport(SchedulerConfig {
+    let rt = BondingRuntime::with_config(SchedulerConfig {
         critical_broadcast: true,
         ..SchedulerConfig::default()
     });
     rt.add_link(LinkConfig {
         id: 1,
-        uri: format!("rist://{}", rcv_addr_1),
+        uri: format!("{}", rcv_addr_1),
         interface: None,
-        recovery_maxbitrate: None,
-        recovery_rtt_max: None,
-        recovery_reorder_buffer: None,
     })
     .unwrap();
     rt.add_link(LinkConfig {
         id: 2,
-        uri: format!("rist://{}", rcv_addr_2),
+        uri: format!("{}", rcv_addr_2),
         interface: None,
-        recovery_maxbitrate: None,
-        recovery_rtt_max: None,
-        recovery_reorder_buffer: None,
     })
     .unwrap();
     std::thread::sleep(Duration::from_millis(200));

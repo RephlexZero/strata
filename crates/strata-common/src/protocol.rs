@@ -157,7 +157,8 @@ pub struct StreamStartPayload {
     pub encoder: EncoderConfig,
     pub destinations: Vec<String>,
     pub bonding_config: serde_json::Value,
-    pub rist_psk: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "rist_psk")]
+    pub psk: Option<String>,
     /// RTMP/RTMPS relay URL — when set, the sender tees its encoded
     /// output and pushes a parallel FLV stream to this URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -514,7 +515,7 @@ mod tests {
             },
             destinations: vec!["dst_yt".into()],
             bonding_config: serde_json::json!({"max_links": 4}),
-            rist_psk: Some("secret".into()),
+            psk: Some("secret".into()),
             relay_url: None,
         });
 

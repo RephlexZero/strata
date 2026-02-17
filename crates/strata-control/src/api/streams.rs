@@ -174,7 +174,7 @@ async fn start_stream(
                 "failover_duration_ms": 3000
             }
         }),
-        rist_psk: None,
+        psk: None,
         relay_url: if relay_url.is_empty() {
             None
         } else {

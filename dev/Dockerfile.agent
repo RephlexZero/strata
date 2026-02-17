@@ -35,7 +35,7 @@ FROM rust:1.93-bookworm AS pipeline
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config clang meson ninja-build \
+    pkg-config clang \
     libgstreamer1.0-dev \
     libgstreamer-plugins-base1.0-dev \
     libgstreamer-plugins-bad1.0-dev \
@@ -47,21 +47,20 @@ WORKDIR /src
 COPY Cargo.lock ./
 
 # Copy only the crates needed for the pipeline build
-COPY vendor/librist vendor/librist
-COPY crates/librist-sys crates/librist-sys
-COPY crates/rist-bonding-core crates/rist-bonding-core
-COPY crates/gst-rist-bonding crates/gst-rist-bonding
-COPY crates/rist-network-sim crates/rist-network-sim
+COPY crates/strata-bonding crates/strata-bonding
+COPY crates/strata-gst crates/strata-gst
+COPY crates/strata-sim crates/strata-sim
+COPY crates/strata-transport crates/strata-transport
 
 # Write a minimal workspace manifest for just the pipeline crates
 RUN cat > Cargo.toml <<'TOML'
 [workspace]
 resolver = "2"
 members = [
-    "crates/librist-sys",
-    "crates/rist-bonding-core",
-    "crates/gst-rist-bonding",
-    "crates/rist-network-sim",
+    "crates/strata-bonding",
+    "crates/strata-gst",
+    "crates/strata-sim",
+    "crates/strata-transport",
 ]
 
 [workspace.dependencies]
@@ -89,8 +88,8 @@ codegen-units = 1
 panic = "abort"
 TOML
 
-# Build integration_node binary AND libgstristbonding.so plugin
-RUN cargo build --release -p gst-rist-bonding
+# Build integration_node binary AND libgststrata.so plugin
+RUN cargo build --release -p strata-gst
 
 # ── Stage 3: Build strata-agent ──────────────────────────────
 FROM rust:1.93-bookworm AS builder
@@ -104,7 +103,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 
-# Write a minimal workspace manifest (avoids needing GStreamer/librist deps)
+# Write a minimal workspace manifest (avoids needing GStreamer deps)
 COPY Cargo.lock ./
 COPY crates/strata-common/Cargo.toml crates/strata-common/Cargo.toml
 COPY crates/strata-agent/Cargo.toml crates/strata-agent/Cargo.toml
@@ -157,11 +156,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /src/target/release/strata-agent /usr/local/bin/strata-agent
 
 # Pipeline binary + GStreamer bonding plugin
-# NOTE: The .so must be named libgst*rsristbonding* to match the plugin_define!
-# name. GStreamer strips "libgst" from the filename to derive the plugin name,
-# then looks for symbol gst_plugin_<derived>_get_desc.
-COPY --from=pipeline /src/target/release/integration_node /usr/local/bin/integration_node
-COPY --from=pipeline /src/target/release/libgstristbonding.so /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstrsristbonding.so
+COPY --from=pipeline /src/target/release/strata_node /usr/local/bin/strata_node
+COPY --from=pipeline /src/target/release/libgststrata.so /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgststrata.so
 
 # Entrypoint script (applies tc netem impairments before starting agent)
 COPY dev/entrypoint-sender.sh /usr/local/bin/entrypoint-sender.sh

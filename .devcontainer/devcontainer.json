@@ -1,5 +1,5 @@
 {
-    "name": "Strata - RIST Link Aggregation",
+    "name": "Strata - Bonded Cellular Transport",
     "build": {
         "dockerfile": "Dockerfile",
         "context": ".."

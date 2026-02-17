@@ -213,7 +213,7 @@ mod imp {
             }
 
             let latency_duration = Duration::from_millis(settings.latency as u64);
-            let receiver = ReceiverBackend::new(latency_duration, true);
+            let receiver = ReceiverBackend::new(latency_duration);
 
             for link in settings.links.split(',') {
                 let link = link.trim();

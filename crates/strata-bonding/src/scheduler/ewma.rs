@@ -2,7 +2,7 @@
 ///
 /// Smooths a noisy measurement series by weighting recent samples more
 /// heavily. Used throughout the scheduler to smooth RTT, bandwidth, and
-/// loss rate observations from librist stats callbacks.
+/// loss rate observations from transport stats callbacks.
 ///
 /// The smoothing factor `alpha` controls responsiveness:
 /// - `alpha` near 1.0: tracks input closely (low smoothing)

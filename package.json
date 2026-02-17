@@ -1,7 +1,7 @@
 {
-  "name": "rist-bonding",
+  "name": "strata",
   "version": "1.0.0",
-  "description": "**Bonded video transport over RIST for GStreamer, written in Rust.**",
+  "description": "Bonded cellular video transport for GStreamer, written in Rust.",
   "main": "index.js",
   "directories": {
     "doc": "docs",

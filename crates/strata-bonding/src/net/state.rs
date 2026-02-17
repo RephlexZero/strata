@@ -7,7 +7,7 @@ use std::time::Instant;
 
 /// Smoothed statistics state for a single link's stats callback.
 ///
-/// Updated by the librist stats callback at each interval (~100ms),
+/// Updated by the transport stats callback at each interval (~100ms),
 /// holding the EWMA filters for RTT, bandwidth, and loss.
 pub struct EwmaStats {
     pub rtt: Ewma,
@@ -35,7 +35,7 @@ impl Default for EwmaStats {
 
 /// Shared atomic state for a single network link.
 ///
-/// Written by the librist stats callback (via `Arc`) and read by
+/// Written by the transport stats callback (via `Arc`) and read by
 /// [`LinkSender::get_metrics()`](crate::net::interface::LinkSender::get_metrics)
 /// on the scheduler thread. Atomic fields avoid lock contention on the hot
 /// path; the `ewma_state` mutex is taken only in the stats callback.

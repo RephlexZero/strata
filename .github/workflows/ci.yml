@@ -19,15 +19,11 @@ jobs:
         with:
           submodules: false
 
-      - name: Fetch required submodules
-        run: git submodule update --init --recursive vendor/librist
-
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang cmake pkg-config \
-            meson ninja-build \
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev \
@@ -59,15 +55,11 @@ jobs:
         with:
           submodules: false
 
-      - name: Fetch required submodules
-        run: git submodule update --init --recursive vendor/librist
-
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang cmake pkg-config \
-            meson ninja-build \
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev \
@@ -94,15 +86,11 @@ jobs:
         with:
           submodules: false
 
-      - name: Fetch required submodules
-        run: git submodule update --init --recursive vendor/librist
-
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang cmake pkg-config \
-            meson ninja-build \
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev \
@@ -120,7 +108,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run end-to-end integration tests
-        run: sudo -E env "PATH=$PATH" cargo test -p gst-rist-bonding --test end_to_end -- --nocapture
+        run: sudo -E env "PATH=$PATH" cargo test -p strata-gst --test end_to_end -- --nocapture
 
   audit:
     name: Security Audit
@@ -152,16 +140,12 @@ jobs:
         with:
           submodules: false
 
-      - name: Fetch required submodules
-        run: git submodule update --init --recursive vendor/librist
-
       - name: Install system dependencies (native)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang cmake pkg-config \
-            meson ninja-build \
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev \
@@ -188,20 +172,20 @@ jobs:
 
       - name: Build release (native)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release -p gst-rist-bonding
+        run: cargo build --release -p strata-gst
 
       - name: Prepare artifact (native)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           mkdir -p dist
-          cp target/release/libgstristbonding.so dist/
+          cp target/release/libgststrata.so dist/
           cp target/release/integration_node dist/ 2>/dev/null || true
 
       - name: Prepare artifact (cross)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           mkdir -p dist
-          cp cross-output/libgstristbonding.so dist/ 2>/dev/null || true
+          cp cross-output/libgststrata.so dist/ 2>/dev/null || true
           cp cross-output/integration_node dist/ 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4

@@ -312,7 +312,7 @@ fn test_dual_link_load_balance() {
     println!("Link 2: {:.3} Mbps", avg_l2_mbps);
 
     // Sender-side bandwidth measures the application→socket send rate,
-    // NOT the post-tc-netem wire rate. librist's bandwidth estimation
+    // NOT the post-tc-netem wire rate. The transport's bandwidth estimation
     // tracks bytes accepted by sendto(), which succeeds before tc shaping.
     // The metric should be non-zero, confirming data is flowing through
     // both links. Congestion feedback (loss/RTT) eventually constrains

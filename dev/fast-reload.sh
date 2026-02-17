@@ -37,8 +37,8 @@ build_control() {
 }
 
 build_pipeline() {
-    echo ">>> Building gst-rist-bonding (integration_node + plugin)..."
-    cargo build -p gst-rist-bonding
+    echo ">>> Building strata-gst (integration_node + plugin)..."
+    cargo build -p strata-gst
 }
 
 restart_sender() {

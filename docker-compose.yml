@@ -64,8 +64,8 @@ services:
   #
   # When a stream is started from the dashboard, the agent spawns
   # integration_node which builds a real GStreamer pipeline:
-  # videotestsrc → x264enc → mpegtsmux → rsristbondsink
-  # sending over bonded RIST links to the receiver.
+  # videotestsrc → x264enc → mpegtsmux → stratasink
+  # sending over bonded transport links to the receiver.
   strata-sender-sim:
     build:
       context: .
@@ -105,9 +105,9 @@ services:
       default: {}   # management — control plane access (no impairment)
     restart: unless-stopped
 
-  # ── Receiver (bonded RIST → RTMP relay) ─────────────────────
+  # ── Receiver (bonded transport → RTMP relay) ─────────────────────
   #
-  # Receives the bonded RIST stream on UDP ports via rsristbondsrc,
+  # Receives the bonded transport stream on UDP ports via stratasrc,
   # reassembles it, and relays to an RTMP destination.
   # Attached to same link networks as the sender so traffic flows
   # across the impaired paths.
@@ -124,23 +124,23 @@ services:
       RUST_LOG: "info"
       GST_PLUGIN_PATH: "/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
       RELAY_URL: "${RELAY_URL:-}"
-      RIST_LINK_COUNT: "3"
+      STRATA_LINK_COUNT: "3"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        # Build bind URL from RIST_LINK_COUNT (default 3)
-        COUNT=$${RIST_LINK_COUNT:-3}
+        # Build bind URL from STRATA_LINK_COUNT (default 3)
+        COUNT=$${STRATA_LINK_COUNT:-3}
         BIND=""
         for i in $$(seq 0 $$((COUNT - 1))); do
           PORT=$$((5000 + i * 2))
           if [ -n "$$BIND" ]; then BIND="$$BIND,"; fi
-          BIND="$${BIND}rist://@0.0.0.0:$$PORT"
+          BIND="$${BIND}0.0.0.0:$$PORT"
         done
         echo "=== Receiver: binding $$BIND ==="
         if [ -n "$$RELAY_URL" ]; then
           echo "=== Receiver: RTMP relay → $$RELAY_URL ==="
           exec gst-launch-1.0 -e \
-            rsristbondsrc links="$$BIND" latency=200 ! \
+            stratasrc links="$$BIND" latency=200 ! \
             queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
             tsdemux name=d \
             d. ! queue ! h264parse ! flvmux name=mux streamable=true ! \
@@ -149,7 +149,7 @@ services:
         else
           echo "=== Receiver: monitor mode (set RELAY_URL to relay) ==="
           exec gst-launch-1.0 -e -v \
-            rsristbondsrc links="$$BIND" latency=200 ! \
+            stratasrc links="$$BIND" latency=200 ! \
             fakesink sync=false
         fi
     ports:

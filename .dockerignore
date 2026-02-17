@@ -6,5 +6,4 @@ target/
 *.md
 docs/
 wiki/
-vendor/librist/.git
 **/*.ts

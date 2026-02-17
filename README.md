@@ -5,7 +5,7 @@
 [![CI](https://github.com/RephlexZero/strata/actions/workflows/ci.yml/badge.svg)](https://github.com/RephlexZero/strata/actions/workflows/ci.yml)
 [![Platform CI](https://github.com/RephlexZero/strata/actions/workflows/platform.yml/badge.svg)](https://github.com/RephlexZero/strata/actions/workflows/platform.yml)
 
-Strata aggregates bandwidth across multiple unreliable network interfaces — cellular modems, WiFi, Ethernet, satellite — into a single resilient video stream. It combines a high-performance GStreamer transport engine (`rsristbondsink` / `rsristbondsrc`) with a full management platform: a control plane, operator dashboard, and field-device portal — all built in Rust.
+Strata aggregates bandwidth across multiple unreliable network interfaces — cellular modems, WiFi, Ethernet, satellite — into a single resilient video stream. It combines a high-performance GStreamer transport engine (`stratasink` / `stratasrc`) with a full management platform: a control plane, operator dashboard, and field-device portal — all built in Rust.
 
 Designed for field deployment on constrained hardware (e.g. Orange Pi 5 Plus with USB cellular modems) where link conditions are unpredictable and every bit of available bandwidth matters.
 
@@ -22,10 +22,10 @@ ARCH="$(uname -m)"
 curl -LO "https://github.com/RephlexZero/strata/releases/download/${VERSION}/strata-${VERSION}-${ARCH}-linux-gnu.so"
 
 # Install the plugin
-sudo cp strata-*-linux-gnu.so /usr/lib/${ARCH}-linux-gnu/gstreamer-1.0/libgstristbonding.so
+sudo cp strata-*-linux-gnu.so /usr/lib/${ARCH}-linux-gnu/gstreamer-1.0/libgststrata.so
 
 # Verify
-gst-inspect-1.0 rsristbondsink
+gst-inspect-1.0 stratasink
 ```
 
 ### Runtime Dependencies (Target Device)
@@ -42,7 +42,7 @@ sudo apt-get install -y \
   gstreamer1.0-tools
 ```
 
-No other dependencies are needed — librist is statically linked into the plugin.
+No other dependencies are needed — the transport is built in pure Rust.
 
 ---
 
@@ -56,16 +56,16 @@ gst-launch-1.0 \
   video/x-raw,width=1920,height=1080,framerate=30/1 ! \
   x264enc tune=zerolatency bitrate=3000 ! \
   mpegtsmux ! \
-  rsristbondsink name=sink \
-    sink.link_0::uri="rist://192.168.1.100:5000" \
-    sink.link_1::uri="rist://10.0.0.100:5000"
+  stratasink name=sink \
+    sink.link_0::destination="192.168.1.100:5000" \
+    sink.link_1::destination="10.0.0.100:5000"
 ```
 
 **Receiver** — listen and display:
 
 ```bash
 gst-launch-1.0 \
-  rsristbondsrc links="rist://@0.0.0.0:5000" latency=100 ! \
+  stratasrc links="0.0.0.0:5000" latency=100 ! \
   tsdemux ! h264parse ! avdec_h264 ! autovideosink
 ```
 
@@ -125,7 +125,7 @@ See the [Strata Platform](https://github.com/RephlexZero/strata/wiki/Strata-Plat
 
 ### Recommended: Dev Container (zero local setup)
 
-The fastest way to get a working build environment is to open this repo in a [Dev Container](https://containers.dev/). Everything — Rust, GStreamer, Meson, librist, clang — is pre-installed and ready to go.
+The fastest way to get a working build environment is to open this repo in a [Dev Container](https://containers.dev/). Everything — Rust, GStreamer, clang — is pre-installed and ready to go.
 
 **VS Code / GitHub Codespaces:**
 1. Install the [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) extension (or open in Codespaces)
@@ -144,14 +144,14 @@ If you prefer not to use the dev container, see the [Getting Started](https://gi
 ```bash
 cargo build                                # Debug build
 cargo build --release                      # Release build (LTO + single codegen unit)
-cargo build --release -p gst-rist-bonding  # Plugin only
+cargo build --release -p strata-gst  # Plugin only
 ```
 
-The GStreamer plugin is produced at `target/release/libgstristbonding.so`.
+The GStreamer plugin is produced at `target/release/libgststrata.so`.
 
 ```bash
 export GST_PLUGIN_PATH="$PWD/target/release:$GST_PLUGIN_PATH"
-gst-inspect-1.0 rsristbondsink
+gst-inspect-1.0 stratasink
 ```
 
 ### Testing
@@ -160,7 +160,7 @@ gst-inspect-1.0 rsristbondsink
 cargo test --workspace --lib                                   # Unit tests (no privileges needed)
 cargo test -p strata-common                                    # Platform model + protocol tests
 cargo test -p strata-control                                   # API integration tests (needs PostgreSQL)
-sudo cargo test -p gst-rist-bonding --test end_to_end          # Transport integration (needs NET_ADMIN)
+sudo cargo test -p strata-gst --test end_to_end          # Transport integration (needs NET_ADMIN)
 ```
 
 See the [Testing](https://github.com/RephlexZero/strata/wiki/Testing) wiki page for the full test matrix.
@@ -171,7 +171,7 @@ A multi-stage Dockerfile handles cross-compilation — no cross toolchain setup 
 
 ```bash
 docker build -f docker/Dockerfile.cross-aarch64 -o dist/ .
-# Output: dist/libgstristbonding.so (aarch64)
+# Output: dist/libgststrata.so (aarch64)
 ```
 
 ---
@@ -186,7 +186,7 @@ Full documentation is in the **[Wiki](https://github.com/RephlexZero/strata/wiki
 | [Strata Platform](https://github.com/RephlexZero/strata/wiki/Strata-Platform) | Management platform — control plane, dashboard, portal, agent |
 | [Getting Started](https://github.com/RephlexZero/strata/wiki/Getting-Started) | Prerequisites, building, quick start |
 | [Configuration Reference](https://github.com/RephlexZero/strata/wiki/Configuration-Reference) | Full TOML config for links, scheduler, receiver, lifecycle |
-| [GStreamer Elements](https://github.com/RephlexZero/strata/wiki/GStreamer-Elements) | `rsristbondsink` and `rsristbondsrc` property + pad reference |
+| [GStreamer Elements](https://github.com/RephlexZero/strata/wiki/GStreamer-Elements) | `stratasink` and `stratasrc` property + pad reference |
 | [Integration Node](https://github.com/RephlexZero/strata/wiki/Integration-Node) | CLI binary for sender/receiver without pipeline code |
 | [Telemetry](https://github.com/RephlexZero/strata/wiki/Telemetry) | Stats message schema and JSON relay |
 | [Testing](https://github.com/RephlexZero/strata/wiki/Testing) | Test suites, how to run, privilege requirements |
@@ -198,17 +198,15 @@ Full documentation is in the **[Wiki](https://github.com/RephlexZero/strata/wiki
 
 ```
 crates/
-  gst-rist-bonding/     GStreamer plugin + integration_node binary
-  rist-bonding-core/     Core bonding logic (no GStreamer dependency)
-  librist-sys/           FFI bindings to librist (built from source via Meson)
-  rist-network-sim/      Linux netns + tc-netem test infrastructure
+  strata-gst/            GStreamer plugin + integration_node binary
+  strata-bonding/        Core bonding logic (no GStreamer dependency)
+  strata-transport/      Pure Rust transport layer (replaces librist)
+  strata-sim/            Linux netns + tc-netem test infrastructure
   strata-common/         Shared types, protocol, auth, ID generation
   strata-control/        Control plane — Axum API, WebSocket, PostgreSQL
   strata-agent/          Sender agent daemon (field devices)
   strata-dashboard/      Operator dashboard — Leptos CSR WASM + Tailwind/DaisyUI
   strata-portal/         Field device portal — Leptos CSR WASM + Tailwind/DaisyUI
-vendor/
-  librist/               librist source (git submodule, statically linked)
 docker/
   Dockerfile.cross-aarch64   Cross-compile for Orange Pi / aarch64
 docker-compose.yml       Dev stack (PostgreSQL, control plane, simulated agent)
@@ -224,10 +222,10 @@ Releases are automated via GitHub Actions. One command does everything:
 
 ```bash
 # Patch release (0.1.1 → 0.1.2) — bumps version, commits, tags, pushes
-cargo release -p gst-rist-bonding patch --execute
+cargo release -p strata-gst patch --execute
 
 # With release notes
-cargo release -p gst-rist-bonding patch --execute \
+cargo release -p strata-gst patch --execute \
   --tag-message "Fix reconnection timeout under high packet loss"
 ```
 
@@ -242,4 +240,4 @@ See the [wiki](https://github.com/RephlexZero/strata/wiki/Getting-Started#releas
 
 ## License
 
-This project is licensed under the [LGPL-2.1-or-later](LICENSE). See [vendor/librist/COPYING](vendor/librist/COPYING) for librist's license terms (BSD-2-Clause).
+This project is licensed under the [LGPL-2.1-or-later](LICENSE).

@@ -17,7 +17,7 @@ pub(crate) struct LinkState<L: ?Sized> {
     pub last_sent_bytes: u64,
     pub last_sent_at: Instant,
     /// Bytes that the scheduler attempted to send but the link rejected
-    /// (e.g. RIST queue overflow). Used for congestion detection.
+    /// (e.g. queue overflow). Used for congestion detection.
     pub failed_bytes: u64,
     pub last_failed_bytes: u64,
     pub measured_bps: f64,
@@ -164,7 +164,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             }
 
             if state.metrics.capacity_bps < 1_000_000.0 {
-                // librist bandwidth hasn't converged yet — use the capacity floor.
+                // Bandwidth hasn't converged yet — use the capacity floor.
                 // Avoid using `measured_bps * 2.0` because the scheduler distributes
                 // traffic proportionally to capacity. If all links bootstrap to
                 // the same 2×throughput, a feedback loop forms and all link stats
@@ -226,7 +226,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
 
     /// Records a failed send attempt for congestion detection.
     ///
-    /// When `link.send()` fails (e.g. RIST queue overflow), the bytes
+    /// When `link.send()` fails (e.g. queue overflow), the bytes
     /// still count toward the link's "observed" throughput so the
     /// congestion signal fires correctly.
     pub fn record_send_failed(&mut self, id: usize, bytes: u64) {

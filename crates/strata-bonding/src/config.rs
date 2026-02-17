@@ -17,8 +17,6 @@ pub struct BondingConfigInput {
     pub receiver: ReceiverConfigInput,
     pub lifecycle: LinkLifecycleConfigInput,
     pub scheduler: SchedulerConfigInput,
-    /// Use strata-transport (pure Rust) instead of librist for link I/O.
-    pub use_transport: Option<bool>,
 }
 
 /// Raw link configuration from TOML input.
@@ -28,12 +26,6 @@ pub struct LinkConfigInput {
     pub id: Option<usize>,
     pub uri: String,
     pub interface: Option<String>,
-    /// Optional: RIST recovery maxbitrate in kbps (defaults to 100000)
-    pub recovery_maxbitrate: Option<u32>,
-    /// Optional: RIST recovery RTT max in ms (defaults to 500)
-    pub recovery_rtt_max: Option<u32>,
-    /// Optional: RIST recovery reorder buffer in ms (defaults to 15)
-    pub recovery_reorder_buffer: Option<u32>,
 }
 
 /// Raw receiver configuration from TOML input.
@@ -113,9 +105,6 @@ pub struct LinkConfig {
     pub id: usize,
     pub uri: String,
     pub interface: Option<String>,
-    pub recovery_maxbitrate: Option<u32>,
-    pub recovery_rtt_max: Option<u32>,
-    pub recovery_reorder_buffer: Option<u32>,
 }
 
 /// Resolved receiver configuration.
@@ -236,9 +225,6 @@ pub struct BondingConfig {
     pub receiver: ReceiverConfig,
     pub lifecycle: LinkLifecycleConfig,
     pub scheduler: SchedulerConfig,
-    /// When true, use `strata-transport` (pure Rust) instead of librist for
-    /// link I/O. Enables the custom wire format, FEC, ARQ, and Biscay CC.
-    pub use_transport: bool,
 }
 
 impl Default for BondingConfig {
@@ -249,7 +235,6 @@ impl Default for BondingConfig {
             receiver: ReceiverConfig::default(),
             lifecycle: LinkLifecycleConfig::default(),
             scheduler: SchedulerConfig::default(),
-            use_transport: true,
         }
     }
 }
@@ -395,9 +380,6 @@ impl BondingConfigInput {
                 id,
                 uri: link.uri,
                 interface: iface,
-                recovery_maxbitrate: link.recovery_maxbitrate,
-                recovery_rtt_max: link.recovery_rtt_max,
-                recovery_reorder_buffer: link.recovery_reorder_buffer,
             });
         }
 
@@ -407,7 +389,6 @@ impl BondingConfigInput {
             receiver,
             lifecycle,
             scheduler,
-            use_transport: self.use_transport.unwrap_or(true),
         })
     }
 }
@@ -510,58 +491,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_toml_config_with_recovery_params() {
+    fn parse_toml_config_with_interface() {
         let toml = r#"
             version = 1
 
             [[links]]
             id = 1
-            uri = "rist://10.0.0.1:5000"
+            uri = "10.0.0.1:5000"
             interface = "wwan0"
-            recovery_maxbitrate = 20000
-            recovery_rtt_max = 800
-            recovery_reorder_buffer = 50
 
             [[links]]
             id = 2
-            uri = "rist://10.0.0.2:5000"
+            uri = "10.0.0.2:5000"
             interface = "wlan0"
-            recovery_rtt_max = 200
         "#;
 
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.links.len(), 2);
-
-        // Link 1 with all recovery params
         assert_eq!(cfg.links[0].id, 1);
-        assert_eq!(cfg.links[0].recovery_maxbitrate, Some(20000));
-        assert_eq!(cfg.links[0].recovery_rtt_max, Some(800));
-        assert_eq!(cfg.links[0].recovery_reorder_buffer, Some(50));
-
-        // Link 2 with partial recovery params
+        assert_eq!(cfg.links[0].interface.as_deref(), Some("wwan0"));
         assert_eq!(cfg.links[1].id, 2);
-        assert_eq!(cfg.links[1].recovery_maxbitrate, None);
-        assert_eq!(cfg.links[1].recovery_rtt_max, Some(200));
-        assert_eq!(cfg.links[1].recovery_reorder_buffer, None);
-    }
-
-    #[test]
-    fn parse_toml_config_without_recovery_params() {
-        let toml = r#"
-            version = 1
-
-            [[links]]
-            id = 1
-            uri = "rist://10.0.0.1:5000"
-        "#;
-
-        let cfg = BondingConfig::from_toml_str(toml).unwrap();
-        assert_eq!(cfg.links.len(), 1);
-
-        // Recovery params should be None when not specified
-        assert_eq!(cfg.links[0].recovery_maxbitrate, None);
-        assert_eq!(cfg.links[0].recovery_rtt_max, None);
-        assert_eq!(cfg.links[0].recovery_reorder_buffer, None);
+        assert_eq!(cfg.links[1].interface.as_deref(), Some("wlan0"));
     }
 
     #[test]

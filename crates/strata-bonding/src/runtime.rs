@@ -1,8 +1,6 @@
-use crate::config::{BondingConfig, LinkConfig, LinkLifecycleConfig, SchedulerConfig};
+use crate::config::{BondingConfig, LinkConfig, SchedulerConfig};
 use crate::net::interface::{LinkMetrics, LinkSender};
-use crate::net::link::Link;
 use crate::net::transport::TransportLink;
-use crate::net::wrapper::RecoveryConfig;
 use crate::scheduler::bonding::BondingScheduler;
 use crate::scheduler::PacketProfile;
 use bytes::Bytes;
@@ -24,7 +22,7 @@ pub enum PacketSendError {
 
 enum RuntimeMessage {
     Packet(Bytes, PacketProfile),
-    ApplyConfig(BondingConfig),
+    ApplyConfig(Box<BondingConfig>),
     AddLink(LinkConfig),
     RemoveLink(usize),
     Shutdown,
@@ -45,22 +43,13 @@ pub struct BondingRuntime {
 }
 
 impl BondingRuntime {
-    /// Creates a runtime with the default scheduler configuration (librist mode).
+    /// Creates a runtime with the default scheduler configuration.
     pub fn new() -> Self {
         Self::with_config(SchedulerConfig::default())
     }
 
-    /// Creates a runtime with the given scheduler configuration (librist mode).
+    /// Creates a runtime with the given scheduler configuration.
     pub fn with_config(scheduler_config: SchedulerConfig) -> Self {
-        Self::build(scheduler_config, false)
-    }
-
-    /// Creates a runtime using strata-transport (pure Rust) for link I/O.
-    pub fn with_transport(scheduler_config: SchedulerConfig) -> Self {
-        Self::build(scheduler_config, true)
-    }
-
-    fn build(scheduler_config: SchedulerConfig, use_transport: bool) -> Self {
         let channel_capacity = scheduler_config.channel_capacity;
         let (tx, rx) = bounded(channel_capacity);
         let metrics = Arc::new(Mutex::new(HashMap::new()));
@@ -68,7 +57,7 @@ impl BondingRuntime {
 
         let handle = thread::Builder::new()
             .name("strata-worker".into())
-            .spawn(move || runtime_worker(rx, metrics_clone, scheduler_config, use_transport))
+            .spawn(move || runtime_worker(rx, metrics_clone, scheduler_config))
             .expect("failed to spawn bonding runtime worker");
 
         Self {
@@ -97,7 +86,7 @@ impl BondingRuntime {
     /// Sends a full configuration update to the worker thread.
     pub fn apply_config(&self, config: BondingConfig) -> anyhow::Result<()> {
         self.sender
-            .send(RuntimeMessage::ApplyConfig(config))
+            .send(RuntimeMessage::ApplyConfig(Box::new(config)))
             .map_err(|e| anyhow::anyhow!("Failed to send config: {}", e))
     }
 
@@ -153,13 +142,10 @@ fn runtime_worker(
     rx: Receiver<RuntimeMessage>,
     metrics: Arc<Mutex<HashMap<usize, LinkMetrics>>>,
     scheduler_config: SchedulerConfig,
-    use_transport: bool,
 ) {
     let mut scheduler: BondingScheduler<dyn LinkSender> =
         BondingScheduler::with_config(scheduler_config.clone());
     let mut current_links: HashMap<usize, LinkConfig> = HashMap::new();
-    let mut lifecycle_config = LinkLifecycleConfig::default();
-    let mut ewma_alpha = scheduler_config.ewma_alpha;
 
     let mut last_fast_stats = Instant::now();
     let fast_stats_interval = Duration::from_millis(100);
@@ -171,32 +157,15 @@ fn runtime_worker(
                     let _ = scheduler.send(data, profile);
                 }
                 RuntimeMessage::AddLink(link) => {
-                    apply_link(
-                        &mut scheduler,
-                        &mut current_links,
-                        &lifecycle_config,
-                        link,
-                        ewma_alpha,
-                        use_transport,
-                    );
+                    apply_link(&mut scheduler, &mut current_links, link);
                 }
                 RuntimeMessage::RemoveLink(id) => {
                     scheduler.remove_link(id);
                     current_links.remove(&id);
                 }
                 RuntimeMessage::ApplyConfig(config) => {
-                    lifecycle_config = config.lifecycle.clone();
-                    ewma_alpha = config.scheduler.ewma_alpha;
-                    let transport = config.use_transport || use_transport;
                     scheduler.update_config(config.scheduler.clone());
-                    apply_config(
-                        &mut scheduler,
-                        &mut current_links,
-                        &lifecycle_config,
-                        config,
-                        ewma_alpha,
-                        transport,
-                    );
+                    apply_config(&mut scheduler, &mut current_links, *config);
                 }
                 RuntimeMessage::Shutdown => break,
             },
@@ -218,10 +187,7 @@ fn runtime_worker(
 fn apply_config(
     scheduler: &mut BondingScheduler<dyn LinkSender>,
     current_links: &mut HashMap<usize, LinkConfig>,
-    lifecycle_config: &LinkLifecycleConfig,
     config: BondingConfig,
-    ewma_alpha: f64,
-    use_transport: bool,
 ) {
     // Only reconcile links if the config explicitly defines them.
     // An empty links list means "don't touch existing links" — this allows
@@ -247,14 +213,7 @@ fn apply_config(
             };
 
             if needs_update {
-                apply_link(
-                    scheduler,
-                    current_links,
-                    lifecycle_config,
-                    link,
-                    ewma_alpha,
-                    use_transport,
-                );
+                apply_link(scheduler, current_links, link);
             }
         }
     }
@@ -263,56 +222,31 @@ fn apply_config(
 fn apply_link(
     scheduler: &mut BondingScheduler<dyn LinkSender>,
     current_links: &mut HashMap<usize, LinkConfig>,
-    lifecycle_config: &LinkLifecycleConfig,
     link: LinkConfig,
-    ewma_alpha: f64,
-    use_transport: bool,
 ) {
     scheduler.remove_link(link.id);
 
-    if use_transport {
-        match create_transport_link(&link) {
-            Ok(tl) => {
-                scheduler.add_link(Arc::new(tl) as Arc<dyn LinkSender>);
-                current_links.insert(link.id, link);
-            }
-            Err(err) => {
-                warn!(
-                    "Failed to create transport link id={} uri={}: {}",
-                    link.id, link.uri, err
-                );
-            }
+    match create_transport_link(&link) {
+        Ok(tl) => {
+            scheduler.add_link(Arc::new(tl) as Arc<dyn LinkSender>);
+            current_links.insert(link.id, link);
         }
-    } else {
-        let recovery = recovery_config_from_link(&link);
-        match Link::new_with_full_config(
-            link.id,
-            &link.uri,
-            link.interface.clone(),
-            lifecycle_config.clone(),
-            recovery,
-            Some(ewma_alpha),
-        ) {
-            Ok(new_link) => {
-                scheduler.add_link(Arc::new(new_link) as Arc<dyn LinkSender>);
-                current_links.insert(link.id, link);
-            }
-            Err(err) => {
-                warn!(
-                    "Failed to create link id={} uri={}: {}",
-                    link.id, link.uri, err
-                );
-            }
+        Err(err) => {
+            warn!(
+                "Failed to create transport link id={} uri={}: {}",
+                link.id, link.uri, err
+            );
         }
     }
 }
 
-/// Parse a RIST URI (e.g. `rist://1.2.3.4:5000`) to a `SocketAddr`.
-fn parse_rist_uri(uri: &str) -> Option<SocketAddr> {
-    // Try listener format first (more specific prefix)
+/// Parse a URI (e.g. `rist://1.2.3.4:5000` or `1.2.3.4:5000`) to a `SocketAddr`.
+fn parse_uri(uri: &str) -> Option<SocketAddr> {
+    // Strip legacy rist:// prefix if present
     let stripped = uri
         .strip_prefix("rist://@")
-        .or_else(|| uri.strip_prefix("rist://"))?;
+        .or_else(|| uri.strip_prefix("rist://"))
+        .unwrap_or(uri);
     // Strip query parameters
     let host_port = stripped.split('?').next()?;
     host_port.parse::<SocketAddr>().ok()
@@ -320,8 +254,8 @@ fn parse_rist_uri(uri: &str) -> Option<SocketAddr> {
 
 /// Create a `TransportLink` from a `LinkConfig`.
 fn create_transport_link(link: &LinkConfig) -> anyhow::Result<TransportLink> {
-    let addr = parse_rist_uri(&link.uri)
-        .ok_or_else(|| anyhow::anyhow!("Invalid URI for transport mode: {}", link.uri))?;
+    let addr = parse_uri(&link.uri)
+        .ok_or_else(|| anyhow::anyhow!("Invalid URI for transport: {}", link.uri))?;
 
     let socket = if let Some(ref iface) = link.interface {
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
@@ -357,22 +291,6 @@ fn create_transport_link(link: &LinkConfig) -> anyhow::Result<TransportLink> {
 
     socket.connect(addr)?;
     Ok(TransportLink::new(link.id, socket, SenderConfig::default()))
-}
-
-/// Build a RecoveryConfig from the link's optional recovery parameters.
-fn recovery_config_from_link(link: &LinkConfig) -> Option<RecoveryConfig> {
-    if link.recovery_maxbitrate.is_some()
-        || link.recovery_rtt_max.is_some()
-        || link.recovery_reorder_buffer.is_some()
-    {
-        Some(RecoveryConfig {
-            recovery_maxbitrate: link.recovery_maxbitrate,
-            recovery_rtt_max: link.recovery_rtt_max,
-            recovery_reorder_buffer: link.recovery_reorder_buffer,
-        })
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]
@@ -440,11 +358,8 @@ mod tests {
         let rt = BondingRuntime::new();
         let link = LinkConfig {
             id: 1,
-            uri: "rist://127.0.0.1:19100".to_string(),
+            uri: "127.0.0.1:19100".to_string(),
             interface: None,
-            recovery_maxbitrate: None,
-            recovery_rtt_max: None,
-            recovery_reorder_buffer: None,
         };
         assert!(rt.add_link(link).is_ok());
         thread::sleep(Duration::from_millis(250));
@@ -457,11 +372,8 @@ mod tests {
         let rt = BondingRuntime::new();
         let link = LinkConfig {
             id: 1,
-            uri: "rist://127.0.0.1:19101".to_string(),
+            uri: "127.0.0.1:19101".to_string(),
             interface: None,
-            recovery_maxbitrate: None,
-            recovery_rtt_max: None,
-            recovery_reorder_buffer: None,
         };
         rt.add_link(link).unwrap();
         thread::sleep(Duration::from_millis(250));
@@ -482,19 +394,13 @@ mod tests {
             links: vec![
                 LinkConfig {
                     id: 1,
-                    uri: "rist://127.0.0.1:19102".to_string(),
+                    uri: "127.0.0.1:19102".to_string(),
                     interface: None,
-                    recovery_maxbitrate: None,
-                    recovery_rtt_max: None,
-                    recovery_reorder_buffer: None,
                 },
                 LinkConfig {
                     id: 2,
-                    uri: "rist://127.0.0.1:19103".to_string(),
+                    uri: "127.0.0.1:19103".to_string(),
                     interface: None,
-                    recovery_maxbitrate: None,
-                    recovery_rtt_max: None,
-                    recovery_reorder_buffer: None,
                 },
             ],
             ..BondingConfig::default()
@@ -508,11 +414,8 @@ mod tests {
         let config2 = BondingConfig {
             links: vec![LinkConfig {
                 id: 2,
-                uri: "rist://127.0.0.1:19103".to_string(),
+                uri: "127.0.0.1:19103".to_string(),
                 interface: None,
-                recovery_maxbitrate: None,
-                recovery_rtt_max: None,
-                recovery_reorder_buffer: None,
             }],
             ..BondingConfig::default()
         };
@@ -548,84 +451,42 @@ mod tests {
     }
 
     #[test]
-    fn recovery_config_all_set() {
-        let link = LinkConfig {
-            id: 1,
-            uri: "rist://1.2.3.4:5000".to_string(),
-            interface: None,
-            recovery_maxbitrate: Some(20000),
-            recovery_rtt_max: Some(800),
-            recovery_reorder_buffer: Some(50),
-        };
-        let rc = recovery_config_from_link(&link).unwrap();
-        assert_eq!(rc.recovery_maxbitrate, Some(20000));
-        assert_eq!(rc.recovery_rtt_max, Some(800));
-        assert_eq!(rc.recovery_reorder_buffer, Some(50));
-    }
-
-    #[test]
-    fn recovery_config_none_when_all_empty() {
-        let link = LinkConfig {
-            id: 1,
-            uri: "rist://1.2.3.4:5000".to_string(),
-            interface: None,
-            recovery_maxbitrate: None,
-            recovery_rtt_max: None,
-            recovery_reorder_buffer: None,
-        };
-        assert!(recovery_config_from_link(&link).is_none());
-    }
-
-    #[test]
-    fn recovery_config_partial() {
-        let link = LinkConfig {
-            id: 1,
-            uri: "rist://1.2.3.4:5000".to_string(),
-            interface: None,
-            recovery_maxbitrate: None,
-            recovery_rtt_max: Some(200),
-            recovery_reorder_buffer: None,
-        };
-        let rc = recovery_config_from_link(&link).unwrap();
-        assert_eq!(rc.recovery_maxbitrate, None);
-        assert_eq!(rc.recovery_rtt_max, Some(200));
-    }
-
-    #[test]
-    fn parse_rist_uri_basic() {
-        let addr = parse_rist_uri("rist://127.0.0.1:5000").unwrap();
+    fn parse_uri_basic() {
+        let addr = parse_uri("127.0.0.1:5000").unwrap();
         assert_eq!(addr, "127.0.0.1:5000".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
-    fn parse_rist_uri_listener() {
-        let addr = parse_rist_uri("rist://@0.0.0.0:5000").unwrap();
+    fn parse_uri_legacy_rist() {
+        let addr = parse_uri("rist://127.0.0.1:5000").unwrap();
+        assert_eq!(addr, "127.0.0.1:5000".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn parse_uri_legacy_rist_listener() {
+        let addr = parse_uri("rist://@0.0.0.0:5000").unwrap();
         assert_eq!(addr, "0.0.0.0:5000".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
-    fn parse_rist_uri_with_query() {
-        let addr = parse_rist_uri("rist://10.0.0.1:6000?miface=eth0").unwrap();
+    fn parse_uri_with_query() {
+        let addr = parse_uri("rist://10.0.0.1:6000?miface=eth0").unwrap();
         assert_eq!(addr, "10.0.0.1:6000".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
-    fn parse_rist_uri_invalid() {
-        assert!(parse_rist_uri("http://example.com").is_none());
-        assert!(parse_rist_uri("").is_none());
-        assert!(parse_rist_uri("not-a-url").is_none());
+    fn parse_uri_invalid() {
+        assert!(parse_uri("").is_none());
+        assert!(parse_uri("not-a-url").is_none());
     }
 
     #[test]
     fn transport_runtime_creates_links() {
-        let rt = BondingRuntime::with_transport(SchedulerConfig::default());
+        let rt = BondingRuntime::new();
         let link = LinkConfig {
             id: 1,
-            uri: "rist://127.0.0.1:19200".to_string(),
+            uri: "127.0.0.1:19200".to_string(),
             interface: None,
-            recovery_maxbitrate: None,
-            recovery_rtt_max: None,
-            recovery_reorder_buffer: None,
         };
         assert!(rt.add_link(link).is_ok());
         thread::sleep(Duration::from_millis(250));
@@ -638,7 +499,7 @@ mod tests {
 
     #[test]
     fn transport_runtime_sends_packets() {
-        let rt = BondingRuntime::with_transport(SchedulerConfig::default());
+        let rt = BondingRuntime::new();
 
         // Bind a receiver socket to get a known port
         let rcv_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -646,11 +507,8 @@ mod tests {
 
         let link = LinkConfig {
             id: 1,
-            uri: format!("rist://{}", rcv_addr),
+            uri: format!("{}", rcv_addr),
             interface: None,
-            recovery_maxbitrate: None,
-            recovery_rtt_max: None,
-            recovery_reorder_buffer: None,
         };
         rt.add_link(link).unwrap();
         thread::sleep(Duration::from_millis(200));

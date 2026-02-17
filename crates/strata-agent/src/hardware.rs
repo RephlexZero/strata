@@ -139,7 +139,7 @@ impl HardwareScanner {
     ///
     /// This only updates the in-memory admin state — it does **not** bring the
     /// OS interface down.  The caller is responsible for telling the running
-    /// pipeline to exclude/include the corresponding RIST link so that
+    /// pipeline to exclude/include the corresponding link so that
     /// disabling an interface only removes it from the bonding transport
     /// without killing connectivity used by other services.
     pub fn set_interface_enabled(&self, name: &str, enabled: bool) -> bool {

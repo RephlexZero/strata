@@ -1,14 +1,13 @@
-//! Transport-agnostic bonding engine for RIST streams.
+//! Bonding engine for Strata transport streams.
 //!
 //! This crate provides the core scheduler, link lifecycle management,
-//! receiver reassembly, and librist FFI wrappers used by the GStreamer
-//! plugin (`gst-rist-bonding`) and the integration node binary.
+//! receiver reassembly, and transport link abstractions used by the
+//! GStreamer plugin (`strata-gst`) and the integration node binary.
 //!
 //! Key components:
 //! - [`scheduler`] — Deficit Weighted Round Robin (DWRR) packet scheduler
 //!   with adaptive redundancy and fast-failover
-//! - [`net`] — Network link abstraction, lifecycle state machine, and
-//!   librist sender/receiver wrappers
+//! - [`net`] — Network link abstraction and lifecycle state machine
 //! - [`receiver`] — Bonding receiver with jitter-buffer reassembly
 //! - [`config`] — TOML-based configuration with versioned schema
 //! - [`runtime`] — Thread-safe runtime that owns the scheduler loop
@@ -24,7 +23,7 @@ pub mod receiver;
 pub mod runtime;
 pub mod scheduler;
 
-/// Initialize the rist-bonding-core library.
+/// Initialize the strata-bonding library.
 ///
 /// Installs a default `tracing` subscriber (env-filter based) if no subscriber
 /// is already set. Safe to call multiple times — subsequent calls are no-ops.
@@ -35,7 +34,7 @@ pub fn init() {
     INIT.call_once(|| {
         // Only install if no subscriber is already set (e.g., by the host application).
         if tracing::dispatcher::has_been_set() {
-            tracing::info!("Rist Bonding Core: tracing subscriber already set");
+            tracing::info!("Strata Bonding: tracing subscriber already set");
             return;
         }
         let subscriber = tracing_subscriber::fmt()
@@ -48,7 +47,7 @@ pub fn init() {
             .compact()
             .finish();
         if tracing::subscriber::set_global_default(subscriber).is_ok() {
-            tracing::info!("Rist Bonding Core initialized");
+            tracing::info!("Strata Bonding initialized");
         }
     });
 }

@@ -3,11 +3,8 @@ set -euo pipefail
 
 echo "── Strata post-create setup ──────────────────────────────"
 
-# Initialise librist submodule if not already present
-if [ ! -f vendor/librist/meson.build ]; then
-    echo "Initialising librist submodule…"
-    git submodule update --init --recursive
-fi
+# Initialise submodules if not already present
+git submodule update --init --recursive 2>/dev/null || true
 
 # Pre-build so rust-analyzer has everything it needs
 echo "Running initial cargo check…"

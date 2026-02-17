@@ -42,7 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 
-# Write a minimal workspace manifest (avoids needing GStreamer/librist deps)
+# Write a minimal workspace manifest (avoids needing GStreamer deps)
 COPY Cargo.lock ./
 COPY crates/strata-common/Cargo.toml crates/strata-common/Cargo.toml
 COPY crates/strata-control/Cargo.toml crates/strata-control/Cargo.toml

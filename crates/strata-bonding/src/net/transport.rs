@@ -15,7 +15,7 @@ use strata_transport::pool::Priority;
 use strata_transport::sender::{Sender, SenderConfig};
 use strata_transport::session::RttTracker;
 
-/// A link backed by `strata-transport::Sender` instead of librist.
+/// A link backed by `strata-transport::Sender`.
 pub struct TransportLink {
     /// Unique link ID.
     id: usize,

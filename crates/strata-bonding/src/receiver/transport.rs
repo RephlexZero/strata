@@ -4,9 +4,6 @@
 //! UDP links, decodes and recovers via the transport-layer receiver (FEC,
 //! reordering), strips the bonding header, then feeds payloads into a
 //! shared [`ReassemblyBuffer`] for multi-link jitter buffering.
-//!
-//! This replaces the librist-based [`BondingReceiver`] with a pure-Rust
-//! receive path that leverages strata-transport's reliability features.
 
 use crate::protocol::header::BondingHeader;
 use crate::receiver::aggregator::{Packet, ReassemblyBuffer, ReassemblyConfig, ReassemblyStats};

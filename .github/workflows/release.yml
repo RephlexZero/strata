@@ -23,7 +23,7 @@ jobs:
           python3 - <<'PY'
           import os, tomllib
           tag = os.environ["GITHUB_REF_NAME"]
-          with open("crates/gst-rist-bonding/Cargo.toml", "rb") as f:
+          with open("crates/strata-gst/Cargo.toml", "rb") as f:
               version = tomllib.load(f)["package"]["version"]
           expected = f"v{version}"
           if tag != expected:
@@ -41,15 +41,11 @@ jobs:
         with:
           submodules: false
 
-      - name: Fetch required submodules
-        run: git submodule update --init --recursive vendor/librist
-
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang cmake pkg-config \
-            meson ninja-build \
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev \
@@ -62,12 +58,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
-        run: cargo build --release -p gst-rist-bonding
+        run: cargo build --release -p strata-gst
 
       - name: Package
         run: |
           mkdir -p staging
-          cp target/release/libgstristbonding.so \
+          cp target/release/libgststrata.so \
             staging/strata-${{ github.ref_name }}-x86_64-linux-gnu.so
 
       - uses: actions/upload-artifact@v4
@@ -85,9 +81,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: false
-
-      - name: Fetch required submodules
-        run: git submodule update --init --recursive vendor/librist
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -107,7 +100,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p staging
-          cp cross-output/libgstristbonding.so \
+          cp cross-output/libgststrata.so \
             staging/strata-${{ github.ref_name }}-aarch64-linux-gnu.so
 
       - uses: actions/upload-artifact@v4

@@ -19,7 +19,7 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     gstreamer1.0-plugins-ugly \
     gstreamer1.0-libav \
     gstreamer1.0-tools \
-    # librist build deps (meson/ninja)
+    # Build tooling (meson/ninja for GStreamer subprojects)
     meson \
     ninja-build \
     # Network tooling (integration tests use netns + tc)

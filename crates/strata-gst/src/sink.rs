@@ -83,9 +83,6 @@ mod imp {
                             id,
                             uri,
                             interface: iface,
-                            recovery_maxbitrate: None,
-                            recovery_rtt_max: None,
-                            recovery_reorder_buffer: None,
                         });
                     }
                     SinkMessage::RemoveLink { id } => {
@@ -101,9 +98,6 @@ mod imp {
                                 id,
                                 uri,
                                 interface: iface,
-                                recovery_maxbitrate: None,
-                                recovery_rtt_max: None,
-                                recovery_reorder_buffer: None,
                             },
                         );
                     }
@@ -374,7 +368,7 @@ mod imp {
     impl BaseSinkImpl for StrataSink {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
             let sched_cfg = lock_or_recover(&self.scheduler_config).clone();
-            let runtime = BondingRuntime::with_transport(sched_cfg.clone());
+            let runtime = BondingRuntime::with_config(sched_cfg.clone());
             let metrics_handle = runtime.metrics_handle();
             *lock_or_recover(&self.runtime) = Some(runtime);
 

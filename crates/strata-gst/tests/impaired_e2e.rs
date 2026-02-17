@@ -12,7 +12,7 @@ use strata_sim::topology::Namespace;
 // Helper to spawn async process in namespace
 fn spawn_in_ns(ns_name: &str, cmd: &str, args: &[&str]) -> std::process::Child {
     // Determine command wrapper based on privs / environment
-    // Assuming sudo or root is available as per rist-network-sim
+    // Assuming sudo or root is available as per strata-sim
     std::process::Command::new("sudo")
         .args(["ip", "netns", "exec", ns_name, cmd])
         .args(args)
@@ -805,11 +805,11 @@ fn test_step_change_convergence_visualization() {
 /// packets to be dropped — drops that are visible to the receiver and produce
 /// RTCP NACKs, enabling AIMD convergence.
 ///
-/// Link rates preserve the 500:1200:1750 ratio, scaled ×10 for reliable RIST.
+/// Link rates preserve the 500:1200:1750 ratio, scaled ×10 for reliable transport.
 ///
 /// Verifies:
 ///   A) netem correctly enforces differentiated bandwidth limits (tc stats)
-///   B) All 3 RIST links are alive from the sender's perspective
+///   B) All 3 links are alive from the sender's perspective
 ///   C) Every link carries traffic (no starvation)
 ///   D) Throughput ordering matches link bandwidth ordering
 #[test]
@@ -912,7 +912,7 @@ fn test_three_link_bandwidth_differentiation() {
     let _ = ns_snd.exec("ip", &["link", "set", "veth_3lnk_c", "up"]);
 
     // 5. Apply bandwidth limits via netem rate + finite limit.
-    //    Ratio 500:1200:1750, scaled ×10 for reliable RIST over veth at 1080p60.
+    //    Ratio 500:1200:1750, scaled ×10 for reliable transport over veth at 1080p60.
     //    The auto-calculated netem limit (from BDP) keeps the queue finite so
     //    excess packets are dropped at the netem level — visible to RTCP.
     let bandwidths_kbit = [5_000u64, 12_000, 17_500];

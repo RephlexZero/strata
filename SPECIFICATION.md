@@ -1,4 +1,4 @@
-# RIST Bonded Transport System Specification
+# Strata Bonded Transport System Specification
 
 **Role:** Senior Systems Architect & Transport Engineer  
 **Date:** January 26, 2026  
@@ -12,31 +12,31 @@
 The system is a userspace bonded video transport solution designed to aggregate bandwidth across multiple heterogeneous network interfaces (LTE, 5G, WiFi, Ethernet). It leverages GStreamer for the media pipeline and Rust for all control plane, scheduling, and IO aggregation logic.
 
 **Core Philosophy:**
-- **RFC Compatibility:** The "Bonding" is non-standard and implementation-specific. The "Transport" is standard RIST (RTP).
-- **Control Inversion:** `librist` is demoted to a dumb socket wrapper. All intelligence (retransmission requests, scheduling, bonding) lives in the Rust `BondingScheduler`.
+- **RFC Compatibility:** The "Bonding" is non-standard and implementation-specific. The "Transport" uses a custom pure-Rust protocol based on RTP.
+- **Control Inversion:** `strata-transport` handles the network I/O. All intelligence (retransmission requests, scheduling, bonding) lives in the Rust `BondingScheduler`.
 
 ### End-to-End Dataflow
 
 1.  **Media Source (GStreamer):**
-    `Video Source` -> `Encoder (H.264)` -> `MPEG-TS Muxer` -> **`rsristbondsink`**
+    `Video Source` -> `Encoder (H.264)` -> `MPEG-TS Muxer` -> **`stratasink`**
 2.  **Bonding Sender (Rust):**
-    - `rsristbondsink` receives GStreamer Buffers.
+    - `stratasink` receives GStreamer Buffers.
     - **Header Extension:** Adds a custom RTP header extension or payload wrapper containing a global sequence number for reassembly.
     - **Scheduler:** Decides which Link (Interface) to use based on current metrics.
-    - **Dispatch:** Pushes packet to specific `librist` instance bound to that interface.
+    - **Dispatch:** Pushes packet to specific `strata-transport` instance bound to that interface.
 3.  **Network Transmission:**
     - Packets travel over independent UDP flows.
     - `Link A (LTE)`: High latency, Medium Jitter.
     - `Link B (5G)`: Low latency, High burstiness.
     - `Link C (WiFi)`: Low loss, prone to contention.
 4.  **Bonding Receiver (Rust):**
-    - Multiple `librist` instances receive packets.
+    - Multiple `strata-transport` instances receive packets.
     - **Aggregator:** Collects packets from all links.
     - **Reordering Buffer:** Uses the global sequence number to re-order packets.
     - **De-jitter:** Holds packets for a configurable duration.
-    - **Output:** Pushes ordered stream to **`rsristbondsrc`**.
+    - **Output:** Pushes ordered stream to **`stratasrc`**.
 5.  **Media Sink (GStreamer):**
-    **`rsristbondsrc`** -> `TS Demux` -> `Decoder` -> `Display`
+    **`stratasrc`** -> `TS Demux` -> `Decoder` -> `Display`
 
 ---
 
@@ -55,13 +55,13 @@ The system operates in a Hybrid Sync/Async model.
 - **Thread:** Dedicated `tokio` runtime thread pool (lazy_static or instance-owned).
 - **Components:**
     - `SchedulerTask`: Event loop processing incoming packets and tick events.
-    - `LinkTask(s)`: One per interface. Manages `librist` polling (via `poll` or async wrapper).
+    - `LinkTask(s)`: One per interface. Manages transport polling (via `poll` or async wrapper).
 
 ---
 
 ## 3. Component Breakdown
 
-### A. `rsristbondsink` (GStreamer Element)
+### A. `stratasink` (GStreamer Element)
 - **Type:** `GstBin` or `GstBaseSink`
 - **Inputs:** `video/mpegts` or `application/x-rtp` (System Stream).
 - **Properties:**
@@ -82,15 +82,15 @@ The system operates in a Hybrid Sync/Async model.
 - **Inputs:** Raw Packets + Size.
 - **Outputs:** Instructions to `LinkManager`.
 
-### C. `LinkManager` & `RistWrapper` (Rust Crate)
-- **Purpose:** Safe wrapper around `librist`.
-- **Ownership:** Owns the `rist_ctx` pointer.
-- **cardinality:** 1 `LinkManager` = 1 Physical Interface = 1 `rist_ctx`.
+### C. `LinkManager` & `TransportContext` (Rust Crate)
+- **Purpose:** Transport layer for network I/O.
+- **Ownership:** Owns the transport context.
+- **cardinality:** 1 `LinkManager` = 1 Physical Interface = 1 transport context.
 - **API:**
     - `send_data(buf)`: Non-blocking send.
     - `get_metrics()`: Return RTT, buffer bloat, lost packets.
 
-### D. `rsristbondsrc` (GStreamer Element)
+### D. `stratasrc` (GStreamer Element)
 - **Type:** `GstPushSrc`
 - **Responsibility:**
     - Spawns `ReceiverAggregator`.
@@ -109,14 +109,14 @@ The system operates in a Hybrid Sync/Async model.
     - **NACK Suppression:** Do not request retransmission for packets that will definitely arrive past the playout deadline.
 
 > **Known Limitation — NACK Suppression:** The current implementation does not
-> intercept or suppress librist's automatic NACK (ARQ) requests for packets
-> that have already been skipped past in the reassembly buffer. Because librist
-> manages retransmission internally per-context and does not expose a hook to
-> filter individual NACK requests, implementing this requires either patching
-> librist or manually managing sequence tracking at the bonding layer. Packets
-> retransmitted after the playout deadline are correctly discarded by the
-> receiver's late-packet detection, but the retransmission itself wastes
-> bandwidth. This is tracked as a future optimization.
+> suppress automatic NACK (ARQ) requests for packets that have already been
+> skipped past in the reassembly buffer. Because the transport layer manages
+> retransmission internally per-context and does not yet expose a hook to
+> filter individual NACK requests, implementing this requires manually
+> managing sequence tracking at the bonding layer. Packets retransmitted
+> after the playout deadline are correctly discarded by the receiver's
+> late-packet detection, but the retransmission itself wastes bandwidth.
+> This is tracked as a future optimization.
 
 ---
 
@@ -125,7 +125,7 @@ The system operates in a Hybrid Sync/Async model.
 The scheduler relies on **Deficit Weighted Round Robin (DWRR)** with **Active Rate Control**.
 
 ### Packet Dispatch Algorithm
-1.  **Metric Update:** Driven by continuous 100ms `stats_callback` updates from `librist`, smoothed using EWMA ($\alpha \approx 0.125$) to filter jitter.
+1.  **Metric Update:** Driven by continuous 100ms stats callback updates from `strata-transport`, smoothed using EWMA ($\alpha \approx 0.125$) to filter jitter.
 2.  **Capacity Estimation:** Each link maintains an estimated `available_bitrate` (EWMA of measured throughput).
 3.  **DWRR Mechanism:**
     - Each Link has a `credit` bucket.

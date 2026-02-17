@@ -1,4 +1,4 @@
-//! Packet scheduling engine for bonded RIST links.
+//! Packet scheduling engine for bonded transport links.
 //!
 //! The scheduler distributes outgoing packets across multiple network links
 //! using a Deficit Weighted Round Robin (DWRR) algorithm. It supports:

@@ -72,48 +72,48 @@ Strata bridges this gap by building a **pure Rust transport** that is:
 ## 2. Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         EDGE NODE                               │
-│                                                                 │
+┌───────────────────────────────────────────────────────────────┐
+│                         EDGE NODE                             │
+│                                                               │
 │  ┌──────────┐   ┌────────────┐   ┌────────────┐   ┌─────────┐ │
-│  │ Encoder  │──▶│  Media     │──▶│  Coding    │──▶│ Network │ │
+│  │ Encoder  │─▶│  Media     │─▶│  Coding    │─▶│ Network │ │
 │  │ (H.264/  │   │  Classifier│   │  Engine    │   │ Reactor │ │
 │  │  H.265/  │   │  (NAL      │   │  (RLNC +   │   │ (per-   │ │
 │  │  AV1)    │   │   parse)   │   │   RS)      │   │  link)  │ │
 │  └──────────┘   └────────────┘   └────────────┘   └────┬────┘ │
-│                                                         │      │
-│  ┌──────────────────────────────────────────────────────┤      │
-│  │              Bonding Scheduler                       │      │
-│  │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐    │      │
-│  │  │Link 1  │  │Link 2  │  │Link 3  │  │Link N  │    │      │
-│  │  │DWRR Q  │  │DWRR Q  │  │DWRR Q  │  │DWRR Q  │    │      │
-│  │  └───┬────┘  └───┬────┘  └───┬────┘  └───┬────┘    │      │
+│                                                        │      │
+│  ┌─────────────────────────────────────────────────────┤      │
+│  │              Bonding Scheduler                      │      │
+│  │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐     │      │
+│  │  │Link 1  │  │Link 2  │  │Link 3  │  │Link N  │     │      │
+│  │  │DWRR Q  │  │DWRR Q  │  │DWRR Q  │  │DWRR Q  │     │      │
+│  │  └───┬────┘  └───┬────┘  └───┬────┘  └───┬────┘     │      │
 │  └──────┼───────────┼───────────┼───────────┼──────────┘      │
-│         │           │           │           │                  │
+│         │           │           │           │                 │
 │  ┌──────▼───────────▼───────────▼───────────▼──────────┐      │
-│  │           Modem Supervisor Daemon                    │      │
-│  │  QMI/MBIM → RSRP, RSRQ, SINR, CQI per link        │      │
+│  │           Modem Supervisor Daemon                   │      │
+│  │  QMI/MBIM → RSRP, RSRQ, SINR, CQI per link          │      │
 │  └─────────────────────────────────────────────────────┘      │
-└─────────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────┘
                               │ UDP × N links
                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       CLOUD GATEWAY                             │
-│                                                                 │
-│  ┌──────────┐   ┌────────────┐   ┌────────────┐               │
-│  │ Network  │──▶│  Decoder   │──▶│  Jitter    │──▶ SRT/RTMP/ │
-│  │ Receiver │   │  (RLNC)   │   │  Buffer    │    NDI/MoQ   │
-│  └──────────┘   └────────────┘   └────────────┘               │
-│                                                                 │
+┌────────────────────────────────────────────────────────────────┐
+│                       CLOUD GATEWAY                            │
+│                                                                │
+│  ┌──────────┐   ┌────────────┐   ┌────────────┐                │
+│  │ Network  │─▶│  Decoder   │─▶│  Jitter    │─▶ SRT/RTMP/   │
+│  │ Receiver │   │  (RLNC)    │   │  Buffer    │    NDI/MoQ     │
+│  └──────────┘   └────────────┘   └────────────┘                │
+│                                                                │
 │  ┌─────────────────────────────────────────────────────┐       │
 │  │        Link Quality Reports → Edge Node             │       │
 │  └─────────────────────────────────────────────────────┘       │
-└─────────────────────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                      CONTROL PLANE                              │
-│  Web Dashboard (Leptos) · REST API (Axum) · Fleet Mgmt         │
+│  Web Dashboard (Leptos) · REST API (Axum) · Fleet Mgmt          │
 │  Prometheus Metrics · WebSocket Telemetry · Remote Config       │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -295,7 +295,7 @@ Where Biscay diverges from pure BBRv3:
 
 ```
                     ┌──────────┐
-          ┌────────▶│  NORMAL  │◀────────┐
+          ┌───────▶│  NORMAL  │◀───────┐
           │         └────┬─────┘         │
           │              │               │
      CQI stable    CQI dropping     Handover
@@ -785,7 +785,7 @@ crates/
 ├── strata-agent/          # Edge node agent (WebSocket telemetry)
 ├── strata-dashboard/      # Leptos WASM web UI
 ├── strata-portal/         # Cloud portal
-└── librist-sys/           # Legacy C bindings (retained for reference)
+└── librist-sys/           # Legacy C bindings (archived)
 ```
 
 ### Dependency Graph
@@ -906,9 +906,9 @@ scheduling.
 
 **Goal**: GStreamer plugin and full system integration.
 
-- [ ] Wire strata-bonding into strata-gst (replace librist-sys dependency)
+- [x] Wire strata-bonding into strata-gst (replace librist-sys dependency)
 - [ ] Integration test: GStreamer → Strata → receiver → GStreamer
-- [ ] Remove librist-sys from active builds (keep for reference)
+- [x] Remove librist-sys from active builds
 - [ ] End-to-end YouTube RTMP test via GStreamer
 - [ ] Prometheus metrics endpoint for all stats
 - [ ] WebSocket telemetry (strata-agent)

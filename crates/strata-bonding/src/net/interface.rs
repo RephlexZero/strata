@@ -39,31 +39,6 @@ pub fn resolve_iface_ipv4(iface: &str) -> Option<IpAddr> {
     }
 }
 
-/// Modify a RIST URL to bind to a specific local IP address via the `miface`
-/// query parameter. librist uses `miface` for source-address binding on
-/// sender sockets (calls `bind()` with the IP or `SO_BINDTODEVICE` with a
-/// device name).
-///
-/// e.g., "rist://1.2.3.4:5000" + iface "eth0" (IP 10.0.0.1)
-///    -> "rist://1.2.3.4:5000?miface=10.0.0.1"
-///
-/// If the URL already has query parameters the new param is appended with `&`.
-pub fn bind_url_to_iface(url: &str, iface: &str) -> Option<String> {
-    let local_ip = resolve_iface_ipv4(iface)?;
-
-    if !url.starts_with("rist://") {
-        return None;
-    }
-
-    // If there's already a miface parameter, don't override.
-    if url.contains("miface=") {
-        return Some(url.to_string());
-    }
-
-    let separator = if url.contains('?') { '&' } else { '?' };
-    Some(format!("{}{}miface={}", url, separator, local_ip))
-}
-
 /// Lifecycle phase of a network link.
 ///
 /// Links progress through these phases based on observed statistics:
@@ -126,7 +101,7 @@ pub struct LinkMetrics {
 
 /// Abstraction for a network link capable of sending packets and reporting metrics.
 ///
-/// Implemented by [`crate::net::link::Link`] (backed by librist) and by
+/// Implemented by [`crate::net::transport::TransportLink`] and by
 /// mock links in tests.
 pub trait LinkSender: Send + Sync {
     /// Returns the unique identifier of this link.

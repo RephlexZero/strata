@@ -1,7 +1,7 @@
 # ── Dev Override: Mount host-built binaries into containers ────────
 #
 # Usage:
-#   cargo build -p strata-agent -p strata-control -p gst-rist-bonding
+#   cargo build -p strata-agent -p strata-control -p strata-gst
 #   docker compose -f docker-compose.yml -f dev/docker-compose.dev.yml up -d
 #
 # Or use the helper script:
@@ -30,12 +30,12 @@ services:
   strata-sender-sim:
     volumes:
       - ${PWD}/target/debug/strata-agent:/usr/local/bin/strata-agent:ro
-      - ${PWD}/target/debug/integration_node:/usr/local/bin/integration_node:ro
-      - ${PWD}/target/debug/libgstristbonding.so:/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstrsristbonding.so:ro
+      - ${PWD}/target/debug/strata_node:/usr/local/bin/strata_node:ro
+      - ${PWD}/target/debug/libgststrata.so:/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgststrata.so:ro
       # Portal WASM — mount if iterating on the portal
       # Build with: cd crates/strata-portal && trunk build
       # - ${PWD}/crates/strata-portal/dist:/app/portal:ro
 
   strata-receiver:
     volumes:
-      - ${PWD}/target/debug/libgstristbonding.so:/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstrsristbonding.so:ro
+      - ${PWD}/target/debug/libgststrata.so:/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgststrata.so:ro
