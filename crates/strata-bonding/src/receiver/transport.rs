@@ -10,13 +10,13 @@ use crate::receiver::aggregator::{Packet, ReassemblyBuffer, ReassemblyConfig, Re
 use anyhow::Result;
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
+use quanta::Instant;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::thread;
-use quanta::Instant;
 use std::time::Duration;
 use strata_transport::receiver::{Receiver as TransportReceiver, ReceiverConfig, ReceiverEvent};
 use tracing::{debug, warn};

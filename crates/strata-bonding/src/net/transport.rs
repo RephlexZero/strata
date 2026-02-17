@@ -127,11 +127,7 @@ impl TransportLink {
                 destination: dest,
                 ecn: None,
                 contents: &batch_buf,
-                segment_size: if count > 1 {
-                    Some(segment_size)
-                } else {
-                    None
-                },
+                segment_size: if count > 1 { Some(segment_size) } else { None },
                 src_ip: None,
             };
 

@@ -6,12 +6,12 @@ use crate::scheduler::bonding::BondingScheduler;
 use crate::scheduler::PacketProfile;
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
+use quanta::Instant;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use quanta::Instant;
 use std::time::Duration;
 use strata_transport::sender::SenderConfig;
 use tracing::warn;
@@ -76,7 +76,13 @@ impl BondingRuntime {
         let handle = thread::Builder::new()
             .name("strata-worker".into())
             .spawn(move || {
-                runtime_worker(packet_rx, control_rx, metrics_clone, scheduler_config, shutdown_clone)
+                runtime_worker(
+                    packet_rx,
+                    control_rx,
+                    metrics_clone,
+                    scheduler_config,
+                    shutdown_clone,
+                )
             })
             .expect("failed to spawn bonding runtime worker");
 

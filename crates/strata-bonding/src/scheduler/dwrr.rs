@@ -1,6 +1,6 @@
-use quanta::Instant;
 use crate::config::SchedulerConfig;
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
+use quanta::Instant;
 use std::collections::HashMap;
 use std::sync::Arc;
 

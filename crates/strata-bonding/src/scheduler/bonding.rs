@@ -7,12 +7,12 @@ use crate::scheduler::kalman::{KalmanConfig, KalmanFilter};
 use crate::scheduler::thompson::ThompsonSelector;
 use anyhow::Result;
 use bytes::Bytes;
+use quanta::Instant;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use quanta::Instant;
 use std::time::Duration;
 use tracing::{error, warn};
 

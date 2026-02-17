@@ -1,6 +1,6 @@
 use bytes::Bytes;
-use std::collections::VecDeque;
 use quanta::Instant;
+use std::collections::VecDeque;
 use std::time::Duration;
 
 /// An incoming packet with its bonding sequence ID and arrival timestamp.
