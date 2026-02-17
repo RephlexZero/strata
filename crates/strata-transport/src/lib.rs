@@ -23,6 +23,7 @@ pub mod codec;
 pub mod congestion;
 pub mod pool;
 pub mod receiver;
+pub mod rlnc;
 pub mod sender;
 pub mod session;
 pub mod stats;

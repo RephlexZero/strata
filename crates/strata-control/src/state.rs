@@ -7,7 +7,7 @@ use sqlx::PgPool;
 use tokio::sync::{broadcast, oneshot};
 
 use strata_common::auth::JwtContext;
-use strata_common::protocol::{DashboardEvent, DeviceStatusPayload};
+use strata_common::protocol::{DashboardEvent, DeviceStatusPayload, StreamStatsPayload};
 
 /// State shared across all request handlers.
 #[derive(Clone)]
@@ -29,6 +29,9 @@ struct Inner {
     /// Streams that have already transitioned to 'live' (avoids repeated
     /// UPDATE queries on every stats tick).
     pub live_streams: DashSet<String>,
+    /// Cached latest stream stats per sender, keyed by sender_id.
+    /// Updated on each `stream.stats` message from agents.
+    pub stream_stats: DashMap<String, StreamStatsPayload>,
 }
 
 /// Handle to a connected sender agent.
@@ -52,6 +55,7 @@ impl AppState {
                 pending_requests: DashMap::new(),
                 dashboard_tx,
                 live_streams: DashSet::new(),
+                stream_stats: DashMap::new(),
             }),
         }
     }
@@ -81,6 +85,11 @@ impl AppState {
     /// Streams that have already transitioned to 'live'.
     pub fn live_streams(&self) -> &DashSet<String> {
         &self.inner.live_streams
+    }
+
+    /// Cached latest stream stats per sender (keyed by sender_id).
+    pub fn stream_stats(&self) -> &DashMap<String, StreamStatsPayload> {
+        &self.inner.stream_stats
     }
 
     /// Broadcast a dashboard event to all subscribed browsers.

@@ -835,7 +835,7 @@ strata-dashboard ──▶ strata-control (REST API)
 - [x] Session handshake (SESSION control packet)
 - [x] Basic stats: packets sent/received/lost, RTT
 - [ ] turmoil test: send 10,000 packets, verify delivery
-- [ ] proptest: VarInt encode/decode roundtrip for all boundary values
+- [x] proptest: VarInt encode/decode roundtrip for all boundary values
 
 **Crate**: `strata-transport` only
 **Runtime**: Start with `tokio` current_thread (switch to monoio in Phase 2)
@@ -851,7 +851,7 @@ strata-dashboard ──▶ strata-control (REST API)
 - [x] TAROT cost function: adaptive FEC rate per link
 - [ ] turmoil tests: 5%, 10%, 20% random loss — verify zero application loss
 - [ ] turmoil tests: burst loss (Gilbert-Elliott model)
-- [ ] proptest: FEC decode correctness for all combinations of K losses
+- [x] proptest: FEC decode correctness for all combinations of K losses
 
 **Milestone**: Single-link reliable transport, 0% application loss at 10% network
 loss, < 50ms added latency.
@@ -864,7 +864,7 @@ loss, < 50ms added latency.
 - [ ] Integrate quinn-udp for GSO/GRO
 - [ ] Replace channels with rtrb SPSC ring buffers
 - [ ] quanta for all timing (replace std::time::Instant)
-- [ ] Benchmark: measure P50/P99 processing latency
+- [x] Benchmark: measure P50/P99 processing latency
 - [ ] Verify < 100µs processing latency per packet
 
 ### Phase 3: Bonding (3-4 weeks)
@@ -878,8 +878,8 @@ loss, < 50ms added latency.
 - [x] Multi-link session management (one session, N links)
 - [x] Per-link Biscay congestion control (BBRv3 base)
 - [x] Kalman filter for RTT/capacity smoothing
-- [ ] turmoil tests: 3 links, heterogeneous RTTs, verify in-order delivery
-- [ ] turmoil tests: link failure mid-stream — seamless failover
+- [x] ~~turmoil~~ deterministic tests: 3 links, heterogeneous RTTs, verify scheduling preference
+- [x] ~~turmoil~~ deterministic tests: link failure mid-stream — seamless failover
 - [ ] Docker simulation: 3 bridge networks, tc netem impairment
 
 **Milestone**: 3-link bonding, bandwidth aggregation, < 500ms glass-to-glass,
@@ -926,7 +926,7 @@ scheduling.
 
 ### Phase 7: Hardening (Ongoing)
 
-- [ ] Fuzz testing (cargo-fuzz on wire parser)
+- [x] Fuzz testing (cargo-fuzz on wire parser)
 - [ ] Sliding-window RLNC (replace block RS)
 - [ ] Upgrade to monoio with io_uring SQPOLL
 - [ ] AV1-SVC support

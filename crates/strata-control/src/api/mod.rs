@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod auth_extractor;
 pub mod destinations;
+pub mod metrics;
 pub mod senders;
 pub mod streams;
 

@@ -104,6 +104,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     // Cleanup
     state.agents().remove(&sender_id);
     state.device_status().remove(&sender_id);
+    state.stream_stats().remove(&sender_id);
     state.broadcast_dashboard(DashboardEvent::SenderStatus {
         sender_id: sender_id.clone(),
         online: false,
@@ -276,7 +277,10 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
                     }
                 }
 
-                state.broadcast_dashboard(DashboardEvent::StreamStats(payload));
+                state.broadcast_dashboard(DashboardEvent::StreamStats(payload.clone()));
+
+                // Cache latest stats for the /metrics endpoint
+                state.stream_stats().insert(sender_id.to_string(), payload);
             }
         }
         "stream.ended" => {

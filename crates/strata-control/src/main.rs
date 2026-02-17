@@ -62,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .nest("/api", api::router())
+        .route("/metrics", axum::routing::get(api::metrics::handler))
         .route("/agent/ws", axum::routing::get(ws_agent::handler))
         .route("/ws", axum::routing::get(ws_dashboard::handler))
         .fallback_service(dashboard_service)

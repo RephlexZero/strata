@@ -215,6 +215,56 @@ impl std::fmt::Display for DestinationPlatform {
     }
 }
 
+// ── Transport Stats ─────────────────────────────────────────────────
+
+/// Sender-side transport protocol statistics, suitable for Prometheus export.
+///
+/// Mirrors `strata_transport::stats::SenderStats` but lives in strata-common
+/// so the metrics renderer doesn't need to depend on strata-transport.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransportSenderMetrics {
+    /// Total packets sent (including retransmissions).
+    pub packets_sent: u64,
+    /// Total original payload bytes sent.
+    pub bytes_sent: u64,
+    /// Packets acknowledged by receiver.
+    pub packets_acked: u64,
+    /// NACK-triggered retransmissions.
+    pub retransmissions: u64,
+    /// Packets expired from send buffer without ACK.
+    pub packets_expired: u64,
+    /// FEC repair packets sent.
+    pub fec_repairs_sent: u64,
+    /// Last measured RTT in microseconds.
+    pub last_rtt_us: u64,
+}
+
+/// Receiver-side transport protocol statistics, suitable for Prometheus export.
+///
+/// Mirrors `strata_transport::stats::ReceiverStats` but lives in strata-common
+/// so the metrics renderer doesn't need to depend on strata-transport.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransportReceiverMetrics {
+    /// Total packets received (including duplicates and late).
+    pub packets_received: u64,
+    /// Total payload bytes received.
+    pub bytes_received: u64,
+    /// Packets delivered to the application (unique + in-order).
+    pub packets_delivered: u64,
+    /// Duplicate packets received.
+    pub duplicates: u64,
+    /// Packets received after playout deadline.
+    pub late_packets: u64,
+    /// Packets recovered via FEC decoding.
+    pub fec_recoveries: u64,
+    /// NACKs sent to request retransmission.
+    pub nacks_sent: u64,
+    /// Highest contiguous sequence number delivered.
+    pub highest_delivered_seq: u64,
+    /// Current jitter buffer depth in packets.
+    pub jitter_buffer_depth: u32,
+}
+
 // ── Link Stats ──────────────────────────────────────────────────────
 
 /// Per-link statistics from the bonding engine, sent in `stream.stats`.
@@ -428,6 +478,58 @@ mod tests {
         let parsed: LinkStats = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.observed_bps, 0);
         assert!(parsed.link_kind.is_none());
+    }
+
+    #[test]
+    fn transport_sender_metrics_serde() {
+        let stats = TransportSenderMetrics {
+            packets_sent: 50_000,
+            bytes_sent: 70_000_000,
+            packets_acked: 49_500,
+            retransmissions: 100,
+            packets_expired: 10,
+            fec_repairs_sent: 500,
+            last_rtt_us: 30_000,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let parsed: TransportSenderMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.packets_sent, 50_000);
+        assert_eq!(parsed.fec_repairs_sent, 500);
+        assert_eq!(parsed.last_rtt_us, 30_000);
+    }
+
+    #[test]
+    fn transport_sender_metrics_default() {
+        let stats = TransportSenderMetrics::default();
+        assert_eq!(stats.packets_sent, 0);
+        assert_eq!(stats.retransmissions, 0);
+    }
+
+    #[test]
+    fn transport_receiver_metrics_serde() {
+        let stats = TransportReceiverMetrics {
+            packets_received: 60_000,
+            bytes_received: 80_000_000,
+            packets_delivered: 55_000,
+            duplicates: 2_000,
+            late_packets: 500,
+            fec_recoveries: 300,
+            nacks_sent: 150,
+            highest_delivered_seq: 54_999,
+            jitter_buffer_depth: 8,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let parsed: TransportReceiverMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.packets_received, 60_000);
+        assert_eq!(parsed.fec_recoveries, 300);
+        assert_eq!(parsed.jitter_buffer_depth, 8);
+    }
+
+    #[test]
+    fn transport_receiver_metrics_default() {
+        let stats = TransportReceiverMetrics::default();
+        assert_eq!(stats.packets_received, 0);
+        assert_eq!(stats.jitter_buffer_depth, 0);
     }
 
     #[test]
