@@ -410,3 +410,297 @@ fn sack_ack_with_gaps() {
     assert_eq!(acked, 5);
     assert_eq!(tx.in_flight(), 5); // seqs 2, 4, 6, 8, 9 still in flight
 }
+
+// ─── Deterministic Simulation Tests ─────────────────────────────────────
+//
+// These replace turmoil-based tests (turmoil is tokio-only; we use monoio).
+// They deterministically simulate network conditions with seeded RNG for
+// reproducibility, matching the master plan's DST intent.
+
+use rand::rngs::SmallRng;
+use rand::{RngExt, SeedableRng};
+
+/// Simulate a lossy network: sender → receiver with seeded random packet loss.
+/// Protects seq 0 from loss (simulates session handshake ensuring first packet arrives).
+fn lossy_transfer(
+    sender: &mut Sender,
+    receiver: &mut Receiver,
+    rng: &mut SmallRng,
+    loss_rate: f64,
+) -> Vec<u64> {
+    let output: Vec<OutputPacket> = sender.drain_output().collect();
+    let mut dropped = Vec::new();
+    for pkt in output {
+        if pkt.is_fec_repair {
+            receiver.receive(pkt.data);
+            continue;
+        }
+        // Never drop seq 0 — receiver needs it to initialize correctly
+        if pkt.sequence > 0 && rng.random_bool(loss_rate) {
+            dropped.push(pkt.sequence);
+        } else {
+            receiver.receive(pkt.data);
+        }
+    }
+    dropped
+}
+
+/// Run full ARQ recovery loop: NACK → retransmit → deliver, up to `max_rounds`.
+fn arq_recovery(sender: &mut Sender, receiver: &mut Receiver, max_rounds: usize) {
+    for _ in 0..max_rounds {
+        if let Some(nack) = receiver.generate_nacks() {
+            let retransmitted = sender.process_nack(&nack);
+            if retransmitted == 0 {
+                break;
+            }
+            perfect_transfer(sender, receiver);
+        } else {
+            break;
+        }
+    }
+}
+
+// ─── Phase 0: 10,000 packet delivery ───────────────────────────────────
+
+#[test]
+fn simulation_10k_packets_perfect_delivery() {
+    let mut tx = Sender::new(SenderConfig {
+        max_payload_size: 1200,
+        pool_capacity: 16384,
+        fec_k: 32,
+        fec_r: 4,
+        packet_ttl: Duration::from_secs(30),
+        max_retries: 5,
+    });
+    let mut rx = Receiver::new(ReceiverConfig {
+        reorder_capacity: 16384,
+        max_fec_generations: 512,
+        nack_rearm_ms: 0,
+        max_nack_retries: 5,
+    });
+
+    let count = 10_000;
+    for i in 0u32..count {
+        let data = format!("pkt-{i:05}");
+        tx.send(Bytes::from(data), Priority::Standard);
+    }
+    perfect_transfer(&mut tx, &mut rx);
+
+    let delivered = collect_deliveries(&mut rx);
+    assert_eq!(
+        delivered.len(),
+        count as usize,
+        "all 10,000 packets should be delivered"
+    );
+
+    // Verify ordering
+    for (i, d) in delivered.iter().enumerate() {
+        let expected = format!("pkt-{i:05}");
+        assert_eq!(d.payload, expected.as_bytes(), "packet {i} mismatch");
+    }
+
+    // Verify stats
+    assert_eq!(tx.stats().packets_sent, count as u64);
+    assert_eq!(rx.stats().packets_delivered, count as u64);
+    assert_eq!(rx.stats().duplicates, 0);
+}
+
+// ─── Phase 1: Random loss at 5%, 10%, 20% ──────────────────────────────
+
+fn run_loss_recovery_test(loss_rate: f64, seed: u64) {
+    let mut tx = Sender::new(SenderConfig {
+        max_payload_size: 1200,
+        pool_capacity: 4096,
+        fec_k: 16,
+        fec_r: 4,
+        packet_ttl: Duration::from_secs(30),
+        max_retries: 50,
+    });
+    let mut rx = Receiver::new(ReceiverConfig {
+        reorder_capacity: 4096,
+        max_fec_generations: 256,
+        nack_rearm_ms: 0,
+        max_nack_retries: 50,
+    });
+    let mut rng = SmallRng::seed_from_u64(seed);
+
+    let count = 1_000u32;
+    let mut delivered_seqs = std::collections::HashSet::new();
+
+    // Send all main packets
+    for i in 0..count {
+        let data = format!("L{i:04}");
+        tx.send(Bytes::from(data), Priority::Standard);
+    }
+
+    // Initial transfer with loss (seq 0 protected to ensure receiver initialization)
+    lossy_transfer(&mut tx, &mut rx, &mut rng, loss_rate);
+    for d in collect_deliveries(&mut rx) {
+        delivered_seqs.insert(d.sequence);
+    }
+
+    // Send probe packets to trigger NACK detection for any tail losses.
+    // In production, the continuous stream provides this naturally.
+    for _ in 0..3u32 {
+        tx.send(Bytes::from("probe"), Priority::Standard);
+    }
+    perfect_transfer(&mut tx, &mut rx);
+    for d in collect_deliveries(&mut rx) {
+        delivered_seqs.insert(d.sequence);
+    }
+
+    // Iterative ARQ recovery
+    for _ in 0..100 {
+        // Check if all main packet seqs (0..count) have been delivered
+        let main_delivered = (0..count as u64)
+            .filter(|s| delivered_seqs.contains(s))
+            .count();
+        if main_delivered >= count as usize {
+            break;
+        }
+        arq_recovery(&mut tx, &mut rx, 1);
+        for d in collect_deliveries(&mut rx) {
+            delivered_seqs.insert(d.sequence);
+        }
+    }
+
+    let main_delivered = (0..count as u64)
+        .filter(|s| delivered_seqs.contains(s))
+        .count();
+    assert_eq!(
+        main_delivered, count as usize,
+        "{loss_rate:.0}% loss (seed={seed}): expected {count} deliveries, got {main_delivered}"
+    );
+}
+
+#[test]
+fn simulation_5_percent_random_loss_zero_app_loss() {
+    run_loss_recovery_test(0.05, 0xDEAD_0005);
+}
+
+#[test]
+fn simulation_10_percent_random_loss_zero_app_loss() {
+    run_loss_recovery_test(0.10, 0xDEAD_0010);
+}
+
+#[test]
+fn simulation_20_percent_random_loss_zero_app_loss() {
+    run_loss_recovery_test(0.20, 0xDEAD_0020);
+}
+
+// ─── Phase 1: Burst loss (Gilbert-Elliott model) ────────────────────────
+
+/// Gilbert-Elliott 2-state Markov chain loss model.
+struct GilbertElliottLoss {
+    /// Probability of transitioning from Good to Bad state.
+    p_good_to_bad: f64,
+    /// Probability of transitioning from Bad to Good state.
+    p_bad_to_good: f64,
+    /// Loss probability in the Bad state.
+    p_loss_in_bad: f64,
+    /// Current state: true = Good, false = Bad.
+    in_good_state: bool,
+}
+
+impl GilbertElliottLoss {
+    fn new(p_good_to_bad: f64, p_bad_to_good: f64, p_loss_in_bad: f64) -> Self {
+        Self {
+            p_good_to_bad,
+            p_bad_to_good,
+            p_loss_in_bad,
+            in_good_state: true,
+        }
+    }
+
+    /// Returns true if this packet should be dropped.
+    fn should_drop(&mut self, rng: &mut SmallRng) -> bool {
+        // State transition
+        if self.in_good_state {
+            if rng.random_bool(self.p_good_to_bad) {
+                self.in_good_state = false;
+            }
+        } else if rng.random_bool(self.p_bad_to_good) {
+            self.in_good_state = true;
+        }
+
+        // Loss decision
+        if !self.in_good_state {
+            rng.random_bool(self.p_loss_in_bad)
+        } else {
+            false
+        }
+    }
+}
+
+#[test]
+fn simulation_burst_loss_gilbert_elliott_recovery() {
+    let mut tx = Sender::new(SenderConfig {
+        max_payload_size: 1200,
+        pool_capacity: 4096,
+        fec_k: 16,
+        fec_r: 4,
+        packet_ttl: Duration::from_secs(30),
+        max_retries: 10,
+    });
+    let mut rx = Receiver::new(ReceiverConfig {
+        reorder_capacity: 4096,
+        max_fec_generations: 256,
+        nack_rearm_ms: 0,
+        max_nack_retries: 10,
+    });
+    let mut rng = SmallRng::seed_from_u64(0xB0857);
+    // p(G→B)=5%, p(B→G)=30%, p(loss|B)=80% — produces bursty loss patterns
+    let mut ge_model = GilbertElliottLoss::new(0.05, 0.30, 0.80);
+
+    let count = 1_000u32;
+    let batch_size = 50;
+    let mut total_delivered = 0usize;
+    let mut total_dropped = 0usize;
+
+    for batch_start in (0..count).step_by(batch_size) {
+        let batch_end = (batch_start + batch_size as u32).min(count);
+        for i in batch_start..batch_end {
+            let data = format!("GE-{i:04}");
+            tx.send(Bytes::from(data), Priority::Standard);
+        }
+
+        // Transfer with Gilbert-Elliott loss
+        let output: Vec<OutputPacket> = tx.drain_output().collect();
+        for pkt in output {
+            if pkt.is_fec_repair {
+                rx.receive(pkt.data);
+                continue;
+            }
+            if ge_model.should_drop(&mut rng) {
+                total_dropped += 1;
+            } else {
+                rx.receive(pkt.data);
+            }
+        }
+
+        total_delivered += collect_deliveries(&mut rx).len();
+
+        // ARQ recovery
+        arq_recovery(&mut tx, &mut rx, 5);
+        total_delivered += collect_deliveries(&mut rx).len();
+    }
+
+    // Final sweep
+    for _ in 0..20 {
+        arq_recovery(&mut tx, &mut rx, 1);
+        let d = collect_deliveries(&mut rx);
+        if d.is_empty() {
+            break;
+        }
+        total_delivered += d.len();
+    }
+
+    assert!(
+        total_dropped > 0,
+        "Gilbert-Elliott model should drop some packets (got 0 drops)"
+    );
+    assert_eq!(
+        total_delivered, count as usize,
+        "burst loss: expected {count} deliveries, got {total_delivered} (dropped {total_dropped})"
+    );
+}

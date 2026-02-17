@@ -4122,6 +4122,7 @@ dependencies = [
  "bytes",
  "compact_str",
  "crossbeam-channel",
+ "io-uring",
  "libc",
  "monoio",
  "quanta",

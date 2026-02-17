@@ -23,4 +23,7 @@ rand = { workspace = true }
 quinn-udp = "0.5.14"
 monoio = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.6"
+
 [dev-dependencies]

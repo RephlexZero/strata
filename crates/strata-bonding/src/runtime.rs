@@ -2,6 +2,46 @@ use crate::config::{BondingConfig, LinkConfig, SchedulerConfig};
 use crate::net::interface::{LinkMetrics, LinkSender};
 use crate::net::transport::TransportLink;
 use crate::scheduler::bonding::BondingScheduler;
+
+/// Build a monoio runtime with io_uring SQPOLL if available.
+///
+/// SQPOLL eliminates the `io_uring_enter` syscall by dedicating a kernel thread
+/// to poll the submission queue. Falls back to regular io_uring/epoll if SQPOLL
+/// is unavailable (requires CAP_SYS_NICE or root).
+#[macro_export]
+macro_rules! build_monoio_runtime {
+    () => {{
+        #[cfg(target_os = "linux")]
+        {
+            let mut urb = io_uring::IoUring::builder();
+            urb.setup_sqpoll(1000);
+            let result = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                .uring_builder(urb)
+                .enable_timer()
+                .build();
+            match result {
+                Ok(rt) => {
+                    tracing::info!("monoio runtime with SQPOLL enabled");
+                    rt
+                }
+                Err(_) => {
+                    tracing::info!("SQPOLL unavailable, falling back to regular io_uring");
+                    monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                        .enable_timer()
+                        .build()
+                        .expect("failed to create monoio runtime")
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                .enable_timer()
+                .build()
+                .expect("failed to create monoio runtime")
+        }
+    }};
+}
 use crate::scheduler::PacketProfile;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
@@ -72,10 +112,7 @@ impl BondingRuntime {
         let handle = thread::Builder::new()
             .name("strata-worker".into())
             .spawn(move || {
-                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
-                    .enable_timer()
-                    .build()
-                    .expect("failed to create monoio runtime for sender worker");
+                let mut rt = build_monoio_runtime!();
                 rt.block_on(async move {
                     runtime_worker_async(packet_rx, control_rx, metrics_clone, scheduler_config)
                         .await;

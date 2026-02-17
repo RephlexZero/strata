@@ -37,6 +37,8 @@ pub struct LossDetector {
     playout_deadline: Duration,
     /// Whether the detector has been initialized (received first packet).
     initialized: bool,
+    /// Maximum NACK retries per sequence.
+    max_nacks_per_seq: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +59,7 @@ impl LossDetector {
             max_gap: 10_000,
             playout_deadline: Duration::from_secs(2),
             initialized: false,
+            max_nacks_per_seq: 3,
         }
     }
 
@@ -68,6 +71,11 @@ impl LossDetector {
     /// Set rearm interval (minimum time between re-NACKs for the same seq).
     pub fn set_rearm_interval(&mut self, interval: Duration) {
         self.rearm_interval = interval;
+    }
+
+    /// Set the maximum number of NACKs per sequence before giving up.
+    pub fn set_max_nacks(&mut self, max_nacks: u8) {
+        self.max_nacks_per_seq = max_nacks;
     }
 
     /// Record a received sequence number. Call this for every received packet.
@@ -150,7 +158,7 @@ impl LossDetector {
                 first_nacked_at: now,
                 last_nacked_at: now,
                 nack_count: 0,
-                max_nacks: 3,
+                max_nacks: self.max_nacks_per_seq,
             });
             state.last_nacked_at = now;
             state.nack_count += 1;

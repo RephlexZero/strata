@@ -387,6 +387,97 @@ impl Default for TarotOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    // ─── proptest: FEC decode correctness ────────────────────────────────
+
+    proptest! {
+        #[test]
+        fn proptest_fec_single_loss_recovery(
+            k in 2..16usize,
+            lost_idx in 0..16usize,
+            symbol_len in 1..64usize,
+            seed in 0..1000u64,
+        ) {
+            let lost_idx = lost_idx % k; // ensure lost_idx < k
+            let r = 1; // XOR recovery supports single loss
+
+            // Generate deterministic symbols
+            let symbols: Vec<Bytes> = (0..k)
+                .map(|i| {
+                    Bytes::from(
+                        (0..symbol_len)
+                            .map(|j| ((i as u64 * 31 + j as u64 + seed) % 256) as u8)
+                            .collect::<Vec<u8>>(),
+                    )
+                })
+                .collect();
+
+            // Encode
+            let mut enc = FecEncoder::new(k, r);
+            let mut repair_packets = Vec::new();
+            for (i, sym) in symbols.iter().enumerate() {
+                let repairs = enc.add_source_symbol(i as u64, sym.clone());
+                repair_packets.extend(repairs);
+            }
+            if repair_packets.is_empty() {
+                // Flush partial generation
+                repair_packets = enc.flush();
+            }
+            prop_assert!(!repair_packets.is_empty(), "should have at least 1 repair");
+
+            // Parse repair packet
+            let mut buf = repair_packets[0].clone();
+            let pkt = crate::wire::Packet::decode(&mut buf).unwrap();
+            let mut payload = pkt.payload;
+            let _subtype = payload.split_to(1);
+            let fec_hdr = FecRepairHeader::decode(&mut payload).unwrap();
+            let repair_data = payload.to_vec();
+
+            // Decode: provide all symbols except lost_idx
+            let mut dec = FecDecoder::new(16);
+            for (i, sym) in symbols.iter().enumerate().take(k) {
+                if i != lost_idx {
+                    dec.add_source_symbol(0, i, k, r, sym.clone());
+                }
+            }
+            dec.add_repair_symbol(&fec_hdr, repair_data);
+
+            let recovered = dec.try_recover(0);
+            prop_assert_eq!(recovered.len(), 1, "should recover exactly 1 symbol");
+            prop_assert_eq!(recovered[0].0, lost_idx, "should recover the lost index");
+            prop_assert_eq!(
+                &recovered[0].1[..],
+                &symbols[lost_idx][..],
+                "recovered data should match original"
+            );
+        }
+
+        #[test]
+        fn proptest_fec_no_loss_no_recovery(
+            k in 2..16usize,
+            symbol_len in 1..64usize,
+        ) {
+            let r = 1;
+            let symbols: Vec<Bytes> = (0..k)
+                .map(|i| Bytes::from(vec![i as u8; symbol_len]))
+                .collect();
+
+            let mut enc = FecEncoder::new(k, r);
+            for (i, sym) in symbols.iter().enumerate() {
+                enc.add_source_symbol(i as u64, sym.clone());
+            }
+
+            let mut dec = FecDecoder::new(16);
+            for (i, sym) in symbols.iter().enumerate().take(k) {
+                dec.add_source_symbol(0, i, k, r, sym.clone());
+            }
+
+            prop_assert!(dec.is_complete(0));
+            let recovered = dec.try_recover(0);
+            prop_assert!(recovered.is_empty(), "no recovery needed when complete");
+        }
+    }
 
     // ─── FEC Encoder Tests ──────────────────────────────────────────────
 

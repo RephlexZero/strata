@@ -125,10 +125,7 @@ impl TransportBondingReceiver {
         let handle = thread::Builder::new()
             .name(format!("strata-rcv-{}", local_addr))
             .spawn(move || {
-                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
-                    .enable_timer()
-                    .build()
-                    .expect("failed to create monoio runtime for link reader");
+                let mut rt = crate::build_monoio_runtime!();
                 rt.block_on(async move {
                     let mono_socket = monoio::net::udp::UdpSocket::from_std(socket)
                         .expect("failed to convert socket for monoio");

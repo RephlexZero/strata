@@ -797,6 +797,50 @@ impl ControlBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    // ─── proptest: VarInt encode/decode roundtrip ─────────────────────────
+
+    /// Strategy that generates values at VarInt encoding boundaries.
+    fn varint_boundary_strategy() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            // 1-byte range: 0..=0x3F
+            0..=0x3Fu64,
+            // 2-byte range: 0x40..=0x3FFF
+            0x40u64..=0x3FFFu64,
+            // 4-byte range: 0x4000..=0x3FFF_FFFF
+            0x4000u64..=0x3FFF_FFFFu64,
+            // 8-byte range: 0x4000_0000..=VarInt::MAX
+            0x4000_0000u64..=VarInt::MAX,
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_varint_roundtrip(val in varint_boundary_strategy()) {
+            let vi = VarInt::from_u64(val);
+            let mut buf = BytesMut::new();
+            vi.encode(&mut buf);
+            prop_assert_eq!(buf.len(), vi.encoded_len());
+            let decoded = VarInt::decode(&mut buf.freeze()).unwrap();
+            prop_assert_eq!(decoded.value(), val);
+        }
+
+        #[test]
+        fn proptest_varint_out_of_range(val in (VarInt::MAX + 1)..=u64::MAX) {
+            prop_assert!(VarInt::new(val).is_none());
+        }
+
+        #[test]
+        fn proptest_varint_encoded_len_consistent(val in varint_boundary_strategy()) {
+            let vi = VarInt::from_u64(val);
+            let expected = if val < 0x40 { 1 }
+                else if val < 0x4000 { 2 }
+                else if val < 0x4000_0000 { 4 }
+                else { 8 };
+            prop_assert_eq!(vi.encoded_len(), expected);
+        }
+    }
 
     #[test]
     fn varint_roundtrip_boundaries() {

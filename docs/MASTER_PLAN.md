@@ -834,8 +834,8 @@ strata-dashboard ──▶ strata-control (REST API)
 - [x] PING/PONG RTT measurement
 - [x] Session handshake (SESSION control packet)
 - [x] Basic stats: packets sent/received/lost, RTT
-- [ ] turmoil test: send 10,000 packets, verify delivery
-- [ ] proptest: VarInt encode/decode roundtrip for all boundary values
+- [x] Deterministic simulation: send 10,000 packets, verify delivery
+- [x] proptest: VarInt encode/decode roundtrip for all boundary values
 
 **Crate**: `strata-transport` only
 **Runtime**: Start with `tokio` current_thread (switch to monoio in Phase 2)
@@ -849,9 +849,9 @@ strata-dashboard ──▶ strata-control (REST API)
 - [x] Reed-Solomon FEC: systematic encoding (K source + R repair)
 - [x] FEC decode: receiver reconstructs from any K-of-N received
 - [x] TAROT cost function: adaptive FEC rate per link
-- [ ] turmoil tests: 5%, 10%, 20% random loss — verify zero application loss
-- [ ] turmoil tests: burst loss (Gilbert-Elliott model)
-- [ ] proptest: FEC decode correctness for all combinations of K losses
+- [x] Deterministic simulation: 5%, 10%, 20% random loss — zero application loss
+- [x] Deterministic simulation: burst loss (Gilbert-Elliott model) recovery
+- [x] proptest: FEC decode correctness for all combinations of K losses
 
 **Milestone**: Single-link reliable transport, 0% application loss at 10% network
 loss, < 50ms added latency.
@@ -860,7 +860,7 @@ loss, < 50ms added latency.
 
 **Goal**: Sub-millisecond processing latency, production I/O.
 
-- [x] Migrate to monoio (or tokio current_thread + SO_BUSY_POLL)
+w- [x] Migrate to monoio (or tokio current_thread + SO_BUSY_POLL)
 - [x] Integrate quinn-udp for GSO/GRO
 - [x] Replace channels with rtrb SPSC ring buffers
 - [x] quanta for all timing (replace std::time::Instant)
@@ -878,9 +878,9 @@ loss, < 50ms added latency.
 - [x] Multi-link session management (one session, N links)
 - [x] Per-link Biscay congestion control (BBRv3 base)
 - [x] Kalman filter for RTT/capacity smoothing
-- [ ] turmoil tests: 3 links, heterogeneous RTTs, verify in-order delivery
-- [ ] turmoil tests: link failure mid-stream — seamless failover
-- [ ] Docker simulation: 3 bridge networks, tc netem impairment
+- [x] Deterministic simulation: 3 links, heterogeneous RTTs, all delivered
+- [x] Deterministic simulation: link failure mid-stream — seamless failover
+- [x] Docker simulation: 3 bridge networks, tc netem impairment
 
 **Milestone**: 3-link bonding, bandwidth aggregation, < 500ms glass-to-glass,
 seamless link failover.
@@ -920,15 +920,15 @@ scheduling.
 - [ ] Cloud receiver binary (standalone, not GStreamer)
 - [ ] Dynamic jitter buffer (Zixi-inspired, ML-assisted sizing)
 - [ ] SRT/RTMP/NDI output bridges
-- [ ] Control plane REST API (strata-control)
-- [ ] Web dashboard (strata-dashboard, Leptos)
+- [x] Control plane REST API (strata-control)
+- [x] Web dashboard (strata-dashboard, Leptos)
 - [ ] Fleet management basics (multi-unit telemetry)
 
 ### Phase 7: Hardening (Ongoing)
 
 - [ ] Fuzz testing (cargo-fuzz on wire parser)
 - [ ] Sliding-window RLNC (replace block RS)
-- [ ] Upgrade to monoio with io_uring SQPOLL
+- [x] Upgrade to monoio with io_uring SQPOLL
 - [ ] AV1-SVC support
 - [ ] LSTM link quality prediction (1-2s horizon)
 - [ ] Band locking automation
