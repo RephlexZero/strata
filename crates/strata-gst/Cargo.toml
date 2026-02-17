@@ -27,5 +27,3 @@ path = "src/lib.rs"
 [[bin]]
 name = "strata-node"
 path = "src/bin/strata_node.rs"
-
-

@@ -12,7 +12,6 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
 slab = "0.4"
-reed-solomon-simd = "3"
 quanta = { workspace = true }
 serde = { workspace = true }
 

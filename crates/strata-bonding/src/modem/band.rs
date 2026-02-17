@@ -145,100 +145,318 @@ pub const GLOBAL_BANDS: &[Band] = &[
     // ═══════════════════════════════════════════════════════════════════
 
     // B20: 800 MHz — Europe's primary low-band (EU Digital Dividend)
-    Band { number: 20, nr: false, freq_mhz: 800, bandwidth_mhz: 10,
-           tier: BandTier::Coverage, regions: &[Region::UK, Region::Europe, Region::MEA] },
+    Band {
+        number: 20,
+        nr: false,
+        freq_mhz: 800,
+        bandwidth_mhz: 10,
+        tier: BandTier::Coverage,
+        regions: &[Region::UK, Region::Europe, Region::MEA],
+    },
     // n28: 700 MHz — EU 5G coverage layer, UK Ofcom cleared 2020
-    Band { number: 28, nr: true, freq_mhz: 703, bandwidth_mhz: 10,
-           tier: BandTier::Coverage, regions: &[Region::UK, Region::Europe, Region::Australia, Region::LatAm, Region::SEA] },
+    Band {
+        number: 28,
+        nr: true,
+        freq_mhz: 703,
+        bandwidth_mhz: 10,
+        tier: BandTier::Coverage,
+        regions: &[
+            Region::UK,
+            Region::Europe,
+            Region::Australia,
+            Region::LatAm,
+            Region::SEA,
+        ],
+    },
     // B28: 700 MHz LTE — APT band, widely deployed
-    Band { number: 28, nr: false, freq_mhz: 703, bandwidth_mhz: 10,
-           tier: BandTier::Coverage, regions: &[Region::UK, Region::Europe, Region::Australia, Region::LatAm, Region::SEA] },
+    Band {
+        number: 28,
+        nr: false,
+        freq_mhz: 703,
+        bandwidth_mhz: 10,
+        tier: BandTier::Coverage,
+        regions: &[
+            Region::UK,
+            Region::Europe,
+            Region::Australia,
+            Region::LatAm,
+            Region::SEA,
+        ],
+    },
     // B8: 900 MHz — global GSM refarmed to LTE
-    Band { number: 8, nr: false, freq_mhz: 900, bandwidth_mhz: 10,
-           tier: BandTier::Coverage, regions: &[Region::UK, Region::Europe, Region::MEA, Region::SEA, Region::Global] },
+    Band {
+        number: 8,
+        nr: false,
+        freq_mhz: 900,
+        bandwidth_mhz: 10,
+        tier: BandTier::Coverage,
+        regions: &[
+            Region::UK,
+            Region::Europe,
+            Region::MEA,
+            Region::SEA,
+            Region::Global,
+        ],
+    },
     // n8: 900 MHz NR
-    Band { number: 8, nr: true, freq_mhz: 900, bandwidth_mhz: 10,
-           tier: BandTier::Coverage, regions: &[Region::Europe] },
+    Band {
+        number: 8,
+        nr: true,
+        freq_mhz: 900,
+        bandwidth_mhz: 10,
+        tier: BandTier::Coverage,
+        regions: &[Region::Europe],
+    },
     // B71: 600 MHz — T-Mobile US primary low-band
-    Band { number: 71, nr: false, freq_mhz: 617, bandwidth_mhz: 10,
-           tier: BandTier::Coverage, regions: &[Region::US] },
+    Band {
+        number: 71,
+        nr: false,
+        freq_mhz: 617,
+        bandwidth_mhz: 10,
+        tier: BandTier::Coverage,
+        regions: &[Region::US],
+    },
     // n71: 600 MHz NR
-    Band { number: 71, nr: true, freq_mhz: 617, bandwidth_mhz: 10,
-           tier: BandTier::Coverage, regions: &[Region::US] },
+    Band {
+        number: 71,
+        nr: true,
+        freq_mhz: 617,
+        bandwidth_mhz: 10,
+        tier: BandTier::Coverage,
+        regions: &[Region::US],
+    },
     // B12: 700 MHz — AT&T US low-band
-    Band { number: 12, nr: false, freq_mhz: 700, bandwidth_mhz: 10,
-           tier: BandTier::Coverage, regions: &[Region::US] },
+    Band {
+        number: 12,
+        nr: false,
+        freq_mhz: 700,
+        bandwidth_mhz: 10,
+        tier: BandTier::Coverage,
+        regions: &[Region::US],
+    },
     // B13: 700 MHz — Verizon US low-band
-    Band { number: 13, nr: false, freq_mhz: 746, bandwidth_mhz: 10,
-           tier: BandTier::Coverage, regions: &[Region::US] },
+    Band {
+        number: 13,
+        nr: false,
+        freq_mhz: 746,
+        bandwidth_mhz: 10,
+        tier: BandTier::Coverage,
+        regions: &[Region::US],
+    },
     // B5: 850 MHz — Americas + Korea
-    Band { number: 5, nr: false, freq_mhz: 850, bandwidth_mhz: 10,
-           tier: BandTier::Coverage, regions: &[Region::US, Region::Korea, Region::LatAm] },
+    Band {
+        number: 5,
+        nr: false,
+        freq_mhz: 850,
+        bandwidth_mhz: 10,
+        tier: BandTier::Coverage,
+        regions: &[Region::US, Region::Korea, Region::LatAm],
+    },
     // B18: 850 MHz — Japan (KDDI)
-    Band { number: 18, nr: false, freq_mhz: 860, bandwidth_mhz: 10,
-           tier: BandTier::Coverage, regions: &[Region::Japan] },
+    Band {
+        number: 18,
+        nr: false,
+        freq_mhz: 860,
+        bandwidth_mhz: 10,
+        tier: BandTier::Coverage,
+        regions: &[Region::Japan],
+    },
     // B19: 850 MHz — Japan (NTT DoCoMo)
-    Band { number: 19, nr: false, freq_mhz: 875, bandwidth_mhz: 10,
-           tier: BandTier::Coverage, regions: &[Region::Japan] },
+    Band {
+        number: 19,
+        nr: false,
+        freq_mhz: 875,
+        bandwidth_mhz: 10,
+        tier: BandTier::Coverage,
+        regions: &[Region::Japan],
+    },
     // B26: 850 MHz extended (Sprint legacy, global)
-    Band { number: 26, nr: false, freq_mhz: 859, bandwidth_mhz: 10,
-           tier: BandTier::Coverage, regions: &[Region::Japan, Region::LatAm] },
-
+    Band {
+        number: 26,
+        nr: false,
+        freq_mhz: 859,
+        bandwidth_mhz: 10,
+        tier: BandTier::Coverage,
+        regions: &[Region::Japan, Region::LatAm],
+    },
     // ═══════════════════════════════════════════════════════════════════
     //  BALANCED TIER (1700–2100 MHz)
     //  Good range with moderate throughput
     // ═══════════════════════════════════════════════════════════════════
 
     // B3: 1800 MHz — the most widely deployed LTE band globally
-    Band { number: 3, nr: false, freq_mhz: 1800, bandwidth_mhz: 20,
-           tier: BandTier::Balanced, regions: &[Region::UK, Region::Europe, Region::Japan, Region::Korea, Region::Australia, Region::MEA, Region::SEA, Region::LatAm, Region::Global] },
+    Band {
+        number: 3,
+        nr: false,
+        freq_mhz: 1800,
+        bandwidth_mhz: 20,
+        tier: BandTier::Balanced,
+        regions: &[
+            Region::UK,
+            Region::Europe,
+            Region::Japan,
+            Region::Korea,
+            Region::Australia,
+            Region::MEA,
+            Region::SEA,
+            Region::LatAm,
+            Region::Global,
+        ],
+    },
     // n3: 1800 MHz NR (DSS or refarmed)
-    Band { number: 3, nr: true, freq_mhz: 1800, bandwidth_mhz: 20,
-           tier: BandTier::Balanced, regions: &[Region::UK, Region::Europe, Region::Global] },
+    Band {
+        number: 3,
+        nr: true,
+        freq_mhz: 1800,
+        bandwidth_mhz: 20,
+        tier: BandTier::Balanced,
+        regions: &[Region::UK, Region::Europe, Region::Global],
+    },
     // B1: 2100 MHz — global 3G/LTE workhorse
-    Band { number: 1, nr: false, freq_mhz: 2100, bandwidth_mhz: 15,
-           tier: BandTier::Balanced, regions: &[Region::UK, Region::Europe, Region::Japan, Region::Korea, Region::MEA, Region::SEA, Region::Global] },
+    Band {
+        number: 1,
+        nr: false,
+        freq_mhz: 2100,
+        bandwidth_mhz: 15,
+        tier: BandTier::Balanced,
+        regions: &[
+            Region::UK,
+            Region::Europe,
+            Region::Japan,
+            Region::Korea,
+            Region::MEA,
+            Region::SEA,
+            Region::Global,
+        ],
+    },
     // n1: 2100 MHz NR
-    Band { number: 1, nr: true, freq_mhz: 2100, bandwidth_mhz: 15,
-           tier: BandTier::Balanced, regions: &[Region::Europe, Region::Global] },
+    Band {
+        number: 1,
+        nr: true,
+        freq_mhz: 2100,
+        bandwidth_mhz: 15,
+        tier: BandTier::Balanced,
+        regions: &[Region::Europe, Region::Global],
+    },
     // B7: 2600 MHz FDD — Europe/Asia capacity+coverage mix
-    Band { number: 7, nr: false, freq_mhz: 2600, bandwidth_mhz: 20,
-           tier: BandTier::Balanced, regions: &[Region::UK, Region::Europe, Region::LatAm, Region::SEA] },
+    Band {
+        number: 7,
+        nr: false,
+        freq_mhz: 2600,
+        bandwidth_mhz: 20,
+        tier: BandTier::Balanced,
+        regions: &[Region::UK, Region::Europe, Region::LatAm, Region::SEA],
+    },
     // B4/B66: AWS 1700/2100 MHz — Americas
-    Band { number: 66, nr: false, freq_mhz: 1710, bandwidth_mhz: 20,
-           tier: BandTier::Balanced, regions: &[Region::US, Region::LatAm] },
+    Band {
+        number: 66,
+        nr: false,
+        freq_mhz: 1710,
+        bandwidth_mhz: 20,
+        tier: BandTier::Balanced,
+        regions: &[Region::US, Region::LatAm],
+    },
     // B2/B25: PCS 1900 MHz — Americas
-    Band { number: 2, nr: false, freq_mhz: 1900, bandwidth_mhz: 15,
-           tier: BandTier::Balanced, regions: &[Region::US, Region::LatAm] },
+    Band {
+        number: 2,
+        nr: false,
+        freq_mhz: 1900,
+        bandwidth_mhz: 15,
+        tier: BandTier::Balanced,
+        regions: &[Region::US, Region::LatAm],
+    },
     // B21: 1500 MHz — Japan (NTT DoCoMo)
-    Band { number: 21, nr: false, freq_mhz: 1500, bandwidth_mhz: 15,
-           tier: BandTier::Balanced, regions: &[Region::Japan] },
-
+    Band {
+        number: 21,
+        nr: false,
+        freq_mhz: 1500,
+        bandwidth_mhz: 15,
+        tier: BandTier::Balanced,
+        regions: &[Region::Japan],
+    },
     // ═══════════════════════════════════════════════════════════════════
     //  CAPACITY TIER (2500+ MHz)
     //  High throughput, short range, dense urban
     // ═══════════════════════════════════════════════════════════════════
 
     // n77: C-band (3.3–4.2 GHz) — primary global 5G mid-band
-    Band { number: 77, nr: true, freq_mhz: 3700, bandwidth_mhz: 100,
-           tier: BandTier::Capacity, regions: &[Region::US, Region::Japan, Region::Korea, Region::Australia, Region::SEA, Region::Global] },
+    Band {
+        number: 77,
+        nr: true,
+        freq_mhz: 3700,
+        bandwidth_mhz: 100,
+        tier: BandTier::Capacity,
+        regions: &[
+            Region::US,
+            Region::Japan,
+            Region::Korea,
+            Region::Australia,
+            Region::SEA,
+            Region::Global,
+        ],
+    },
     // n78: C-band (3.3–3.8 GHz) — primary European/UK 5G
-    Band { number: 78, nr: true, freq_mhz: 3500, bandwidth_mhz: 100,
-           tier: BandTier::Capacity, regions: &[Region::UK, Region::Europe, Region::Japan, Region::Korea, Region::Australia, Region::MEA, Region::SEA, Region::Global] },
+    Band {
+        number: 78,
+        nr: true,
+        freq_mhz: 3500,
+        bandwidth_mhz: 100,
+        tier: BandTier::Capacity,
+        regions: &[
+            Region::UK,
+            Region::Europe,
+            Region::Japan,
+            Region::Korea,
+            Region::Australia,
+            Region::MEA,
+            Region::SEA,
+            Region::Global,
+        ],
+    },
     // B38: 2600 MHz TDD — EU/Asia
-    Band { number: 38, nr: false, freq_mhz: 2600, bandwidth_mhz: 20,
-           tier: BandTier::Capacity, regions: &[Region::Europe, Region::MEA, Region::SEA] },
+    Band {
+        number: 38,
+        nr: false,
+        freq_mhz: 2600,
+        bandwidth_mhz: 20,
+        tier: BandTier::Capacity,
+        regions: &[Region::Europe, Region::MEA, Region::SEA],
+    },
     // B40: 2300 MHz TDD — UK (Three/O2), India, SEA
-    Band { number: 40, nr: false, freq_mhz: 2300, bandwidth_mhz: 20,
-           tier: BandTier::Capacity, regions: &[Region::UK, Region::Europe, Region::MEA, Region::SEA] },
+    Band {
+        number: 40,
+        nr: false,
+        freq_mhz: 2300,
+        bandwidth_mhz: 20,
+        tier: BandTier::Capacity,
+        regions: &[Region::UK, Region::Europe, Region::MEA, Region::SEA],
+    },
     // B41/n41: 2500 MHz TDD — global
-    Band { number: 41, nr: false, freq_mhz: 2500, bandwidth_mhz: 20,
-           tier: BandTier::Capacity, regions: &[Region::US, Region::Japan, Region::Korea, Region::Global] },
-    Band { number: 41, nr: true, freq_mhz: 2500, bandwidth_mhz: 40,
-           tier: BandTier::Capacity, regions: &[Region::US, Region::Japan, Region::Korea, Region::Global] },
+    Band {
+        number: 41,
+        nr: false,
+        freq_mhz: 2500,
+        bandwidth_mhz: 20,
+        tier: BandTier::Capacity,
+        regions: &[Region::US, Region::Japan, Region::Korea, Region::Global],
+    },
+    Band {
+        number: 41,
+        nr: true,
+        freq_mhz: 2500,
+        bandwidth_mhz: 40,
+        tier: BandTier::Capacity,
+        regions: &[Region::US, Region::Japan, Region::Korea, Region::Global],
+    },
     // n79: 4.5 GHz — Japan (NTT DoCoMo, KDDI)
-    Band { number: 79, nr: true, freq_mhz: 4700, bandwidth_mhz: 100,
-           tier: BandTier::Capacity, regions: &[Region::Japan, Region::Korea] },
+    Band {
+        number: 79,
+        nr: true,
+        freq_mhz: 4700,
+        bandwidth_mhz: 100,
+        tier: BandTier::Capacity,
+        regions: &[Region::Japan, Region::Korea],
+    },
 ];
 
 /// Convenience alias — kept for backward compatibility.
@@ -628,18 +846,34 @@ mod tests {
     #[test]
     fn uk_bands_have_all_tiers() {
         let uk = bands_for_region(Region::UK);
-        assert!(uk.len() >= 5, "UK should have at least 5 bands, got {}", uk.len());
+        assert!(
+            uk.len() >= 5,
+            "UK should have at least 5 bands, got {}",
+            uk.len()
+        );
 
         let tiers: std::collections::HashSet<_> = uk.iter().map(|b| b.tier).collect();
-        assert!(tiers.contains(&BandTier::Coverage), "UK must have coverage bands");
-        assert!(tiers.contains(&BandTier::Balanced), "UK must have balanced bands");
-        assert!(tiers.contains(&BandTier::Capacity), "UK must have capacity bands");
+        assert!(
+            tiers.contains(&BandTier::Coverage),
+            "UK must have coverage bands"
+        );
+        assert!(
+            tiers.contains(&BandTier::Balanced),
+            "UK must have balanced bands"
+        );
+        assert!(
+            tiers.contains(&BandTier::Capacity),
+            "UK must have capacity bands"
+        );
     }
 
     #[test]
     fn us_bands_include_b71_b13() {
         let us = bands_for_region(Region::US);
-        assert!(us.iter().any(|b| b.number == 71 && !b.nr), "US should have LTE B71");
+        assert!(
+            us.iter().any(|b| b.number == 71 && !b.nr),
+            "US should have LTE B71"
+        );
         assert!(us.iter().any(|b| b.number == 13), "US should have B13");
     }
 
@@ -654,15 +888,23 @@ mod tests {
     fn global_bands_included_in_all_regions() {
         // B8 (900 MHz) is tagged with Region::Global — it should appear
         // in every region's filtered list.
-        let b8_global = GLOBAL_BANDS.iter().find(|b| b.number == 8 && !b.nr
-            && b.regions.contains(&Region::Global));
+        let b8_global = GLOBAL_BANDS
+            .iter()
+            .find(|b| b.number == 8 && !b.nr && b.regions.contains(&Region::Global));
         assert!(b8_global.is_some(), "B8 should be tagged Global");
 
-        for region in &[Region::UK, Region::US, Region::Japan, Region::Korea, Region::Australia] {
+        for region in &[
+            Region::UK,
+            Region::US,
+            Region::Japan,
+            Region::Korea,
+            Region::Australia,
+        ] {
             let filtered = bands_for_region(*region);
             assert!(
                 filtered.iter().any(|b| b.number == 8 && !b.nr),
-                "B8 Global should appear in {:?} filtered results", region
+                "B8 Global should appear in {:?} filtered results",
+                region
             );
         }
     }

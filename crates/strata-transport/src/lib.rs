@@ -11,7 +11,7 @@
 //! - [`wire`] — Packet header serialization, control packets, VarInt
 //! - [`pool`] — Slab-based packet buffer pool
 //! - [`session`] — Session handshake, keepalive, RTT tracking
-//! - [`codec`] — FEC encoding/decoding (Reed-Solomon)
+//! - [`codec`] — FEC encoding/decoding (sliding-window RLNC over GF(2^8))
 //! - [`arq`] — NACK-based loss detection and retransmission
 //! - [`congestion`] — Biscay congestion control (BBRv3-inspired)
 //! - [`stats`] — Per-link and aggregate statistics

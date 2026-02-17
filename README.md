@@ -1,178 +1,247 @@
-# Strata
+<p align="center">
+  <strong>Strata</strong><br/>
+  <em>Open-source bonded cellular video transport — the $15,000 LiveU alternative, written in Rust.</em>
+</p>
 
-**Bonded video transport and live-streaming management platform, written in Rust.**
-
-[![CI](https://github.com/RephlexZero/strata/actions/workflows/ci.yml/badge.svg)](https://github.com/RephlexZero/strata/actions/workflows/ci.yml)
-[![Platform CI](https://github.com/RephlexZero/strata/actions/workflows/platform.yml/badge.svg)](https://github.com/RephlexZero/strata/actions/workflows/platform.yml)
-
-Strata aggregates bandwidth across multiple unreliable network interfaces — cellular modems, WiFi, Ethernet, satellite — into a single resilient video stream. It combines a high-performance GStreamer transport engine (`stratasink` / `stratasrc`) with a full management platform: a control plane, operator dashboard, and field-device portal — all built in Rust.
-
-Designed for field deployment on constrained hardware (e.g. Orange Pi 5 Plus with USB cellular modems) where link conditions are unpredictable and every bit of available bandwidth matters.
+<p align="center">
+  <a href="https://github.com/RephlexZero/strata/actions/workflows/ci.yml"><img src="https://github.com/RephlexZero/strata/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/RephlexZero/strata/actions/workflows/platform.yml"><img src="https://github.com/RephlexZero/strata/actions/workflows/platform.yml/badge.svg" alt="Platform CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPL--2.1--or--later-blue.svg" alt="License"></a>
+</p>
 
 ---
 
-## Install a Release
+Strata bonds 2–6 unreliable network interfaces — USB cellular modems, WiFi, Ethernet, satellite — into a single resilient live video stream. It ships as a **GStreamer plugin** (`stratasink` / `stratasrc`), a standalone CLI (`strata-node`), and a complete **management platform** with a web dashboard, control plane API, and field-device agent.
 
-Pre-built plugin binaries are published for **x86_64** and **aarch64** Linux on the [Releases](https://github.com/RephlexZero/strata/releases) page.
+Built for field deployment on commodity ARM64 hardware (Orange Pi 5 Plus, Raspberry Pi 5) with off-the-shelf USB modems. Pure Rust from the wire protocol up — no C transport dependencies, no vendor lock-in.
 
-```bash
-# Download the latest release for your architecture (example: v0.1.2)
-VERSION="v0.1.2"
-ARCH="$(uname -m)"
-curl -LO "https://github.com/RephlexZero/strata/releases/download/${VERSION}/strata-${VERSION}-${ARCH}-linux-gnu.so"
+### Why Strata?
 
-# Install the plugin
-sudo cp strata-*-linux-gnu.so /usr/lib/${ARCH}-linux-gnu/gstreamer-1.0/libgststrata.so
-
-# Verify
-gst-inspect-1.0 stratasink
-```
-
-### Runtime Dependencies (Target Device)
-
-The plugin requires GStreamer 1.x at runtime. On Debian/Ubuntu (including Armbian on Orange Pi):
-
-```bash
-sudo apt-get install -y \
-  gstreamer1.0-plugins-base \
-  gstreamer1.0-plugins-good \
-  gstreamer1.0-plugins-bad \
-  gstreamer1.0-plugins-ugly \
-  gstreamer1.0-libav \
-  gstreamer1.0-tools
-```
-
-No other dependencies are needed — the transport is built in pure Rust.
+| Capability | LiveU | TVU | Dejero | SRT | RIST | **Strata** |
+|---|---|---|---|---|---|---|
+| N-link bonding | ✓ (6+) | ✓ (12) | ✓ (3-6) | Limited | Load share | **2-6 links** |
+| Per-packet scheduling | ✓ | ✓ | ✓ | Round-robin | — | **IoDS / BLEST** |
+| RF-aware routing | ✓ | ✓ | ✓ | ✗ | ✗ | **Biscay CC** |
+| Predictive handover | ✓ | ✓ | ✓ | ✗ | ✗ | **Kalman + modem supervisor** |
+| Adaptive FEC | Dynamic | RaptorQ | — | ✗ | ✗ | **TAROT cost function** |
+| Media-aware priority | ✓ | ✓ | ✓ | ✗ | ✗ | **NAL classification** |
+| Encoder feedback loop | ✓ | ✓ | ✓ | ✗ | TR-06-04 | **Built-in** |
+| Fleet management | ✓ | ✓ | ✓ | ✗ | ✗ | **Web dashboard** |
+| Open source | ✗ | ✗ | ✗ | ✓ | Spec only | **✓** |
+| Price | $15K+ | $15K+ | $15K+ | Free | Free | **Free** |
 
 ---
 
 ## Quick Start
 
-**Sender** — stream over two bonded links:
+### Install a Release
+
+Pre-built binaries for **x86_64** and **aarch64** Linux are on the [Releases](https://github.com/RephlexZero/strata/releases) page.
 
 ```bash
-gst-launch-1.0 \
-  videotestsrc is-live=true ! \
-  video/x-raw,width=1920,height=1080,framerate=30/1 ! \
-  x264enc tune=zerolatency bitrate=3000 ! \
-  mpegtsmux ! \
-  stratasink name=sink \
-    sink.link_0::destination="192.168.1.100:5000" \
-    sink.link_1::destination="10.0.0.100:5000"
+VERSION="v0.5.0"
+ARCH="$(uname -m)"
+curl -LO "https://github.com/RephlexZero/strata/releases/download/${VERSION}/strata-${VERSION}-${ARCH}-linux-gnu.so"
+sudo cp strata-*-linux-gnu.so /usr/lib/${ARCH}-linux-gnu/gstreamer-1.0/libgststrata.so
+gst-inspect-1.0 stratasink   # verify
 ```
 
-**Receiver** — listen and display:
+Only GStreamer 1.x is needed at runtime — the transport is pure Rust with no C dependencies.
+
+### Send and Receive
+
+**Sender** — bonded stream over two links:
 
 ```bash
-gst-launch-1.0 \
-  stratasrc links="0.0.0.0:5000" latency=100 ! \
+strata-node sender --source test --bitrate 3000 \
+  --dest 192.168.1.100:5000,10.0.0.100:5000
+```
+
+**Receiver** — reassemble and relay to YouTube:
+
+```bash
+strata-node receiver --bind 0.0.0.0:5000,0.0.0.0:5002 \
+  --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
+```
+
+Or use GStreamer directly:
+
+```bash
+# Sender
+gst-launch-1.0 videotestsrc is-live=true ! x264enc tune=zerolatency bitrate=3000 ! \
+  mpegtsmux ! stratasink destinations="192.168.1.100:5000,10.0.0.100:5000"
+
+# Receiver
+gst-launch-1.0 stratasrc links="0.0.0.0:5000" latency=100 ! \
   tsdemux ! h264parse ! avdec_h264 ! autovideosink
 ```
 
-See the [Getting Started](https://github.com/RephlexZero/strata/wiki/Getting-Started) guide for TOML config examples, production deployments, and livestreaming relay pipelines.
-
----
-
-## Strata Platform
-
-Beyond the GStreamer transport plugin, Strata includes a full management platform for operating bonded senders in the field.
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Operator Dashboard                       │
-│                   (Leptos WASM · :3000)                     │
-│         Senders · Streams · Destinations · Stats            │
-└────────────────────────┬────────────────────────────────────┘
-                         │ REST + WebSocket
-┌────────────────────────▼────────────────────────────────────┐
-│                    Control Plane                            │
-│              (Axum · PostgreSQL · JWT)                      │
-│   API · Agent WS · Dashboard WS · Migrations · Auth        │
-└──────┬──────────────────────────────────────────────────────┘
-       │ WebSocket (ed25519 device auth)
-┌──────▼──────────────────────────────────────────────────────┐
-│               Sender Agent (field device)                   │
-│     Hardware scan · Interface mgmt · Stream lifecycle       │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │            Sender Portal (Leptos WASM · :3001)       │   │
-│  │     Enrollment · Config · Interfaces · Test          │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-```
-
-| Crate | Role |
-|---|---|
-| **strata-common** | Shared types, protocol messages, auth (JWT + ed25519), ID generation |
-| **strata-control** | Control plane server — Axum REST API, WebSocket hubs, PostgreSQL |
-| **strata-agent** | Sender daemon — hardware scanning, interface management, stream control |
-| **strata-dashboard** | Operator web UI — Leptos CSR WASM, Tailwind CSS + DaisyUI |
-| **strata-portal** | Field device web UI — enrollment, configuration, connectivity test |
-
-### Running the Dev Stack
+### Run the Full Platform
 
 ```bash
-docker compose up -d          # PostgreSQL + control plane + simulated sender
-# Dashboard:  http://localhost:3000   (admin@strata.local / admin)
+docker compose up --build -d
+# Dashboard:  http://localhost:3000  (dev@strata.local / development)
 # Portal:     http://localhost:3001
 ```
 
-See the [Strata Platform](https://github.com/RephlexZero/strata/wiki/Strata-Platform) wiki page for the full architecture and development guide.
+This starts PostgreSQL, the control plane, a simulated sender with tc-netem cellular impairments across 3 isolated bridge networks, and a receiver — a complete end-to-end demo with realistic network conditions.
+
+---
+
+## Architecture
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                         EDGE NODE                             │
+│  ┌──────────┐   ┌────────────┐   ┌────────────┐   ┌─────────┐│
+│  │ Encoder  │──▶│  Media     │──▶│  FEC       │──▶│ Network ││
+│  │ (H.264/  │   │  Classifier│   │  Codec     │   │ Reactor ││
+│  │  H.265/  │   │  (NAL      │   │  (XOR +    │   │ (per-   ││
+│  │  AV1)    │   │   parse)   │   │   TAROT)   │   │  link)  ││
+│  └──────────┘   └────────────┘   └────────────┘   └────┬────┘│
+│  ┌─────────────────────────────────────────────────────┤     │
+│  │              Bonding Scheduler                      │     │
+│  │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐    │     │
+│  │  │Link 1  │  │Link 2  │  │Link 3  │  │Link N  │    │     │
+│  │  │DWRR Q  │  │DWRR Q  │  │DWRR Q  │  │DWRR Q  │    │     │
+│  │  └───┬────┘  └───┬────┘  └───┬────┘  └───┬────┘    │     │
+│  └──────┼───────────┼───────────┼───────────┼─────────┘     │
+│  ┌──────▼───────────▼───────────▼───────────▼─────────┐     │
+│  │           Modem Supervisor                          │     │
+│  │  QMI/MBIM → RSRP, RSRQ, SINR, CQI per link        │     │
+│  └─────────────────────────────────────────────────────┘     │
+└───────────────────────────────────────────────────────────────┘
+                              │ UDP × N links
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│                       CLOUD GATEWAY                            │
+│  ┌──────────┐   ┌────────────┐   ┌────────────┐               │
+│  │ Network  │──▶│  FEC       │──▶│  Jitter    │──▶ RTMP/SRT/ │
+│  │ Receiver │   │  Decoder   │   │  Buffer    │   HLS/Record  │
+│  └──────────┘   └────────────┘   └────────────┘               │
+└────────────────────────────────────────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────────┐
+│                      CONTROL PLANE                              │
+│  Web Dashboard (Leptos) · REST API (Axum) · Fleet Management    │
+│  PostgreSQL · WebSocket Telemetry · Remote Config               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Strata is a **three-layer system**: a custom wire protocol (`strata-transport`), a multi-link bonding engine (`strata-bonding`), and a management platform. Each layer is a separate Rust crate.
+
+### Transport Protocol (`strata-transport`)
+
+A custom UDP protocol purpose-built for bonded video, replacing RIST/SRT:
+
+- **Custom wire format** — 12-byte header with QUIC-style VarInt sequence numbers (62-bit space), media-aware flags (keyframe, codec config, fragment markers)
+- **Hybrid FEC + ARQ** — systematic XOR-based FEC with NACK-triggered coded repair; TAROT cost function auto-tunes FEC rate per link
+- **Biscay congestion control** — BBRv3 base with cellular radio feed-forward (SINR→capacity ceiling, CQI derivative tracking, handover detection)
+- **Session management** — handshake, keepalive, link join/leave, RTT tracking (RFC 6298 SRTT/RTTVAR)
+
+### Bonding Engine (`strata-bonding`)
+
+Multi-link scheduling and orchestration:
+
+- **DWRR scheduler** — per-link Deficit Weighted Round Robin queues with capacity-proportional weights
+- **IoDS** — In-order Delivery Scheduler enforcing monotonic arrival constraint to minimize receiver reordering
+- **BLEST** — Blocking estimation guard prevents head-of-line blocking on slow links
+- **Thompson Sampling** — contextual bandit link selection with Beta distribution priors
+- **Kalman filter** — smooths RTT/capacity estimates, tracks RSRP trend for handover prediction
+- **Media awareness** — NAL unit parser (H.264/H.265/AV1) classifies packets by priority; keyframes broadcast to all links
+- **Modem supervisor** — QMI/MBIM polling for RSRP, RSRQ, SINR, CQI; band management and link health scoring
+
+### Management Platform
+
+- **Control plane** (`strata-control`) — Axum REST API, WebSocket hubs for agents and dashboards, PostgreSQL, JWT auth
+- **Operator dashboard** (`strata-dashboard`) — Leptos WASM SPA with live sender status, stream management, destination CRUD
+- **Sender agent** (`strata-agent`) — field device daemon with hardware scanning, interface management, GStreamer pipeline lifecycle
+- **Sender portal** (`strata-portal`) — local WASM UI for on-site enrollment, configuration, and diagnostics
+
+---
+
+## Project Structure
+
+```
+crates/
+  strata-transport/      Custom wire protocol — FEC, ARQ, Biscay CC, session mgmt
+  strata-bonding/        Bonding engine — DWRR/IoDS/BLEST scheduler, modem, media
+  strata-gst/            GStreamer plugin (stratasink/stratasrc) + strata-node CLI
+  strata-sim/            Network simulation — Linux netns + tc-netem
+  strata-common/         Shared types, protocol messages, auth (JWT + ed25519)
+  strata-control/        Control plane — Axum API, WebSocket, PostgreSQL
+  strata-agent/          Sender agent daemon (field devices)
+  strata-dashboard/      Operator dashboard — Leptos CSR WASM + Tailwind/DaisyUI
+  strata-portal/         Field device portal — Leptos CSR WASM + Tailwind/DaisyUI
+docker/
+  Dockerfile.cross-aarch64   Cross-compile for Orange Pi / aarch64
+docker-compose.yml           Full dev stack with simulated impaired networks
+```
+
+### Dependency Graph
+
+```
+strata-gst ──▶ strata-bonding ──▶ strata-transport
+                     │
+                     └──▶ strata-common
+
+strata-control ──▶ strata-common
+strata-agent   ──▶ strata-common
+strata-dashboard ──▶ strata-common (types only)
+```
 
 ---
 
 ## Development
 
-### Recommended: Dev Container (zero local setup)
+### Dev Container (Recommended)
 
-The fastest way to get a working build environment is to open this repo in a [Dev Container](https://containers.dev/). Everything — Rust, GStreamer, clang — is pre-installed and ready to go.
+The fastest path — zero local setup:
 
-**VS Code / GitHub Codespaces:**
 1. Install the [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) extension (or open in Codespaces)
-2. Open this repo → VS Code will prompt "Reopen in Container" → click it
-3. Wait for the container to build (~2 min first time)
-4. `cargo build` — you're done
+2. "Reopen in Container"
+3. `cargo build`
 
-> The dev container runs in **privileged mode** with `NET_ADMIN` capabilities so that integration tests can create network namespaces and apply `tc-netem` impairments. This is safe inside a container and required for the full test suite.
-
-### Manual Setup
-
-If you prefer not to use the dev container, see the [Getting Started](https://github.com/RephlexZero/strata/wiki/Getting-Started) wiki page for the full list of system dependencies.
+Includes Rust, GStreamer dev libs, network tooling (`iproute2`, `tc`, `tcpdump`), and all build dependencies.
 
 ### Building
 
 ```bash
-cargo build                                # Debug build
-cargo build --release                      # Release build (LTO + single codegen unit)
+cargo build                          # Debug
+cargo build --release                # Release (LTO)
 cargo build --release -p strata-gst  # Plugin only
 ```
-
-The GStreamer plugin is produced at `target/release/libgststrata.so`.
 
 ```bash
 export GST_PLUGIN_PATH="$PWD/target/release:$GST_PLUGIN_PATH"
 gst-inspect-1.0 stratasink
 ```
 
-### Testing
-
-```bash
-cargo test --workspace --lib                                   # Unit tests (no privileges needed)
-cargo test -p strata-common                                    # Platform model + protocol tests
-cargo test -p strata-control                                   # API integration tests (needs PostgreSQL)
-sudo cargo test -p strata-gst --test end_to_end          # Transport integration (needs NET_ADMIN)
-```
-
-See the [Testing](https://github.com/RephlexZero/strata/wiki/Testing) wiki page for the full test matrix.
-
-### Cross-compiling for aarch64 (Orange Pi 5 Plus)
-
-A multi-stage Dockerfile handles cross-compilation — no cross toolchain setup needed:
+### Cross-compiling for aarch64
 
 ```bash
 docker build -f docker/Dockerfile.cross-aarch64 -o dist/ .
 # Output: dist/libgststrata.so (aarch64)
 ```
+
+### Testing
+
+```bash
+cargo test --workspace --lib                          # Unit tests (no privileges)
+cargo test -p strata-transport                        # Transport protocol tests
+cargo test -p strata-common                           # Platform model + protocol tests
+cargo test -p strata-control                          # API integration (needs PostgreSQL)
+sudo cargo test -p strata-gst --test end_to_end       # Transport integration (needs NET_ADMIN)
+sudo cargo test -p strata-gst --test video_output     # Produces reviewable MPEG-TS files
+```
+
+### Releasing
+
+```bash
+cargo release -p strata-gst patch --execute
+```
+
+GitHub Actions builds x86_64 + aarch64 and creates a release with `.so` assets.
 
 ---
 
@@ -182,62 +251,19 @@ Full documentation is in the **[Wiki](https://github.com/RephlexZero/strata/wiki
 
 | Page | Description |
 |---|---|
-| [Architecture](https://github.com/RephlexZero/strata/wiki/Architecture) | System design, component overview, key decisions |
-| [Strata Platform](https://github.com/RephlexZero/strata/wiki/Strata-Platform) | Management platform — control plane, dashboard, portal, agent |
-| [Getting Started](https://github.com/RephlexZero/strata/wiki/Getting-Started) | Prerequisites, building, quick start |
-| [Configuration Reference](https://github.com/RephlexZero/strata/wiki/Configuration-Reference) | Full TOML config for links, scheduler, receiver, lifecycle |
-| [GStreamer Elements](https://github.com/RephlexZero/strata/wiki/GStreamer-Elements) | `stratasink` and `stratasrc` property + pad reference |
-| [Integration Node](https://github.com/RephlexZero/strata/wiki/Integration-Node) | CLI binary for sender/receiver without pipeline code |
-| [Telemetry](https://github.com/RephlexZero/strata/wiki/Telemetry) | Stats message schema and JSON relay |
-| [Testing](https://github.com/RephlexZero/strata/wiki/Testing) | Test suites, how to run, privilege requirements |
-| [Deployment](https://github.com/RephlexZero/strata/wiki/Deployment) | Privileges, performance budgets, operational guidance |
-
----
-
-## Project Structure
-
-```
-crates/
-  strata-gst/            GStreamer plugin + integration_node binary
-  strata-bonding/        Core bonding logic (no GStreamer dependency)
-  strata-transport/      Pure Rust transport layer (replaces librist)
-  strata-sim/            Linux netns + tc-netem test infrastructure
-  strata-common/         Shared types, protocol, auth, ID generation
-  strata-control/        Control plane — Axum API, WebSocket, PostgreSQL
-  strata-agent/          Sender agent daemon (field devices)
-  strata-dashboard/      Operator dashboard — Leptos CSR WASM + Tailwind/DaisyUI
-  strata-portal/         Field device portal — Leptos CSR WASM + Tailwind/DaisyUI
-docker/
-  Dockerfile.cross-aarch64   Cross-compile for Orange Pi / aarch64
-docker-compose.yml       Dev stack (PostgreSQL, control plane, simulated agent)
-.devcontainer/           Dev Container config (recommended for development)
-.github/workflows/       CI and release automation
-```
-
----
-
-## Releasing
-
-Releases are automated via GitHub Actions. One command does everything:
-
-```bash
-# Patch release (0.1.1 → 0.1.2) — bumps version, commits, tags, pushes
-cargo release -p strata-gst patch --execute
-
-# With release notes
-cargo release -p strata-gst patch --execute \
-  --tag-message "Fix reconnection timeout under high packet loss"
-```
-
-This triggers the [Release workflow](.github/workflows/release.yml) which:
-1. Verifies the tag matches the crate version
-2. Builds the plugin for x86_64 (native) and aarch64 (cross-compiled via Docker)
-3. Creates a GitHub Release with pre-built `.so` assets for both architectures
-
-See the [wiki](https://github.com/RephlexZero/strata/wiki/Getting-Started#releasing) for the full release guide.
+| [Architecture](https://github.com/RephlexZero/strata/wiki/Architecture) | Transport protocol, bonding engine, scheduling algorithms, FEC/ARQ design |
+| [Getting Started](https://github.com/RephlexZero/strata/wiki/Getting-Started) | Install, build, quick start, dev container, cross-compilation |
+| [Strata Platform](https://github.com/RephlexZero/strata/wiki/Strata-Platform) | Control plane, dashboard, agent, portal — full platform guide |
+| [Configuration Reference](https://github.com/RephlexZero/strata/wiki/Configuration-Reference) | Complete TOML config — links, scheduler, CC, FEC, lifecycle, receiver |
+| [GStreamer Elements](https://github.com/RephlexZero/strata/wiki/GStreamer-Elements) | `stratasink` / `stratasrc` properties, pads, pipeline examples |
+| [Strata Node CLI](https://github.com/RephlexZero/strata/wiki/Strata-Node) | `strata-node` sender/receiver usage, source hot-swap, RTMP relay |
+| [Cellular Modem Setup](https://github.com/RephlexZero/strata/wiki/Cellular-Modem-Setup) | USB modem config, policy routing, band management |
+| [Telemetry](https://github.com/RephlexZero/strata/wiki/Telemetry) | Stats schema, JSON relay, Prometheus metrics |
+| [Testing](https://github.com/RephlexZero/strata/wiki/Testing) | Test matrix, simulation framework, CI workflows |
+| [Deployment](https://github.com/RephlexZero/strata/wiki/Deployment) | Production setup, privileges, performance budgets, troubleshooting |
 
 ---
 
 ## License
 
-This project is licensed under the [LGPL-2.1-or-later](LICENSE).
+[LGPL-2.1-or-later](LICENSE)

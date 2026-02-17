@@ -200,18 +200,41 @@ When T=1 and subtype=0x03, the header is followed by:
 ## 4. Reliability: Hybrid FEC + ARQ
 
 The key insight from research: **pure ARQ is too slow** (wastes an RTT) and
-**pure FEC wastes bandwidth** on clean links. Strata uses a **hybrid** approach.
+**pure FEC wastes bandwidth** on clean links. Strata uses a **hybrid** approach
+with two FEC tiers operating at different layers.
 
-### Layer 1: Thin Continuous FEC (Systematic RLNC)
+### Layer 1: Sliding-Window RLNC (strata-transport)
 
 - **Always on**: 5-10% coded redundancy, continuously streamed
-- **Systematic**: send K source packets unencoded (zero latency in no-loss case),
-  then append coded repair symbols
-- **Sliding window**: RLNC over a sliding window of K=32-64 packets (not block
-  FEC — no need to accumulate a full block before encoding)
+- **Systematic**: source packets sent unencoded (zero latency in no-loss case),
+  repair symbols generated from a sliding window
+- **Sliding window**: RLNC over a sliding window of W=64 packets — no
+  accumulate-and-wait like block codes. Repair symbols can reference any packet
+  still in the window, giving immediate recoverability
+- **GF(2^8) coding**: coefficients drawn from Galois Field(256) using a
+  seeded PRNG (seed = window start sequence), enabling multi-loss recovery.
+  Each repair symbol is an independent random linear combination of all
+  source symbols in the window
+- **Progressive decoding**: Gaussian elimination applied incrementally as
+  repair symbols arrive — no need to wait for a full batch
 - **Zero CPU at zero loss**: receiver processes source packets directly; only
-  invokes the RLNC decoder when losses detected
-- **Crate**: `reed-solomon-simd` for small-K RS, custom RLNC for sliding window
+  invokes the RLNC decoder when losses are detected
+
+### Layer 1b: Unequal Error Protection (strata-bonding)
+
+The bonding layer applies **differential FEC overhead** based on media priority
+(see §8). This is *in addition to* the transport-level RLNC:
+
+| Protection Level | Overhead | Use Case |
+|---|---|---|
+| **High** | 50% (2:1) | Critical / I-frame data |
+| **Low** | 10% (10:1) | P/B-frame, droppable data |
+| **None** | 0% | Raw passthrough (already protected by Layer 1) |
+
+UEP uses RaptorQ (RFC 6330) fountain codes at the bonding layer, with a
+Gilbert-Elliott channel model driving dynamic overhead adjustment.
+
+Implementation: `strata-bonding/src/scheduler/fec.rs`
 
 ### Layer 2: NACK-Triggered Coded Repair
 
@@ -241,11 +264,11 @@ This is what LiveU calls "dynamic FEC" — we make it mathematically rigorous.
 
 ### FEC Performance Budget
 
-| Platform | reed-solomon-simd throughput | Link budget |
-|---|---|---|
-| x86 AVX2 | >10 GB/s | 1,000,000× headroom |
-| ARM64 NEON (RPi5) | ~2 GB/s | 200,000× headroom |
-| RaptorQ (RPi3) | ~200 Mb/s | 20× headroom |
+| Platform | RLNC GF(2^8) throughput | RaptorQ throughput | Link budget |
+|---|---|---|---|
+| x86 AVX2 | ~4 GB/s (SIMD XOR chains) | >10 GB/s | 400,000× headroom |
+| ARM64 NEON (RPi5) | ~1.5 GB/s | ~2 GB/s | 150,000× headroom |
+| ARM64 (RPi3) | ~500 MB/s | ~200 Mb/s | 50× headroom |
 
 FEC encoding/decoding is **negligible** at 2-10 Mbps. CPU is free for scheduling.
 
@@ -395,6 +418,59 @@ Per-link SRTT and capacity estimates are smoothed via Kalman filtering:
 Dead Zone heuristic: If RSRP slope < -2.5 dB/s AND RSRQ < -12 dB, the link
 enters PRE_HANDOVER and is deprioritized in the scheduler.
 
+Implementation: `strata-bonding/src/scheduler/kalman.rs`
+
+### EWMA Smoothing Filter
+
+Fast exponentially weighted moving average for scheduler metrics (RTT jitter,
+throughput samples, queue depths) that don't require Kalman's full state model.
+Used as the primary smoother inside the DWRR quantum calculator and Thompson
+Sampling reward signal.
+
+Implementation: `strata-bonding/src/scheduler/ewma.rs`
+
+### Shared Bottleneck Detection (RFC 8382)
+
+When two cellular modems connect to the same tower, they share backhaul. Blind
+independent probing on both links causes congestion on the shared segment.
+Strata implements the RFC 8382 SBD algorithm:
+
+1. **Sample**: Collect N OWD samples per link over T-second base intervals
+2. **Statistics**: Compute per-link skewness, MAD-based variability,
+   oscillation frequency, and packet loss
+3. **Summarise**: Aggregate base-interval statistics across M intervals
+4. **Threshold**: Classify each link as "bottlenecked" if metrics exceed
+   configurable thresholds
+5. **Group**: Cluster bottlenecked links with similar delay distributions
+
+When links are grouped as sharing a bottleneck, the scheduler couples their
+congestion responses: a rate reduction on one link prevents the other from
+filling the freed capacity on the shared segment.
+
+Implementation: `strata-bonding/src/scheduler/sbd.rs`
+
+### Bonding Scheduler Compositor
+
+The `BondingScheduler<L>` struct composes all scheduling primitives into a
+single unified pipeline:
+
+```
+Packet → Priority classify → Keyframe broadcast?
+  → Thompson Sampling (link preference)
+  → IoDS (in-order arrival constraint)
+  → BLEST (HoL blocking guard)
+  → DWRR (weighted fair queue)
+  → Link send
+```
+
+Additional features beyond the core pipeline:
+- **Critical packet broadcast**: keyframes sent to ALL alive links
+- **Fast-failover mode**: broadcasts all traffic when link instability detected
+- **Adaptive redundancy**: duplicates important packets when spare capacity exists
+- **Escalating dead-link logging**: progressively louder warnings for failing links
+
+Implementation: `strata-bonding/src/scheduler/bonding.rs`
+
 ---
 
 ## 7. Modem Intelligence Layer
@@ -513,6 +589,10 @@ When AV1-SVC encoders become common, Strata can:
 - Route enhancement layers on opportunistic links with lower FEC
 - Drop enhancement layers first during congestion
 
+> **Status**: AV1 NAL (OBU) parsing is not yet implemented. H.264 and H.265
+> are fully supported. AV1 support will be added when AV1-SVC hardware encoders
+> become available on target platforms (RPi5, Jetson).
+
 ---
 
 ## 9. Rust Runtime & I/O Architecture
@@ -596,17 +676,32 @@ Pre-allocate 4096 slots (6 MB) — trivial memory footprint.
 5. Delivered to application via `Bytes` handle
 6. Buffer returned to pool on drop
 
+### Zero-Copy Send Abstraction
+
+The `ZeroCopySender` trait provides a future integration point for `io_uring`
+zero-copy transmit. When `io_uring` support is enabled, packet payloads skip
+the kernel copy on `sendto(2)` by registering fixed buffers:
+
+- `FallbackSender` — standard `sendto(2)` path (current default)
+- Future: `IoUringSender` — `io_uring SQE` with `IORING_OP_SEND_ZC`
+
+Implementation: `strata-bonding/src/net/zerocopy.rs`
+
 ---
 
 ## 11. Simulation & Testing
 
-### Tier 1: Deterministic Simulation (turmoil)
+### Tier 1: Deterministic Simulation
 
-- Mock UDP sockets and system clock
+> **Implementation note**: turmoil (tokio-only) was replaced with seeded-RNG
+> deterministic simulations that run on monoio. Same guarantees — reproducible,
+> single-threaded, simulating loss/burst/reordering/partitions — without the
+> runtime coupling.
+
 - Seeded RNG for reproducible failures
 - Simulate: packet loss, reordering, latency spikes, partitions
 - Run entire multi-host protocol in a single thread
-- **Every protocol change must pass turmoil tests**
+- **Every protocol change must pass deterministic simulation tests**
 
 ### Tier 2: Property-Based Testing (proptest)
 
@@ -616,21 +711,35 @@ Pre-allocate 4096 slots (6 MB) — trivial memory footprint.
 - State machine invariants (ACKed bytes never decrease)
 - Congestion window monotonicity during steady state
 
-### Tier 3: Docker Network Simulation
+### Tier 3: Network Namespace Simulation
 
-Replace ns-3 (too CPU-heavy) with **tc netem + Docker bridge networks**:
+Replace ns-3 (too CPU-heavy) with **tc netem + Linux network namespaces**:
+
+> **Implementation note**: The original plan specified Docker bridge networks.
+> In practice, Linux network namespaces with veth pairs proved lighter,
+> faster to set up/tear down, and more controllable for CI. The `strata-sim`
+> crate wraps the `ip netns` / `tc netem` APIs directly.
 
 ```
-┌─────────┐     ┌─────────────┐     ┌─────────┐
-│  Sender │◀───▶│net_controller│◀───▶│Receiver │
-│Container│     │  (sidecar)   │     │Container│
-└────┬────┘     └──────┬───────┘     └────┬────┘
-     │                 │                   │
- ┌───▼────┐       ┌────▼────┐        ┌────▼────┐
- │bridge_1│       │bridge_2 │        │bridge_3 │
- │(link 1)│       │(link 2) │        │(link 3) │
- └────────┘       └─────────┘        └─────────┘
+┌─────────┐     veth pair (per link)     ┌─────────┐
+│  Sender │◀──── tc netem qdisc ────▶│Receiver │
+│   NS   │                            │   NS   │
+└─────────┘                            └─────────┘
+     │         strata-sim               │
+     │   Namespace / ImpairmentConfig    │
+     │   Scenario (random-walk)          │
+     └────────────────────────────────┘
 ```
+
+Test scenarios (in `strata-sim/tests/tier3_netem.rs`):
+
+| Test | What it validates |
+|---|---|
+| `capacity_step_change` | Throughput recovers after mid-stream bandwidth drop |
+| `link_failure_recovery` | Survives link down/up cycle without crash |
+| `chaos_scenario` | 25s of evolving impairment via `Scenario` random-walk |
+| `throughput_stability` | CV < 30% over 20s proves no oscillation/drift |
+| `asymmetric_rtt_bonding` | Both links carry traffic with 20ms vs 150ms RTT |
 
 #### Impairment Model
 
@@ -737,55 +846,129 @@ crates/
 ├── strata-transport/      # Core transport protocol
 │   ├── src/
 │   │   ├── lib.rs         # Public API
-│   │   ├── wire.rs        # Packet header serialization
-│   │   ├── codec.rs       # RLNC / RS FEC engine
+│   │   ├── wire.rs        # Packet header serialization, VarInt
+│   │   ├── codec.rs       # Sliding-window RLNC FEC engine
 │   │   ├── arq.rs         # NACK tracking, repair dispatch
 │   │   ├── sender.rs      # Sender state machine
 │   │   ├── receiver.rs    # Receiver state machine
 │   │   ├── congestion.rs  # Biscay congestion control
+│   │   ├── pool.rs        # Slab packet buffer pool
 │   │   ├── session.rs     # Handshake, teardown, keepalive
 │   │   └── stats.rs       # Per-link statistics
+│   ├── tests/             # Deterministic simulation tests
+│   ├── fuzz/              # Tier 4: cargo-fuzz targets
+│   ├── benches/           # Criterion benchmarks
 │   └── Cargo.toml
 │
 ├── strata-bonding/        # Multi-link scheduler & orchestrator
 │   ├── src/
 │   │   ├── lib.rs
+│   │   ├── config.rs      # TOML configuration system
+│   │   ├── metrics.rs     # Prometheus text exposition
+│   │   ├── runtime.rs     # monoio/io_uring runtime builder
+│   │   ├── adaptation.rs  # Encoder bitrate feedback loop
 │   │   ├── scheduler/
 │   │   │   ├── mod.rs
+│   │   │   ├── bonding.rs # BondingScheduler compositor
 │   │   │   ├── iods.rs    # In-order Delivery Scheduler
 │   │   │   ├── blest.rs   # Blocking estimation guard
 │   │   │   ├── dwrr.rs    # Deficit Weighted Round Robin
-│   │   │   └── thompson.rs # Thompson Sampling link selector
+│   │   │   ├── thompson.rs # Thompson Sampling link selector
+│   │   │   ├── kalman.rs  # Kalman filter (RTT, capacity, signal)
+│   │   │   ├── ewma.rs    # EWMA smoothing filter
+│   │   │   ├── sbd.rs     # Shared Bottleneck Detection (RFC 8382)
+│   │   │   └── fec.rs     # UEP FEC (RaptorQ + Gilbert-Elliott)
 │   │   ├── modem/
 │   │   │   ├── mod.rs
 │   │   │   ├── supervisor.rs  # QMI/MBIM polling daemon
-│   │   │   ├── kalman.rs      # RF metric smoothing
-│   │   │   └── health.rs      # Link health scoring
+│   │   │   ├── health.rs      # Link health scoring
+│   │   │   └── band.rs        # Band catalog & diversity assignment
 │   │   ├── media/
 │   │   │   ├── mod.rs
-│   │   │   ├── nal.rs     # H.264/H.265/AV1 NAL parser
+│   │   │   ├── nal.rs     # H.264/H.265 NAL parser
 │   │   │   └── priority.rs # Packet priority classification
-│   │   └── adaptation.rs  # Encoder bitrate feedback loop
+│   │   ├── net/
+│   │   │   ├── mod.rs
+│   │   │   ├── interface.rs  # Link abstraction (LinkSender trait)
+│   │   │   ├── signal.rs     # Wireless signal watermark
+│   │   │   ├── state.rs      # Link state machine (probation/alive/dead)
+│   │   │   ├── transport.rs  # UDP transport layer
+│   │   │   └── zerocopy.rs   # ZeroCopySender trait (io_uring future)
+│   │   ├── receiver/
+│   │   │   ├── mod.rs
+│   │   │   ├── aggregator.rs # Adaptive jitter buffer
+│   │   │   └── transport.rs  # Multi-link receiver
+│   │   └── protocol/
+│   │       └── header.rs     # Bonding-layer protocol header
+│   ├── tests/             # Phase 3-4 integration tests
 │   └── Cargo.toml
 │
 ├── strata-sim/            # Network simulation framework
 │   ├── src/
 │   │   ├── lib.rs
-│   │   ├── impairment.rs  # Gilbert-Elliott, Pareto, trace replay
-│   │   ├── topology.rs    # Docker bridge network management
-│   │   ├── scenario.rs    # Pre-built test scenarios
-│   │   └── controller.rs  # pyroute2-style tc management
+│   │   ├── impairment.rs  # tc netem management (delay, loss, rate)
+│   │   ├── topology.rs    # Linux namespace management
+│   │   ├── scenario.rs    # Deterministic random-walk impairment
+│   │   ├── bonding_scenarios.rs # Pre-built LinkFailure/Handover/CorrelatedFading
+│   │   └── test_util.rs   # Privilege checks, test harness helpers
+│   ├── tests/             # Tier 3: tc netem integration tests
 │   └── Cargo.toml
 │
 ├── strata-gst/            # GStreamer plugin
-│   └── ...                # Wraps strata-bonding for GStreamer pipelines
+│   ├── src/
+│   │   ├── lib.rs         # Plugin registration + unit tests
+│   │   ├── sink.rs        # stratasink GStreamer element
+│   │   ├── src.rs         # stratasrc GStreamer element
+│   │   └── bin/strata_node.rs # CLI binary (sender/receiver/loopback)
+│   └── Cargo.toml
 │
-├── strata-common/         # Shared types, config
-├── strata-control/        # Axum REST API
-├── strata-agent/          # Edge node agent (WebSocket telemetry)
-├── strata-dashboard/      # Leptos WASM web UI
-├── strata-portal/         # Cloud portal
-└── librist-sys/           # Legacy C bindings (archived)
+├── strata-common/         # Shared types, auth, IDs
+│   └── src/
+│       ├── lib.rs
+│       ├── auth.rs        # JWT token generation/validation
+│       └── ids.rs         # Type-safe ID generation
+│
+├── strata-control/        # Axum REST API + WebSocket hub
+│   ├── src/
+│   │   ├── main.rs
+│   │   ├── state.rs       # AppState (DB pool, JWT secret)
+│   │   ├── db.rs          # SQLite connection pool
+│   │   ├── ws_agent.rs    # WebSocket: agent → control plane
+│   │   ├── ws_dashboard.rs # WebSocket: dashboard → live updates
+│   │   └── api/
+│   │       ├── mod.rs
+│   │       ├── auth.rs        # POST /register, /login (JWT)
+│   │       ├── senders.rs     # Sender CRUD endpoints
+│   │       ├── streams.rs     # Stream start/stop/status
+│   │       └── destinations.rs # RTMP destination management
+│   ├── migrations/        # SQLite schema migrations
+│   ├── tests/             # API integration tests
+│   └── Cargo.toml
+│
+├── strata-agent/          # Edge node agent
+│   └── src/
+│       ├── main.rs
+│       ├── control.rs     # WebSocket session to control plane
+│       └── telemetry.rs   # Metrics collection & relay loop
+│
+├── strata-dashboard/      # Leptos WASM web UI (cloud-side)
+│   ├── src/
+│   ├── style/
+│   ├── index.html
+│   └── Trunk.toml
+│
+├── strata-portal/         # Cloud portal (public-facing UI)
+│   ├── src/
+│   ├── style/
+│   ├── index.html
+│   └── Trunk.toml
+│
+└── dev/                   # Development environment
+    ├── docker-compose.yml # Full-stack local environment
+    ├── Dockerfile.agent   # Edge agent container
+    ├── Dockerfile.control # Control plane container
+    ├── Makefile           # Development shortcuts
+    └── fast-reload.sh     # Hot-reload helper
 ```
 
 ### Dependency Graph
@@ -794,11 +977,19 @@ crates/
 strata-gst ──▶ strata-bonding ──▶ strata-transport
                      │
                      ├──▶ strata-common
+                     ├──▶ raptorq (UEP FEC)
                      └──▶ [modem supervisor uses QMI/MBIM]
 
-strata-control ──▶ strata-bonding (stats, config)
-strata-agent ──▶ strata-control (WebSocket)
-strata-dashboard ──▶ strata-control (REST API)
+strata-control ──▶ strata-common (auth, IDs)
+                     ├──▶ axum + tower (REST + WebSocket)
+                     └──▶ rusqlite (SQLite persistence)
+
+strata-agent ──▶ strata-common (auth)
+               └──▶ tokio-tungstenite (WebSocket client)
+
+strata-dashboard ──▶ strata-control (REST API, WebSocket)
+strata-portal ────▶ strata-control (REST API)
+strata-sim ──────▶ strata-bonding (ImpairmentConfig reuse)
 ```
 
 ### Key Dependencies
@@ -811,13 +1002,15 @@ strata-dashboard ──▶ strata-control (REST API)
 | `slab` | 0.4 | Pre-allocated packet pool | YES |
 | `rtrb` | 0.3 | Lock-free SPSC ring buffer | YES |
 | `quanta` | 0.12 | TSC-based nanosecond timing | YES |
-| `reed-solomon-simd` | latest | SIMD-accelerated RS FEC | YES |
+| `raptorq` | latest | RaptorQ fountain codes (UEP FEC) | YES |
 | `crossbeam-channel` | 0.5 | Inter-thread messaging | No (control) |
 | `tracing` | 0.1 | Structured logging | No (debug) |
-| `turmoil` | latest | Deterministic simulation | Test only |
 | `proptest` | 1.x | Property-based testing | Test only |
 | `tokio` | 1.x | Control plane runtime | No (control) |
 | `axum` | 0.8 | REST API server | No (control) |
+| `leptos` | latest | Leptos WASM dashboard | No (UI) |
+| `rusqlite` | latest | SQLite persistence | No (control) |
+| `jsonwebtoken` | latest | JWT auth tokens | No (control) |
 
 ---
 
@@ -864,7 +1057,7 @@ w- [x] Migrate to monoio (or tokio current_thread + SO_BUSY_POLL)
 - [x] Integrate quinn-udp for GSO/GRO
 - [x] Replace channels with rtrb SPSC ring buffers
 - [x] quanta for all timing (replace std::time::Instant)
-- [x] Benchmark: measure P50/P99 processing latency
+- [x] Benchmark: measure P50/P99 processing latency (Criterion)
 - [x] Verify < 100µs processing latency per packet
 
 ### Phase 3: Bonding (3-4 weeks)
@@ -878,6 +1071,13 @@ w- [x] Migrate to monoio (or tokio current_thread + SO_BUSY_POLL)
 - [x] Multi-link session management (one session, N links)
 - [x] Per-link Biscay congestion control (BBRv3 base)
 - [x] Kalman filter for RTT/capacity smoothing
+- [x] EWMA smoothing filter for scheduler metrics
+- [x] `BondingScheduler` compositor (IoDS + BLEST + Thompson + DWRR + Kalman)
+- [x] Shared Bottleneck Detection (RFC 8382) — link grouping via OWD analysis
+- [x] Network abstraction layer (`net/interface.rs`, `signal.rs`, `state.rs`, `transport.rs`)
+- [x] Signal watermark (`/proc/net/wireless` and sysfs polling)
+- [x] Link state machine (probation → alive → dead, with escalating logging)
+- [x] ZeroCopySender trait + FallbackSender (future io_uring integration point)
 - [x] Deterministic simulation: 3 links, heterogeneous RTTs, all delivered
 - [x] Deterministic simulation: link failure mid-stream — seamless failover
 - [x] Docker simulation: 3 bridge networks, tc netem impairment
@@ -894,9 +1094,12 @@ seamless link failover.
 - [x] CQI derivative tracking → CAUTIOUS state
 - [x] Handover detection (RSRP slope) → PRE_HANDOVER state
 - [x] Link health score computation and export
-- [x] NAL unit parser (H.264 first, then H.265, AV1)
+- [x] NAL unit parser (H.264, H.265)
 - [x] Priority classification → scheduler weight adjustment
 - [x] Encoder bitrate feedback loop (BITRATE_CMD)
+- [x] UEP FEC at bonding layer (RaptorQ + Gilbert-Elliott channel model)
+- [x] Band catalog with tier system and diversity assignment algorithm
+- [x] TOML configuration system (`BondingConfigInput` → `SchedulerConfig`)
 - [ ] Docker simulation with Mahimahi cellular traces
 
 **Milestone**: Radio-aware routing, predictive handover, media-prioritized
@@ -921,16 +1124,23 @@ scheduling.
 - [x] Dynamic jitter buffer (adaptive sizing based on network conditions)
 - ~~SRT/RTMP/NDI output bridges~~ *(GStreamer handles output conversion)*
 - [x] Control plane REST API (strata-control)
-- [x] Web dashboard (strata-dashboard, Leptos)
+- [x] JWT authentication (register / login)
+- [x] RTMP destination management (YouTube, custom RTMP endpoints)
+- [x] Dual WebSocket hub (agent ↔ control ↔ dashboard)
+- [x] SQLite persistence with schema migrations
+- [x] Web dashboard (strata-dashboard, Leptos CSR WASM)
+- [x] Cloud portal (strata-portal, Leptos CSR WASM)
 - [ ] Fleet management basics (multi-unit telemetry, web UI)
 
 ### Phase 7: Hardening (Ongoing)
 
-- [x] Fuzz testing (cargo-fuzz on wire parser)
-- [ ] Sliding-window RLNC (replace block RS)
+- [x] Fuzz testing (cargo-fuzz on wire parser + receiver state machine)
+- [x] Sliding-window RLNC (replace block RS in strata-transport)
 - [x] Upgrade to monoio with io_uring SQPOLL
 - [x] Band locking automation
+- [x] Development environment (Docker Compose, Dockerfiles, fast-reload)
 - [ ] Mahimahi network simulation traces (Docker-based)
+- [ ] AV1 OBU parser (when AV1-SVC hardware encoders become available)
 
 ---
 
@@ -960,12 +1170,14 @@ This plan synthesizes findings from 7 research documents:
 
 | Term | Definition |
 |---|---|
-| RLNC | Random Linear Network Coding — sliding window erasure code |
+| RLNC | Random Linear Network Coding — sliding-window erasure code over GF(2^8) |
+| UEP | Unequal Error Protection — differential FEC overhead by media priority |
 | TAROT | Adaptive FEC rate optimization cost function |
 | Biscay | Radio-aware congestion control (BBRv3 + SINR/CQI) |
 | IoDS | In-order Delivery Scheduler |
 | BLEST | BLocking ESTimation scheduler |
 | DWRR | Deficit Weighted Round Robin |
+| SBD | Shared Bottleneck Detection (RFC 8382) |
 | SINR | Signal-to-Interference-plus-Noise Ratio |
 | CQI | Channel Quality Indicator |
 | RSRP | Reference Signal Received Power |
@@ -976,3 +1188,4 @@ This plan synthesizes findings from 7 research documents:
 | MCS | Modulation and Coding Scheme |
 | OWD | One-Way Delay |
 | DST | Deterministic Simulation Testing |
+| GF(2^8) | Galois Field with 256 elements — arithmetic field for RLNC coding |
