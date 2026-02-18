@@ -5,8 +5,8 @@ use leptos::prelude::*;
 
 use crate::api;
 use crate::types::{
-    DashboardEvent, LinkStats, MediaInput, NetworkInterface, SenderDetail, SenderFullStatus,
-    StreamSummary, TestRunResponse,
+    DashboardEvent, EncoderConfig, LinkStats, MediaInput, NetworkInterface, SenderDetail,
+    SenderFullStatus, SourceConfig, StreamSummary, TestRunResponse,
 };
 use crate::ws::WsClient;
 use crate::AuthState;
@@ -61,6 +61,17 @@ pub fn SenderDetailPage() -> impl IntoView {
     let (destinations, set_destinations) = signal(Vec::<crate::types::DestinationSummary>::new());
     let (selected_dest, set_selected_dest) = signal(Option::<String>::None);
     let (dests_loading, set_dests_loading) = signal(false);
+
+    // Stream config signals
+    let (cfg_source_mode, set_cfg_source_mode) = signal(String::from("test"));
+    let (cfg_resolution, set_cfg_resolution) = signal(String::from("1920x1080"));
+    let (cfg_framerate, set_cfg_framerate) = signal(30u32);
+    let (cfg_codec, set_cfg_codec) = signal(String::from("h265"));
+    let (cfg_bitrate, set_cfg_bitrate) = signal(5000u32);
+    let (cfg_min_bitrate, set_cfg_min_bitrate) = signal(3000u32);
+    let (cfg_max_bitrate, set_cfg_max_bitrate) = signal(6000u32);
+    let (cfg_test_pattern, set_cfg_test_pattern) = signal(String::from("smpte"));
+    let (cfg_device, set_cfg_device) = signal(String::from("/dev/video0"));
 
     // Receiver URL change confirmation
     let (show_receiver_confirm, set_show_receiver_confirm) = signal(false);
@@ -196,10 +207,33 @@ pub fn SenderDetailPage() -> impl IntoView {
         let id = params.get().get("id").unwrap_or_default();
         let token = auth_start2.token.get_untracked().unwrap_or_default();
         let dest_id = selected_dest.get_untracked();
+        let source_mode = cfg_source_mode.get_untracked();
+
+        let source = Some(SourceConfig {
+            mode: source_mode.clone(),
+            device: if source_mode == "v4l2" {
+                Some(cfg_device.get_untracked())
+            } else {
+                None
+            },
+            uri: None,
+            resolution: Some(cfg_resolution.get_untracked()),
+            framerate: Some(cfg_framerate.get_untracked()),
+        });
+
+        let encoder = Some(EncoderConfig {
+            bitrate_kbps: cfg_bitrate.get_untracked(),
+            tune: Some("zerolatency".into()),
+            keyint_max: Some(cfg_framerate.get_untracked() * 2),
+            codec: Some(cfg_codec.get_untracked()),
+            min_bitrate_kbps: Some(cfg_min_bitrate.get_untracked()),
+            max_bitrate_kbps: Some(cfg_max_bitrate.get_untracked()),
+        });
+
         set_action_loading.set(true);
         set_show_start_modal.set(false);
         leptos::task::spawn_local(async move {
-            match api::start_stream(&token, &id, dest_id).await {
+            match api::start_stream(&token, &id, dest_id, source, encoder).await {
                 Ok(resp) => {
                     set_stream_state.set(resp.state);
                     set_action_loading.set(false);
@@ -320,17 +354,175 @@ pub fn SenderDetailPage() -> impl IntoView {
                 <div class="alert alert-error text-sm mb-4">{e}</div>
             })}
 
-            // ── Start Stream — Destination Picker (outside sender reactive scope) ──
+            // ── Start Stream — Stream Config Modal ──
             {move || show_start_modal.get().then(|| {
                 view! {
                     <div class="modal modal-open">
-                        <div class="modal-box">
+                        <div class="modal-box max-w-2xl">
                             <h3 class="font-bold text-lg">"Start Stream"</h3>
-                            <p class="text-sm text-base-content/60 mt-2">
-                                "Select a destination for the stream, or start without one for bonded RIST only."
-                            </p>
 
+                            // ── Source Selection ──
                             <div class="mt-4">
+                                <h4 class="text-sm font-semibold text-base-content/60 uppercase tracking-wide mb-2">"Video Source"</h4>
+                                <div class="flex gap-2">
+                                    <button
+                                        class=move || if cfg_source_mode.get() == "test" { "btn btn-sm btn-primary" } else { "btn btn-sm btn-ghost" }
+                                        on:click=move |_| set_cfg_source_mode.set("test".into())
+                                    >"Test Pattern"</button>
+                                    <button
+                                        class=move || if cfg_source_mode.get() == "v4l2" { "btn btn-sm btn-primary" } else { "btn btn-sm btn-ghost" }
+                                        on:click=move |_| set_cfg_source_mode.set("v4l2".into())
+                                    >"Camera / Capture"</button>
+                                </div>
+
+                                // Test pattern picker
+                                {move || (cfg_source_mode.get() == "test").then(|| view! {
+                                    <div class="flex gap-2 mt-2">
+                                        {["smpte", "ball", "snow", "black"].into_iter().map(|p| {
+                                            let p_str = p.to_string();
+                                            let p_str2 = p.to_string();
+                                            let label = match p {
+                                                "smpte" => "Colour Bars",
+                                                "ball" => "Bouncing Ball",
+                                                "snow" => "Noise",
+                                                "black" => "Black",
+                                                _ => p,
+                                            };
+                                            view! {
+                                                <button
+                                                    class=move || if cfg_test_pattern.get() == p_str { "btn btn-xs btn-accent" } else { "btn btn-xs btn-ghost" }
+                                                    on:click=move |_| set_cfg_test_pattern.set(p_str2.clone())
+                                                >{label}</button>
+                                            }
+                                        }).collect::<Vec<_>>()}
+                                    </div>
+                                })}
+
+                                // Camera device selector (from detected media inputs)
+                                {move || (cfg_source_mode.get() == "v4l2").then(|| {
+                                    let inputs = hw_inputs.get();
+                                    let cameras: Vec<_> = inputs.iter().filter(|i| i.input_type == "video").collect();
+                                    view! {
+                                        <div class="mt-2">
+                                            {if cameras.is_empty() {
+                                                view! { <p class="text-sm text-base-content/40">"No cameras detected"</p> }.into_any()
+                                            } else {
+                                                view! {
+                                                    <select
+                                                        class="select select-bordered select-sm w-full"
+                                                        on:change=move |ev| set_cfg_device.set(event_target_value(&ev))
+                                                    >
+                                                        {cameras.iter().map(|c| {
+                                                            let dev = c.device.clone();
+                                                            let label = format!("{} ({})", c.label, c.device);
+                                                            view! { <option value={dev}>{label}</option> }
+                                                        }).collect::<Vec<_>>()}
+                                                    </select>
+                                                }.into_any()
+                                            }}
+                                        </div>
+                                    }
+                                })}
+                            </div>
+
+                            // ── Resolution / Framerate / Codec ──
+                            <div class="grid grid-cols-3 gap-3 mt-4">
+                                <fieldset class="fieldset">
+                                    <label class="fieldset-label">"Resolution"</label>
+                                    <select
+                                        class="select select-bordered select-sm w-full"
+                                        prop:value=move || cfg_resolution.get()
+                                        on:change=move |ev| set_cfg_resolution.set(event_target_value(&ev))
+                                    >
+                                        <option value="1280x720">"720p"</option>
+                                        <option value="1920x1080">"1080p"</option>
+                                        <option value="2560x1440">"1440p"</option>
+                                        <option value="3840x2160">"4K"</option>
+                                    </select>
+                                </fieldset>
+                                <fieldset class="fieldset">
+                                    <label class="fieldset-label">"Framerate"</label>
+                                    <select
+                                        class="select select-bordered select-sm w-full"
+                                        prop:value=move || cfg_framerate.get().to_string()
+                                        on:change=move |ev| {
+                                            if let Ok(v) = event_target_value(&ev).parse::<u32>() {
+                                                set_cfg_framerate.set(v);
+                                            }
+                                        }
+                                    >
+                                        <option value="24">"24 fps"</option>
+                                        <option value="25">"25 fps"</option>
+                                        <option value="30">"30 fps"</option>
+                                        <option value="50">"50 fps"</option>
+                                        <option value="60">"60 fps"</option>
+                                    </select>
+                                </fieldset>
+                                <fieldset class="fieldset">
+                                    <label class="fieldset-label">"Codec"</label>
+                                    <select
+                                        class="select select-bordered select-sm w-full"
+                                        prop:value=move || cfg_codec.get()
+                                        on:change=move |ev| set_cfg_codec.set(event_target_value(&ev))
+                                    >
+                                        <option value="h265">"H.265 (HEVC)"</option>
+                                        <option value="h264">"H.264 (AVC)"</option>
+                                    </select>
+                                </fieldset>
+                            </div>
+
+                            // ── Bitrate Controls ──
+                            <div class="mt-4">
+                                <h4 class="text-sm font-semibold text-base-content/60 uppercase tracking-wide mb-2">"Bitrate"</h4>
+                                <div class="grid grid-cols-3 gap-3">
+                                    <fieldset class="fieldset">
+                                        <label class="fieldset-label">"Min (kbps)"</label>
+                                        <input
+                                            type="number"
+                                            class="input input-bordered input-sm w-full font-mono"
+                                            prop:value=move || cfg_min_bitrate.get().to_string()
+                                            on:change=move |ev| {
+                                                if let Ok(v) = event_target_value(&ev).parse::<u32>() {
+                                                    set_cfg_min_bitrate.set(v);
+                                                }
+                                            }
+                                        />
+                                    </fieldset>
+                                    <fieldset class="fieldset">
+                                        <label class="fieldset-label">"Target (kbps)"</label>
+                                        <input
+                                            type="number"
+                                            class="input input-bordered input-sm w-full font-mono"
+                                            prop:value=move || cfg_bitrate.get().to_string()
+                                            on:change=move |ev| {
+                                                if let Ok(v) = event_target_value(&ev).parse::<u32>() {
+                                                    set_cfg_bitrate.set(v);
+                                                }
+                                            }
+                                        />
+                                    </fieldset>
+                                    <fieldset class="fieldset">
+                                        <label class="fieldset-label">"Max (kbps)"</label>
+                                        <input
+                                            type="number"
+                                            class="input input-bordered input-sm w-full font-mono"
+                                            prop:value=move || cfg_max_bitrate.get().to_string()
+                                            on:change=move |ev| {
+                                                if let Ok(v) = event_target_value(&ev).parse::<u32>() {
+                                                    set_cfg_max_bitrate.set(v);
+                                                }
+                                            }
+                                        />
+                                    </fieldset>
+                                </div>
+                                <p class="text-xs text-base-content/40 mt-1">
+                                    "Smart defaults based on resolution, framerate, and codec. Adjust manually if needed."
+                                </p>
+                            </div>
+
+                            // ── Destination ──
+                            <div class="mt-4">
+                                <h4 class="text-sm font-semibold text-base-content/60 uppercase tracking-wide mb-2">"Destination"</h4>
                                 {move || {
                                     if dests_loading.get() {
                                         view! { <p class="text-sm text-base-content/40">"Loading destinations…"</p> }.into_any()
@@ -338,7 +530,6 @@ pub fn SenderDetailPage() -> impl IntoView {
                                         let dests = destinations.get();
                                         view! {
                                             <div class="flex flex-col gap-2">
-                                                // "No destination" option — RIST-only
                                                 <label class="flex items-center gap-3 p-3 bg-base-300 rounded cursor-pointer hover:bg-base-content/10 border border-base-300"
                                                     class:border-primary=move || selected_dest.get().is_none()
                                                 >
@@ -350,12 +541,11 @@ pub fn SenderDetailPage() -> impl IntoView {
                                                         on:change=move |_| set_selected_dest.set(None)
                                                     />
                                                     <div>
-                                                        <div class="font-medium text-sm">"Bonded RIST Only"</div>
+                                                        <div class="font-medium text-sm">"Bonded Strata Only"</div>
                                                         <div class="text-xs text-base-content/60">"Stream to the configured receiver without an RTMP relay"</div>
                                                     </div>
                                                 </label>
 
-                                                // Destination options
                                                 {dests.iter().map(|d| {
                                                     let d_id = d.id.clone();
                                                     let d_id3 = d.id.clone();
@@ -541,7 +731,7 @@ pub fn SenderDetailPage() -> impl IntoView {
                                     })}
 
                                     <p class="text-sm text-base-content/60 mb-3">
-                                        "Set the RIST receiver address this sender will transmit to."
+                                        "Set the receiver address this sender will transmit to."
                                     </p>
 
                                     <div class="flex gap-3 items-end">
@@ -550,7 +740,7 @@ pub fn SenderDetailPage() -> impl IntoView {
                                             <input
                                                 class="input input-bordered w-full"
                                                 type="text"
-                                                placeholder="rist://receiver.example.com:5000"
+                                                placeholder="strata://receiver.example.com:5000"
                                                 prop:value=move || receiver_input.get()
                                                 disabled=!is_online
                                                 on:input=move |ev| {

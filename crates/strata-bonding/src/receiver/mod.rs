@@ -16,7 +16,7 @@ use self::transport::TransportBondingReceiver;
 /// Bonding receiver backed by the pure-Rust strata-transport layer.
 ///
 /// Wraps [`TransportBondingReceiver`] and provides URI parsing for
-/// backward compatibility with both `host:port` and legacy `rist://` formats.
+/// backward compatibility with `host:port`, `strata://`, and legacy `rist://` formats.
 pub struct ReceiverBackend {
     inner: TransportBondingReceiver,
 }
@@ -31,8 +31,8 @@ impl ReceiverBackend {
 
     /// Add a link by address string.
     ///
-    /// Accepts both plain socket addresses (e.g. `0.0.0.0:5000`) and
-    /// legacy `rist://` URIs for backward compatibility.
+    /// Accepts plain socket addresses (e.g. `0.0.0.0:5000`), `strata://`
+    /// URIs, and legacy `rist://` URIs for backward compatibility.
     pub fn add_link(&self, addr: &str) -> Result<()> {
         let socket_addr = parse_receiver_addr(addr)?;
         self.inner.add_link(socket_addr)
@@ -61,12 +61,13 @@ impl ReceiverBackend {
 
 /// Parse a receiver address string to a `SocketAddr`.
 ///
-/// Supports plain `host:port` format and legacy `rist://` URIs for
-/// backward compatibility.
+/// Supports plain `host:port` format, `strata://` URIs, and legacy
+/// `rist://` URIs for backward compatibility.
 fn parse_receiver_addr(addr: &str) -> Result<SocketAddr> {
-    // Strip legacy rist:// prefix if present
     if let Some(stripped) = addr
-        .strip_prefix("rist://@")
+        .strip_prefix("strata://@")
+        .or_else(|| addr.strip_prefix("strata://"))
+        .or_else(|| addr.strip_prefix("rist://@"))
         .or_else(|| addr.strip_prefix("rist://"))
     {
         let host_port = stripped.split('?').next().unwrap_or(stripped);
@@ -85,14 +86,20 @@ mod tests {
 
     #[test]
     fn parse_receiver_addr_listener() {
-        let addr = parse_receiver_addr("rist://@0.0.0.0:5000").unwrap();
+        let addr = parse_receiver_addr("strata://@0.0.0.0:5000").unwrap();
         assert_eq!(addr, "0.0.0.0:5000".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
     fn parse_receiver_addr_sender() {
-        let addr = parse_receiver_addr("rist://127.0.0.1:6000").unwrap();
+        let addr = parse_receiver_addr("strata://127.0.0.1:6000").unwrap();
         assert_eq!(addr, "127.0.0.1:6000".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn parse_receiver_addr_legacy_rist() {
+        let addr = parse_receiver_addr("rist://@0.0.0.0:5000").unwrap();
+        assert_eq!(addr, "0.0.0.0:5000".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
@@ -103,7 +110,7 @@ mod tests {
 
     #[test]
     fn parse_receiver_addr_with_query() {
-        let addr = parse_receiver_addr("rist://@0.0.0.0:5000?miface=eth0").unwrap();
+        let addr = parse_receiver_addr("strata://@0.0.0.0:5000?miface=eth0").unwrap();
         assert_eq!(addr, "0.0.0.0:5000".parse::<SocketAddr>().unwrap());
     }
 

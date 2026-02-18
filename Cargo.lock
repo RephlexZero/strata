@@ -3868,6 +3868,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strata-bonding",
+ "strata-common",
  "tracing",
 ]
 

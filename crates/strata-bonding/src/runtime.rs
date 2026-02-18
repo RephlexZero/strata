@@ -333,11 +333,13 @@ fn apply_link(
     }
 }
 
-/// Parse a URI (e.g. `rist://1.2.3.4:5000` or `1.2.3.4:5000`) to a `SocketAddr`.
+/// Parse a URI (e.g. `strata://1.2.3.4:5000` or `1.2.3.4:5000`) to a `SocketAddr`.
 fn parse_uri(uri: &str) -> Option<SocketAddr> {
-    // Strip legacy rist:// prefix if present
     let stripped = uri
-        .strip_prefix("rist://@")
+        .strip_prefix("strata://@")
+        .or_else(|| uri.strip_prefix("strata://"))
+        // Accept legacy rist:// URIs for backward compat
+        .or_else(|| uri.strip_prefix("rist://@"))
         .or_else(|| uri.strip_prefix("rist://"))
         .unwrap_or(uri);
     // Strip query parameters
@@ -574,20 +576,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_uri_strata_scheme() {
+        let addr = parse_uri("strata://127.0.0.1:5000").unwrap();
+        assert_eq!(addr, "127.0.0.1:5000".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn parse_uri_strata_listener() {
+        let addr = parse_uri("strata://@0.0.0.0:5000").unwrap();
+        assert_eq!(addr, "0.0.0.0:5000".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
     fn parse_uri_legacy_rist() {
         let addr = parse_uri("rist://127.0.0.1:5000").unwrap();
         assert_eq!(addr, "127.0.0.1:5000".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
-    fn parse_uri_legacy_rist_listener() {
-        let addr = parse_uri("rist://@0.0.0.0:5000").unwrap();
-        assert_eq!(addr, "0.0.0.0:5000".parse::<SocketAddr>().unwrap());
-    }
-
-    #[test]
     fn parse_uri_with_query() {
-        let addr = parse_uri("rist://10.0.0.1:6000?miface=eth0").unwrap();
+        let addr = parse_uri("strata://10.0.0.1:6000?miface=eth0").unwrap();
         assert_eq!(addr, "10.0.0.1:6000".parse::<SocketAddr>().unwrap());
     }
 

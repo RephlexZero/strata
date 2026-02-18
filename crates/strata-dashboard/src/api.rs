@@ -124,8 +124,14 @@ pub async fn start_stream(
     token: &str,
     sender_id: &str,
     destination_id: Option<String>,
+    source: Option<crate::types::SourceConfig>,
+    encoder: Option<crate::types::EncoderConfig>,
 ) -> ApiResult<StartStreamResponse> {
-    let body = StartStreamRequest { destination_id };
+    let body = StartStreamRequest {
+        destination_id,
+        source,
+        encoder,
+    };
     let resp = Request::post(&format!("/api/streams/start/{sender_id}"))
         .header("Authorization", &auth_header(token))
         .json(&body)

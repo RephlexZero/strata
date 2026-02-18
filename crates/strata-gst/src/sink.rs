@@ -5,7 +5,7 @@ use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
 use std::collections::HashMap;
-use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Mutex};
+use std::sync::{atomic::AtomicBool, atomic::AtomicU32, atomic::Ordering, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use strata_bonding::adaptation::{
     AdaptationConfig, BitrateAdapter, LinkCapacity, ReceiverFeedback,
@@ -60,6 +60,10 @@ mod imp {
         pub(crate) pad_map: Mutex<HashMap<String, usize>>,
         pub(crate) pending_links: Mutex<HashMap<usize, LinkConfig>>,
         pub(crate) scheduler_config: Mutex<SchedulerConfig>,
+
+        /// Bitrate envelope for adaptation (set via properties).
+        pub(crate) adaptation_min_kbps: AtomicU32,
+        pub(crate) adaptation_max_kbps: AtomicU32,
     }
 
     impl Default for StrataSink {
@@ -73,6 +77,8 @@ mod imp {
                 pad_map: Mutex::new(HashMap::new()),
                 pending_links: Mutex::new(HashMap::new()),
                 scheduler_config: Mutex::new(SchedulerConfig::default()),
+                adaptation_min_kbps: AtomicU32::new(500),
+                adaptation_max_kbps: AtomicU32::new(25_000),
             }
         }
     }
@@ -399,6 +405,9 @@ mod imp {
             let running = self.stats_running.clone();
             running.store(true, Ordering::Relaxed);
 
+            let adapt_min = self.adaptation_min_kbps.load(Ordering::Relaxed);
+            let adapt_max = self.adaptation_max_kbps.load(Ordering::Relaxed);
+
             let handle = std::thread::Builder::new()
                 .name("strata-stats".into())
                 .spawn(move || {
@@ -408,8 +417,8 @@ mod imp {
                     let mut stats_seq: u64 = 0;
 
                     let mut adapter = BitrateAdapter::new(AdaptationConfig {
-                        max_bitrate_kbps: 25_000, // 4K60 AV1 YouTube ceiling
-                        min_bitrate_kbps: 500,
+                        max_bitrate_kbps: adapt_max,
+                        min_bitrate_kbps: adapt_min,
                         ..AdaptationConfig::default()
                     });
 
@@ -674,6 +683,16 @@ impl StrataSink {
         if let Some(rt) = runtime.as_ref() {
             rt.set_degradation_stage(stage);
         }
+    }
+
+    /// Set the bitrate adaptation envelope (must be called before PLAYING).
+    pub fn set_adaptation_envelope(&self, min_kbps: u32, max_kbps: u32) {
+        self.imp()
+            .adaptation_min_kbps
+            .store(min_kbps, Ordering::Relaxed);
+        self.imp()
+            .adaptation_max_kbps
+            .store(max_kbps, Ordering::Relaxed);
     }
 }
 

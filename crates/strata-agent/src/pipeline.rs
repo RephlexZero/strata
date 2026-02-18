@@ -250,6 +250,19 @@ fn spawn_strata_node(payload: &StreamStartPayload) -> anyhow::Result<Child> {
     cmd.arg("--bitrate")
         .arg(payload.encoder.bitrate_kbps.to_string());
 
+    // Codec (default h265)
+    if let Some(ref codec) = payload.encoder.codec {
+        cmd.arg("--codec").arg(codec);
+    }
+
+    // Bitrate envelope for adaptation
+    if let Some(min) = payload.encoder.min_bitrate_kbps {
+        cmd.arg("--min-bitrate").arg(min.to_string());
+    }
+    if let Some(max) = payload.encoder.max_bitrate_kbps {
+        cmd.arg("--max-bitrate").arg(max.to_string());
+    }
+
     // Framerate (from source config, default 30)
     if let Some(fps) = payload.source.framerate {
         cmd.arg("--framerate").arg(fps.to_string());

@@ -2,7 +2,7 @@
 //!
 //! Generates `BitrateCmd` control packets based on aggregate link capacity,
 //! degradation stage, and congestion signals. This is the "encoder feedback
-//! loop" that separates Strata from SRT/RIST.
+//! loop" that separates Strata from SRT and block-FEC approaches.
 //!
 //! ## Policy
 //!

@@ -9,4 +9,5 @@
 pub mod auth;
 pub mod ids;
 pub mod models;
+pub mod profiles;
 pub mod protocol;

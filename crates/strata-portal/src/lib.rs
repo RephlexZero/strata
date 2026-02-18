@@ -275,7 +275,7 @@ pub fn App() -> impl IntoView {
                     })}
 
                     <p class="text-sm text-base-content/60 mb-3">
-                        "Set the RIST receiver address this sender will transmit to."
+                        "Set the receiver address this sender will transmit to."
                     </p>
 
                     <div class="flex gap-3 items-end">
@@ -284,7 +284,7 @@ pub fn App() -> impl IntoView {
                             <input
                                 class="input input-bordered w-full"
                                 type="text"
-                                placeholder="rist://receiver.example.com:5000"
+                                placeholder="strata://receiver.example.com:5000"
                                 prop:value=move || receiver_input.get()
                                 on:input=move |ev| {
                                     set_receiver_input.set(event_target_value(&ev));

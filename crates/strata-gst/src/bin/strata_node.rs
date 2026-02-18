@@ -18,7 +18,9 @@ OPTIONS:
   --uri <uri>         Media URI for uridecodebin (used with --source uri)
                       e.g. file:///home/user/video.mp4
   --bitrate <kbps>    Target encoder bitrate in kbps (default: 2000)
-  --codec <codec>      Video codec: h264 (default) or h265/hevc
+  --codec <codec>      Video codec: h265 (default) or h264
+  --min-bitrate <kbps> Minimum bitrate for adaptation (default: from profile)
+  --max-bitrate <kbps> Maximum bitrate for adaptation (default: from profile)
   --framerate <fps>   Video framerate (default: 30)
   --audio             Add silent AAC audio track (required for RTMP targets)
   --config <path>     Path to TOML config file (see Configuration Reference)
@@ -73,7 +75,7 @@ OPTIONS:
   --output <path>     Record to file (.ts = raw MPEG-TS, .mp4 = remuxed)
   --relay-url <url>   RTMP/RTMPS URL to relay the received stream to
                       e.g. rtmp://a.rtmp.youtube.com/live2/STREAM_KEY
-  --codec <codec>     Codec of incoming stream: h264 (default) or h265
+  --codec <codec>     Codec of incoming stream: h265 (default) or h264
   --config <path>     Path to TOML config file (see Configuration Reference)
   --metrics-port <port> Start Prometheus metrics endpoint on this port
                         (serves /metrics on 0.0.0.0:<port>)
@@ -155,7 +157,9 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut resolution = "1280x720";
     let mut relay_url = "";
     let mut metrics_port: Option<u16> = None;
-    let mut codec_str = "h264";
+    let mut codec_str = "h265";
+    let mut min_bitrate_kbps: Option<u32> = None;
+    let mut max_bitrate_kbps: Option<u32> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -178,6 +182,14 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--codec" if i + 1 < args.len() => {
                 codec_str = &args[i + 1];
+                i += 1;
+            }
+            "--min-bitrate" if i + 1 < args.len() => {
+                min_bitrate_kbps = Some(args[i + 1].parse().unwrap_or(500));
+                i += 1;
+            }
+            "--max-bitrate" if i + 1 < args.len() => {
+                max_bitrate_kbps = Some(args[i + 1].parse().unwrap_or(25000));
                 i += 1;
             }
             "--framerate" if i + 1 < args.len() => {
@@ -269,7 +281,11 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         gststrata::codec::CodecType::H264
     });
     let codec_ctrl = gststrata::codec::CodecController::new(codec_type);
-    let max_bitrate_kbps = 25000u32;
+    // Resolve min/max from CLI or profile defaults
+    let profile =
+        strata_common::profiles::lookup_profile(Some(resolution), Some(framerate), Some(codec_str));
+    let min_bitrate_kbps_val = min_bitrate_kbps.unwrap_or(profile.min_kbps);
+    let max_bitrate_kbps_val = max_bitrate_kbps.unwrap_or(profile.max_kbps);
 
     // Build the pipeline with input-selector.
     // The test source is always available as the fallback.
@@ -320,7 +336,8 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "! queue ! mux.".to_string()
     };
 
-    let enc_fragment = codec_ctrl.pipeline_fragment("enc", bitrate_kbps, key_int, max_bitrate_kbps);
+    let enc_fragment =
+        codec_ctrl.pipeline_fragment("enc", bitrate_kbps, key_int, max_bitrate_kbps_val);
 
     let pipeline_str = format!(
         "videotestsrc name=testsrc is-live=true pattern=smpte \
@@ -413,6 +430,18 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         return Err("Failed to find stratasink element".into());
+    }
+
+    // ── Set bitrate adaptation envelope ──
+    if let Some(sink) = pipeline.by_name("rsink") {
+        let strata_sink = sink
+            .downcast::<gststrata::sink::StrataSink>()
+            .expect("rsink is not a StrataSink");
+        strata_sink.set_adaptation_envelope(min_bitrate_kbps_val, max_bitrate_kbps_val);
+        eprintln!(
+            "Adaptation envelope: {}–{} kbps",
+            min_bitrate_kbps_val, max_bitrate_kbps_val
+        );
     }
 
     // ── Stats relay (always if stats-dest is configured) ──
@@ -572,9 +601,11 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// Parses the host from `host:port` and runs
 /// `ip route get <host>` to determine the outgoing interface.
 fn resolve_interface_for_uri(uri: &str) -> Option<String> {
-    // Strip any legacy rist:// prefix for backwards compat
+    // Strip strata:// or legacy rist:// prefix for backwards compat
     let stripped = uri
-        .strip_prefix("rist://")
+        .strip_prefix("strata://")
+        .or_else(|| uri.strip_prefix("strata://@"))
+        .or_else(|| uri.strip_prefix("rist://"))
         .or_else(|| uri.strip_prefix("rist://@"))
         .unwrap_or(uri);
     let host = stripped.split(':').next()?;
@@ -1022,7 +1053,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut output_file = "";
     let mut config_path = "";
     let mut relay_url = "";
-    let mut codec_str = "h264";
+    let mut codec_str = "h265";
     let mut metrics_port: Option<u16> = None;
     let mut i = 0;
     while i < args.len() {

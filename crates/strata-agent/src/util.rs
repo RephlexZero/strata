@@ -21,7 +21,8 @@ pub async fn check_tcp_reachable(url: &str, timeout_secs: u64) -> bool {
 
 /// Extract host:port from various URL schemes.
 ///
-/// Handles `ws://`, `wss://`, `http://`, `https://`, `rist://`, `srt://`.
+/// Handles `ws://`, `wss://`, `http://`, `https://`, `strata://`, `srt://`.
+/// Also accepts legacy `rist://` for backward compatibility.
 /// Strips the path portion (everything after the first `/` past the scheme).
 fn extract_host(url: &str) -> String {
     let stripped = url
@@ -29,6 +30,7 @@ fn extract_host(url: &str) -> String {
         .trim_start_matches("wss://")
         .trim_start_matches("http://")
         .trim_start_matches("https://")
+        .trim_start_matches("strata://")
         .trim_start_matches("rist://")
         .trim_start_matches("srt://");
     stripped.split('/').next().unwrap_or("").to_string()
@@ -46,7 +48,7 @@ mod tests {
             "cloud.example.com:443"
         );
         assert_eq!(
-            extract_host("rist://192.168.1.100:5000"),
+            extract_host("strata://192.168.1.100:5000"),
             "192.168.1.100:5000"
         );
         assert_eq!(extract_host("srt://receiver:4000/stream"), "receiver:4000");
