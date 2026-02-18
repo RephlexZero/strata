@@ -1,9 +1,10 @@
+# syntax=docker/dockerfile:1.7-labs
+
 # ── Stage 1: Build portal WASM ───────────────────────────────
 FROM rust:1.93-bookworm AS portal
 
 # Node.js required for Tailwind CSS / DaisyUI pre-build hook
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm && \
     rm -rf /var/lib/apt/lists/*
 
 RUN rustup target add wasm32-unknown-unknown && \
@@ -24,7 +25,8 @@ members = ["crates/strata-portal"]
 TOML
 
 # Install Tailwind CSS + DaisyUI and build CSS, then build WASM with trunk
-RUN cd crates/strata-portal && \
+RUN --mount=type=cache,target=/root/.npm \
+    cd crates/strata-portal && \
     npm init -y && npm install @tailwindcss/cli daisyui && \
     npx @tailwindcss/cli -i style/input.css -o style/main.css --minify && \
     trunk build --release
@@ -79,6 +81,8 @@ crossbeam-channel = "0.5.15"
 arc-swap = "1.7"
 compact_str = "0.8"
 rtrb = "0.3"
+quanta = "0.12"
+quinn-udp = "0.5"
 raptorq = "2.0"
 rand = "0.10.0"
 
@@ -89,7 +93,9 @@ panic = "abort"
 TOML
 
 # Build integration_node binary AND libgststrata.so plugin
-RUN cargo build --release -p strata-gst
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    cargo build --release -p strata-gst
 
 # ── Stage 3: Build strata-agent ──────────────────────────────
 FROM rust:1.93-bookworm AS builder
@@ -127,14 +133,18 @@ RUN mkdir -p crates/strata-common/src && echo "" > crates/strata-common/src/lib.
     mkdir -p crates/strata-agent/src && echo "fn main() {}" > crates/strata-agent/src/main.rs
 
 # Pre-build deps
-RUN cargo build --release -p strata-agent 2>/dev/null || true
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    cargo build --release -p strata-agent 2>/dev/null || true
 
 # Copy real source
 COPY crates/strata-common/src crates/strata-common/src
 COPY crates/strata-agent/src crates/strata-agent/src
 
 # Build for real
-RUN touch crates/strata-common/src/lib.rs crates/strata-agent/src/main.rs && \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    touch crates/strata-common/src/lib.rs crates/strata-agent/src/main.rs && \
     cargo build --release -p strata-agent
 
 # ── Stage 4: Runtime ────────────────────────────────────────
@@ -142,6 +152,7 @@ FROM debian:12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     iproute2 \
     gstreamer1.0-plugins-base \
     gstreamer1.0-plugins-good \
@@ -152,11 +163,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgstreamer1.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# Bundle a sample video for dev testing (Big Buck Bunny 30s 1080p30, ~7MB, CC BY 3.0)
+RUN mkdir -p /opt/strata/test-media && \
+    curl -fSL -o /opt/strata/test-media/sample.mp4 \
+    "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/1080/Big_Buck_Bunny_1080_10s_30MB.mp4" || \
+    echo "Warning: failed to download sample video, dev file source will not work"
+
 # Agent binary
 COPY --from=builder /src/target/release/strata-agent /usr/local/bin/strata-agent
 
 # Pipeline binary + GStreamer bonding plugin
-COPY --from=pipeline /src/target/release/strata_node /usr/local/bin/strata_node
+COPY --from=pipeline /src/target/release/strata-node /usr/local/bin/strata-node
 COPY --from=pipeline /src/target/release/libgststrata.so /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgststrata.so
 
 # Entrypoint script (applies tc netem impairments before starting agent)

@@ -75,7 +75,7 @@ async fn captive_redirect() -> impl IntoResponse {
 async fn api_status(State(state): State<Arc<AgentState>>) -> Json<serde_json::Value> {
     let hw = state.hardware.scan().await;
     let sender_id = state.sender_id.lock().await.clone();
-    let pipeline = state.pipeline.lock().await;
+    let mut pipeline = state.pipeline.lock().await;
     let control_connected = state
         .control_connected
         .load(std::sync::atomic::Ordering::Relaxed);

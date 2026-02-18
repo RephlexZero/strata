@@ -243,6 +243,40 @@ pub struct LinkStats {
     pub link_kind: Option<String>,
 }
 
+// ── Stream Config Update (Hot Reconfig) ─────────────────────────────
+
+/// Request body for `POST /api/senders/:id/stream/config`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StreamConfigUpdateRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<EncoderConfigUpdate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<serde_json::Value>,
+}
+
+/// Partial encoder update — only set fields are applied.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EncoderConfigUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tune: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyint_max: Option<u32>,
+}
+
+/// Source switch request — sent to POST /api/senders/:id/source.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceSwitchRequest {
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+}
+
 // ── API Error Response ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]

@@ -36,6 +36,7 @@ fn standalone_receiver_multi_link_reassembly() {
         0,
         send_a,
         strata_transport::sender::SenderConfig::default(),
+        None,
     );
 
     let send_b = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -44,6 +45,7 @@ fn standalone_receiver_multi_link_reassembly() {
         1,
         send_b,
         strata_transport::sender::SenderConfig::default(),
+        None,
     );
 
     use strata_bonding::net::interface::LinkSender;
@@ -271,6 +273,7 @@ fn receiver_graceful_shutdown_drains_pending() {
         0,
         send_sock,
         strata_transport::sender::SenderConfig::default(),
+        None,
     );
 
     use strata_bonding::net::interface::LinkSender;

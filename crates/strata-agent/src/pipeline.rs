@@ -10,7 +10,7 @@
 //! Hot-swap source switching is supported via a Unix domain socket at
 //! `/tmp/strata-pipeline.sock`.
 
-use std::process::Child;
+use std::process::{Child, ExitStatus};
 use std::time::Instant;
 
 use strata_common::protocol::StreamStartPayload;
@@ -48,7 +48,32 @@ impl PipelineManager {
     }
 
     /// Check if a pipeline is currently running.
-    pub fn is_running(&self) -> bool {
+    ///
+    /// Also checks the actual child process — if it has exited but we
+    /// haven't cleaned up yet, returns `false`.
+    pub fn is_running(&mut self) -> bool {
+        if self.stream_id.is_some() {
+            if let Some(ref mut child) = self.child {
+                // Check if the child process is still alive
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        // Child has exited but we haven't cleaned up yet
+                        return false;
+                    }
+                    Ok(None) => {} // Still running
+                    Err(_) => {}   // Error checking — assume still running
+                }
+            } else if !self.simulate {
+                // No child process and not simulating — not really running
+                return false;
+            }
+        }
+        self.stream_id.is_some()
+    }
+
+    /// Quick check if a stream ID is set (does not poll the child process).
+    /// Use this when you only need a guard and don't hold &mut self.
+    pub fn has_stream(&self) -> bool {
         self.stream_id.is_some()
     }
 
@@ -141,7 +166,7 @@ impl PipelineManager {
         uri: Option<&str>,
         pattern: Option<&str>,
     ) {
-        if !self.is_running() {
+        if !self.has_stream() {
             tracing::warn!("cannot switch source: no pipeline running");
             return;
         }
@@ -184,7 +209,7 @@ impl PipelineManager {
     /// strata-node can add or remove the link at runtime without
     /// affecting OS-level connectivity.
     pub fn toggle_link(&self, iface: &str, enabled: bool) {
-        if !self.is_running() {
+        if !self.has_stream() {
             tracing::debug!(iface, enabled, "no pipeline running, skip toggle_link");
             return;
         }
@@ -207,6 +232,64 @@ impl PipelineManager {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to connect to pipeline control socket");
+            }
+        }
+    }
+
+    /// Send an arbitrary JSON command to the running strata-node process.
+    ///
+    /// Returns `true` if the command was sent successfully.
+    pub fn send_command(&self, cmd: &serde_json::Value) -> bool {
+        if !self.has_stream() {
+            tracing::debug!("no pipeline running, skip send_command");
+            return false;
+        }
+        match std::os::unix::net::UnixStream::connect(CONTROL_SOCK_PATH) {
+            Ok(mut stream) => {
+                use std::io::Write;
+                let msg = format!("{}\n", cmd);
+                if let Err(e) = stream.write_all(msg.as_bytes()) {
+                    tracing::warn!(error = %e, "failed to send command to pipeline");
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to connect to pipeline control socket");
+                false
+            }
+        }
+    }
+
+    /// Check if the child process has exited unexpectedly.
+    ///
+    /// Returns `Some(info)` if the child exited (crash or normal EOS),
+    /// along with stream info for reporting. Cleans up internal state.
+    pub fn check_child_exit(&mut self) -> Option<ChildExitInfo> {
+        let child = self.child.as_mut()?;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stream_id = self.stream_id.take().unwrap_or_default();
+                let duration_s = self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                let total_bytes = self.total_bytes;
+
+                // Clean up
+                self.child = None;
+                self.started_at = None;
+                self.total_bytes = 0;
+
+                Some(ChildExitInfo {
+                    stream_id,
+                    exit_status: status,
+                    duration_s,
+                    total_bytes,
+                })
+            }
+            Ok(None) => None, // Still running
+            Err(e) => {
+                tracing::warn!(error = %e, "error checking child process status");
+                None
             }
         }
     }
@@ -249,6 +332,11 @@ fn spawn_strata_node(payload: &StreamStartPayload) -> anyhow::Result<Child> {
     // Encoder
     cmd.arg("--bitrate")
         .arg(payload.encoder.bitrate_kbps.to_string());
+
+    // Passthrough mode — bypass encoder for file sources
+    if payload.source.passthrough.unwrap_or(false) {
+        cmd.arg("--passthrough");
+    }
 
     // Framerate (from source config, default 30)
     if let Some(fps) = payload.source.framerate {
@@ -294,6 +382,14 @@ fn spawn_strata_node(payload: &StreamStartPayload) -> anyhow::Result<Child> {
     tracing::info!(cmd = ?cmd, "spawning strata-node");
     let child = cmd.spawn()?;
     Ok(child)
+}
+
+/// Info returned when a child process exits unexpectedly.
+pub struct ChildExitInfo {
+    pub stream_id: String,
+    pub exit_status: ExitStatus,
+    pub duration_s: u64,
+    pub total_bytes: u64,
 }
 
 /// Wait for a child process with a timeout.

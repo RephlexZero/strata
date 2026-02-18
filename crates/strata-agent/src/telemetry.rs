@@ -41,7 +41,7 @@ pub async fn run(state: Arc<AgentState>) {
         }
 
         // Only send stats if we have a pipeline running
-        let pipeline = state.pipeline.lock().await;
+        let mut pipeline = state.pipeline.lock().await;
         if !pipeline.is_running() {
             last_real_stats = None;
             tracing::trace!("telemetry: pipeline not running");

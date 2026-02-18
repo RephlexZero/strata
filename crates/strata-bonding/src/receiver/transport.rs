@@ -297,6 +297,7 @@ mod tests {
             0,
             send_socket,
             strata_transport::sender::SenderConfig::default(),
+            None,
         );
 
         // Build bonding-header-wrapped payload and send
@@ -331,6 +332,7 @@ mod tests {
             0,
             send_socket,
             strata_transport::sender::SenderConfig::default(),
+            None,
         );
 
         use crate::net::interface::LinkSender;

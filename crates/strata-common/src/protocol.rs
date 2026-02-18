@@ -36,6 +36,16 @@ impl Envelope {
         }
     }
 
+    /// Create an envelope from a pre-built JSON value.
+    pub fn new_raw(msg_type: impl Into<String>, payload: serde_json::Value) -> Self {
+        Self {
+            id: Uuid::now_v7().to_string(),
+            msg_type: msg_type.into(),
+            ts: Utc::now(),
+            payload,
+        }
+    }
+
     /// Parse the payload into a concrete type.
     pub fn parse_payload<T: for<'de> Deserialize<'de>>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_value(self.payload.clone())
@@ -117,6 +127,8 @@ pub enum StreamEndReason {
     ControlPlaneStop,
     AgentShutdown,
     Timeout,
+    PipelineCrash,
+    AgentDisconnect,
 }
 
 // ── Control Plane → Agent ───────────────────────────────────────────
@@ -172,6 +184,10 @@ pub struct SourceConfig {
     pub uri: Option<String>,
     pub resolution: Option<String>,
     pub framerate: Option<u32>,
+    /// When true, bypass the encoder and pass the source through as-is
+    /// (remux into MPEG-TS without re-encoding). Only applies to file sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,8 +205,33 @@ pub struct StreamStopPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigUpdatePayload {
-    /// Partial config — only fields present are updated.
+    /// Partial encoder config — only fields present are applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<EncoderConfigUpdate>,
+    /// Partial bonding/scheduler config (TOML-serializable map).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<serde_json::Value>,
+}
+
+/// Partial encoder update — all fields optional.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncoderConfigUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tune: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyint_max: Option<u32>,
+}
+
+/// Response to a `config.update` command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigUpdateResponsePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Command to switch the active video source on a running pipeline.
@@ -507,6 +548,7 @@ mod tests {
                 uri: None,
                 resolution: Some("1920x1080".into()),
                 framerate: Some(30),
+                passthrough: None,
             },
             encoder: EncoderConfig {
                 bitrate_kbps: 5000,
@@ -536,6 +578,7 @@ mod tests {
     #[test]
     fn control_message_config_update() {
         let msg = ControlMessage::ConfigUpdate(ConfigUpdatePayload {
+            encoder: None,
             scheduler: Some(serde_json::json!({"algo": "weighted_round_robin"})),
         });
 

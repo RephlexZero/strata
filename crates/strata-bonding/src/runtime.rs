@@ -375,7 +375,12 @@ fn create_transport_link(link: &LinkConfig) -> anyhow::Result<TransportLink> {
     }
 
     socket.connect(addr)?;
-    Ok(TransportLink::new(link.id, socket, SenderConfig::default()))
+    Ok(TransportLink::new(
+        link.id,
+        socket,
+        SenderConfig::default(),
+        link.interface.clone(),
+    ))
 }
 
 #[cfg(test)]

@@ -38,13 +38,15 @@ pub struct TransportLink {
     bytes_sent: AtomicU64,
     /// Total packets sent.
     packets_sent: AtomicU64,
+    /// Network interface name (e.g. "eth1").
+    iface: Option<String>,
 }
 
 impl TransportLink {
     /// Create a new transport link.
     ///
     /// `socket` should be bound and connected to the remote peer.
-    pub fn new(id: usize, socket: UdpSocket, config: SenderConfig) -> Self {
+    pub fn new(id: usize, socket: UdpSocket, config: SenderConfig, iface: Option<String>) -> Self {
         let udp_state = UdpSocketState::new((&socket).into())
             .expect("failed to initialize quinn-udp socket state");
         TransportLink {
@@ -55,6 +57,7 @@ impl TransportLink {
             udp_state,
             bytes_sent: AtomicU64::new(0),
             packets_sent: AtomicU64::new(0),
+            iface,
         }
     }
 
@@ -261,10 +264,20 @@ impl LinkSender for TransportLink {
         let sender = self.sender.lock().unwrap();
         let rtt = self.rtt.lock().unwrap();
 
+        // Only report transport-level loss when we have receiver feedback
+        // (packets_acked > 0). Without ACK channel, the unacked ratio is
+        // always 100% which is misleading — report 0.0 instead.
+        let stats = sender.stats();
+        let loss_rate = if stats.packets_acked > 0 {
+            stats.loss_rate()
+        } else {
+            0.0
+        };
+
         LinkMetrics {
             rtt_ms: rtt.srtt_us() / 1000.0,
             capacity_bps: 0.0, // Filled by modem/kalman layer
-            loss_rate: sender.stats().loss_rate(),
+            loss_rate,
             observed_bps: 0.0,
             observed_bytes: self.bytes_sent.load(Ordering::Relaxed),
             queue_depth: sender.output_queue_len(),
@@ -273,7 +286,7 @@ impl LinkSender for TransportLink {
             phase: LinkPhase::Live,
             os_up: Some(true),
             mtu: None,
-            iface: None,
+            iface: self.iface.clone(),
             link_kind: Some("strata-transport".into()),
         }
     }
@@ -288,7 +301,7 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();
         socket.connect(addr).unwrap();
-        TransportLink::new(id, socket, SenderConfig::default())
+        TransportLink::new(id, socket, SenderConfig::default(), None)
     }
 
     #[test]

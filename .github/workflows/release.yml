@@ -76,7 +76,7 @@ jobs:
     name: Build aarch64
     needs: verify-tag
     runs-on: ubuntu-24.04
-    continue-on-error: true          # don't block the release if cross fails
+    continue-on-error: true # don't block the release if cross fails
     steps:
       - uses: actions/checkout@v4
         with:
@@ -95,6 +95,10 @@ jobs:
           file: docker/Dockerfile.cross-aarch64
           push: false
           tags: strata-cross-aarch64:latest
+          cache-from: type=gha,scope=strata-cross-aarch64
+          cache-to: type=gha,mode=max,scope=strata-cross-aarch64
+          provenance: false
+          sbom: false
           outputs: type=local,dest=./cross-output
 
       - name: Package

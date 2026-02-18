@@ -143,7 +143,7 @@ fn transport_link_direct_to_receiver() {
     let rcv = TransportBondingReceiver::new(Duration::from_millis(20));
     rcv.add_link_socket(rcv_socket).unwrap();
 
-    let link = TransportLink::new(0, send_socket, SenderConfig::default());
+    let link = TransportLink::new(0, send_socket, SenderConfig::default(), None);
 
     // Send bonding-header-wrapped packets directly
     for i in 0..10u64 {
@@ -235,7 +235,7 @@ fn large_payload_integrity() {
     let rcv = TransportBondingReceiver::new(Duration::from_millis(30));
     rcv.add_link_socket(rcv_socket).unwrap();
 
-    let link = TransportLink::new(0, send_socket, SenderConfig::default());
+    let link = TransportLink::new(0, send_socket, SenderConfig::default(), None);
 
     // 8KB payload — exceeds MTU, will be fragmented by transport layer
     let payload: Vec<u8> = (0..8192).map(|i| (i % 256) as u8).collect();
@@ -260,7 +260,7 @@ fn receiver_stats_update() {
     let rcv = TransportBondingReceiver::new(Duration::from_millis(20));
     rcv.add_link_socket(rcv_socket).unwrap();
 
-    let link = TransportLink::new(0, send_socket, SenderConfig::default());
+    let link = TransportLink::new(0, send_socket, SenderConfig::default(), None);
 
     for i in 0..5u64 {
         let payload = Bytes::from(format!("stats-{}", i));

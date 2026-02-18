@@ -65,6 +65,20 @@ async fn start_stream(
         return Err(ApiError::not_found("sender not found"));
     }
 
+    // Guard: no concurrent streams for the same sender
+    let already_active = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM streams WHERE sender_id = $1 AND state IN ('starting', 'live'))",
+    )
+    .bind(&sender_id)
+    .bind(&user.user_id)
+    .fetch_one(state.pool())
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    if already_active {
+        return Err(ApiError::bad_request("sender already has an active stream"));
+    }
+
     // Resolve destination → RTMP relay URL (optional — bonded RIST
     // streams don't require a destination record)
     let relay_url = if let Some(ref dest_id) = body.destination_id {
@@ -145,17 +159,28 @@ async fn start_stream(
         "building RIST destinations for sender"
     );
 
+    let default_source = match std::env::var("STRATA_DEFAULT_SOURCE").as_deref() {
+        Ok("file") | Ok("uri") => strata_common::protocol::SourceConfig {
+            mode: "uri".into(),
+            device: None,
+            uri: Some("file:///opt/strata/test-media/sample.mp4".into()),
+            resolution: None,
+            framerate: None,
+            passthrough: Some(true),
+        },
+        _ => strata_common::protocol::SourceConfig {
+            mode: "test".into(),
+            device: None,
+            uri: None,
+            resolution: Some("1280x720".into()),
+            framerate: Some(30),
+            passthrough: None,
+        },
+    };
+
     let start_payload = StreamStartPayload {
         stream_id: stream_id.clone(),
-        source: body
-            .source
-            .unwrap_or(strata_common::protocol::SourceConfig {
-                mode: "test".into(),
-                device: None,
-                uri: None,
-                resolution: Some("1280x720".into()),
-                framerate: Some(30),
-            }),
+        source: body.source.unwrap_or(default_source),
         encoder: body
             .encoder
             .unwrap_or(strata_common::protocol::EncoderConfig {
@@ -206,10 +231,15 @@ async fn start_stream(
     let envelope = Envelope::new("stream.start", &start_payload);
     let json = serde_json::to_string(&envelope).unwrap();
 
-    agent_tx
-        .send(json)
-        .await
-        .map_err(|_| ApiError::internal("failed to send to agent"))?;
+    if agent_tx.send(json).await.is_err() {
+        // Agent channel closed — roll back the DB row
+        let _ = sqlx::query("UPDATE streams SET state = 'ended', ended_at = $1 WHERE id = $2")
+            .bind(Utc::now())
+            .bind(&stream_id)
+            .execute(state.pool())
+            .await;
+        return Err(ApiError::internal("failed to send to agent"));
+    }
 
     // Notify dashboard
     state.broadcast_dashboard(
@@ -273,12 +303,42 @@ async fn stop_stream(
     // Notify dashboard
     state.broadcast_dashboard(
         strata_common::protocol::DashboardEvent::StreamStateChanged {
-            stream_id,
-            sender_id,
+            stream_id: stream_id.clone(),
+            sender_id: sender_id.clone(),
             state: strata_common::models::StreamState::Stopping,
             error: None,
         },
     );
+
+    // Safety timeout: if the agent never sends stream.ended, force the
+    // transition after 15 seconds so the UI doesn't get stuck in "stopping".
+    {
+        let state = state.clone();
+        let stream_id = stream_id.clone();
+        let sender_id = sender_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            let result = sqlx::query(
+                "UPDATE streams SET state = 'ended', ended_at = $1 WHERE id = $2 AND state = 'stopping'",
+            )
+            .bind(Utc::now())
+            .bind(&stream_id)
+            .execute(state.pool())
+            .await;
+            if result.as_ref().map(|r| r.rows_affected()).unwrap_or(0) > 0 {
+                state.live_streams().remove(&stream_id);
+                state.broadcast_dashboard(
+                    strata_common::protocol::DashboardEvent::StreamStateChanged {
+                        stream_id,
+                        sender_id,
+                        state: strata_common::models::StreamState::Ended,
+                        error: Some("stop timeout".into()),
+                    },
+                );
+                tracing::warn!("stream stop timed out, forced to ended");
+            }
+        });
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }

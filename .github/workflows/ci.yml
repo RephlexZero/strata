@@ -162,6 +162,10 @@ jobs:
           file: docker/Dockerfile.cross-aarch64
           push: false
           tags: strata-cross-aarch64:latest
+          cache-from: type=gha,scope=strata-cross-aarch64
+          cache-to: type=gha,mode=max,scope=strata-cross-aarch64
+          provenance: false
+          sbom: false
           outputs: type=local,dest=./cross-output
 
       - uses: dtolnay/rust-toolchain@stable
@@ -179,14 +183,16 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/libgststrata.so dist/
-          cp target/release/integration_node dist/ 2>/dev/null || true
+          cp target/release/strata-node dist/ 2>/dev/null || \
+            cp target/release/integration_node dist/ 2>/dev/null || true
 
       - name: Prepare artifact (cross)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           mkdir -p dist
           cp cross-output/libgststrata.so dist/ 2>/dev/null || true
-          cp cross-output/integration_node dist/ 2>/dev/null || true
+          cp cross-output/strata-node dist/ 2>/dev/null || \
+            cp cross-output/integration_node dist/ 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:

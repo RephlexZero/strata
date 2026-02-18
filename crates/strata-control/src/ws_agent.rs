@@ -111,6 +111,32 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
         status: None,
     });
 
+    // Transition any active streams to 'ended' — the agent is gone so they
+    // are definitely not running any more.
+    let orphaned: Vec<(String,)> = sqlx::query_as(
+        "UPDATE streams SET state = 'ended', ended_at = $1 \
+         WHERE sender_id = $2 AND state IN ('starting', 'live', 'stopping') \
+         RETURNING id",
+    )
+    .bind(Utc::now())
+    .bind(&sender_id)
+    .fetch_all(state.pool())
+    .await
+    .unwrap_or_default();
+
+    for (stream_id,) in &orphaned {
+        state.live_streams().remove(stream_id);
+        state.broadcast_dashboard(DashboardEvent::StreamStateChanged {
+            stream_id: stream_id.clone(),
+            sender_id: sender_id.clone(),
+            state: strata_common::models::StreamState::Ended,
+            error: Some("agent disconnected".into()),
+        });
+    }
+    if !orphaned.is_empty() {
+        tracing::warn!(sender_id = %sender_id, count = orphaned.len(), "cleaned up orphaned streams");
+    }
+
     // Update last_seen_at
     let _ = sqlx::query("UPDATE senders SET last_seen_at = $1 WHERE id = $2")
         .bind(Utc::now())
@@ -308,6 +334,7 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
         }
         // Route request-response messages back to pending callers
         "config.set.response"
+        | "config.update.response"
         | "test.run.response"
         | "interfaces.scan.response"
         | "interface.command.response" => {

@@ -17,10 +17,10 @@ use tokio_tungstenite::tungstenite::Message;
 use strata_common::models::StreamState;
 use strata_common::protocol::{
     AuthLoginPayload, AuthLoginResponsePayload, ConfigSetPayload, ConfigSetResponsePayload,
-    DeviceStatusPayload, Envelope, InterfaceCommandPayload, InterfaceCommandResponsePayload,
-    InterfacesScanPayload, InterfacesScanResponsePayload, SourceSwitchPayload, StreamEndReason,
-    StreamEndedPayload, StreamStartPayload, StreamStopPayload, TestRunPayload,
-    TestRunResponsePayload,
+    ConfigUpdatePayload, ConfigUpdateResponsePayload, DeviceStatusPayload, Envelope,
+    InterfaceCommandPayload, InterfaceCommandResponsePayload, InterfacesScanPayload,
+    InterfacesScanResponsePayload, SourceSwitchPayload, StreamEndReason, StreamEndedPayload,
+    StreamStartPayload, StreamStopPayload, TestRunPayload, TestRunResponsePayload,
 };
 
 use crate::AgentState;
@@ -219,7 +219,7 @@ async fn connect_and_run(
 /// Build a device.status heartbeat payload.
 async fn build_heartbeat(state: &AgentState) -> DeviceStatusPayload {
     let hw = state.hardware.scan().await;
-    let pipeline = state.pipeline.lock().await;
+    let mut pipeline = state.pipeline.lock().await;
     let receiver_url = state.receiver_url.lock().await.clone();
 
     DeviceStatusPayload {
@@ -279,7 +279,55 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
             }
         }
         "config.update" => {
-            tracing::info!("received config.update (hot-reload not yet implemented)");
+            if let Ok(payload) = envelope.parse_payload::<ConfigUpdatePayload>() {
+                tracing::info!("received config.update");
+                let pipeline = state.pipeline.lock().await;
+                let mut errors: Vec<String> = Vec::new();
+
+                // Apply encoder changes
+                if let Some(enc) = &payload.encoder {
+                    let mut cmd = serde_json::json!({ "cmd": "set_encoder" });
+                    if let Some(bps) = enc.bitrate_kbps {
+                        cmd["bitrate_kbps"] = serde_json::json!(bps);
+                    }
+                    if let Some(ref tune) = enc.tune {
+                        cmd["tune"] = serde_json::json!(tune);
+                    }
+                    if let Some(ki) = enc.keyint_max {
+                        cmd["keyint_max"] = serde_json::json!(ki);
+                    }
+                    if !pipeline.send_command(&cmd) {
+                        errors.push("failed to send encoder update".into());
+                    }
+                }
+
+                // Apply scheduler/bonding changes
+                if let Some(sched) = &payload.scheduler {
+                    let cmd = serde_json::json!({
+                        "cmd": "set_bonding_config",
+                        "config": sched,
+                    });
+                    if !pipeline.send_command(&cmd) {
+                        errors.push("failed to send scheduler update".into());
+                    }
+                }
+
+                let request_id = envelope
+                    .payload
+                    .get("request_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let resp = ConfigUpdateResponsePayload {
+                    request_id,
+                    success: errors.is_empty(),
+                    error: if errors.is_empty() {
+                        None
+                    } else {
+                        Some(errors.join("; "))
+                    },
+                };
+                send_envelope(state, "config.update.response", &resp).await;
+            }
         }
         "source.switch" => {
             if let Ok(payload) = envelope.parse_payload::<SourceSwitchPayload>() {

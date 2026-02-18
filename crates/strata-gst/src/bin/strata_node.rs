@@ -143,6 +143,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut control_sock_path = "/tmp/strata-pipeline.sock";
     let mut resolution = "1280x720";
     let mut relay_url = "";
+    let mut passthrough = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -198,6 +199,9 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 relay_url = &args[i + 1];
                 i += 1;
             }
+            "--passthrough" => {
+                passthrough = true;
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 eprint!("{SENDER_HELP}");
@@ -227,6 +231,18 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     register_plugins()?;
+
+    // ── Passthrough mode: remux file source into MPEG-TS without re-encoding ──
+    if passthrough {
+        return run_sender_passthrough(
+            source_uri,
+            dest_str,
+            relay_url,
+            config_path,
+            stats_dest,
+            control_sock_path,
+        );
+    }
 
     // ── Build pipeline with input-selector for hot-swap support ──
     //
@@ -490,6 +506,166 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Parses the host from `host:port` and runs
 /// `ip route get <host>` to determine the outgoing interface.
+/// Run the sender in passthrough mode — remux a file source into MPEG-TS
+/// without decoding or re-encoding. The video and audio elementary streams
+/// are parsed and fed directly into mpegtsmux.
+fn run_sender_passthrough(
+    source_uri: &str,
+    dest_str: &str,
+    _relay_url: &str,
+    config_path: &str,
+    stats_dest: &str,
+    control_sock_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if source_uri.is_empty() {
+        return Err("passthrough mode requires --uri".into());
+    }
+
+    // Build pipeline: uridecodebin → parsebin → mpegtsmux → stratasink
+    // uridecodebin with `caps` restricted to parsed formats avoids actual decoding.
+    let pipeline_str = format!(
+        "uridecodebin name=urisrc uri=\"{uri}\" \
+         ! parsebin name=pbin \
+         mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 \
+         ! stratasink name=rsink",
+        uri = source_uri,
+    );
+
+    eprintln!("Passthrough Pipeline: {}", pipeline_str);
+
+    let pipeline = gst::parse::launch(&pipeline_str)?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| "Failed to cast to pipeline")?;
+
+    // Wire up parsebin's dynamic pads to mpegtsmux
+    let mux = pipeline.by_name("mux").ok_or("Failed to find mux")?;
+    let mux_weak = mux.downgrade();
+    let pbin = pipeline.by_name("pbin").ok_or("Failed to find pbin")?;
+    pbin.connect_pad_added(move |_element, pad| {
+        let Some(mux) = mux_weak.upgrade() else {
+            return;
+        };
+        let caps = pad.current_caps();
+        let caps_str = caps.as_ref().map(|c| c.to_string()).unwrap_or_default();
+        eprintln!("parsebin pad-added: {} (caps: {})", pad.name(), caps_str);
+
+        // Request a sink pad on mpegtsmux and link
+        if let Some(mux_pad) = mux.request_pad_simple("sink_%d") {
+            if pad.link(&mux_pad).is_ok() {
+                eprintln!("Linked {} → {}", pad.name(), mux_pad.name());
+            } else {
+                eprintln!("Failed to link {} → {}", pad.name(), mux_pad.name());
+            }
+        }
+    });
+
+    // Configure stratasink destinations
+    if let Some(sink) = pipeline.by_name("rsink") {
+        if !config_path.is_empty() {
+            let config_toml = std::fs::read_to_string(config_path)
+                .map_err(|e| format!("Failed to read config: {e}"))?;
+            sink.set_property("config", &config_toml);
+        }
+        for (idx, uri) in dest_str.split(',').enumerate() {
+            let uri = uri.trim();
+            if uri.is_empty() {
+                continue;
+            }
+            let pad = sink
+                .request_pad_simple("link_%u")
+                .ok_or("Failed to request link pad")?;
+            pad.set_property("uri", uri);
+            if let Some(iface) = resolve_interface_for_uri(uri) {
+                pad.set_property("interface", &iface);
+                eprintln!("Link {} → {} (via {})", idx, uri, iface);
+            } else {
+                eprintln!("Link {} → {}", idx, uri);
+            }
+        }
+    }
+
+    // Start pipeline
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|e| format!("Failed to set pipeline to Playing: {e}"))?;
+
+    // Start control socket for hot-swap commands
+    let _ = std::fs::remove_file(control_sock_path);
+    let pipeline_weak = pipeline.downgrade();
+    let control_path = control_sock_path.to_string();
+    std::thread::Builder::new()
+        .name("ctrl-sock".into())
+        .spawn(move || {
+            run_control_socket(&control_path, pipeline_weak);
+        })?;
+
+    // Stats relay
+    let mut stats_socket = None;
+    if !stats_dest.is_empty() {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        stats_socket = Some(sock);
+        eprintln!("Stats relay → {}", stats_dest);
+    }
+
+    // Graceful shutdown
+    let pipeline_weak = pipeline.downgrade();
+    ctrlc::set_handler(move || {
+        if let Some(p) = pipeline_weak.upgrade() {
+            let _ = p.send_event(gst::event::Eos::new());
+        }
+    })?;
+
+    eprintln!("Passthrough sender running (uri={})...", source_uri);
+
+    // Bus loop — handle EOS (auto-loop), errors, and stats
+    let bus = pipeline.bus().unwrap();
+    for msg in bus.iter_timed(gst::ClockTime::NONE) {
+        match msg.view() {
+            MessageView::Error(err) => {
+                eprintln!(
+                    "Pipeline error: {} ({})",
+                    err.error(),
+                    err.debug().unwrap_or_default()
+                );
+                break;
+            }
+            MessageView::Eos(_) => {
+                // Loop: seek back to the beginning
+                eprintln!("EOS — looping playback");
+                let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT;
+                if pipeline.seek_simple(flags, gst::ClockTime::ZERO).is_err() {
+                    eprintln!("Seek failed, ending stream");
+                    break;
+                }
+            }
+            MessageView::Element(elem) => {
+                if let Some(s) = elem.structure() {
+                    if s.name() == "bonding-stats" {
+                        if let (Some(sock), Ok(addr)) =
+                            (&stats_socket, stats_dest.parse::<std::net::SocketAddr>())
+                        {
+                            let json = serialize_bonding_stats(s);
+                            let _ = sock.send_to(json.as_bytes(), addr);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pipeline.set_state(gst::State::Null)?;
+    Ok(())
+}
+
+/// Convert a serde_json::Value to TOML string for stratasink's config property.
+fn json_to_toml(value: &serde_json::Value) -> Result<String, String> {
+    // serde_json::Value → toml::Value via intermediate serialization
+    let toml_value: toml::Value =
+        serde_json::from_value(value.clone()).map_err(|e| format!("json→toml conversion: {e}"))?;
+    toml::to_string(&toml_value).map_err(|e| format!("toml serialization: {e}"))
+}
+
 fn resolve_interface_for_uri(uri: &str) -> Option<String> {
     // Strip any legacy rist:// prefix for backwards compat
     let stripped = uri
@@ -928,6 +1104,46 @@ fn run_control_socket(path: &str, pipeline_weak: gst::glib::WeakRef<gst::Pipelin
                         "Control: queued toggle-link iface={} enabled={}",
                         iface, enabled
                     );
+                }
+            } else if cmd.get("cmd").and_then(|v| v.as_str()) == Some("set_encoder") {
+                // Hot-update encoder properties (bitrate, tune, keyint)
+                if let Some(enc) = pipeline.by_name("enc") {
+                    if let Some(bps) = cmd.get("bitrate_kbps").and_then(|v| v.as_u64()) {
+                        let bps = bps as u32;
+                        enc.set_property("bitrate", bps);
+                        eprintln!("Control: set encoder bitrate to {} kbps", bps);
+                    }
+                    if let Some(tune) = cmd.get("tune").and_then(|v| v.as_str()) {
+                        enc.set_property_from_str("tune", tune);
+                        eprintln!("Control: set encoder tune to {}", tune);
+                    }
+                    if let Some(ki) = cmd.get("keyint_max").and_then(|v| v.as_u64()) {
+                        enc.set_property("key-int-max", ki as u32);
+                        eprintln!("Control: set encoder keyint-max to {}", ki);
+                    }
+                } else {
+                    eprintln!("Control: set_encoder — encoder element 'enc' not found");
+                }
+            } else if cmd.get("cmd").and_then(|v| v.as_str()) == Some("set_bonding_config") {
+                // Hot-update bonding/scheduler config via stratasink's "config" property
+                if let Some(config_val) = cmd.get("config") {
+                    if let Some(sink) = pipeline.by_name("rsink") {
+                        // Convert JSON config to TOML (stratasink expects TOML)
+                        match json_to_toml(config_val) {
+                            Ok(toml_str) => {
+                                sink.set_property("config", &toml_str);
+                                eprintln!("Control: applied bonding config update");
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Control: set_bonding_config — failed to convert config: {}",
+                                    e
+                                );
+                            }
+                        }
+                    } else {
+                        eprintln!("Control: set_bonding_config — sink element 'rsink' not found");
+                    }
                 }
             } else {
                 eprintln!("Control: unknown command: {}", line);

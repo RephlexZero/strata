@@ -23,9 +23,11 @@ web-sys = { version = "0.3", features = [
     "CloseEvent",
     "ErrorEvent",
     "HtmlInputElement",
+    "Window",
     "console",
 ] }
 wasm-bindgen = "0.2"
+js-sys = "0.3"
 
 # Serialization (shared types)
 serde = { version = "1", features = ["derive"] }

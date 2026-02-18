@@ -3961,6 +3961,7 @@ dependencies = [
  "console_log",
  "gloo-net",
  "gloo-storage",
+ "js-sys",
  "leptos",
  "leptos_router",
  "log",
@@ -3983,6 +3984,7 @@ dependencies = [
  "serde_json",
  "strata-bonding",
  "strata-sim",
+ "toml",
 ]
 
 [[package]]

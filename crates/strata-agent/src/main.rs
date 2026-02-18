@@ -12,6 +12,7 @@ mod control;
 mod hardware;
 mod metrics;
 mod pipeline;
+mod pipeline_monitor;
 mod portal;
 mod telemetry;
 pub(crate) mod util;
@@ -151,6 +152,12 @@ async fn main() -> anyhow::Result<()> {
     let telemetry_state = state.clone();
     let _telemetry_handle = tokio::spawn(async move {
         telemetry::run(telemetry_state).await;
+    });
+
+    // ── Task 2b: Pipeline child process monitor ────────────────
+    let monitor_state = state.clone();
+    tokio::spawn(async move {
+        pipeline_monitor::run(monitor_state).await;
     });
 
     // ── Task 3: Onboarding portal (HTTP) ────────────────────────

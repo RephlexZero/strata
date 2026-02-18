@@ -1,10 +1,14 @@
+# syntax=docker/dockerfile:1.7-labs
+
 # ── Stage 1: Build dashboard WASM ────────────────────────────
+FROM node:20-bookworm AS node-base
 FROM rust:1.93-bookworm AS dashboard
 
-# Node.js required for Tailwind CSS / DaisyUI pre-build hook
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
-    rm -rf /var/lib/apt/lists/*
+# Node.js 20+ required for @tailwindcss/oxide native module
+COPY --from=node-base /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-base /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
 RUN rustup target add wasm32-unknown-unknown && \
     cargo install trunk --version 0.21.14
@@ -24,7 +28,8 @@ members = ["crates/strata-dashboard"]
 TOML
 
 # Install Tailwind CSS + DaisyUI and build CSS, then build WASM with trunk
-RUN cd crates/strata-dashboard && \
+RUN --mount=type=cache,target=/root/.npm \
+    cd crates/strata-dashboard && \
     npm init -y && npm install @tailwindcss/cli daisyui && \
     npx @tailwindcss/cli -i style/input.css -o style/main.css --minify && \
     trunk build --release
@@ -66,7 +71,9 @@ RUN mkdir -p crates/strata-common/src && echo "" > crates/strata-common/src/lib.
     mkdir -p crates/strata-control/src && echo "fn main() {}" > crates/strata-control/src/main.rs
 
 # Pre-build dependencies (cached unless Cargo.toml/lock changes)
-RUN cargo build --release -p strata-control 2>/dev/null || true
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    cargo build --release -p strata-control 2>/dev/null || true
 
 # Copy real source
 COPY crates/strata-common/src crates/strata-common/src
@@ -74,7 +81,9 @@ COPY crates/strata-control/src crates/strata-control/src
 COPY crates/strata-control/migrations crates/strata-control/migrations
 
 # Build for real
-RUN touch crates/strata-common/src/lib.rs crates/strata-control/src/main.rs && \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    touch crates/strata-common/src/lib.rs crates/strata-control/src/main.rs && \
     cargo build --release -p strata-control
 
 # ── Stage 3: Runtime ────────────────────────────────────────

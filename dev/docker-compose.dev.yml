@@ -30,7 +30,7 @@ services:
   strata-sender-sim:
     volumes:
       - ${PWD}/target/debug/strata-agent:/usr/local/bin/strata-agent:ro
-      - ${PWD}/target/debug/strata_node:/usr/local/bin/strata_node:ro
+      - ${PWD}/target/debug/strata-node:/usr/local/bin/strata-node:ro
       - ${PWD}/target/debug/libgststrata.so:/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgststrata.so:ro
       # Portal WASM — mount if iterating on the portal
       # Build with: cd crates/strata-portal && trunk build

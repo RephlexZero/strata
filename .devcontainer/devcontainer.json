@@ -1,8 +1,11 @@
 {
-    "name": "Strata - Bonded Cellular Transport",
+    "name": "Rust RIST Bonding",
     "build": {
         "dockerfile": "Dockerfile",
-        "context": ".."
+        "context": "..",
+        "options": [
+            "--network=host"
+        ]
     },
     "customizations": {
         "vscode": {
@@ -10,13 +13,8 @@
                 "rust-lang.rust-analyzer",
                 "tamasfe.even-better-toml",
                 "vadimcn.vscode-lldb",
-                "fill-labs.dependi",
-                "mhutchie.git-graph"
-            ],
-            "settings": {
-                "rust-analyzer.cargo.allTargets": true,
-                "rust-analyzer.check.command": "clippy"
-            }
+                "fill-labs.dependi"
+            ]
         }
     },
     // "privileged": true is required for ip netns creation (mount operations)
@@ -35,5 +33,6 @@
         "ghcr.io/devcontainers/features/rust:1": {},
         "ghcr.io/devcontainers/features/docker-in-docker:2": {}
     },
-    "postCreateCommand": ".devcontainer/post-create.sh"
+    "postCreateCommand": ".devcontainer/post-create.sh",
+    "postStartCommand": ".devcontainer/post-start.sh"
 }

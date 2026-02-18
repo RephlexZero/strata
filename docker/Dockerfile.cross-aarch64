@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7-labs
+
 # ── Stage 1: Build Strata for aarch64 ────────────────────────
 FROM debian:12 AS builder
 
@@ -48,9 +50,11 @@ ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc"
 ENV CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++"
 
 # Build the plugin + binary
-RUN cargo build --release --target aarch64-unknown-linux-gnu -p strata-gst
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    cargo build --release --target aarch64-unknown-linux-gnu -p strata-gst
 
 # ── Stage 2: Extract artifacts ───────────────────────────────
 FROM scratch AS export
 COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/libgststrata.so /libgststrata.so
-COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/strata_node /strata_node
+COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/strata-node /strata-node

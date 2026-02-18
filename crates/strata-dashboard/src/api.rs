@@ -354,3 +354,47 @@ pub async fn scan_sender_interfaces(
         Err(parse_error(resp).await)
     }
 }
+
+// ── Stream Config (Hot Reconfig) ────────────────────────────────────
+
+/// Update encoder / scheduler config on a live stream.
+pub async fn update_stream_config(
+    token: &str,
+    sender_id: &str,
+    body: &crate::types::StreamConfigUpdateRequest,
+) -> ApiResult<()> {
+    let resp = Request::post(&format!("/api/senders/{sender_id}/stream/config"))
+        .header("Authorization", &auth_header(token))
+        .json(body)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Switch the active video source on a running pipeline.
+pub async fn switch_source(
+    token: &str,
+    sender_id: &str,
+    body: &crate::types::SourceSwitchRequest,
+) -> ApiResult<()> {
+    let resp = Request::post(&format!("/api/senders/{sender_id}/source"))
+        .header("Authorization", &auth_header(token))
+        .json(body)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}

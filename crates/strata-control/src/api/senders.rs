@@ -23,7 +23,8 @@ use uuid::Uuid;
 
 use strata_common::ids;
 use strata_common::protocol::{
-    ConfigSetPayload, Envelope, InterfaceCommandPayload, InterfacesScanPayload, TestRunPayload,
+    ConfigSetPayload, ConfigUpdatePayload, Envelope, InterfaceCommandPayload,
+    InterfacesScanPayload, SourceSwitchPayload, TestRunPayload,
 };
 
 use crate::api::auth::ApiError;
@@ -51,6 +52,11 @@ pub fn router() -> Router<AppState> {
             "/{id}/interfaces/{name}/disable",
             axum::routing::post(disable_interface),
         )
+        .route(
+            "/{id}/stream/config",
+            axum::routing::post(update_stream_config),
+        )
+        .route("/{id}/source", axum::routing::post(switch_source))
 }
 
 // ── List Senders ────────────────────────────────────────────────────
@@ -523,6 +529,99 @@ async fn scan_interfaces(
             Err(ApiError::internal("interface scan timed out"))
         }
     }
+}
+
+// ── Hot Stream Config Update ────────────────────────────────────────
+
+/// Update the active stream's encoder or scheduler config at runtime.
+///
+/// POST /api/senders/:id/stream/config
+/// Body: { "encoder": { "bitrate_kbps": 2000 }, "scheduler": { ... } }
+async fn update_stream_config(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(sender_id): Path<String>,
+    Json(body): Json<ConfigUpdatePayload>,
+) -> Result<StatusCode, ApiError> {
+    verify_ownership(&state, &user, &sender_id).await?;
+
+    let agent = state
+        .agents()
+        .get(&sender_id)
+        .ok_or_else(|| ApiError::bad_request("sender is offline"))?;
+    let agent_tx = agent.tx.clone();
+    drop(agent);
+
+    // Build a request_id so we can wait for the response
+    let request_id = Uuid::now_v7().to_string();
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    state.pending_requests().insert(request_id.clone(), resp_tx);
+
+    // Wrap the payload with the request_id
+    let mut payload_val = serde_json::to_value(&body).unwrap_or_default();
+    payload_val["request_id"] = serde_json::json!(request_id);
+    let envelope = Envelope::new_raw("config.update", payload_val);
+    let json = serde_json::to_string(&envelope).unwrap();
+
+    agent_tx
+        .send(json)
+        .await
+        .map_err(|_| ApiError::internal("failed to send to agent"))?;
+
+    // Wait for response with timeout
+    match tokio::time::timeout(Duration::from_secs(10), resp_rx).await {
+        Ok(Ok(resp)) => {
+            let success = resp
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if success {
+                Ok(StatusCode::OK)
+            } else {
+                let err = resp
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                Err(ApiError::internal(err.to_string()))
+            }
+        }
+        Ok(Err(_)) => {
+            state.pending_requests().remove(&request_id);
+            Err(ApiError::internal("agent response channel closed"))
+        }
+        Err(_) => {
+            state.pending_requests().remove(&request_id);
+            Err(ApiError::internal("config update timed out"))
+        }
+    }
+}
+
+// ── Source Switch ────────────────────────────────────────────────────
+
+async fn switch_source(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(sender_id): Path<String>,
+    Json(body): Json<SourceSwitchPayload>,
+) -> Result<StatusCode, ApiError> {
+    verify_ownership(&state, &user, &sender_id).await?;
+
+    let agent = state
+        .agents()
+        .get(&sender_id)
+        .ok_or_else(|| ApiError::bad_request("sender is offline"))?;
+    let agent_tx = agent.tx.clone();
+    drop(agent);
+
+    let envelope = Envelope::new("source.switch", &body);
+    let json = serde_json::to_string(&envelope).map_err(|e| ApiError::internal(e.to_string()))?;
+
+    agent_tx
+        .send(json)
+        .await
+        .map_err(|_| ApiError::internal("failed to send to agent"))?;
+
+    Ok(StatusCode::OK)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
