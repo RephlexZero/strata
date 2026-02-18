@@ -1,29 +1,32 @@
-.PHONY: up down logs clean build ps dashboard
+.PHONY: up down logs clean build ps web-dev
+
+COMPOSE = docker compose -f ../docker-compose.yml
 
 # Build images and start all services
-up: build
-	docker compose up -d
+up:
+	$(COMPOSE) up --build -d
 
 # Build images only
 build:
-	docker compose build
+	$(COMPOSE) build
 
-# Build the dashboard WASM bundle
-dashboard:
-	cd ../crates/strata-dashboard && trunk build --release
+# Start web dev hot-reload servers (dashboard on :8080, portal on :8081)
+# Edit .rs / .css files and the browser refreshes automatically.
+web-dev:
+	$(COMPOSE) --profile web-dev up --build dashboard-dev portal-dev
 
 # Stop services (preserves data volume)
 down:
-	docker compose down
+	$(COMPOSE) down
 
 # Tail logs for all services
 logs:
-	docker compose logs -f
+	$(COMPOSE) logs -f
 
 # Stop and delete everything including data
 clean:
-	docker compose down -v --remove-orphans
+	$(COMPOSE) down -v --remove-orphans
 
 # Show running containers
 ps:
-	docker compose ps
+	$(COMPOSE) ps

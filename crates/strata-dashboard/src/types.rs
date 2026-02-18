@@ -159,6 +159,90 @@ pub struct StreamDetail {
 pub struct StartStreamRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub destination_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<EncoderConfig>,
+}
+
+/// Source configuration for stream start.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceConfig {
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framerate: Option<u32>,
+}
+
+/// Encoder configuration for stream start.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncoderConfig {
+    pub bitrate_kbps: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tune: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyint_max: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_bitrate_kbps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bitrate_kbps: Option<u32>,
+}
+
+/// A smart-default bitrate envelope for a given video profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoProfile {
+    pub min_kbps: u32,
+    pub default_kbps: u32,
+    pub max_kbps: u32,
+}
+
+/// Compute smart-default bitrate envelope from resolution + framerate + codec.
+/// Client-side mirror of strata_common::profiles::lookup_profile.
+pub fn lookup_profile(
+    resolution: Option<&str>,
+    framerate: Option<u32>,
+    codec: Option<&str>,
+) -> VideoProfile {
+    let res = resolution.unwrap_or("1920x1080");
+    let fps = framerate.unwrap_or(30);
+    let codec = codec.unwrap_or("h265");
+
+    let height = res
+        .split('x')
+        .nth(1)
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1080);
+
+    let hfr = fps > 30;
+
+    let (min, default, max) = match (height, hfr) {
+        (0..=540, false) => (800, 1500, 3000),
+        (0..=540, true) => (1000, 2000, 4000),
+        (541..=720, false) => (1500, 3000, 4000),
+        (541..=720, true) => (2000, 4000, 6000),
+        (721..=1080, false) => (3000, 5000, 6000),
+        (721..=1080, true) => (4000, 7000, 10000),
+        (1081..=1440, false) => (6000, 10000, 13000),
+        (1081..=1440, true) => (8000, 14000, 20000),
+        (1441..=2160, false) => (10000, 20000, 30000),
+        (1441..=2160, true) => (13000, 27000, 40000),
+        _ => (13000, 27000, 40000),
+    };
+
+    let scale = if codec == "h264" { 1.5 } else { 1.0 };
+
+    VideoProfile {
+        min_kbps: (min as f64 * scale) as u32,
+        default_kbps: (default as f64 * scale) as u32,
+        max_kbps: (max as f64 * scale) as u32,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

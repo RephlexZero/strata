@@ -30,7 +30,7 @@ mod imp {
     #[derive(Default)]
     pub struct StrataSrc {
         settings: Mutex<Settings>,
-        receiver: Mutex<Option<ReceiverBackend>>,
+        pub(crate) receiver: Mutex<Option<ReceiverBackend>>,
         stats_running: Arc<AtomicBool>,
         stats_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     }
@@ -333,6 +333,22 @@ mod imp {
 glib::wrapper! {
     pub struct StrataSrc(ObjectSubclass<imp::StrataSrc>)
         @extends gst_base::PushSrc, gst_base::BaseSrc, gst::Element, gst::Object;
+}
+
+impl StrataSrc {
+    /// Returns a shared handle to the receiver's reassembly stats.
+    ///
+    /// This can be passed to `ReceiverMetricsServer::start()` for Prometheus
+    /// scraping. Returns `None` if the element hasn't been started yet.
+    pub fn stats_handle(
+        &self,
+    ) -> Option<
+        std::sync::Arc<std::sync::Mutex<strata_bonding::receiver::aggregator::ReassemblyStats>>,
+    > {
+        let receiver: std::sync::MutexGuard<'_, Option<ReceiverBackend>> =
+            lock_or_recover(&self.imp().receiver);
+        receiver.as_ref().map(|rx| rx.stats_handle())
+    }
 }
 
 pub fn register(plugin: Option<&gst::Plugin>) -> Result<(), glib::BoolError> {

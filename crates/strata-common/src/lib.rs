@@ -10,4 +10,5 @@ pub mod auth;
 pub mod ids;
 pub mod metrics;
 pub mod models;
+pub mod profiles;
 pub mod protocol;

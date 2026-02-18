@@ -8,7 +8,7 @@
 use crate::protocol::header::BondingHeader;
 use crate::receiver::aggregator::{Packet, ReassemblyBuffer, ReassemblyConfig, ReassemblyStats};
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use quanta::Instant;
 use std::net::{SocketAddr, UdpSocket};
@@ -18,7 +18,10 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
+use strata_transport::pool::TimestampClock;
 use strata_transport::receiver::{Receiver as TransportReceiver, ReceiverConfig, ReceiverEvent};
+use strata_transport::session::RttTracker;
+use strata_transport::wire::{ControlBody, Packet as WirePacket, PacketHeader};
 use tracing::{debug, warn};
 
 /// Multi-link bonding receiver backed by `strata-transport`.
@@ -102,54 +105,18 @@ impl TransportBondingReceiver {
 
     /// Add a link by binding a UDP socket to `bind_addr`.
     ///
-    /// Spawns a reader thread that receives strata-transport wire-format
-    /// packets, decodes them through the transport receiver (FEC + reorder),
-    /// extracts application data, strips the bonding header, and feeds the
-    /// result into the shared reassembly buffer.
+    /// Spawns a reader thread running a monoio event loop (io_uring on
+    /// Linux ≥5.1, epoll fallback) that asynchronously receives datagrams,
+    /// decodes them through the transport receiver, and feeds results into
+    /// the shared reassembly buffer.
     pub fn add_link(&self, bind_addr: SocketAddr) -> Result<()> {
         let socket = UdpSocket::bind(bind_addr)?;
-        socket.set_read_timeout(Some(Duration::from_millis(50)))?;
-
-        // Enable SO_BUSY_POLL for reduced receive latency
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = socket.as_raw_fd();
-            let poll_us: libc::c_int = 50; // 50µs busy-poll budget
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_BUSY_POLL,
-                    &poll_us as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
-        }
-
-        let input_tx = self
-            .input_tx
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Receiver shut down"))?
-            .clone();
-        let running = self.running.clone();
-
-        let handle = thread::Builder::new()
-            .name(format!("strata-rcv-{}", bind_addr))
-            .spawn(move || {
-                link_reader(socket, input_tx, running);
-            })?;
-
-        if let Ok(mut handles) = self.thread_handles.lock() {
-            handles.push(handle);
-        }
-
-        Ok(())
+        self.add_link_socket(socket)
     }
 
     /// Add a link from an already-bound UDP socket.
     pub fn add_link_socket(&self, socket: UdpSocket) -> Result<()> {
-        socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+        let local_addr = socket.local_addr()?;
 
         let input_tx = self
             .input_tx
@@ -157,11 +124,17 @@ impl TransportBondingReceiver {
             .ok_or_else(|| anyhow::anyhow!("Receiver shut down"))?
             .clone();
         let running = self.running.clone();
+        let stats = self.stats.clone();
 
         let handle = thread::Builder::new()
-            .name("strata-rcv-link".into())
+            .name(format!("strata-rcv-{}", local_addr))
             .spawn(move || {
-                link_reader(socket, input_tx, running);
+                let mut rt = crate::build_monoio_runtime!();
+                rt.block_on(async move {
+                    let mono_socket = monoio::net::udp::UdpSocket::from_std(socket)
+                        .expect("failed to convert socket for monoio");
+                    link_reader_async(mono_socket, input_tx, running, stats).await;
+                });
             })?;
 
         if let Ok(mut handles) = self.thread_handles.lock() {
@@ -186,6 +159,12 @@ impl TransportBondingReceiver {
         self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// Returns a shared handle to the reassembly stats for external polling
+    /// (e.g., Prometheus metrics server).
+    pub fn stats_handle(&self) -> Arc<Mutex<ReassemblyStats>> {
+        self.stats.clone()
+    }
+
     /// Check if the receiver is still running.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
@@ -198,53 +177,239 @@ impl Drop for TransportBondingReceiver {
     }
 }
 
-/// Per-link reader loop.
+/// Per-link reader loop (async, runs on a monoio event loop).
 ///
-/// Reads raw UDP datagrams, feeds them to a `strata_transport::Receiver`,
-/// then processes delivered packets: strips the bonding header and pushes
-/// them into the shared reassembly channel.
-fn link_reader(socket: UdpSocket, input_tx: Sender<Packet>, running: Arc<AtomicBool>) {
+/// Uses io_uring (or epoll fallback) for async UDP receives, feeding
+/// datagrams into a `strata_transport::Receiver` for FEC decoding
+/// and reorder. Delivered payloads have the bonding header stripped
+/// and are pushed into the shared reassembly channel.
+async fn link_reader_async(
+    socket: monoio::net::udp::UdpSocket,
+    input_tx: Sender<Packet>,
+    running: Arc<AtomicBool>,
+    reassembly_stats: Arc<Mutex<ReassemblyStats>>,
+) {
     let mut transport_rx = TransportReceiver::new(ReceiverConfig::default());
     let mut buf = vec![0u8; 65536];
+    let clock = TimestampClock::new();
+    let mut last_ack = std::time::Instant::now();
+    let ack_interval = Duration::from_millis(50);
+    let mut last_report = std::time::Instant::now();
+    let report_interval = Duration::from_secs(1);
+    // Track bytes delivered for goodput calculation.
+    let mut prev_bytes_delivered: u64 = 0;
+    let mut prev_report_time = std::time::Instant::now();
+    // Most recently seen sender address on this socket.
+    let mut sender_addr: Option<std::net::SocketAddr> = None;
 
     while running.load(Ordering::Relaxed) {
-        match socket.recv_from(&mut buf) {
-            Ok((n, _addr)) => {
-                let raw = Bytes::copy_from_slice(&buf[..n]);
+        // Await next datagram with a timeout so we can check the running flag.
+        match monoio::time::timeout(Duration::from_millis(50), socket.recv_from(buf)).await {
+            Ok((Ok((n, addr)), returned_buf)) => {
+                sender_addr = Some(addr);
+                let raw = Bytes::copy_from_slice(&returned_buf[..n]);
+
+                // Check for control packets (Ping) before handing to transport_rx.
+                // Respond with Pong immediately.
+                if let Some(pong_bytes) = try_make_pong(&returned_buf[..n], &clock) {
+                    let _ = socket.send_to(pong_bytes, addr).await;
+                }
+
                 transport_rx.receive(raw);
+                buf = returned_buf;
 
                 for event in transport_rx.drain_events() {
-                    if let ReceiverEvent::Deliver(delivered) = event {
-                        // The delivered payload is: BondingHeader + original payload
-                        if let Some((header, original_payload)) =
-                            BondingHeader::unwrap(delivered.payload)
-                        {
-                            let packet = Packet {
-                                seq_id: header.seq_id,
-                                payload: original_payload,
-                                arrival_time: Instant::now(),
-                            };
-                            if input_tx.send(packet).is_err() {
-                                return;
+                    match event {
+                        ReceiverEvent::Deliver(delivered) => {
+                            if let Some((header, original_payload)) =
+                                BondingHeader::unwrap(delivered.payload)
+                            {
+                                let packet = Packet {
+                                    seq_id: header.seq_id,
+                                    payload: original_payload,
+                                    arrival_time: quanta::Instant::now(),
+                                };
+                                if input_tx.send(packet).is_err() {
+                                    return;
+                                }
+                            } else {
+                                debug!("Dropped packet with invalid bonding header");
                             }
-                        } else {
-                            debug!("Dropped packet with invalid bonding header");
+                        }
+                        ReceiverEvent::SendAck(ack) => {
+                            if let Some(addr) = sender_addr {
+                                let pkt_bytes = encode_control_packet(&ack, &clock);
+                                let _ = socket.send_to(pkt_bytes, addr).await;
+                            }
+                        }
+                        ReceiverEvent::SendNack(nack) => {
+                            if let Some(addr) = sender_addr {
+                                let pkt_bytes = encode_nack_packet(&nack, &clock);
+                                let _ = socket.send_to(pkt_bytes, addr).await;
+                            }
                         }
                     }
                 }
+
+                // Periodically generate and send ACKs.
+                if last_ack.elapsed() >= ack_interval {
+                    let ack = transport_rx.generate_ack();
+                    if let Some(addr) = sender_addr {
+                        let pkt_bytes = encode_control_packet(&ack, &clock);
+                        let _ = socket.send_to(pkt_bytes, addr).await;
+                    }
+                    // Also generate NACKs for missing packets.
+                    if let Some(nack) = transport_rx.generate_nacks() {
+                        if let Some(addr) = sender_addr {
+                            let pkt_bytes = encode_nack_packet(&nack, &clock);
+                            let _ = socket.send_to(pkt_bytes, addr).await;
+                        }
+                    }
+                    last_ack = std::time::Instant::now();
+                }
+
+                // Periodically send ReceiverReport.
+                if last_report.elapsed() >= report_interval {
+                    if let Some(addr) = sender_addr {
+                        let rx_stats = transport_rx.stats();
+                        let now = std::time::Instant::now();
+                        let dt = now.duration_since(prev_report_time).as_secs_f64();
+
+                        // Compute goodput from bytes delivered since last report
+                        let cur_bytes = rx_stats.bytes_received;
+                        let delta_bytes = cur_bytes.saturating_sub(prev_bytes_delivered);
+                        let goodput_bps = if dt > 0.01 {
+                            ((delta_bytes as f64 * 8.0) / dt) as u64
+                        } else {
+                            0
+                        };
+                        prev_bytes_delivered = cur_bytes;
+                        prev_report_time = now;
+
+                        // FEC repair rate
+                        let total = rx_stats.packets_received.max(1);
+                        let fec_rate =
+                            (rx_stats.fec_recoveries as f64 / total as f64).clamp(0.0, 1.0);
+
+                        // Jitter buffer depth from reassembly stats
+                        let jitter_ms = reassembly_stats
+                            .lock()
+                            .map(|s| s.current_latency_ms as u32)
+                            .unwrap_or(0);
+
+                        // Residual loss: (lost - fec_recovered) / total, after FEC
+                        let delivered = rx_stats.packets_delivered;
+                        let residual = total.saturating_sub(delivered);
+                        let loss_after_fec = (residual as f64 / total as f64).clamp(0.0, 1.0);
+
+                        let report = strata_transport::wire::ReceiverReportPacket {
+                            goodput_bps,
+                            fec_repair_rate: (fec_rate * 10000.0) as u16,
+                            jitter_buffer_ms: jitter_ms,
+                            loss_after_fec: (loss_after_fec * 10000.0) as u16,
+                        };
+                        let pkt_bytes = encode_receiver_report(&report, &clock);
+                        let _ = socket.send_to(pkt_bytes, addr).await;
+                    }
+                    last_report = std::time::Instant::now();
+                }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Timeout — continue loop
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                // Timeout on Windows-style timeout
-            }
-            Err(e) => {
+            Ok((Err(e), returned_buf)) => {
+                buf = returned_buf;
                 warn!("Link reader recv error: {}", e);
-                thread::sleep(Duration::from_millis(10));
+                monoio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(_elapsed) => {
+                // Timeout — re-check running flag. Buffer ownership was consumed
+                // by the cancelled io_uring op; allocate a fresh one.
+                buf = vec![0u8; 65536];
+
+                // Still send periodic ACKs even when idle.
+                if last_ack.elapsed() >= ack_interval {
+                    if let Some(addr) = sender_addr {
+                        let ack = transport_rx.generate_ack();
+                        let pkt_bytes = encode_control_packet(&ack, &clock);
+                        let _ = socket.send_to(pkt_bytes, addr).await;
+                    }
+                    last_ack = std::time::Instant::now();
+                }
             }
         }
     }
+}
+
+/// Try to decode a Ping control packet and produce a Pong response.
+fn try_make_pong(data: &[u8], clock: &TimestampClock) -> Option<Vec<u8>> {
+    use strata_transport::wire::Packet as WP;
+    use strata_transport::wire::PacketType;
+    let mut cursor: &[u8] = data;
+    let pkt = WP::decode(&mut cursor)?;
+    if pkt.header.packet_type != PacketType::Control {
+        return None;
+    }
+    let mut payload_cursor = &pkt.payload[..];
+    if let Some(ControlBody::Ping(ping)) = ControlBody::decode(&mut payload_cursor) {
+        let pong = RttTracker::make_pong(&ping, clock.now_us());
+        let mut body = BytesMut::with_capacity(16);
+        pong.encode(&mut body);
+        let body_bytes = body.freeze();
+        let header = PacketHeader::control(0, clock.now_us(), body_bytes.len() as u16);
+        let pkt = WirePacket {
+            header,
+            payload: body_bytes,
+        };
+        Some(pkt.encode().to_vec())
+    } else {
+        None
+    }
+}
+
+/// Encode an ACK as a wire-format control packet.
+fn encode_control_packet(
+    ack: &strata_transport::wire::AckPacket,
+    clock: &TimestampClock,
+) -> Vec<u8> {
+    let mut body = BytesMut::with_capacity(16);
+    ack.encode(&mut body);
+    let body_bytes = body.freeze();
+    let header = PacketHeader::control(0, clock.now_us(), body_bytes.len() as u16);
+    let pkt = WirePacket {
+        header,
+        payload: body_bytes,
+    };
+    pkt.encode().to_vec()
+}
+
+/// Encode a NACK as a wire-format control packet.
+fn encode_nack_packet(
+    nack: &strata_transport::wire::NackPacket,
+    clock: &TimestampClock,
+) -> Vec<u8> {
+    let mut body = BytesMut::with_capacity(64);
+    nack.encode(&mut body);
+    let body_bytes = body.freeze();
+    let header = PacketHeader::control(0, clock.now_us(), body_bytes.len() as u16);
+    let pkt = WirePacket {
+        header,
+        payload: body_bytes,
+    };
+    pkt.encode().to_vec()
+}
+
+/// Encode a ReceiverReport as a wire-format control packet.
+fn encode_receiver_report(
+    report: &strata_transport::wire::ReceiverReportPacket,
+    clock: &TimestampClock,
+) -> Vec<u8> {
+    let mut body = BytesMut::with_capacity(24);
+    report.encode(&mut body);
+    let body_bytes = body.freeze();
+    let header = PacketHeader::control(0, clock.now_us(), body_bytes.len() as u16);
+    let pkt = WirePacket {
+        header,
+        payload: body_bytes,
+    };
+    pkt.encode().to_vec()
 }
 
 #[cfg(test)]

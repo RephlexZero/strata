@@ -1,0 +1,21 @@
+# cargo-audit configuration
+# See: https://rustsec.org/
+
+[advisories]
+# Ignore RSA vulnerability in sqlx-mysql since we only use PostgreSQL backend
+# The vulnerable code path in RSA crate is not executed in our application
+# 
+# Context: sqlx-macros-core pulls in all database backends (mysql, postgres, sqlite)
+# at compile-time for its procedural macros. We use default-features = false
+# with explicit features = ["postgres", "macros", "migrate", ...] but the macros
+# feature still transitively depends on sqlx-mysql which brings in the rsa crate.
+# 
+# Risk assessment: The RSA vulnerability (Marvin timing attack) only affects
+# MySQL authentication at runtime. Our application exclusively uses PostgreSQL
+# and never executes the MySQL code path.
+ignore = [
+    "RUSTSEC-2023-0071",  # RSA Marvin Attack - only affects MySQL backend we don't use
+]
+
+# Show informational warnings (e.g., unmaintained crates)
+informational_warnings = ["unmaintained"]

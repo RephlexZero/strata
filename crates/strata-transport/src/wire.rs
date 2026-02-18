@@ -218,6 +218,7 @@ pub enum ControlType {
     Ping = 0x06,
     Pong = 0x07,
     Session = 0x08,
+    ReceiverReport = 0x09,
 }
 
 impl ControlType {
@@ -231,6 +232,7 @@ impl ControlType {
             0x06 => Some(ControlType::Ping),
             0x07 => Some(ControlType::Pong),
             0x08 => Some(ControlType::Session),
+            0x09 => Some(ControlType::ReceiverReport),
             _ => None,
         }
     }
@@ -720,6 +722,54 @@ impl SessionPacket {
     }
 }
 
+/// Receiver report: aggregate receiver-side metrics sent back to the sender
+/// so the sender's BitrateAdapter can incorporate ground-truth feedback.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReceiverReportPacket {
+    /// Total recovered video goodput (bits/sec).
+    pub goodput_bps: u64,
+    /// Fraction of packets recovered by FEC (0.0–1.0), encoded as u16 (0–10000).
+    pub fec_repair_rate: u16,
+    /// Current jitter buffer depth in milliseconds.
+    pub jitter_buffer_ms: u32,
+    /// Residual loss after FEC recovery (0.0–1.0), encoded as u16 (0–10000).
+    pub loss_after_fec: u16,
+}
+
+impl ReceiverReportPacket {
+    pub const ENCODED_LEN: usize = 16; // 8 + 2 + 4 + 2
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(ControlType::ReceiverReport as u8);
+        buf.put_u64(self.goodput_bps);
+        buf.put_u16(self.fec_repair_rate);
+        buf.put_u32(self.jitter_buffer_ms);
+        buf.put_u16(self.loss_after_fec);
+    }
+
+    pub fn decode(buf: &mut impl Buf) -> Option<Self> {
+        if buf.remaining() < Self::ENCODED_LEN {
+            return None;
+        }
+        Some(ReceiverReportPacket {
+            goodput_bps: buf.get_u64(),
+            fec_repair_rate: buf.get_u16(),
+            jitter_buffer_ms: buf.get_u32(),
+            loss_after_fec: buf.get_u16(),
+        })
+    }
+
+    /// FEC repair rate as a float (0.0–1.0).
+    pub fn fec_repair_rate_f32(&self) -> f32 {
+        self.fec_repair_rate as f32 / 10000.0
+    }
+
+    /// Residual loss after FEC as a float (0.0–1.0).
+    pub fn loss_after_fec_f32(&self) -> f32 {
+        self.loss_after_fec as f32 / 10000.0
+    }
+}
+
 // ─── Full Packet Serialization ──────────────────────────────────────────────
 
 /// A fully serialized Strata packet (header + payload).
@@ -771,6 +821,7 @@ pub enum ControlBody {
     Ping(PingPacket),
     Pong(PongPacket),
     Session(SessionPacket),
+    ReceiverReport(ReceiverReportPacket),
 }
 
 impl ControlBody {
@@ -790,6 +841,9 @@ impl ControlBody {
             ControlType::Ping => PingPacket::decode(buf).map(ControlBody::Ping),
             ControlType::Pong => PongPacket::decode(buf).map(ControlBody::Pong),
             ControlType::Session => SessionPacket::decode(buf).map(ControlBody::Session),
+            ControlType::ReceiverReport => {
+                ReceiverReportPacket::decode(buf).map(ControlBody::ReceiverReport)
+            }
         }
     }
 }
@@ -797,6 +851,50 @@ impl ControlBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    // ─── proptest: VarInt encode/decode roundtrip ─────────────────────────
+
+    /// Strategy that generates values at VarInt encoding boundaries.
+    fn varint_boundary_strategy() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            // 1-byte range: 0..=0x3F
+            0..=0x3Fu64,
+            // 2-byte range: 0x40..=0x3FFF
+            0x40u64..=0x3FFFu64,
+            // 4-byte range: 0x4000..=0x3FFF_FFFF
+            0x4000u64..=0x3FFF_FFFFu64,
+            // 8-byte range: 0x4000_0000..=VarInt::MAX
+            0x4000_0000u64..=VarInt::MAX,
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_varint_roundtrip(val in varint_boundary_strategy()) {
+            let vi = VarInt::from_u64(val);
+            let mut buf = BytesMut::new();
+            vi.encode(&mut buf);
+            prop_assert_eq!(buf.len(), vi.encoded_len());
+            let decoded = VarInt::decode(&mut buf.freeze()).unwrap();
+            prop_assert_eq!(decoded.value(), val);
+        }
+
+        #[test]
+        fn proptest_varint_out_of_range(val in (VarInt::MAX + 1)..=u64::MAX) {
+            prop_assert!(VarInt::new(val).is_none());
+        }
+
+        #[test]
+        fn proptest_varint_encoded_len_consistent(val in varint_boundary_strategy()) {
+            let vi = VarInt::from_u64(val);
+            let expected = if val < 0x40 { 1 }
+                else if val < 0x4000 { 2 }
+                else if val < 0x4000_0000 { 4 }
+                else { 8 };
+            prop_assert_eq!(vi.encoded_len(), expected);
+        }
+    }
 
     #[test]
     fn varint_roundtrip_boundaries() {
@@ -967,5 +1065,36 @@ mod tests {
         };
         let sacked: Vec<u64> = ack.sacked_sequences().collect();
         assert_eq!(sacked, vec![101, 103]);
+    }
+
+    #[test]
+    fn receiver_report_roundtrip() {
+        let report = ReceiverReportPacket {
+            goodput_bps: 5_000_000,
+            fec_repair_rate: 250, // 2.5%
+            jitter_buffer_ms: 120,
+            loss_after_fec: 50, // 0.5%
+        };
+        let mut buf = BytesMut::new();
+        report.encode(&mut buf);
+        assert_eq!(buf.len(), ReceiverReportPacket::ENCODED_LEN + 1); // +1 for type byte
+        let _ = buf.get_u8(); // skip type byte
+        let decoded = ReceiverReportPacket::decode(&mut buf).unwrap();
+        assert_eq!(decoded.goodput_bps, 5_000_000);
+        assert_eq!(decoded.fec_repair_rate, 250);
+        assert_eq!(decoded.jitter_buffer_ms, 120);
+        assert_eq!(decoded.loss_after_fec, 50);
+    }
+
+    #[test]
+    fn receiver_report_float_conversions() {
+        let report = ReceiverReportPacket {
+            goodput_bps: 0,
+            fec_repair_rate: 1000, // 10%
+            jitter_buffer_ms: 0,
+            loss_after_fec: 10000, // 100%
+        };
+        assert!((report.fec_repair_rate_f32() - 0.10).abs() < 1e-5);
+        assert!((report.loss_after_fec_f32() - 1.0).abs() < 1e-5);
     }
 }

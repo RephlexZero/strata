@@ -17,6 +17,13 @@ bytes = "1"
 path = ".."
 
 [[bin]]
+name = "fuzz_packet_decode"
+path = "fuzz_targets/fuzz_packet_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_wire_parser"
 path = "fuzz_targets/fuzz_wire_parser.rs"
 test = false
@@ -33,6 +40,13 @@ bench = false
 [[bin]]
 name = "fuzz_control"
 path = "fuzz_targets/fuzz_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_receiver"
+path = "fuzz_targets/fuzz_receiver.rs"
 test = false
 doc = false
 bench = false

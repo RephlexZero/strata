@@ -91,6 +91,7 @@ fn jitter_buffer_adapts_to_high_jitter_then_recovers() {
         skip_after: Some(Duration::from_millis(200)),
         jitter_latency_multiplier: 4.0,
         max_latency_ms: 300,
+        ..Default::default()
     };
     let mut buf = ReassemblyBuffer::with_config(0, config);
     let start = quanta::Instant::now();
@@ -142,6 +143,7 @@ fn receiver_stats_reflect_impairments() {
         skip_after: Some(Duration::from_millis(50)),
         jitter_latency_multiplier: 4.0,
         max_latency_ms: 500,
+        ..Default::default()
     };
     let mut buf = ReassemblyBuffer::with_config(0, config);
     let start = quanta::Instant::now();

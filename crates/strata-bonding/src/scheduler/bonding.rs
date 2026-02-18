@@ -1,4 +1,5 @@
 use crate::config::SchedulerConfig;
+use crate::media::priority::{DegradationStage, Treatment};
 use crate::net::interface::LinkSender;
 use crate::scheduler::blest::BlestGuard;
 use crate::scheduler::dwrr::Dwrr;
@@ -51,6 +52,10 @@ pub struct BondingScheduler<L: LinkSender + ?Sized> {
     /// RNG for Thompson Sampling.
     rng: SmallRng,
 
+    // ─── Degradation ────────────────────────────────────────────────
+    /// Current degradation stage from BitrateAdapter.
+    degradation_stage: DegradationStage,
+
     // ─── Fast-failover state ────────────────────────────────────────
     failover_until: Option<Instant>,
     prev_phases: HashMap<usize, crate::net::interface::LinkPhase>,
@@ -78,6 +83,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             thompson: ThompsonSelector::new(),
             kalman_rtt: HashMap::new(),
             rng: SmallRng::seed_from_u64(0xB04D),
+            degradation_stage: DegradationStage::Normal,
             failover_until: None,
             prev_phases: HashMap::new(),
             prev_rtts: HashMap::new(),
@@ -94,6 +100,16 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
     /// Replaces the scheduler configuration at runtime.
     pub fn update_config(&mut self, config: SchedulerConfig) {
         self.scheduler.update_config(config);
+    }
+
+    /// Updates the degradation stage (called when BitrateAdapter produces a new stage).
+    pub fn set_degradation_stage(&mut self, stage: DegradationStage) {
+        self.degradation_stage = stage;
+    }
+
+    /// Returns the current degradation stage.
+    pub fn degradation_stage(&self) -> DegradationStage {
+        self.degradation_stage
     }
 
     /// Registers a new link with the scheduler and all intelligence overlays.
@@ -271,6 +287,23 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
     pub fn send(&mut self, payload: Bytes, profile: crate::scheduler::PacketProfile) -> Result<()> {
         let packet_len = payload.len();
         let config = self.scheduler.config();
+
+        // Check degradation stage: drop packets the current stage doesn't allow.
+        let treatment = if profile.is_critical {
+            Treatment::Broadcast
+        } else if profile.can_drop {
+            Treatment::Droppable
+        } else {
+            Treatment::Normal
+        };
+        if !self.degradation_stage.allows(treatment) {
+            tracing::debug!(
+                stage = ?self.degradation_stage,
+                ?treatment,
+                "dropping packet per degradation policy"
+            );
+            return Ok(());
+        }
 
         // Fast-failover: Broadcast during link instability
         let should_broadcast = (config.critical_broadcast && profile.is_critical)
@@ -452,6 +485,10 @@ mod tests {
                     mtu: None,
                     iface: None,
                     link_kind: None,
+                    transport: None,
+                    estimated_capacity_bps: 0.0,
+                    owd_ms: 0.0,
+                    receiver_report: None,
                 }),
                 sent_packets: Mutex::new(Vec::new()),
             }
@@ -1051,5 +1088,150 @@ mod tests {
         assert_eq!(scheduler.iods.link_count(), 1);
         assert_eq!(scheduler.thompson.link_count(), 1);
         assert!(!scheduler.kalman_rtt.contains_key(&2));
+    }
+
+    // ─── Degradation Stage Tests ────────────────────────────────────────
+
+    #[test]
+    fn test_degradation_drop_disposable_drops_droppable_packets() {
+        let mut scheduler = BondingScheduler::new();
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        scheduler.add_link(l1.clone());
+        scheduler.refresh_metrics();
+
+        scheduler.set_degradation_stage(DegradationStage::DropDisposable);
+
+        // Droppable packet should be silently dropped
+        let payload = Bytes::from_static(b"B-frame");
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: false,
+            can_drop: true,
+            size_bytes: payload.len(),
+        };
+        scheduler.send(payload, profile).unwrap();
+        assert_eq!(
+            l1.sent_packets.lock().unwrap().len(),
+            0,
+            "droppable packet should be filtered in DropDisposable stage"
+        );
+
+        // Non-droppable standard packet should still go through
+        let payload = Bytes::from_static(b"P-frame");
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: false,
+            can_drop: false,
+            size_bytes: payload.len(),
+        };
+        scheduler.send(payload, profile).unwrap();
+        assert_eq!(
+            l1.sent_packets.lock().unwrap().len(),
+            1,
+            "standard packet should pass in DropDisposable stage"
+        );
+    }
+
+    #[test]
+    fn test_degradation_protect_keyframes_drops_standard() {
+        let mut scheduler = BondingScheduler::new();
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        scheduler.add_link(l1.clone());
+        scheduler.refresh_metrics();
+
+        scheduler.set_degradation_stage(DegradationStage::ProtectKeyframes);
+
+        // Standard (non-critical, non-droppable) should be dropped
+        let payload = Bytes::from_static(b"P-frame");
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: false,
+            can_drop: false,
+            size_bytes: payload.len(),
+        };
+        scheduler.send(payload, profile).unwrap();
+        assert_eq!(
+            l1.sent_packets.lock().unwrap().len(),
+            0,
+            "standard packet should be filtered in ProtectKeyframes stage"
+        );
+
+        // Critical should still go through
+        let payload = Bytes::from_static(b"IDR");
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: true,
+            can_drop: false,
+            size_bytes: payload.len(),
+        };
+        scheduler.send(payload, profile).unwrap();
+        assert_eq!(
+            l1.sent_packets.lock().unwrap().len(),
+            1,
+            "critical packet should pass in ProtectKeyframes stage"
+        );
+    }
+
+    #[test]
+    fn test_degradation_normal_passes_everything() {
+        let mut scheduler = BondingScheduler::new();
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        scheduler.add_link(l1.clone());
+        scheduler.refresh_metrics();
+
+        scheduler.set_degradation_stage(DegradationStage::Normal);
+
+        // All packet types should pass
+        for (is_critical, can_drop) in [(false, true), (false, false), (true, false)] {
+            let payload = Bytes::from_static(b"data");
+            let profile = crate::scheduler::PacketProfile {
+                is_critical,
+                can_drop,
+                size_bytes: payload.len(),
+            };
+            scheduler.send(payload, profile).unwrap();
+        }
+        assert_eq!(
+            l1.sent_packets.lock().unwrap().len(),
+            3,
+            "all packets should pass in Normal stage"
+        );
+    }
+
+    #[test]
+    fn test_degradation_stage_persists_across_sends() {
+        let mut scheduler = BondingScheduler::new();
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        scheduler.add_link(l1.clone());
+        scheduler.refresh_metrics();
+
+        scheduler.set_degradation_stage(DegradationStage::DropDisposable);
+        assert_eq!(
+            scheduler.degradation_stage(),
+            DegradationStage::DropDisposable
+        );
+
+        // Send several droppable packets — all should be filtered
+        for _ in 0..5 {
+            let payload = Bytes::from_static(b"B-frame");
+            let profile = crate::scheduler::PacketProfile {
+                is_critical: false,
+                can_drop: true,
+                size_bytes: payload.len(),
+            };
+            scheduler.send(payload, profile).unwrap();
+        }
+        assert_eq!(l1.sent_packets.lock().unwrap().len(), 0);
+
+        // Change back to Normal
+        scheduler.set_degradation_stage(DegradationStage::Normal);
+        let payload = Bytes::from_static(b"B-frame");
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: false,
+            can_drop: true,
+            size_bytes: payload.len(),
+        };
+        scheduler.send(payload, profile).unwrap();
+        assert_eq!(
+            l1.sent_packets.lock().unwrap().len(),
+            1,
+            "droppable should pass after returning to Normal"
+        );
     }
 }

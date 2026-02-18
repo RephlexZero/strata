@@ -228,6 +228,7 @@ impl Receiver {
         let loss_detector = {
             let mut d = LossDetector::new();
             d.set_rearm_interval(std::time::Duration::from_millis(config.nack_rearm_ms));
+            d.set_max_nacks(config.max_nack_retries);
             d
         };
         let fec_decoder = FecDecoder::new(config.max_fec_generations);

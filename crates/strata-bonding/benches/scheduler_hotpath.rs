@@ -39,6 +39,7 @@ impl MockLink {
                 mtu: None,
                 iface: None,
                 link_kind: None,
+                ..Default::default()
             }),
         }
     }

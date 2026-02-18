@@ -9,5 +9,4 @@ pub mod impairment;
 pub mod scenario;
 pub mod topology;
 
-#[cfg(test)]
-pub(crate) mod test_util;
+pub mod test_util;

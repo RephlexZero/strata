@@ -50,6 +50,7 @@ COPY Cargo.lock ./
 
 # Copy only the crates needed for the pipeline build
 COPY crates/strata-bonding crates/strata-bonding
+COPY crates/strata-common crates/strata-common
 COPY crates/strata-gst crates/strata-gst
 COPY crates/strata-sim crates/strata-sim
 COPY crates/strata-transport crates/strata-transport
@@ -60,6 +61,7 @@ RUN cat > Cargo.toml <<'TOML'
 resolver = "2"
 members = [
     "crates/strata-bonding",
+    "crates/strata-common",
     "crates/strata-gst",
     "crates/strata-sim",
     "crates/strata-transport",
@@ -85,6 +87,8 @@ quanta = "0.12"
 quinn-udp = "0.5"
 raptorq = "2.0"
 rand = "0.10.0"
+monoio = "0.2"
+quanta = "0.12"
 
 [profile.release]
 lto = true

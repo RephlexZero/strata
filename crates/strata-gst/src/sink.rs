@@ -5,8 +5,11 @@ use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
 use std::collections::HashMap;
-use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, Mutex};
+use std::sync::{atomic::AtomicBool, atomic::AtomicU32, atomic::Ordering, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use strata_bonding::adaptation::{
+    AdaptationConfig, BitrateAdapter, LinkCapacity, ReceiverFeedback,
+};
 use strata_bonding::config::{BondingConfig, LinkConfig, SchedulerConfig};
 use strata_bonding::runtime::{BondingRuntime, PacketSendError};
 use strata_bonding::scheduler::PacketProfile;
@@ -15,6 +18,7 @@ fn parse_config(config: &str) -> Result<BondingConfig, String> {
     BondingConfig::from_toml_str(config)
 }
 
+#[cfg(test)]
 fn compute_congestion_recommendation(
     total_capacity_bps: f64,
     observed_bps: f64,
@@ -57,6 +61,10 @@ mod imp {
         pub(crate) pad_map: Mutex<HashMap<String, usize>>,
         pub(crate) pending_links: Mutex<HashMap<usize, LinkConfig>>,
         pub(crate) scheduler_config: Mutex<SchedulerConfig>,
+
+        /// Bitrate envelope for adaptation (set via properties).
+        pub(crate) adaptation_min_kbps: AtomicU32,
+        pub(crate) adaptation_max_kbps: AtomicU32,
     }
 
     impl Default for StrataSink {
@@ -71,6 +79,8 @@ mod imp {
                 pad_map: Mutex::new(HashMap::new()),
                 pending_links: Mutex::new(HashMap::new()),
                 scheduler_config: Mutex::new(SchedulerConfig::default()),
+                adaptation_min_kbps: AtomicU32::new(500),
+                adaptation_max_kbps: AtomicU32::new(25_000),
             }
         }
     }
@@ -439,8 +449,9 @@ mod imp {
             let element_weak = self.obj().downgrade();
             let running = self.stats_running.clone();
             running.store(true, Ordering::Relaxed);
-            let congestion_headroom = sched_cfg.congestion_headroom_ratio;
-            let congestion_trigger = sched_cfg.congestion_trigger_ratio;
+
+            let adapt_min = self.adaptation_min_kbps.load(Ordering::Relaxed);
+            let adapt_max = self.adaptation_max_kbps.load(Ordering::Relaxed);
 
             let handle = std::thread::Builder::new()
                 .name("strata-stats".into())
@@ -449,6 +460,12 @@ mod imp {
                     let mut last_stats = Instant::now();
                     let start = Instant::now();
                     let mut stats_seq: u64 = 0;
+
+                    let mut adapter = BitrateAdapter::new(AdaptationConfig {
+                        max_bitrate_kbps: adapt_max,
+                        min_bitrate_kbps: adapt_min,
+                        ..AdaptationConfig::default()
+                    });
 
                     while running.load(Ordering::Relaxed) {
                         if last_stats.elapsed() >= stats_interval {
@@ -461,12 +478,18 @@ mod imp {
                                     .unwrap_or(0);
 
                                 let mut total_capacity = 0.0;
-                                let mut total_observed_bps = 0.0;
                                 let mut alive_links = 0u64;
-                                for m in metrics.values() {
+                                let mut link_caps = Vec::new();
+                                for (&id, m) in &metrics {
+                                    link_caps.push(LinkCapacity {
+                                        link_id: id,
+                                        capacity_kbps: m.capacity_bps / 1000.0,
+                                        alive: m.alive,
+                                        loss_rate: m.loss_rate,
+                                        rtt_ms: m.rtt_ms,
+                                    });
                                     if m.alive {
                                         total_capacity += m.capacity_bps;
-                                        total_observed_bps += m.observed_bps;
                                         alive_links += 1;
                                     }
                                 }
@@ -479,7 +502,7 @@ mod imp {
                                     .field("wall_time_ms", wall_time_ms)
                                     .field("total_capacity", total_capacity)
                                     .field("alive_links", alive_links);
-                                for (id, m) in metrics {
+                                for (id, m) in &metrics {
                                     let os_up =
                                         m.os_up.map(|v| if v { 1i32 } else { 0i32 }).unwrap_or(-1);
                                     let mtu = m.mtu.map(|v| v as i32).unwrap_or(-1);
@@ -504,16 +527,32 @@ mod imp {
                                 let _ = element
                                     .post_message(gst::message::Element::new(msg_struct.build()));
 
-                                if let Some(recommended) = compute_congestion_recommendation(
-                                    total_capacity,
-                                    total_observed_bps,
-                                    congestion_headroom,
-                                    congestion_trigger,
-                                ) {
-                                    let msg = gst::Structure::builder("congestion-control")
-                                        .field("recommended-bitrate", recommended)
-                                        .field("total_capacity", total_capacity)
-                                        .field("observed_bps", total_observed_bps)
+                                // Aggregate receiver reports into feedback
+                                let feedback = metrics
+                                    .values()
+                                    .filter_map(|m| m.receiver_report.as_ref())
+                                    .next()
+                                    .map(|r| ReceiverFeedback {
+                                        goodput_bps: r.goodput_bps,
+                                        fec_repair_rate: r.fec_repair_rate,
+                                        jitter_buffer_ms: r.jitter_buffer_ms,
+                                        loss_after_fec: r.loss_after_fec,
+                                    });
+
+                                // Feed BitrateAdapter and post command if target changed
+                                let cmd = if let Some(ref fb) = feedback {
+                                    adapter.update_with_feedback(&link_caps, fb)
+                                } else {
+                                    adapter.update(&link_caps)
+                                };
+                                if let Some(cmd) = cmd {
+                                    let msg = gst::Structure::builder("bitrate-command")
+                                        .field("target-kbps", cmd.target_kbps)
+                                        .field("reason", format!("{:?}", cmd.reason))
+                                        .field("stage", format!("{:?}", cmd.stage))
+                                        .field("mode", format!("{:?}", cmd.mode))
+                                        .field("spare-bw-kbps", cmd.spare_bw_kbps)
+                                        .field("fec-overhead", cmd.recommended_fec_overhead)
                                         .build();
                                     let _ = element.post_message(gst::message::Element::new(msg));
                                 }
@@ -669,6 +708,37 @@ mod tests {
 glib::wrapper! {
     pub struct StrataSink(ObjectSubclass<imp::StrataSink>)
         @extends gst_base::BaseSink, gst::Element, gst::Object;
+}
+
+impl StrataSink {
+    /// Returns a shared handle to the bonding runtime's metrics map.
+    ///
+    /// This can be passed to `MetricsServer::start()` for Prometheus scraping.
+    /// Returns `None` if the element hasn't been started yet.
+    pub fn metrics_handle(
+        &self,
+    ) -> Option<Arc<Mutex<HashMap<usize, strata_bonding::net::interface::LinkMetrics>>>> {
+        let runtime = lock_or_recover(&self.imp().runtime);
+        runtime.as_ref().map(|rt| rt.metrics_handle())
+    }
+
+    /// Forwards a degradation stage to the bonding scheduler.
+    pub fn set_degradation_stage(&self, stage: strata_bonding::media::priority::DegradationStage) {
+        let runtime = lock_or_recover(&self.imp().runtime);
+        if let Some(rt) = runtime.as_ref() {
+            rt.set_degradation_stage(stage);
+        }
+    }
+
+    /// Set the bitrate adaptation envelope (must be called before PLAYING).
+    pub fn set_adaptation_envelope(&self, min_kbps: u32, max_kbps: u32) {
+        self.imp()
+            .adaptation_min_kbps
+            .store(min_kbps, Ordering::Relaxed);
+        self.imp()
+            .adaptation_max_kbps
+            .store(max_kbps, Ordering::Relaxed);
+    }
 }
 
 pub fn register(plugin: Option<&gst::Plugin>) -> Result<(), glib::BoolError> {

@@ -560,7 +560,7 @@ async fn update_stream_config(
     // Wrap the payload with the request_id
     let mut payload_val = serde_json::to_value(&body).unwrap_or_default();
     payload_val["request_id"] = serde_json::json!(request_id);
-    let envelope = Envelope::new_raw("config.update", payload_val);
+    let envelope = Envelope::new("config.update", &payload_val);
     let json = serde_json::to_string(&envelope).unwrap();
 
     agent_tx

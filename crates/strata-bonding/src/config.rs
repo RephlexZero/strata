@@ -415,10 +415,10 @@ mod tests {
 
             [[links]]
             id = 10
-            uri = "rist://1.2.3.4:5000"
+            uri = "strata://1.2.3.4:5000"
 
             [[links]]
-            uri = "rist://5.6.7.8:5000"
+            uri = "strata://5.6.7.8:5000"
             interface = "eth0"
 
             [receiver]
@@ -436,7 +436,7 @@ mod tests {
         assert_eq!(cfg.version, CONFIG_VERSION);
         assert_eq!(cfg.links.len(), 2);
         assert_eq!(cfg.links[0].id, 10);
-        assert_eq!(cfg.links[0].uri, "rist://1.2.3.4:5000");
+        assert_eq!(cfg.links[0].uri, "strata://1.2.3.4:5000");
         assert!(cfg.links[0].interface.is_none());
         assert_eq!(cfg.links[1].id, 1);
         assert_eq!(cfg.links[1].interface.as_deref(), Some("eth0"));
@@ -469,13 +469,13 @@ mod tests {
         let toml = r#"
             version = 0
             [[links]]
-            uri = "rist://1.2.3.4:5000"
+            uri = "strata://1.2.3.4:5000"
         "#;
 
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.version, CONFIG_VERSION);
         assert_eq!(cfg.links.len(), 1);
-        assert_eq!(cfg.links[0].uri, "rist://1.2.3.4:5000");
+        assert_eq!(cfg.links[0].uri, "strata://1.2.3.4:5000");
     }
 
     #[test]
@@ -520,7 +520,7 @@ mod tests {
             version = 1
 
             [[links]]
-            uri = "rist://10.0.0.1:5000"
+            uri = "strata://10.0.0.1:5000"
 
             [scheduler]
             redundancy_enabled = false
@@ -571,7 +571,7 @@ mod tests {
         let toml = r#"
             version = 1
             [[links]]
-            uri = "rist://10.0.0.1:5000"
+            uri = "strata://10.0.0.1:5000"
         "#;
 
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
@@ -606,7 +606,7 @@ mod tests {
         let toml = r#"
             version = 99
             [[links]]
-            uri = "rist://1.2.3.4:5000"
+            uri = "strata://1.2.3.4:5000"
         "#;
         let result = BondingConfig::from_toml_str(toml);
         assert!(result.is_err());
@@ -717,7 +717,7 @@ mod tests {
             version = 1
             [[links]]
             id = 1
-            uri = "rist://1.2.3.4:5000"
+            uri = "strata://1.2.3.4:5000"
             interface = ""
         "#;
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
@@ -729,9 +729,9 @@ mod tests {
         let toml = r#"
             version = 1
             [[links]]
-            uri = "rist://1.2.3.4:5000"
+            uri = "strata://1.2.3.4:5000"
             [[links]]
-            uri = "rist://5.6.7.8:5000"
+            uri = "strata://5.6.7.8:5000"
         "#;
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.links[0].id, 0);

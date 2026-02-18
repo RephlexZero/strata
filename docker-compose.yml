@@ -7,6 +7,10 @@
 # Dashboard:  http://localhost:3000
 # Login:      dev@strata.local / development
 #
+# Web development (hot-reload, edit .rs/.css → auto-refresh):
+#   docker compose --profile web-dev up --build dashboard-dev   # :8080
+#   docker compose --profile web-dev up --build portal-dev      # :8081
+#
 # To stream to YouTube (or any RTMP target), set RELAY_URL:
 #   RELAY_URL="rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY" docker compose up -d
 #
@@ -164,6 +168,80 @@ services:
       link2:
         ipv4_address: 172.30.2.20
       default: {}   # management — host access for RELAY_URL
+    restart: unless-stopped
+
+  # ── Dashboard Dev (hot-reload WASM) ──────────────────────────────
+  #
+  # Live-reloading Trunk dev server for the dashboard.
+  # Source is bind-mounted — edit .rs / .css files and the browser
+  # refreshes automatically.  API and WebSocket calls are proxied
+  # to the control plane.
+  #
+  #   docker compose --profile web-dev up dashboard-dev
+  #   open http://localhost:8080
+  dashboard-dev:
+    profiles: ["web-dev"]
+    build:
+      context: .
+      dockerfile: dev/Dockerfile.web-dev
+      args:
+        CRATE: strata-dashboard
+    depends_on:
+      - strata-control
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./crates/strata-dashboard/src:/src/crates/strata-dashboard/src
+      - ./crates/strata-dashboard/style:/src/crates/strata-dashboard/style
+      - ./crates/strata-dashboard/index.html:/src/crates/strata-dashboard/index.html:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        cat >> Trunk.toml <<'PROXY'
+
+        [[proxy]]
+        rewrite = "/api/"
+        backend = "http://strata-control:3000/api/"
+
+        [[proxy]]
+        rewrite = "/dashboard/"
+        backend = "http://strata-control:3000/dashboard/"
+        ws = true
+        PROXY
+        exec trunk serve --address 0.0.0.0 --port 8080
+    restart: unless-stopped
+
+  # ── Portal Dev (hot-reload WASM) ────────────────────────────────
+  #
+  # Live-reloading Trunk dev server for the sender portal.
+  #
+  #   docker compose --profile web-dev up portal-dev
+  #   open http://localhost:8081
+  portal-dev:
+    profiles: ["web-dev"]
+    build:
+      context: .
+      dockerfile: dev/Dockerfile.web-dev
+      args:
+        CRATE: strata-portal
+    depends_on:
+      - strata-sender-sim
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./crates/strata-portal/src:/src/crates/strata-portal/src
+      - ./crates/strata-portal/style:/src/crates/strata-portal/style
+      - ./crates/strata-portal/index.html:/src/crates/strata-portal/index.html:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        cat >> Trunk.toml <<'PROXY'
+
+        [[proxy]]
+        rewrite = "/api/"
+        backend = "http://strata-sender-sim:3001/api/"
+        PROXY
+        exec trunk serve --address 0.0.0.0 --port 8080
     restart: unless-stopped
 
 networks:

@@ -1,11 +1,52 @@
 use crate::config::{BondingConfig, LinkConfig, SchedulerConfig};
+use crate::media::priority::DegradationStage;
 use crate::metrics::MetricsServer;
 use crate::net::interface::{LinkMetrics, LinkSender};
 use crate::net::transport::TransportLink;
 use crate::scheduler::bonding::BondingScheduler;
+
+/// Build a monoio runtime with io_uring SQPOLL if available.
+///
+/// SQPOLL eliminates the `io_uring_enter` syscall by dedicating a kernel thread
+/// to poll the submission queue. Falls back to regular io_uring/epoll if SQPOLL
+/// is unavailable (requires CAP_SYS_NICE or root).
+#[macro_export]
+macro_rules! build_monoio_runtime {
+    () => {{
+        #[cfg(target_os = "linux")]
+        {
+            let mut urb = io_uring::IoUring::builder();
+            urb.setup_sqpoll(1000);
+            let result = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                .uring_builder(urb)
+                .enable_timer()
+                .build();
+            match result {
+                Ok(rt) => {
+                    tracing::info!("monoio runtime with SQPOLL enabled");
+                    rt
+                }
+                Err(_) => {
+                    tracing::info!("SQPOLL unavailable, falling back to regular io_uring");
+                    monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                        .enable_timer()
+                        .build()
+                        .expect("failed to create monoio runtime")
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                .enable_timer()
+                .build()
+                .expect("failed to create monoio runtime")
+        }
+    }};
+}
 use crate::scheduler::PacketProfile;
 use bytes::Bytes;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender};
 use quanta::Instant;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
@@ -23,17 +64,12 @@ pub enum PacketSendError {
     Disconnected,
 }
 
-/// Hot-path packet data sent via lock-free SPSC ring buffer.
-struct PacketData {
-    data: Bytes,
-    profile: PacketProfile,
-}
-
-/// Control messages sent via crossbeam channel (infrequent).
+/// Control messages for the worker thread (cold path).
 enum ControlMessage {
     ApplyConfig(Box<BondingConfig>),
     AddLink(LinkConfig),
     RemoveLink(usize),
+    SetDegradationStage(DegradationStage),
     Shutdown,
 }
 
@@ -43,15 +79,14 @@ enum ControlMessage {
 /// loop, processing packets, applying configuration changes, and refreshing
 /// link metrics.
 ///
-/// **Hot path** (packets) uses a lock-free SPSC ring buffer (`rtrb`) for
-/// minimal latency. **Control path** (config, link changes, shutdown) uses
-/// a bounded crossbeam channel.
+/// Packets flow through a lock-free SPSC ring buffer (`rtrb`) for minimal
+/// latency. Control messages use a crossbeam channel for reliable delivery.
 ///
 /// Dropping the runtime triggers a graceful shutdown of the worker thread.
 pub struct BondingRuntime {
-    packet_tx: rtrb::Producer<PacketData>,
+    packet_tx: rtrb::Producer<(Bytes, PacketProfile)>,
     control_tx: Sender<ControlMessage>,
-    shutdown: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     metrics: Arc<Mutex<HashMap<usize, LinkMetrics>>>,
     handle: Option<thread::JoinHandle<()>>,
     metrics_server: Option<MetricsServer>,
@@ -64,32 +99,36 @@ impl BondingRuntime {
     }
 
     /// Creates a runtime with the given scheduler configuration.
+    ///
+    /// The worker thread runs a monoio event loop (io_uring on Linux ≥5.1,
+    /// epoll fallback otherwise). Packets flow via a lock-free SPSC ring
+    /// buffer; control messages use a crossbeam channel. The monoio reactor
+    /// drives the idle/wake cycle, replacing the old busy-poll `thread::sleep`.
     pub fn with_config(scheduler_config: SchedulerConfig) -> Self {
-        let channel_capacity = scheduler_config.channel_capacity;
-        let (packet_tx, packet_rx) = rtrb::RingBuffer::new(channel_capacity);
-        let (control_tx, control_rx) = bounded(64);
+        let ring_capacity = scheduler_config.channel_capacity.next_power_of_two();
+        let (packet_tx, packet_rx) = rtrb::RingBuffer::new(ring_capacity);
+        let (control_tx, control_rx) = crossbeam_channel::unbounded();
         let metrics = Arc::new(Mutex::new(HashMap::new()));
         let metrics_clone = metrics.clone();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = shutdown.clone();
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_clone = alive.clone();
 
         let handle = thread::Builder::new()
             .name("strata-worker".into())
             .spawn(move || {
-                runtime_worker(
-                    packet_rx,
-                    control_rx,
-                    metrics_clone,
-                    scheduler_config,
-                    shutdown_clone,
-                )
+                let mut rt = build_monoio_runtime!();
+                rt.block_on(async move {
+                    runtime_worker_async(packet_rx, control_rx, metrics_clone, scheduler_config)
+                        .await;
+                });
+                alive_clone.store(false, Ordering::Relaxed);
             })
             .expect("failed to spawn bonding runtime worker");
 
         Self {
             packet_tx,
             control_tx,
-            shutdown,
+            alive,
             metrics,
             handle: Some(handle),
             metrics_server: None,
@@ -105,13 +144,12 @@ impl BondingRuntime {
         data: Bytes,
         profile: PacketProfile,
     ) -> Result<(), PacketSendError> {
-        if self.shutdown.load(Ordering::Relaxed) {
+        if !self.alive.load(Ordering::Relaxed) {
             return Err(PacketSendError::Disconnected);
         }
-        match self.packet_tx.push(PacketData { data, profile }) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(PacketSendError::Full),
-        }
+        self.packet_tx
+            .push((data, profile))
+            .map_err(|_| PacketSendError::Full)
     }
 
     /// Sends a full configuration update to the worker thread.
@@ -133,6 +171,13 @@ impl BondingRuntime {
         self.control_tx
             .send(ControlMessage::RemoveLink(id))
             .map_err(|e| anyhow::anyhow!("Failed to remove link: {}", e))
+    }
+
+    /// Updates the degradation stage on the scheduler (thread-safe).
+    pub fn set_degradation_stage(&self, stage: DegradationStage) {
+        let _ = self
+            .control_tx
+            .send(ControlMessage::SetDegradationStage(stage));
     }
 
     /// Returns a snapshot of all link metrics (thread-safe clone).
@@ -171,7 +216,6 @@ impl BondingRuntime {
         if let Some(mut server) = self.metrics_server.take() {
             server.stop();
         }
-        self.shutdown.store(true, Ordering::Relaxed);
         let _ = self.control_tx.send(ControlMessage::Shutdown);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -191,12 +235,11 @@ impl Drop for BondingRuntime {
     }
 }
 
-fn runtime_worker(
-    mut packet_rx: rtrb::Consumer<PacketData>,
+async fn runtime_worker_async(
+    mut packet_rx: rtrb::Consumer<(Bytes, PacketProfile)>,
     control_rx: Receiver<ControlMessage>,
     metrics: Arc<Mutex<HashMap<usize, LinkMetrics>>>,
     scheduler_config: SchedulerConfig,
-    shutdown: Arc<AtomicBool>,
 ) {
     let mut scheduler: BondingScheduler<dyn LinkSender> =
         BondingScheduler::with_config(scheduler_config.clone());
@@ -206,34 +249,45 @@ fn runtime_worker(
     let fast_stats_interval = Duration::from_millis(100);
 
     loop {
-        // Hot path: drain all available packets from SPSC ring buffer
-        while let Ok(pkt) = packet_rx.pop() {
-            let _ = scheduler.send(pkt.data, pkt.profile);
+        let mut did_work = false;
+
+        // Drain all available packets from the lock-free ring buffer.
+        while let Ok((data, profile)) = packet_rx.pop() {
+            let _ = scheduler.send(data, profile);
+            did_work = true;
         }
 
-        // Control path: process one control message (non-blocking)
-        match control_rx.try_recv() {
-            Ok(msg) => match msg {
-                ControlMessage::AddLink(link) => {
-                    apply_link(&mut scheduler, &mut current_links, link);
+        // Process control messages (non-blocking).
+        loop {
+            match control_rx.try_recv() {
+                Ok(msg) => {
+                    did_work = true;
+                    match msg {
+                        ControlMessage::AddLink(link) => {
+                            apply_link(&mut scheduler, &mut current_links, link);
+                        }
+                        ControlMessage::RemoveLink(id) => {
+                            scheduler.remove_link(id);
+                            current_links.remove(&id);
+                        }
+                        ControlMessage::ApplyConfig(config) => {
+                            scheduler.update_config(config.scheduler.clone());
+                            apply_config(&mut scheduler, &mut current_links, *config);
+                        }
+                        ControlMessage::SetDegradationStage(stage) => {
+                            scheduler.set_degradation_stage(stage);
+                        }
+                        ControlMessage::Shutdown => return,
+                    }
                 }
-                ControlMessage::RemoveLink(id) => {
-                    scheduler.remove_link(id);
-                    current_links.remove(&id);
-                }
-                ControlMessage::ApplyConfig(config) => {
-                    scheduler.update_config(config.scheduler.clone());
-                    apply_config(&mut scheduler, &mut current_links, *config);
-                }
-                ControlMessage::Shutdown => break,
-            },
-            Err(crossbeam_channel::TryRecvError::Empty) => {}
-            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+            }
         }
 
-        // If no work was available, yield CPU briefly to avoid busy-spin
-        if packet_rx.slots() == 0 && shutdown.load(Ordering::Relaxed) {
-            break;
+        if !did_work {
+            // Yield to monoio reactor instead of blocking the thread.
+            monoio::time::sleep(Duration::from_micros(50)).await;
         }
 
         if last_fast_stats.elapsed() >= fast_stats_interval {
@@ -308,11 +362,13 @@ fn apply_link(
     }
 }
 
-/// Parse a URI (e.g. `rist://1.2.3.4:5000` or `1.2.3.4:5000`) to a `SocketAddr`.
+/// Parse a URI (e.g. `strata://1.2.3.4:5000` or `1.2.3.4:5000`) to a `SocketAddr`.
 fn parse_uri(uri: &str) -> Option<SocketAddr> {
-    // Strip legacy rist:// prefix if present
     let stripped = uri
-        .strip_prefix("rist://@")
+        .strip_prefix("strata://@")
+        .or_else(|| uri.strip_prefix("strata://"))
+        // Accept legacy rist:// URIs for backward compat
+        .or_else(|| uri.strip_prefix("rist://@"))
         .or_else(|| uri.strip_prefix("rist://"))
         .unwrap_or(uri);
     // Strip query parameters
@@ -357,24 +413,8 @@ fn create_transport_link(link: &LinkConfig) -> anyhow::Result<TransportLink> {
         UdpSocket::bind("0.0.0.0:0")?
     };
 
-    // Enable SO_BUSY_POLL for reduced latency on the hot path
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = socket.as_raw_fd();
-        let poll_us: libc::c_int = 50; // 50µs busy-poll budget
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_BUSY_POLL,
-                &poll_us as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-    }
-
     socket.connect(addr)?;
+    set_busy_poll(&socket);
     Ok(TransportLink::new(
         link.id,
         socket,
@@ -382,6 +422,29 @@ fn create_transport_link(link: &LinkConfig) -> anyhow::Result<TransportLink> {
         link.interface.clone(),
     ))
 }
+
+/// Enable SO_BUSY_POLL on a socket for reduced NIC-to-application latency.
+///
+/// The kernel will busy-poll the NIC driver queue for up to 50µs before
+/// sleeping, eliminating interrupt-driven wakeup overhead on the receive path.
+#[cfg(target_os = "linux")]
+fn set_busy_poll(socket: &UdpSocket) {
+    use std::os::unix::io::AsRawFd;
+    let fd = socket.as_raw_fd();
+    let busy_poll_us: libc::c_int = 50;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BUSY_POLL,
+            &busy_poll_us as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&busy_poll_us) as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_busy_poll(_socket: &UdpSocket) {}
 
 #[cfg(test)]
 mod tests {
@@ -557,20 +620,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_uri_strata_scheme() {
+        let addr = parse_uri("strata://127.0.0.1:5000").unwrap();
+        assert_eq!(addr, "127.0.0.1:5000".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn parse_uri_strata_listener() {
+        let addr = parse_uri("strata://@0.0.0.0:5000").unwrap();
+        assert_eq!(addr, "0.0.0.0:5000".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
     fn parse_uri_legacy_rist() {
         let addr = parse_uri("rist://127.0.0.1:5000").unwrap();
         assert_eq!(addr, "127.0.0.1:5000".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
-    fn parse_uri_legacy_rist_listener() {
-        let addr = parse_uri("rist://@0.0.0.0:5000").unwrap();
-        assert_eq!(addr, "0.0.0.0:5000".parse::<SocketAddr>().unwrap());
-    }
-
-    #[test]
     fn parse_uri_with_query() {
-        let addr = parse_uri("rist://10.0.0.1:6000?miface=eth0").unwrap();
+        let addr = parse_uri("strata://10.0.0.1:6000?miface=eth0").unwrap();
         assert_eq!(addr, "10.0.0.1:6000".parse::<SocketAddr>().unwrap());
     }
 

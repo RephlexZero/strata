@@ -13,6 +13,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use strata_common::ids;
+use strata_common::profiles;
 use strata_common::protocol::{Envelope, StreamStartPayload, StreamStopPayload};
 
 use crate::api::auth::ApiError;
@@ -79,7 +80,7 @@ async fn start_stream(
         return Err(ApiError::bad_request("sender already has an active stream"));
     }
 
-    // Resolve destination → RTMP relay URL (optional — bonded RIST
+    // Resolve destination → RTMP relay URL (optional — bonded Strata
     // streams don't require a destination record)
     let relay_url = if let Some(ref dest_id) = body.destination_id {
         if dest_id.is_empty() {
@@ -126,7 +127,7 @@ async fn start_stream(
 
     // Build stream.start command and send to agent.
     //
-    // RIST destinations are built dynamically based on the sender's
+    // Strata destinations are built dynamically based on the sender's
     // currently enabled network interfaces.  Each link targets the
     // receiver's IP on the matching subnet so traffic flows over
     // physically separate paths.
@@ -148,16 +149,24 @@ async fn start_stream(
         })
         .unwrap_or(receiver_links.len());
     let link_count = enabled_count.min(receiver_links.len());
-    let rist_dests: Vec<String> = receiver_links[..link_count]
+    let strata_dests: Vec<String> = receiver_links[..link_count]
         .iter()
-        .map(|addr| format!("rist://{addr}?buffer=2000"))
+        .map(|addr| format!("strata://{addr}?buffer=2000"))
         .collect();
 
     tracing::info!(
         links = link_count,
-        dests = ?rist_dests,
-        "building RIST destinations for sender"
+        dests = ?strata_dests,
+        "building Strata destinations for sender"
     );
+
+    // Extract source config values before they're consumed into the payload.
+    let body_source_resolution = body
+        .source
+        .as_ref()
+        .and_then(|s| s.resolution.clone())
+        .or_else(|| Some("1920x1080".into()));
+    let body_source_framerate = body.source.as_ref().and_then(|s| s.framerate).or(Some(30));
 
     let default_source = match std::env::var("STRATA_DEFAULT_SOURCE").as_deref() {
         Ok("file") | Ok("uri") => strata_common::protocol::SourceConfig {
@@ -172,7 +181,7 @@ async fn start_stream(
             mode: "test".into(),
             device: None,
             uri: None,
-            resolution: Some("1280x720".into()),
+            resolution: Some("1920x1080".into()),
             framerate: Some(30),
             passthrough: None,
         },
@@ -181,14 +190,39 @@ async fn start_stream(
     let start_payload = StreamStartPayload {
         stream_id: stream_id.clone(),
         source: body.source.unwrap_or(default_source),
-        encoder: body
-            .encoder
-            .unwrap_or(strata_common::protocol::EncoderConfig {
-                bitrate_kbps: 1000,
-                tune: Some("zerolatency".into()),
-                keyint_max: Some(60),
-            }),
-        destinations: rist_dests,
+        encoder: {
+            let enc = body
+                .encoder
+                .unwrap_or(strata_common::protocol::EncoderConfig {
+                    bitrate_kbps: 0, // placeholder — overridden below
+                    tune: Some("zerolatency".into()),
+                    keyint_max: Some(60),
+                    codec: Some("h265".into()),
+                    min_bitrate_kbps: None,
+                    max_bitrate_kbps: None,
+                });
+            // Resolve codec (default h265)
+            let codec = enc.codec.clone().unwrap_or_else(|| "h265".into());
+            // Resolution + framerate come from the source config above
+            let source_res = body_source_resolution.as_deref();
+            let source_fps = body_source_framerate;
+            let profile = profiles::lookup_profile(source_res, source_fps, Some(&codec));
+            // Apply smart defaults: if the caller didn't set values, use profile
+            let bitrate = if enc.bitrate_kbps == 0 {
+                profile.default_kbps
+            } else {
+                enc.bitrate_kbps
+            };
+            strata_common::protocol::EncoderConfig {
+                bitrate_kbps: bitrate,
+                tune: enc.tune,
+                keyint_max: enc.keyint_max,
+                codec: Some(codec),
+                min_bitrate_kbps: Some(enc.min_bitrate_kbps.unwrap_or(profile.min_kbps)),
+                max_bitrate_kbps: Some(enc.max_bitrate_kbps.unwrap_or(profile.max_kbps)),
+            }
+        },
+        destinations: strata_dests,
         bonding_config: serde_json::json!({
             "version": 1,
             "scheduler": {

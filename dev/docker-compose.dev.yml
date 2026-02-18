@@ -4,14 +4,15 @@
 #   cargo build -p strata-agent -p strata-control -p strata-gst
 #   docker compose -f docker-compose.yml -f dev/docker-compose.dev.yml up -d
 #
-# Or use the helper script:
-#   ./dev/fast-reload.sh
+# Rebuild a crate and restart its container:
+#   cargo build -p strata-control && docker compose restart strata-control
+#   cargo build -p strata-agent  && docker compose restart strata-sender-sim
+#   cargo build -p strata-gst    && docker compose restart strata-sender-sim strata-receiver
 #
-# This override mounts the host's debug-built binaries directly into
-# the running containers via bind-mounts, completely skipping the
-# multi-stage Docker build.  Changes take effect with a simple:
-#
-#   cargo build -p strata-agent && docker compose restart strata-sender-sim
+# For web development (dashboard / portal) use the hot-reload profile
+# instead — no manual builds or restarts needed:
+#   docker compose --profile web-dev up dashboard-dev
+#   docker compose --profile web-dev up portal-dev
 #
 # The host dev container and the Docker runtime are both Debian 12
 # (bookworm) with identical GStreamer 1.22 packages, so the binaries
@@ -23,18 +24,12 @@ services:
   strata-control:
     volumes:
       - ${PWD}/target/debug/strata-control:/usr/local/bin/strata-control:ro
-      # Dashboard WASM — mount if you're iterating on the dashboard too
-      # Build with: cd crates/strata-dashboard && trunk build
-      # - ${PWD}/crates/strata-dashboard/dist:/app/dashboard:ro
 
   strata-sender-sim:
     volumes:
       - ${PWD}/target/debug/strata-agent:/usr/local/bin/strata-agent:ro
       - ${PWD}/target/debug/strata-node:/usr/local/bin/strata-node:ro
       - ${PWD}/target/debug/libgststrata.so:/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgststrata.so:ro
-      # Portal WASM — mount if iterating on the portal
-      # Build with: cd crates/strata-portal && trunk build
-      # - ${PWD}/crates/strata-portal/dist:/app/portal:ro
 
   strata-receiver:
     volumes:

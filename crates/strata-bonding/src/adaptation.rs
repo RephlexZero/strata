@@ -2,7 +2,7 @@
 //!
 //! Generates `BitrateCmd` control packets based on aggregate link capacity,
 //! degradation stage, and congestion signals. This is the "encoder feedback
-//! loop" that separates Strata from SRT/RIST.
+//! loop" that separates Strata from SRT and block-FEC approaches.
 //!
 //! ## Policy
 //!
@@ -35,6 +35,14 @@ pub struct AdaptationConfig {
     /// Pressure ratio threshold for degradation stages.
     /// pressure = encoder_bitrate / available_capacity.
     pub pressure_threshold: f64,
+    /// Bitrate cap for "visually lossless" in MaxReliability mode (kbps).
+    /// When in MaxReliability mode, encoder target is capped here and spare
+    /// bandwidth is diverted to FEC + packet duplication.
+    /// Default: 6000 (6 Mbps — good for 1080p60 HEVC).
+    pub quality_cap_kbps: u32,
+    /// Minimum spare bandwidth (kbps) to trigger MaxReliability mode.
+    /// Default: 3000 (3 Mbps spare).
+    pub reliability_spare_threshold_kbps: u32,
 }
 
 impl Default for AdaptationConfig {
@@ -47,6 +55,8 @@ impl Default for AdaptationConfig {
             ramp_down_factor: 0.7,
             min_interval: Duration::from_millis(200),
             pressure_threshold: 0.9,
+            quality_cap_kbps: 6_000,
+            reliability_spare_threshold_kbps: 3_000,
         }
     }
 }
@@ -64,6 +74,19 @@ pub enum AdaptationReason {
     Recovery,
 }
 
+/// Reliability vs quality trade-off mode.
+///
+/// When spare bandwidth exists, the adapter can either push encoder quality
+/// higher (MaxQuality) or cap the encoder and divert spare capacity to
+/// FEC overhead and packet duplication (MaxReliability).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReliabilityMode {
+    /// Push encoder bitrate up, minimal FEC overhead.
+    MaxQuality,
+    /// Cap encoder at visually-lossless threshold, divert spare to FEC + duplication.
+    MaxReliability,
+}
+
 /// A bitrate command to send to the encoder.
 #[derive(Debug, Clone)]
 pub struct BitrateCommand {
@@ -73,6 +96,12 @@ pub struct BitrateCommand {
     pub reason: AdaptationReason,
     /// Current degradation stage.
     pub stage: DegradationStage,
+    /// Current reliability mode.
+    pub mode: ReliabilityMode,
+    /// Spare bandwidth available for redundancy (kbps). 0 in MaxQuality mode.
+    pub spare_bw_kbps: u32,
+    /// Recommended FEC overhead fraction (0.10 = 10% default, up to 0.50).
+    pub recommended_fec_overhead: f64,
 }
 
 /// Per-link capacity input for the adapter.
@@ -90,6 +119,22 @@ pub struct LinkCapacity {
     pub rtt_ms: f64,
 }
 
+/// Receiver-side telemetry feedback for the BitrateAdapter.
+///
+/// Provides ground-truth metrics from the receiver that the sender
+/// cannot estimate purely from its own observations.
+#[derive(Debug, Clone, Default)]
+pub struct ReceiverFeedback {
+    /// Total recovered video goodput (bits/sec).
+    pub goodput_bps: u64,
+    /// Fraction of packets recovered by FEC (0.0–1.0).
+    pub fec_repair_rate: f32,
+    /// Current jitter buffer depth in milliseconds.
+    pub jitter_buffer_ms: u32,
+    /// Residual loss after FEC recovery (0.0–1.0).
+    pub loss_after_fec: f32,
+}
+
 /// Encoder Bitrate Adapter.
 ///
 /// Monitors aggregate capacity and generates bitrate commands
@@ -100,6 +145,10 @@ pub struct BitrateAdapter {
     current_target_kbps: u32,
     /// Current degradation stage.
     stage: DegradationStage,
+    /// Current reliability mode.
+    mode: ReliabilityMode,
+    /// Spare bandwidth available for redundancy (kbps).
+    spare_bw_kbps: u32,
     /// When the last command was issued (None = never).
     last_command_time: Option<Instant>,
     /// Previous aggregate capacity for trend detection.
@@ -117,6 +166,8 @@ impl BitrateAdapter {
             config,
             current_target_kbps: initial,
             stage: DegradationStage::Normal,
+            mode: ReliabilityMode::MaxQuality,
+            spare_bw_kbps: 0,
             last_command_time: None,
             prev_capacity_kbps: 0.0,
             consecutive_increases: 0,
@@ -132,6 +183,44 @@ impl BitrateAdapter {
     /// Current degradation stage.
     pub fn stage(&self) -> DegradationStage {
         self.stage
+    }
+
+    /// Current reliability mode.
+    pub fn mode(&self) -> ReliabilityMode {
+        self.mode
+    }
+
+    /// Spare bandwidth in kbps (available for redundancy).
+    pub fn spare_bw_kbps(&self) -> u32 {
+        self.spare_bw_kbps
+    }
+
+    /// Recommended FEC overhead fraction based on spare bandwidth.
+    ///
+    /// Returns 0.10 (10%) as baseline. With spare bandwidth in MaxReliability
+    /// mode, scales up linearly to 0.50 (50%) as the spare-to-target ratio
+    /// increases.
+    pub fn recommended_fec_overhead(&self) -> f64 {
+        const BASE_OVERHEAD: f64 = 0.10;
+        const MAX_OVERHEAD: f64 = 0.50;
+        if self.mode != ReliabilityMode::MaxReliability || self.spare_bw_kbps == 0 {
+            return BASE_OVERHEAD;
+        }
+        // Scale overhead: spare / target ratio, capped at MAX_OVERHEAD
+        let ratio = self.spare_bw_kbps as f64 / self.current_target_kbps.max(1) as f64;
+        (BASE_OVERHEAD + ratio * (MAX_OVERHEAD - BASE_OVERHEAD)).min(MAX_OVERHEAD)
+    }
+
+    /// Build a BitrateCommand with current mode/spare/fec fields.
+    fn make_command(&self, target_kbps: u32, reason: AdaptationReason) -> BitrateCommand {
+        BitrateCommand {
+            target_kbps,
+            reason,
+            stage: self.stage,
+            mode: self.mode,
+            spare_bw_kbps: self.spare_bw_kbps,
+            recommended_fec_overhead: self.recommended_fec_overhead(),
+        }
     }
 
     /// Update with new link capacity information and optionally produce
@@ -175,8 +264,38 @@ impl BitrateAdapter {
         }
         self.prev_capacity_kbps = aggregate_kbps;
 
+        // ─── Mode switching: MaxQuality ↔ MaxReliability ────────────
+        // Switch to MaxReliability when encoder is at 80%+ of ceiling
+        // and spare bandwidth exceeds threshold.
+        let at_ceiling =
+            self.current_target_kbps as f64 >= self.config.max_bitrate_kbps as f64 * 0.80;
+        let big_spare = usable_kbps
+            > (self.current_target_kbps + self.config.reliability_spare_threshold_kbps) as f64;
+
+        if at_ceiling && big_spare {
+            self.mode = ReliabilityMode::MaxReliability;
+        } else if usable_kbps < self.config.quality_cap_kbps as f64 * 1.2 {
+            // Not enough capacity to even reach the quality cap with spare
+            self.mode = ReliabilityMode::MaxQuality;
+        }
+
+        // Compute effective max bitrate (capped in MaxReliability mode)
+        let effective_max = if self.mode == ReliabilityMode::MaxReliability {
+            self.config.quality_cap_kbps
+        } else {
+            self.config.max_bitrate_kbps
+        };
+
         // Determine if we need a bitrate change
         let (new_target, reason) = self.compute_target(usable_kbps, pressure, alive_count);
+        let new_target = new_target.min(effective_max);
+
+        // Track spare bandwidth
+        self.spare_bw_kbps = if usable_kbps > new_target as f64 {
+            (usable_kbps - new_target as f64) as u32
+        } else {
+            0
+        };
 
         // Only issue command if target changed meaningfully and enough time passed
         let target_changed = (new_target as i64 - self.current_target_kbps as i64).unsigned_abs()
@@ -188,14 +307,56 @@ impl BitrateAdapter {
         if target_changed && interval_ok {
             self.current_target_kbps = new_target;
             self.last_command_time = Some(Instant::now());
-            Some(BitrateCommand {
-                target_kbps: new_target,
-                reason,
-                stage: self.stage,
-            })
+            Some(self.make_command(new_target, reason))
         } else {
             None
         }
+    }
+
+    /// Update with link capacity AND receiver feedback.
+    ///
+    /// The receiver feedback provides ground-truth signals that can override
+    /// or supplement the sender's local capacity estimates:
+    /// - `loss_after_fec > 1%` → apply congestion pressure
+    /// - `jitter_buffer_ms > 500` → bufferbloat, cap bitrate
+    /// - `goodput_bps` significantly below encoder output → congestion
+    pub fn update_with_feedback(
+        &mut self,
+        links: &[LinkCapacity],
+        feedback: &ReceiverFeedback,
+    ) -> Option<BitrateCommand> {
+        // Start with normal capacity-based update
+        let mut result = self.update(links);
+
+        // Apply receiver-side pressure signals
+        let loss_pressure = feedback.loss_after_fec > 0.01;
+        let bufferbloat = feedback.jitter_buffer_ms > 500;
+        let goodput_shortfall = feedback.goodput_bps > 0
+            && (feedback.goodput_bps as f64) < self.current_target_kbps as f64 * 1000.0 * 0.7;
+
+        if loss_pressure || bufferbloat || goodput_shortfall {
+            // Receiver signals congestion — force a reduction
+            let new_target =
+                (self.current_target_kbps as f64 * self.config.ramp_down_factor) as u32;
+            let new_target = new_target.max(self.config.min_bitrate_kbps);
+
+            if new_target < self.current_target_kbps {
+                self.current_target_kbps = new_target;
+                self.last_command_time = Some(Instant::now());
+                self.consecutive_decreases += 1;
+                self.consecutive_increases = 0;
+
+                let reason = if loss_pressure {
+                    AdaptationReason::Congestion
+                } else {
+                    AdaptationReason::Capacity
+                };
+
+                result = Some(self.make_command(new_target, reason));
+            }
+        }
+
+        result
     }
 
     /// Compute the new target bitrate.
@@ -246,17 +407,15 @@ impl BitrateAdapter {
         let new_target = new_target.max(self.config.min_bitrate_kbps);
         self.current_target_kbps = new_target;
         self.last_command_time = Some(Instant::now());
-        BitrateCommand {
-            target_kbps: new_target,
-            reason,
-            stage: self.stage,
-        }
+        self.make_command(new_target, reason)
     }
 
     /// Reset to maximum bitrate (e.g., on stream restart).
     pub fn reset(&mut self) {
         self.current_target_kbps = self.config.max_bitrate_kbps;
         self.stage = DegradationStage::Normal;
+        self.mode = ReliabilityMode::MaxQuality;
+        self.spare_bw_kbps = 0;
         self.consecutive_increases = 0;
         self.consecutive_decreases = 0;
         self.prev_capacity_kbps = 0.0;
@@ -505,5 +664,238 @@ mod tests {
             adapter.current_target_kbps() <= 10_000,
             "should respect headroom"
         );
+    }
+
+    // ─── ReceiverFeedback ─────────────────────────────────────────────
+
+    #[test]
+    fn feedback_high_loss_forces_ramp_down() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+
+        let links = make_links(&[(10_000.0, true)]);
+        adapter.update(&links); // prime the adapter
+
+        let feedback = ReceiverFeedback {
+            goodput_bps: 5_000_000,
+            fec_repair_rate: 0.0,
+            jitter_buffer_ms: 100,
+            loss_after_fec: 0.05, // 5% — well above 1% threshold
+        };
+
+        let before = adapter.current_target_kbps();
+        let cmd = adapter.update_with_feedback(&links, &feedback);
+        assert!(cmd.is_some(), "should emit command on high loss");
+        assert!(
+            adapter.current_target_kbps() < before,
+            "target should decrease: was {} now {}",
+            before,
+            adapter.current_target_kbps()
+        );
+    }
+
+    #[test]
+    fn feedback_low_loss_no_extra_pressure() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+
+        let links = make_links(&[(10_000.0, true)]);
+        adapter.update(&links); // prime
+        let target_after_prime = adapter.current_target_kbps();
+
+        let feedback = ReceiverFeedback {
+            goodput_bps: 8_000_000,
+            fec_repair_rate: 0.01,
+            jitter_buffer_ms: 50,
+            loss_after_fec: 0.005, // below 1% threshold
+        };
+
+        adapter.update_with_feedback(&links, &feedback);
+        // Should not decrease below where update alone would go
+        assert!(
+            adapter.current_target_kbps() >= target_after_prime - 100,
+            "no extra pressure expected: {} vs {}",
+            adapter.current_target_kbps(),
+            target_after_prime
+        );
+    }
+
+    #[test]
+    fn feedback_high_jitter_forces_ramp_down() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+
+        let links = make_links(&[(10_000.0, true)]);
+        adapter.update(&links); // prime
+
+        let feedback = ReceiverFeedback {
+            goodput_bps: 8_000_000,
+            fec_repair_rate: 0.0,
+            jitter_buffer_ms: 800, // well above 500ms threshold
+            loss_after_fec: 0.0,
+        };
+
+        let before = adapter.current_target_kbps();
+        let cmd = adapter.update_with_feedback(&links, &feedback);
+        assert!(cmd.is_some(), "high jitter should trigger command");
+        assert!(
+            adapter.current_target_kbps() < before,
+            "target should decrease on high jitter"
+        );
+    }
+
+    // ─── ReliabilityMode ─────────────────────────────────────────────
+
+    #[test]
+    fn starts_in_max_quality_mode() {
+        let adapter = BitrateAdapter::default();
+        assert_eq!(adapter.mode(), ReliabilityMode::MaxQuality);
+        assert_eq!(adapter.spare_bw_kbps(), 0);
+    }
+
+    #[test]
+    fn switches_to_max_reliability_with_spare_bw() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            quality_cap_kbps: 6_000,
+            reliability_spare_threshold_kbps: 3_000,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+
+        // Huge capacity: 25 Mbps across 3 links — adapter is at 10k ceiling,
+        // 80%+ of max, and spare > 3 Mbps after headroom
+        let links = make_links(&[(10_000.0, true), (8_000.0, true), (7_000.0, true)]);
+        // Prime multiple times so target ramps toward max
+        for _ in 0..10 {
+            adapter.update(&links);
+        }
+
+        assert_eq!(
+            adapter.mode(),
+            ReliabilityMode::MaxReliability,
+            "should switch to MaxReliability with abundant spare BW"
+        );
+        assert!(
+            adapter.current_target_kbps() <= 6_000,
+            "target should be capped at quality_cap_kbps: {}",
+            adapter.current_target_kbps()
+        );
+        assert!(
+            adapter.spare_bw_kbps() > 0,
+            "should have spare BW: {}",
+            adapter.spare_bw_kbps()
+        );
+    }
+
+    #[test]
+    fn stays_max_quality_when_constrained() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            quality_cap_kbps: 6_000,
+            reliability_spare_threshold_kbps: 3_000,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+
+        // Just enough capacity — no real spare for reliability mode
+        let links = make_links(&[(5_000.0, true)]);
+        adapter.update(&links);
+
+        assert_eq!(
+            adapter.mode(),
+            ReliabilityMode::MaxQuality,
+            "should stay in MaxQuality when capacity is tight"
+        );
+    }
+
+    #[test]
+    fn recommended_fec_overhead_default() {
+        let adapter = BitrateAdapter::default();
+        assert!(
+            (adapter.recommended_fec_overhead() - 0.10).abs() < 1e-6,
+            "default FEC overhead should be 10%"
+        );
+    }
+
+    #[test]
+    fn recommended_fec_overhead_scales_with_spare() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            quality_cap_kbps: 6_000,
+            reliability_spare_threshold_kbps: 3_000,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+
+        // Push into MaxReliability
+        let links = make_links(&[(10_000.0, true), (8_000.0, true), (7_000.0, true)]);
+        for _ in 0..10 {
+            adapter.update(&links);
+        }
+
+        assert_eq!(adapter.mode(), ReliabilityMode::MaxReliability);
+        let overhead = adapter.recommended_fec_overhead();
+        assert!(
+            overhead > 0.10,
+            "FEC overhead should increase with spare BW: {}",
+            overhead
+        );
+        assert!(
+            overhead <= 0.50,
+            "FEC overhead should not exceed 50%: {}",
+            overhead
+        );
+    }
+
+    #[test]
+    fn command_includes_mode_and_spare() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+
+        let links = make_links(&[(3_000.0, true)]);
+        let cmd = adapter.update(&links).unwrap();
+
+        // Check that the new fields are populated
+        assert!(matches!(
+            cmd.mode,
+            ReliabilityMode::MaxQuality | ReliabilityMode::MaxReliability
+        ));
+        assert!(cmd.recommended_fec_overhead >= 0.10);
+        assert!(cmd.recommended_fec_overhead <= 0.50);
+    }
+
+    #[test]
+    fn reset_clears_mode() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            quality_cap_kbps: 6_000,
+            reliability_spare_threshold_kbps: 3_000,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+
+        // Push into MaxReliability
+        let links = make_links(&[(10_000.0, true), (8_000.0, true), (7_000.0, true)]);
+        for _ in 0..10 {
+            adapter.update(&links);
+        }
+        assert_eq!(adapter.mode(), ReliabilityMode::MaxReliability);
+
+        adapter.reset();
+        assert_eq!(adapter.mode(), ReliabilityMode::MaxQuality);
+        assert_eq!(adapter.spare_bw_kbps(), 0);
     }
 }

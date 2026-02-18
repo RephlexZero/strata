@@ -20,10 +20,14 @@ strata-transport = { path = "../strata-transport" }
 libc = "0.2"
 rtrb = { workspace = true }
 quanta = { workspace = true }
-quinn-udp = { workspace = true }
+quinn-udp = "0.5.14"
 raptorq = { workspace = true }
 rand = { workspace = true }
 ctrlc = "3.5.2"
+monoio = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.6"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

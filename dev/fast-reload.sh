@@ -1,23 +1,22 @@
 #!/bin/bash
 # ── Fast Reload — build on host, restart containers ────────────────
 #
-# Usage:
-#   ./dev/fast-reload.sh              # rebuild everything
-#   ./dev/fast-reload.sh agent        # rebuild agent only, restart sender
-#   ./dev/fast-reload.sh control      # rebuild control plane only
-#   ./dev/fast-reload.sh pipeline     # rebuild integration_node + bonding plugin
-#   ./dev/fast-reload.sh all          # rebuild all, restart all
+# DEPRECATED: Prefer the built-in Docker workflows instead:
+#
+#   Web development (hot-reload, no builds needed):
+#     docker compose --profile web-dev up dashboard-dev   # :8080
+#     docker compose --profile web-dev up portal-dev      # :8081
+#
+#   Rust binary iteration (with dev overlay):
+#     cargo build -p strata-control && docker compose restart strata-control
+#     cargo build -p strata-agent  && docker compose restart strata-sender-sim
+#     cargo build -p strata-gst    && docker compose restart strata-sender-sim strata-receiver
+#
+# This script is kept for backwards compatibility only.
 #
 # Prerequisites:
-#   - Containers already running (docker compose up -d)
-#   - Host has matching Debian 12 bookworm + GStreamer 1.22 (devcontainer)
-#
-# This skips the Docker multi-stage build entirely. Instead it:
-#   1. Builds the Rust crate(s) on the host (incremental, ~2-8 seconds)
-#   2. Restarts the container — which picks up the newly-mounted binary
-#
-# First run: you need to start containers with the dev overlay:
-#   docker compose -f docker-compose.yml -f dev/docker-compose.dev.yml up -d
+#   - Containers running with dev overlay:
+#     docker compose -f docker-compose.yml -f dev/docker-compose.dev.yml up -d
 
 set -e
 cd "$(dirname "$0")/.."
@@ -26,57 +25,22 @@ COMPOSE="docker compose -f docker-compose.yml -f dev/docker-compose.dev.yml"
 
 TARGET=${1:-all}
 
-build_agent() {
-    echo ">>> Building strata-agent..."
-    cargo build -p strata-agent
-}
-
-build_control() {
-    echo ">>> Building strata-control..."
-    cargo build -p strata-control
-}
-
-build_pipeline() {
-    echo ">>> Building strata-gst (integration_node + plugin)..."
-    cargo build -p strata-gst
-}
-
-restart_sender() {
-    echo ">>> Restarting strata-sender-sim..."
-    $COMPOSE restart strata-sender-sim
-}
-
-restart_receiver() {
-    echo ">>> Restarting strata-receiver..."
-    $COMPOSE restart strata-receiver
-}
-
-restart_control() {
-    echo ">>> Restarting strata-control..."
-    $COMPOSE restart strata-control
-}
-
 case "$TARGET" in
     agent)
-        build_agent
-        restart_sender
+        cargo build -p strata-agent
+        $COMPOSE restart strata-sender-sim
         ;;
     control)
-        build_control
-        restart_control
+        cargo build -p strata-control
+        $COMPOSE restart strata-control
         ;;
     pipeline)
-        build_pipeline
-        restart_sender
-        restart_receiver
+        cargo build -p strata-gst
+        $COMPOSE restart strata-sender-sim strata-receiver
         ;;
     all|"")
-        build_agent
-        build_control
-        build_pipeline
-        restart_sender
-        restart_receiver
-        restart_control
+        cargo build -p strata-agent -p strata-control -p strata-gst
+        $COMPOSE restart strata-sender-sim strata-receiver strata-control
         ;;
     *)
         echo "Usage: $0 [agent|control|pipeline|all]"
@@ -84,6 +48,4 @@ case "$TARGET" in
         ;;
 esac
 
-echo ""
-echo "Done. Containers restarted with host-built binaries."
-echo "Use 'docker compose logs -f <service>' to tail logs."
+echo "Done. Use 'docker compose logs -f <service>' to tail logs."

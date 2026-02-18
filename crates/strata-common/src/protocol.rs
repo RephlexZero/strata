@@ -36,16 +36,6 @@ impl Envelope {
         }
     }
 
-    /// Create an envelope from a pre-built JSON value.
-    pub fn new_raw(msg_type: impl Into<String>, payload: serde_json::Value) -> Self {
-        Self {
-            id: Uuid::now_v7().to_string(),
-            msg_type: msg_type.into(),
-            ts: Utc::now(),
-            payload,
-        }
-    }
-
     /// Parse the payload into a concrete type.
     pub fn parse_payload<T: for<'de> Deserialize<'de>>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_value(self.payload.clone())
@@ -128,7 +118,6 @@ pub enum StreamEndReason {
     AgentShutdown,
     Timeout,
     PipelineCrash,
-    AgentDisconnect,
 }
 
 // ── Control Plane → Agent ───────────────────────────────────────────
@@ -143,7 +132,7 @@ pub enum ControlMessage {
 
     /// Start a broadcast.
     #[serde(rename = "stream.start")]
-    StreamStart(StreamStartPayload),
+    StreamStart(Box<StreamStartPayload>),
 
     /// Stop a broadcast.
     #[serde(rename = "stream.stop")]
@@ -169,7 +158,12 @@ pub struct StreamStartPayload {
     pub encoder: EncoderConfig,
     pub destinations: Vec<String>,
     pub bonding_config: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "rist_psk")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "rist_psk",
+        alias = "strata_psk"
+    )]
     pub psk: Option<String>,
     /// RTMP/RTMPS relay URL — when set, the sender tees its encoded
     /// output and pushes a parallel FLV stream to this URL.
@@ -184,8 +178,7 @@ pub struct SourceConfig {
     pub uri: Option<String>,
     pub resolution: Option<String>,
     pub framerate: Option<u32>,
-    /// When true, bypass the encoder and pass the source through as-is
-    /// (remux into MPEG-TS without re-encoding). Only applies to file sources.
+    /// Skip encoding — remux file source directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passthrough: Option<bool>,
 }
@@ -195,6 +188,15 @@ pub struct EncoderConfig {
     pub bitrate_kbps: u32,
     pub tune: Option<String>,
     pub keyint_max: Option<u32>,
+    /// Video codec: "h264" or "h265". Defaults to "h265".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    /// Minimum bitrate for adaptation envelope (kbps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_bitrate_kbps: Option<u32>,
+    /// Maximum bitrate for adaptation envelope (kbps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bitrate_kbps: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,32 +207,25 @@ pub struct StreamStopPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigUpdatePayload {
-    /// Partial encoder config — only fields present are applied.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoder: Option<EncoderConfigUpdate>,
-    /// Partial bonding/scheduler config (TOML-serializable map).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Partial config — only fields present are updated.
     pub scheduler: Option<serde_json::Value>,
+    /// Encoder parameters to hot-update.
+    pub encoder: Option<EncoderConfigUpdate>,
 }
 
-/// Partial encoder update — all fields optional.
+/// Partial encoder config for hot-update (all fields optional).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncoderConfigUpdate {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bitrate_kbps: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tune: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyint_max: Option<u32>,
 }
 
-/// Response to a `config.update` command.
+/// Response to config.update.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigUpdateResponsePayload {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     pub success: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -409,7 +404,7 @@ mod tests {
             cpu_percent: 25.0,
             mem_used_mb: 512,
             uptime_s: 3600,
-            receiver_url: Some("rcv.example.com:5000".into()),
+            receiver_url: Some("strata://rcv.example.com:5000".into()),
         });
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -420,7 +415,7 @@ mod tests {
             AgentMessage::DeviceStatus(p) => {
                 assert!((p.cpu_percent - 25.0).abs() < f32::EPSILON);
                 assert_eq!(p.mem_used_mb, 512);
-                assert_eq!(p.receiver_url.unwrap(), "rcv.example.com:5000");
+                assert_eq!(p.receiver_url.unwrap(), "strata://rcv.example.com:5000");
             }
             _ => panic!("wrong variant"),
         }
@@ -540,7 +535,7 @@ mod tests {
 
     #[test]
     fn control_message_stream_start() {
-        let msg = ControlMessage::StreamStart(StreamStartPayload {
+        let msg = ControlMessage::StreamStart(Box::new(StreamStartPayload {
             stream_id: "str_new".into(),
             source: SourceConfig {
                 mode: "test".into(),
@@ -554,22 +549,25 @@ mod tests {
                 bitrate_kbps: 5000,
                 tune: Some("zerolatency".into()),
                 keyint_max: Some(60),
+                codec: Some("h265".into()),
+                min_bitrate_kbps: Some(1500),
+                max_bitrate_kbps: Some(10000),
             },
             destinations: vec!["dst_yt".into()],
             bonding_config: serde_json::json!({"max_links": 4}),
             psk: Some("secret".into()),
             relay_url: None,
-        });
+        }));
 
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("stream.start"));
 
         let recovered: ControlMessage = serde_json::from_str(&json).unwrap();
         match recovered {
-            ControlMessage::StreamStart(p) => {
+            ControlMessage::StreamStart(ref p) => {
                 assert_eq!(p.stream_id, "str_new");
                 assert_eq!(p.encoder.bitrate_kbps, 5000);
-                assert_eq!(p.source.resolution.unwrap(), "1920x1080");
+                assert_eq!(p.source.resolution.as_deref(), Some("1920x1080"));
             }
             _ => panic!("wrong variant"),
         }
@@ -578,8 +576,8 @@ mod tests {
     #[test]
     fn control_message_config_update() {
         let msg = ControlMessage::ConfigUpdate(ConfigUpdatePayload {
-            encoder: None,
             scheduler: Some(serde_json::json!({"algo": "weighted_round_robin"})),
+            encoder: None,
         });
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -699,12 +697,15 @@ mod tests {
     fn config_set_payload_serde() {
         let payload = ConfigSetPayload {
             request_id: "req_123".into(),
-            receiver_url: Some("rist://recv.example.com:5000".into()),
+            receiver_url: Some("strata://recv.example.com:5000".into()),
         };
         let json = serde_json::to_string(&payload).unwrap();
         let parsed: ConfigSetPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.request_id, "req_123");
-        assert_eq!(parsed.receiver_url.unwrap(), "rist://recv.example.com:5000");
+        assert_eq!(
+            parsed.receiver_url.unwrap(),
+            "strata://recv.example.com:5000"
+        );
     }
 
     #[test]
@@ -712,7 +713,7 @@ mod tests {
         let resp = ConfigSetResponsePayload {
             request_id: "req_456".into(),
             success: true,
-            receiver_url: Some("rist://192.168.1.50:5000".into()),
+            receiver_url: Some("strata://192.168.1.50:5000".into()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: ConfigSetResponsePayload = serde_json::from_str(&json).unwrap();
