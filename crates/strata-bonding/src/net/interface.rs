@@ -99,6 +99,25 @@ pub struct LinkMetrics {
     pub link_kind: Option<String>,
     /// Transport-layer statistics (FEC, ARQ, retransmissions).
     pub transport: Option<TransportMetrics>,
+    /// AIMD delay-gradient capacity estimate (0.0 if estimator disabled).
+    pub estimated_capacity_bps: f64,
+    /// One-way delay estimate in milliseconds (0.0 if not available).
+    pub owd_ms: f64,
+    /// Latest receiver report from the remote receiver (if any).
+    pub receiver_report: Option<ReceiverReportMetrics>,
+}
+
+/// Receiver report metrics forwarded from the remote receiver.
+#[derive(Debug, Clone, Default)]
+pub struct ReceiverReportMetrics {
+    /// Total recovered goodput (bits/sec).
+    pub goodput_bps: u64,
+    /// Fraction of packets recovered by FEC (0.0–1.0).
+    pub fec_repair_rate: f32,
+    /// Current jitter buffer depth in milliseconds.
+    pub jitter_buffer_ms: u32,
+    /// Residual loss after FEC recovery (0.0–1.0).
+    pub loss_after_fec: f32,
 }
 
 /// Transport-layer statistics from `strata-transport`.
@@ -130,4 +149,10 @@ pub trait LinkSender: Send + Sync {
     fn send(&self, packet: &[u8]) -> Result<usize>;
     /// Returns a snapshot of the link's current metrics.
     fn get_metrics(&self) -> LinkMetrics;
+    /// Read and process any pending feedback (ACKs, NACKs, Pongs) from the
+    /// receiver. Also sends periodic Ping probes for RTT measurement.
+    /// Returns the number of feedback packets processed.
+    fn recv_feedback(&self) -> usize {
+        0
+    }
 }

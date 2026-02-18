@@ -1,4 +1,5 @@
 use crate::config::{BondingConfig, LinkConfig, SchedulerConfig};
+use crate::media::priority::DegradationStage;
 use crate::net::interface::{LinkMetrics, LinkSender};
 use crate::net::transport::TransportLink;
 use crate::scheduler::bonding::BondingScheduler;
@@ -67,6 +68,7 @@ enum ControlMessage {
     ApplyConfig(Box<BondingConfig>),
     AddLink(LinkConfig),
     RemoveLink(usize),
+    SetDegradationStage(DegradationStage),
     Shutdown,
 }
 
@@ -168,6 +170,13 @@ impl BondingRuntime {
             .map_err(|e| anyhow::anyhow!("Failed to remove link: {}", e))
     }
 
+    /// Updates the degradation stage on the scheduler (thread-safe).
+    pub fn set_degradation_stage(&self, stage: DegradationStage) {
+        let _ = self
+            .control_tx
+            .send(ControlMessage::SetDegradationStage(stage));
+    }
+
     /// Returns a snapshot of all link metrics (thread-safe clone).
     pub fn get_metrics(&self) -> HashMap<usize, LinkMetrics> {
         self.metrics
@@ -240,6 +249,9 @@ async fn runtime_worker_async(
                         ControlMessage::ApplyConfig(config) => {
                             scheduler.update_config(config.scheduler.clone());
                             apply_config(&mut scheduler, &mut current_links, *config);
+                        }
+                        ControlMessage::SetDegradationStage(stage) => {
+                            scheduler.set_degradation_stage(stage);
                         }
                         ControlMessage::Shutdown => return,
                     }

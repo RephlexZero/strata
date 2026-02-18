@@ -742,6 +742,9 @@ mod tests {
                     fec_repairs_sent: 200,
                     packets_expired: 3,
                 }),
+                estimated_capacity_bps: 0.0,
+                owd_ms: 0.0,
+                receiver_report: None,
             },
         );
         map.insert(
@@ -767,6 +770,9 @@ mod tests {
                     fec_repairs_sent: 120,
                     packets_expired: 5,
                 }),
+                estimated_capacity_bps: 0.0,
+                owd_ms: 0.0,
+                receiver_report: None,
             },
         );
         map

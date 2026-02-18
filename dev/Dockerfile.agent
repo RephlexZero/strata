@@ -81,6 +81,8 @@ compact_str = "0.8"
 rtrb = "0.3"
 raptorq = "2.0"
 rand = "0.10.0"
+monoio = "0.2"
+quanta = "0.12"
 
 [profile.release]
 lto = true
@@ -156,7 +158,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /src/target/release/strata-agent /usr/local/bin/strata-agent
 
 # Pipeline binary + GStreamer bonding plugin
-COPY --from=pipeline /src/target/release/strata_node /usr/local/bin/strata_node
+COPY --from=pipeline /src/target/release/strata-node /usr/local/bin/strata-node
 COPY --from=pipeline /src/target/release/libgststrata.so /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgststrata.so
 
 # Entrypoint script (applies tc netem impairments before starting agent)

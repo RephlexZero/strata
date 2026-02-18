@@ -18,6 +18,7 @@ OPTIONS:
   --uri <uri>         Media URI for uridecodebin (used with --source uri)
                       e.g. file:///home/user/video.mp4
   --bitrate <kbps>    Target encoder bitrate in kbps (default: 2000)
+  --codec <codec>      Video codec: h264 (default) or h265/hevc
   --framerate <fps>   Video framerate (default: 30)
   --audio             Add silent AAC audio track (required for RTMP targets)
   --config <path>     Path to TOML config file (see Configuration Reference)
@@ -72,6 +73,7 @@ OPTIONS:
   --output <path>     Record to file (.ts = raw MPEG-TS, .mp4 = remuxed)
   --relay-url <url>   RTMP/RTMPS URL to relay the received stream to
                       e.g. rtmp://a.rtmp.youtube.com/live2/STREAM_KEY
+  --codec <codec>     Codec of incoming stream: h264 (default) or h265
   --config <path>     Path to TOML config file (see Configuration Reference)
   --metrics-port <port> Start Prometheus metrics endpoint on this port
                         (serves /metrics on 0.0.0.0:<port>)
@@ -83,6 +85,10 @@ EXAMPLES:
 
   # Receive bonded stream and relay to YouTube
   strata-node receiver --bind 0.0.0.0:5000,0.0.0.0:5002,0.0.0.0:5004 \
+    --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
+
+  # Receive H.265 stream and relay
+  strata-node receiver --bind 0.0.0.0:5000 --codec h265 \
     --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
 
   # Receive and record to MPEG-TS file
@@ -149,6 +155,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut resolution = "1280x720";
     let mut relay_url = "";
     let mut metrics_port: Option<u16> = None;
+    let mut codec_str = "h264";
 
     let mut i = 0;
     while i < args.len() {
@@ -167,6 +174,10 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--bitrate" if i + 1 < args.len() => {
                 bitrate_kbps = args[i + 1].parse().unwrap_or(2000);
+                i += 1;
+            }
+            "--codec" if i + 1 < args.len() => {
+                codec_str = &args[i + 1];
                 i += 1;
             }
             "--framerate" if i + 1 < args.len() => {
@@ -252,12 +263,20 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // Additional branches are added dynamically via the control socket.
     let key_int = framerate * 2;
 
+    // Parse codec type
+    let codec_type = gststrata::codec::CodecType::from_str_loose(codec_str).unwrap_or_else(|| {
+        eprintln!("Unknown codec '{}', defaulting to h264", codec_str);
+        gststrata::codec::CodecType::H264
+    });
+    let codec_ctrl = gststrata::codec::CodecController::new(codec_type);
+    let max_bitrate_kbps = 25000u32;
+
     // Build the pipeline with input-selector.
     // The test source is always available as the fallback.
     //
     // When --relay-url is set, the encoded video and audio are teed:
-    //   x264enc → tee → queue → mpegtsmux → stratasink   (Strata)
-    //                 └→ queue → h264parse → flvmux → rtmpsink (RTMP)
+    //   encoder → tee → queue → mpegtsmux → stratasink   (Strata)
+    //                 └→ queue → parser → flvmux → rtmpsink (RTMP)
     //   voaacenc → tee → aacparse → queue → mpegtsmux         (Strata)
     //                 └→ queue → aacparse → flvmux             (RTMP)
     let use_relay = !relay_url.is_empty();
@@ -290,28 +309,32 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Video path: with relay, tee after encoder; without, straight to mux
+    let parser = codec_type.parser_factory();
     let video_to_mux = if use_relay {
-        "! tee name=vtee \
-         vtee. ! queue ! mux. \
-         vtee. ! queue ! h264parse ! fmux."
+        format!(
+            "! tee name=vtee \
+             vtee. ! queue ! mux. \
+             vtee. ! queue ! {parser} ! fmux."
+        )
     } else {
-        "! queue ! mux."
+        "! queue ! mux.".to_string()
     };
+
+    let enc_fragment = codec_ctrl.pipeline_fragment("enc", bitrate_kbps, key_int, max_bitrate_kbps);
 
     let pipeline_str = format!(
         "videotestsrc name=testsrc is-live=true pattern=smpte \
          ! video/x-raw,width={w},height={h},framerate={fps}/1 \
          ! queue name=testq max-size-buffers=3 ! sel. \
          input-selector name=sel \
-         ! x264enc name=enc tune=zerolatency bitrate={bps} vbv-buf-capacity={bps} key-int-max={ki} \
+         ! {enc_fragment} \
          {video_to_mux}{audio} \
          mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 \
          ! stratasink name=rsink{rtmp}",
         w = res_w,
         h = res_h,
         fps = framerate,
-        bps = bitrate_kbps,
-        ki = key_int,
+        enc_fragment = enc_fragment,
         video_to_mux = video_to_mux,
         audio = audio_fragment,
         rtmp = rtmp_fragment,
@@ -399,9 +422,6 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         stats_socket = Some(sock);
         eprintln!("Stats relay → {}", stats_dest);
     }
-
-    // ── NADA ceiling tracking ──
-    let nada_ceiling_kbps = Arc::new(Mutex::new(bitrate_kbps));
 
     // ── Control socket for hot-swap commands ──
     // Remove stale socket file, then listen.
@@ -494,25 +514,39 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             MessageView::Element(element) => {
                 if let Some(s) = element.structure() {
-                    if s.name() == "congestion-control" {
-                        if let Ok(recommended) = s.get::<u64>("recommended-bitrate") {
+                    if s.name() == "bitrate-command" {
+                        if let Ok(target_kbps) = s.get::<u32>("target-kbps") {
                             if let Some(enc) = pipeline.by_name("enc") {
-                                let recommended_kbps = (recommended / 1000) as u32;
-                                let target = recommended_kbps.clamp(500, bitrate_kbps);
-                                let current: u32 = enc.property("bitrate");
-                                if target != current {
+                                let current = codec_ctrl.get_bitrate_kbps(&enc);
+                                // Limit step to +50% to avoid VBV shock
+                                let max_step = current + current / 2;
+                                let clamped = target_kbps.min(max_step).max(500);
+                                if (clamped as i32 - current as i32).unsigned_abs() > 50 {
+                                    let reason = s.get::<String>("reason").unwrap_or_default();
+                                    let stage = s.get::<String>("stage").unwrap_or_default();
                                     eprintln!(
-                                        "NADA Rate Signal: {} -> {} kbps (r_vin={})",
-                                        current, target, recommended
+                                        "Bitrate: {} -> {} kbps (reason={}, stage={})",
+                                        current, clamped, reason, stage
                                     );
-                                    enc.set_property("bitrate", target);
+                                    codec_ctrl.set_bitrate_kbps(&enc, clamped);
                                 }
                             }
                         }
-                    } else if s.name() == "bandwidth-available" {
-                        if let Ok(max_bps) = s.get::<u64>("max-bitrate") {
-                            let ceiling = ((max_bps / 1000) as u32).min(bitrate_kbps);
-                            *nada_ceiling_kbps.lock().unwrap() = ceiling;
+                        // Forward degradation stage to scheduler
+                        if let Ok(stage_str) = s.get::<String>("stage") {
+                            if let Some(sink) = pipeline.by_name("rsink") {
+                                let strata_sink = sink
+                                    .downcast::<gststrata::sink::StrataSink>()
+                                    .expect("rsink is not a StrataSink");
+                                let stage = match stage_str.as_str() {
+                                    "DropDisposable" => strata_bonding::media::priority::DegradationStage::DropDisposable,
+                                    "ReduceBitrate" => strata_bonding::media::priority::DegradationStage::ReduceBitrate,
+                                    "ProtectKeyframes" => strata_bonding::media::priority::DegradationStage::ProtectKeyframes,
+                                    "KeyframeOnly" => strata_bonding::media::priority::DegradationStage::KeyframeOnly,
+                                    _ => strata_bonding::media::priority::DegradationStage::Normal,
+                                };
+                                strata_sink.set_degradation_stage(stage);
+                            }
                         }
                     } else if s.name() == "strata-stats" {
                         if let Some(sock) = &stats_socket {
@@ -988,6 +1022,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut output_file = "";
     let mut config_path = "";
     let mut relay_url = "";
+    let mut codec_str = "h264";
     let mut metrics_port: Option<u16> = None;
     let mut i = 0;
     while i < args.len() {
@@ -1010,6 +1045,10 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--relay-url" if i + 1 < args.len() => {
                 relay_url = &args[i + 1];
+                i += 1;
+            }
+            "--codec" if i + 1 < args.len() => {
+                codec_str = &args[i + 1];
                 i += 1;
             }
             "--metrics-port" if i + 1 < args.len() => {
@@ -1036,10 +1075,14 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     register_plugins()?;
 
+    let codec_type = gststrata::codec::CodecType::from_str_loose(codec_str)
+        .unwrap_or(gststrata::codec::CodecType::H264);
+    let video_parser = codec_type.parser_factory();
+
     // Pipeline construction:
     //
     // --relay-url (RTMP relay):
-    //   stratasrc ! tsdemux ! h264parse ! flvmux streamable=true ! rtmpsink
+    //   stratasrc ! tsdemux ! {parser} ! flvmux streamable=true ! rtmpsink
     //   (audio pads are connected dynamically via pad-added signal)
     //
     // --output (recording):
@@ -1051,17 +1094,17 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let use_relay = !relay_url.is_empty();
 
     let pipeline_str = if use_relay {
-        // RTMP relay pipeline — we use tsdemux with dynamic pads.
-        // The gst_parse syntax `d. !` auto-links pads by type.
-        // This handles both video-only and video+audio MPEG-TS inputs.
+        let relay_frag = gststrata::codec::CodecController::new(codec_type).relay_muxer_fragment();
         format!(
             "stratasrc links=\"{bind}\" name=src latency=200 ! \
              queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
              tsdemux name=d \
-             d. ! queue ! h264parse ! flvmux name=mux streamable=true ! \
+             d. ! queue ! {parser} ! {relay} \
              rtmpsink location=\"{url}\" sync=false \
              d. ! queue ! aacparse ! mux.",
             bind = bind_str,
+            parser = video_parser,
+            relay = relay_frag,
             url = relay_url
         )
     } else if !output_file.is_empty() {
@@ -1072,12 +1115,10 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 bind_str, output_file
             )
         } else {
-            // Remux to encoded container: Encoded H264 TS -> Demux -> Parse -> MP4 Mux -> File
-            // Use faststart=true to move MOOV atom to front (requires rewriting file at end).
-            // Use queues to prevent blocking.
+            // Remux to encoded container: Demux -> Parse -> MP4 Mux -> File
             format!(
-                "stratasrc links=\"{}\" name=src ! tee name=t ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! appsink name=sink emit-signals=true sync=false t. ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! tsdemux ! h264parse ! mp4mux faststart=true ! filesink location=\"{}\" sync=false",
-                bind_str, output_file
+                "stratasrc links=\"{}\" name=src ! tee name=t ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! appsink name=sink emit-signals=true sync=false t. ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! tsdemux ! {} ! mp4mux faststart=true ! filesink location=\"{}\" sync=false",
+                bind_str, video_parser, output_file
             )
         }
     } else {

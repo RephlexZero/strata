@@ -119,6 +119,19 @@ impl FecEncoder {
         self.config.enabled
     }
 
+    /// Dynamically update FEC overhead ratios based on available spare bandwidth.
+    ///
+    /// Called by the stats/adaptation loop when the BitrateAdapter computes
+    /// a new `recommended_fec_overhead`. Both High and Low protection scale
+    /// relative to the recommended value:
+    /// - High = recommended × 2.5 (capped at 1.0)
+    /// - Low = recommended (10–50% range)
+    pub fn set_overheads(&mut self, recommended: f64) {
+        let recommended = recommended.clamp(0.0, 1.0);
+        self.config.low_overhead = recommended;
+        self.config.high_overhead = (recommended * 2.5).min(1.0);
+    }
+
     /// Add a source packet.  Returns any repair symbols if a complete
     /// source block has been assembled.
     pub fn push(&mut self, payload: Bytes, level: ProtectionLevel) -> Vec<RepairSymbol> {
@@ -667,5 +680,50 @@ mod tests {
             "Protection level change should flush previous block"
         );
         assert_eq!(enc.blocks_emitted(), 1);
+    }
+
+    #[test]
+    fn set_overheads_scales_protection() {
+        let cfg = FecConfig {
+            enabled: true,
+            source_block_size: 4,
+            high_overhead: 0.50,
+            low_overhead: 0.10,
+        };
+        let mut enc = FecEncoder::new(cfg);
+
+        // Increase FEC overhead (simulating spare bandwidth)
+        enc.set_overheads(0.40);
+
+        // Low should now be 0.40 and High should be 1.0 (0.40 * 2.5 = 1.0)
+        // Push 4 large packets at Low level — should produce more repair than default 10%
+        let pkt_size = 3000;
+        let mut repairs = Vec::new();
+        for i in 0..4 {
+            repairs.extend(enc.push(Bytes::from(vec![i; pkt_size]), ProtectionLevel::Low));
+        }
+        assert!(
+            !repairs.is_empty(),
+            "set_overheads at 40% should produce repair symbols for Low level"
+        );
+
+        // Compare against a default encoder at 10% Low
+        let mut enc_default = FecEncoder::new(FecConfig {
+            enabled: true,
+            source_block_size: 4,
+            high_overhead: 0.50,
+            low_overhead: 0.10,
+        });
+        let mut default_repairs = Vec::new();
+        for i in 0..4 {
+            default_repairs
+                .extend(enc_default.push(Bytes::from(vec![i; pkt_size]), ProtectionLevel::Low));
+        }
+        assert!(
+            repairs.len() > default_repairs.len(),
+            "40% overhead ({} repairs) should produce more repairs than 10% ({} repairs)",
+            repairs.len(),
+            default_repairs.len()
+        );
     }
 }

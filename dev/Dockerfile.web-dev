@@ -1,0 +1,46 @@
+# ── Trunk Serve Dev Container ─────────────────────────────────────
+#
+# Hot-reloading WASM dev server for dashboard or portal.
+# Parameterised by CRATE build arg (strata-dashboard | strata-portal).
+#
+# Usage (via docker compose profiles):
+#   docker compose --profile web-dev up dashboard-dev
+#   docker compose --profile web-dev up portal-dev
+#
+# Source code is bind-mounted from the host so changes trigger
+# an automatic trunk rebuild + browser hot-reload.  No scripts needed.
+
+FROM rust:1.93-bookworm
+
+# Node.js for Tailwind CSS / DaisyUI
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add wasm32-unknown-unknown && \
+    cargo install trunk --version 0.21.14
+
+ARG CRATE
+WORKDIR /src
+
+# Minimal workspace manifest for just this crate
+COPY Cargo.lock ./
+COPY crates/${CRATE}/Cargo.toml crates/${CRATE}/Cargo.toml
+
+RUN printf '[workspace]\nresolver = "2"\nmembers = ["crates/%s"]\n' "${CRATE}" > Cargo.toml
+
+# Install npm deps (Tailwind CSS + DaisyUI)
+COPY crates/${CRATE}/style crates/${CRATE}/style
+RUN cd crates/${CRATE} && npm init -y && npm install @tailwindcss/cli daisyui
+
+# Copy Trunk config and source for initial dep cache build
+COPY crates/${CRATE}/Trunk.toml crates/${CRATE}/Trunk.toml
+COPY crates/${CRATE}/index.html crates/${CRATE}/index.html
+COPY crates/${CRATE}/src crates/${CRATE}/src
+
+# Warm the cargo + wasm-bindgen cache (first build downloads all deps)
+RUN cd crates/${CRATE} && trunk build 2>/dev/null || true
+
+WORKDIR /src/crates/${CRATE}
+
+EXPOSE 8080

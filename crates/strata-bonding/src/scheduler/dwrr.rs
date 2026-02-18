@@ -129,26 +129,45 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         let penalty_recovery = self.config.penalty_recovery;
 
         for state in self.links.values_mut() {
+            // Process any pending feedback (ACKs, Pongs) before reading metrics.
+            state.link.recv_feedback();
+
             let now = Instant::now();
             state.metrics = state.link.get_metrics();
             let dt_sent = now.duration_since(state.last_sent_at).as_secs_f64();
-            if dt_sent > 0.0 {
-                let delta_bytes = state.sent_bytes.saturating_sub(state.last_sent_bytes);
-                let delta_failed = state.failed_bytes.saturating_sub(state.last_failed_bytes);
-                let delta_total = delta_bytes + delta_failed;
-                if delta_total > 0 {
-                    state.measured_bps = (delta_total as f64 * 8.0) / dt_sent;
-                    state.has_traffic = true;
-                }
-                state.last_sent_bytes = state.sent_bytes;
-                state.last_failed_bytes = state.failed_bytes;
-                state.last_sent_at = now;
-            }
 
-            state.metrics.observed_bps = state.measured_bps;
-            // observed_bytes includes both delivered and failed sends so
-            // that congestion detection sees the *attempted* throughput.
-            state.metrics.observed_bytes = state.sent_bytes.saturating_add(state.failed_bytes);
+            // Transport links report socket-level observed_bps (includes FEC
+            // overhead) and capacity directly. Only fall back to scheduler-
+            // level byte tracking for non-transport links.
+            if state.metrics.transport.is_some() {
+                // Update scheduler tracking for congestion detection, but
+                // don't overwrite the transport's per-link observed stats.
+                if dt_sent > 0.0 {
+                    state.last_sent_bytes = state.sent_bytes;
+                    state.last_failed_bytes = state.failed_bytes;
+                    state.last_sent_at = now;
+                }
+                state.has_traffic = state.metrics.observed_bps > 0.0;
+                state.measured_bps = state.metrics.observed_bps;
+            } else {
+                if dt_sent > 0.0 {
+                    let delta_bytes = state.sent_bytes.saturating_sub(state.last_sent_bytes);
+                    let delta_failed = state.failed_bytes.saturating_sub(state.last_failed_bytes);
+                    let delta_total = delta_bytes + delta_failed;
+                    if delta_total > 0 {
+                        state.measured_bps = (delta_total as f64 * 8.0) / dt_sent;
+                        state.has_traffic = true;
+                    }
+                    state.last_sent_bytes = state.sent_bytes;
+                    state.last_failed_bytes = state.failed_bytes;
+                    state.last_sent_at = now;
+                }
+
+                state.metrics.observed_bps = state.measured_bps;
+                // observed_bytes includes both delivered and failed sends so
+                // that congestion detection sees the *attempted* throughput.
+                state.metrics.observed_bytes = state.sent_bytes.saturating_add(state.failed_bytes);
+            }
 
             // Calculate spare capacity: only when we have observed traffic,
             // otherwise spare is 0 to prevent premature duplication at startup
@@ -501,6 +520,9 @@ mod tests {
                     iface: None,
                     link_kind: None,
                     transport: None,
+                    estimated_capacity_bps: 0.0,
+                    owd_ms: 0.0,
+                    receiver_report: None,
                 }),
             }
         }

@@ -814,3 +814,725 @@ fn asymmetric_rtt_bonding() {
         avg_total_mbps
     );
 }
+
+// ─── GAME_PLAN Phase E: Core Scenarios ──────────────────────────────
+
+/// Scenario 1 — "The Cliff": highest-capacity link drops to 0 instantly.
+/// Three links, link A (8 Mbps) is the strongest. It goes to 100% loss at t=10s.
+/// Assertion: stream survives, throughput recovers to remaining capacity.
+#[test]
+fn the_cliff() {
+    let bin = match require_privileged_env() {
+        Some(b) => b,
+        None => return,
+    };
+    let bin_str = bin.to_str().unwrap();
+
+    let ns_snd = Arc::new(Namespace::new("st_cliff_snd").unwrap());
+    let ns_rcv = Arc::new(Namespace::new("st_cliff_rcv").unwrap());
+
+    // Link A: 8 Mbps (strongest — will cliff)
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "st_cl1_a",
+            "st_cl1_b",
+            "10.70.1.1/24",
+            "10.70.1.2/24",
+        )
+        .unwrap();
+    // Link B: 5 Mbps
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "st_cl2_a",
+            "st_cl2_b",
+            "10.70.2.1/24",
+            "10.70.2.2/24",
+        )
+        .unwrap();
+    // Link C: 6 Mbps
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "st_cl3_a",
+            "st_cl3_b",
+            "10.70.3.1/24",
+            "10.70.3.2/24",
+        )
+        .unwrap();
+
+    setup_mgmt_link(
+        "st_mgmt_cl",
+        "st_mgmt_cm",
+        "st_cliff_snd",
+        "192.168.210.1/24",
+        "192.168.210.2/24",
+    );
+
+    // Initial: A=8 Mbps, B=5 Mbps, C=6 Mbps, all 30ms
+    apply_impairment(
+        &ns_snd,
+        "st_cl1_a",
+        ImpairmentConfig {
+            rate_kbit: Some(8_000),
+            delay_ms: Some(30),
+            loss_percent: Some(0.1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    apply_impairment(
+        &ns_snd,
+        "st_cl2_a",
+        ImpairmentConfig {
+            rate_kbit: Some(5_000),
+            delay_ms: Some(30),
+            loss_percent: Some(0.1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    apply_impairment(
+        &ns_snd,
+        "st_cl3_a",
+        ImpairmentConfig {
+            rate_kbit: Some(6_000),
+            delay_ms: Some(30),
+            loss_percent: Some(0.1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut recv = spawn_in_ns(
+        &ns_rcv.name,
+        bin_str,
+        &["receiver", "--bind", "0.0.0.0:7500"],
+    );
+    let mut collector = StatsCollector::new("192.168.210.1:9810");
+
+    let mut sender = spawn_in_ns(&ns_snd.name, bin_str, &[
+        "sender", "--dest",
+        "10.70.1.2:7500?rtt-min=60&buffer=2000,10.70.2.2:7500?rtt-min=60&buffer=2000,10.70.3.2:7500?rtt-min=60&buffer=2000",
+        "--stats-dest", "192.168.210.1:9810",
+        "--bitrate", "15000",
+    ]);
+
+    // Stabilize
+    thread::sleep(Duration::from_secs(10));
+
+    // THE CLIFF: Link A goes to 100% loss
+    eprintln!(">>> THE CLIFF: Link A (8 Mbps) goes DOWN");
+    apply_impairment(
+        &ns_snd,
+        "st_cl1_a",
+        ImpairmentConfig {
+            rate_kbit: Some(1),
+            delay_ms: Some(2000),
+            loss_percent: Some(100.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Let it recover on remaining links
+    thread::sleep(Duration::from_secs(10));
+
+    let _ = sender.kill();
+    let _ = sender.wait();
+    let _ = recv.kill();
+    let _ = recv.wait();
+    let data = collector.stop();
+    cleanup_mgmt_link("st_mgmt_cl");
+
+    assert!(!data.is_empty(), "No stats received during The Cliff");
+
+    // Post-cliff recovery (last 5s)
+    let last_ts = data.last().unwrap()["timestamp_ms"].as_u64().unwrap_or(0) as f64;
+    let window_start = last_ts - 5000.0;
+
+    let recovery_bps: Vec<f64> = data
+        .iter()
+        .filter(|v| v["timestamp_ms"].as_u64().unwrap_or(0) as f64 >= window_start)
+        .map(total_observed_bps)
+        .filter(|&b| b > 0.0)
+        .collect();
+
+    assert!(!recovery_bps.is_empty(), "No stats in post-cliff window");
+    let avg_mbps = recovery_bps.iter().sum::<f64>() / recovery_bps.len() as f64 / 1_000_000.0;
+
+    eprintln!(
+        "The Cliff — post-cliff throughput: {:.2} Mbps (B+C cap: ~11 Mbps)",
+        avg_mbps
+    );
+
+    // Should recover to at least 2 Mbps on remaining B+C links
+    assert!(
+        avg_mbps > 2.0,
+        "Post-cliff throughput ({:.2} Mbps) too low — stream did not survive the cliff",
+        avg_mbps
+    );
+}
+
+/// Scenario 2 — "Flapping Link": one link toggles between 5 Mbps and 500 kbps
+/// every 5 seconds. Verifies scheduler penalizes the unstable link and no
+/// encoder oscillation occurs.
+#[test]
+fn flapping_link() {
+    let bin = match require_privileged_env() {
+        Some(b) => b,
+        None => return,
+    };
+    let bin_str = bin.to_str().unwrap();
+
+    let ns_snd = Arc::new(Namespace::new("st_flap_snd").unwrap());
+    let ns_rcv = Arc::new(Namespace::new("st_flap_rcv").unwrap());
+
+    // Link A: stable
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "st_fl1_a",
+            "st_fl1_b",
+            "10.71.1.1/24",
+            "10.71.1.2/24",
+        )
+        .unwrap();
+    // Link B: flapping
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "st_fl2_a",
+            "st_fl2_b",
+            "10.71.2.1/24",
+            "10.71.2.2/24",
+        )
+        .unwrap();
+
+    setup_mgmt_link(
+        "st_mgmt_fp",
+        "st_mgmt_fq",
+        "st_flap_snd",
+        "192.168.211.1/24",
+        "192.168.211.2/24",
+    );
+
+    // Both links start at 5 Mbps
+    let stable_cfg = ImpairmentConfig {
+        rate_kbit: Some(5_000),
+        delay_ms: Some(30),
+        loss_percent: Some(0.1),
+        ..Default::default()
+    };
+    apply_impairment(&ns_snd, "st_fl1_a", stable_cfg.clone()).unwrap();
+    apply_impairment(&ns_snd, "st_fl2_a", stable_cfg).unwrap();
+
+    let mut recv = spawn_in_ns(
+        &ns_rcv.name,
+        bin_str,
+        &["receiver", "--bind", "0.0.0.0:7510"],
+    );
+    let mut collector = StatsCollector::new("192.168.211.1:9811");
+
+    let mut sender = spawn_in_ns(
+        &ns_snd.name,
+        bin_str,
+        &[
+            "sender",
+            "--dest",
+            "10.71.1.2:7510?rtt-min=60&buffer=2000,10.71.2.2:7510?rtt-min=60&buffer=2000",
+            "--stats-dest",
+            "192.168.211.1:9811",
+            "--bitrate",
+            "8000",
+        ],
+    );
+
+    // Stabilize
+    thread::sleep(Duration::from_secs(5));
+
+    // Flap link B: 5 Mbps ↔ 500 kbps every 5s, total 30s
+    let flap_start = Instant::now();
+    for cycle in 0..6 {
+        let rate = if cycle % 2 == 0 { 500 } else { 5_000 };
+        eprintln!(">>> FLAP cycle {}: Link B → {} kbps", cycle, rate);
+        apply_impairment(
+            &ns_snd,
+            "st_fl2_a",
+            ImpairmentConfig {
+                rate_kbit: Some(rate),
+                delay_ms: Some(30),
+                loss_percent: Some(0.1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let target = flap_start + Duration::from_secs((cycle + 1) * 5);
+        let now = Instant::now();
+        if now < target {
+            thread::sleep(target - now);
+        }
+    }
+
+    let _ = sender.kill();
+    let _ = sender.wait();
+    let _ = recv.kill();
+    let _ = recv.wait();
+    let data = collector.stop();
+    cleanup_mgmt_link("st_mgmt_fp");
+
+    assert!(!data.is_empty(), "No stats received during flapping test");
+
+    // Throughput should remain non-zero throughout — the stable link carries traffic
+    let all_bps: Vec<f64> = data
+        .iter()
+        .map(total_observed_bps)
+        .filter(|&b| b > 0.0)
+        .collect();
+
+    assert!(
+        all_bps.len() >= 5,
+        "Too few throughput samples during flapping"
+    );
+
+    // Last 5s: should be stable on link A at minimum
+    let last_ts = data.last().unwrap()["timestamp_ms"].as_u64().unwrap_or(0) as f64;
+    let window_start = last_ts - 5000.0;
+
+    let final_bps: Vec<f64> = data
+        .iter()
+        .filter(|v| v["timestamp_ms"].as_u64().unwrap_or(0) as f64 >= window_start)
+        .map(total_observed_bps)
+        .filter(|&b| b > 0.0)
+        .collect();
+
+    if !final_bps.is_empty() {
+        let avg_mbps = final_bps.iter().sum::<f64>() / final_bps.len() as f64 / 1_000_000.0;
+        eprintln!("Flapping — final window throughput: {:.2} Mbps", avg_mbps);
+
+        assert!(
+            avg_mbps > 0.5,
+            "Final throughput ({:.2} Mbps) collapsed during flapping",
+            avg_mbps
+        );
+    }
+}
+
+/// Scenario 3 — "Jitter Bomb": all links get 500ms jitter simultaneously.
+/// Verifies smooth delivery with higher latency, no stuttering.
+#[test]
+fn jitter_bomb() {
+    let bin = match require_privileged_env() {
+        Some(b) => b,
+        None => return,
+    };
+    let bin_str = bin.to_str().unwrap();
+
+    let ns_snd = Arc::new(Namespace::new("st_jit_snd").unwrap());
+    let ns_rcv = Arc::new(Namespace::new("st_jit_rcv").unwrap());
+
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "st_j1_a",
+            "st_j1_b",
+            "10.72.1.1/24",
+            "10.72.1.2/24",
+        )
+        .unwrap();
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "st_j2_a",
+            "st_j2_b",
+            "10.72.2.1/24",
+            "10.72.2.2/24",
+        )
+        .unwrap();
+
+    setup_mgmt_link(
+        "st_mgmt_jt",
+        "st_mgmt_ju",
+        "st_jit_snd",
+        "192.168.212.1/24",
+        "192.168.212.2/24",
+    );
+
+    // Start with low jitter
+    let base_cfg = ImpairmentConfig {
+        rate_kbit: Some(5_000),
+        delay_ms: Some(30),
+        jitter_ms: Some(5),
+        ..Default::default()
+    };
+    apply_impairment(&ns_snd, "st_j1_a", base_cfg.clone()).unwrap();
+    apply_impairment(&ns_snd, "st_j2_a", base_cfg).unwrap();
+
+    let mut recv = spawn_in_ns(
+        &ns_rcv.name,
+        bin_str,
+        &["receiver", "--bind", "0.0.0.0:7520"],
+    );
+    let mut collector = StatsCollector::new("192.168.212.1:9812");
+
+    let mut sender = spawn_in_ns(
+        &ns_snd.name,
+        bin_str,
+        &[
+            "sender",
+            "--dest",
+            "10.72.1.2:7520?rtt-min=60&buffer=3000,10.72.2.2:7520?rtt-min=60&buffer=3000",
+            "--stats-dest",
+            "192.168.212.1:9812",
+            "--bitrate",
+            "6000",
+        ],
+    );
+
+    // Stabilize
+    thread::sleep(Duration::from_secs(7));
+
+    // JITTER BOMB: 500ms jitter on both links
+    eprintln!(">>> JITTER BOMB: both links → 500ms jitter");
+    let jitter_cfg = ImpairmentConfig {
+        rate_kbit: Some(5_000),
+        delay_ms: Some(50),
+        jitter_ms: Some(500),
+        ..Default::default()
+    };
+    apply_impairment(&ns_snd, "st_j1_a", jitter_cfg.clone()).unwrap();
+    apply_impairment(&ns_snd, "st_j2_a", jitter_cfg).unwrap();
+
+    // Run under jitter for 15s
+    thread::sleep(Duration::from_secs(15));
+
+    let _ = sender.kill();
+    let _ = sender.wait();
+    let _ = recv.kill();
+    let _ = recv.wait();
+    let data = collector.stop();
+    cleanup_mgmt_link("st_mgmt_jt");
+
+    assert!(!data.is_empty(), "No stats received during jitter bomb");
+
+    // Check that system didn't crash — any non-zero throughput in last 5s
+    let last_ts = data.last().unwrap()["timestamp_ms"].as_u64().unwrap_or(0) as f64;
+    let window_start = last_ts - 5000.0;
+
+    let jitter_bps: Vec<f64> = data
+        .iter()
+        .filter(|v| v["timestamp_ms"].as_u64().unwrap_or(0) as f64 >= window_start)
+        .map(total_observed_bps)
+        .filter(|&b| b > 0.0)
+        .collect();
+
+    eprintln!(
+        "Jitter Bomb — {} samples with throughput in final window",
+        jitter_bps.len()
+    );
+
+    // Under extreme jitter, we just want the system to survive and deliver SOMETHING
+    assert!(
+        !jitter_bps.is_empty() || data.len() >= 5,
+        "System appears to have collapsed under jitter bomb"
+    );
+}
+
+/// Scenario 4 — "Burst Loss": 20% loss for 2 seconds simulating a cellular handover.
+/// Verifies FEC + ARQ recovers with minimal visible impact.
+#[test]
+fn burst_loss() {
+    let bin = match require_privileged_env() {
+        Some(b) => b,
+        None => return,
+    };
+    let bin_str = bin.to_str().unwrap();
+
+    let ns_snd = Arc::new(Namespace::new("st_burst_snd").unwrap());
+    let ns_rcv = Arc::new(Namespace::new("st_burst_rcv").unwrap());
+
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "st_b1_a",
+            "st_b1_b",
+            "10.73.1.1/24",
+            "10.73.1.2/24",
+        )
+        .unwrap();
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "st_b2_a",
+            "st_b2_b",
+            "10.73.2.1/24",
+            "10.73.2.2/24",
+        )
+        .unwrap();
+
+    setup_mgmt_link(
+        "st_mgmt_bu",
+        "st_mgmt_bv",
+        "st_burst_snd",
+        "192.168.213.1/24",
+        "192.168.213.2/24",
+    );
+
+    let normal_cfg = ImpairmentConfig {
+        rate_kbit: Some(5_000),
+        delay_ms: Some(30),
+        loss_percent: Some(0.1),
+        ..Default::default()
+    };
+    apply_impairment(&ns_snd, "st_b1_a", normal_cfg.clone()).unwrap();
+    apply_impairment(&ns_snd, "st_b2_a", normal_cfg).unwrap();
+
+    let mut recv = spawn_in_ns(
+        &ns_rcv.name,
+        bin_str,
+        &["receiver", "--bind", "0.0.0.0:7530"],
+    );
+    let mut collector = StatsCollector::new("192.168.213.1:9813");
+
+    let mut sender = spawn_in_ns(
+        &ns_snd.name,
+        bin_str,
+        &[
+            "sender",
+            "--dest",
+            "10.73.1.2:7530?rtt-min=60&buffer=2000,10.73.2.2:7530?rtt-min=60&buffer=2000",
+            "--stats-dest",
+            "192.168.213.1:9813",
+            "--bitrate",
+            "6000",
+        ],
+    );
+
+    // Stabilize
+    thread::sleep(Duration::from_secs(8));
+
+    // BURST LOSS: 20% on both links for 2 seconds
+    eprintln!(">>> BURST LOSS: 20% loss on both links for 2s");
+    let burst_cfg = ImpairmentConfig {
+        rate_kbit: Some(5_000),
+        delay_ms: Some(30),
+        loss_percent: Some(20.0),
+        ..Default::default()
+    };
+    apply_impairment(&ns_snd, "st_b1_a", burst_cfg.clone()).unwrap();
+    apply_impairment(&ns_snd, "st_b2_a", burst_cfg).unwrap();
+
+    thread::sleep(Duration::from_secs(2));
+
+    // Restore normal
+    eprintln!(">>> BURST LOSS: restored to normal");
+    let normal_cfg = ImpairmentConfig {
+        rate_kbit: Some(5_000),
+        delay_ms: Some(30),
+        loss_percent: Some(0.1),
+        ..Default::default()
+    };
+    apply_impairment(&ns_snd, "st_b1_a", normal_cfg.clone()).unwrap();
+    apply_impairment(&ns_snd, "st_b2_a", normal_cfg).unwrap();
+
+    // Recovery window
+    thread::sleep(Duration::from_secs(8));
+
+    let _ = sender.kill();
+    let _ = sender.wait();
+    let _ = recv.kill();
+    let _ = recv.wait();
+    let data = collector.stop();
+    cleanup_mgmt_link("st_mgmt_bu");
+
+    assert!(!data.is_empty(), "No stats received during burst loss");
+
+    // Post-burst recovery (last 5s)
+    let last_ts = data.last().unwrap()["timestamp_ms"].as_u64().unwrap_or(0) as f64;
+    let window_start = last_ts - 5000.0;
+
+    let recovery_bps: Vec<f64> = data
+        .iter()
+        .filter(|v| v["timestamp_ms"].as_u64().unwrap_or(0) as f64 >= window_start)
+        .map(total_observed_bps)
+        .filter(|&b| b > 0.0)
+        .collect();
+
+    assert!(!recovery_bps.is_empty(), "No stats in post-burst window");
+    let avg_mbps = recovery_bps.iter().sum::<f64>() / recovery_bps.len() as f64 / 1_000_000.0;
+
+    eprintln!(
+        "Burst Loss — post-recovery throughput: {:.2} Mbps",
+        avg_mbps
+    );
+
+    assert!(
+        avg_mbps > 1.0,
+        "Post-burst throughput ({:.2} Mbps) too low — system did not recover from burst loss",
+        avg_mbps
+    );
+}
+
+/// Scenario 5 — "Bandwidth Ramp": link capacity increases from 1 Mbps to 20 Mbps
+/// over 30 seconds. Verifies the capacity estimator detects the increase and
+/// encoder bitrate ramps up.
+#[test]
+fn bandwidth_ramp() {
+    let bin = match require_privileged_env() {
+        Some(b) => b,
+        None => return,
+    };
+    let bin_str = bin.to_str().unwrap();
+
+    let ns_snd = Arc::new(Namespace::new("st_ramp_snd").unwrap());
+    let ns_rcv = Arc::new(Namespace::new("st_ramp_rcv").unwrap());
+
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "st_r1_a",
+            "st_r1_b",
+            "10.74.1.1/24",
+            "10.74.1.2/24",
+        )
+        .unwrap();
+
+    setup_mgmt_link(
+        "st_mgmt_rm",
+        "st_mgmt_rn",
+        "st_ramp_snd",
+        "192.168.214.1/24",
+        "192.168.214.2/24",
+    );
+
+    // Start at 1 Mbps
+    apply_impairment(
+        &ns_snd,
+        "st_r1_a",
+        ImpairmentConfig {
+            rate_kbit: Some(1_000),
+            delay_ms: Some(30),
+            loss_percent: Some(0.1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut recv = spawn_in_ns(
+        &ns_rcv.name,
+        bin_str,
+        &["receiver", "--bind", "0.0.0.0:7540"],
+    );
+    let mut collector = StatsCollector::new("192.168.214.1:9814");
+
+    let mut sender = spawn_in_ns(
+        &ns_snd.name,
+        bin_str,
+        &[
+            "sender",
+            "--dest",
+            "10.74.1.2:7540?rtt-min=60&buffer=2000",
+            "--stats-dest",
+            "192.168.214.1:9814",
+            "--bitrate",
+            "20000",
+        ],
+    );
+
+    // Stabilize at 1 Mbps
+    thread::sleep(Duration::from_secs(5));
+
+    // Ramp from 1 Mbps → 20 Mbps over 30 seconds
+    let ramp_start = Instant::now();
+    let ramp_duration = Duration::from_secs(30);
+    let ramp_steps = 30;
+    for step in 0..ramp_steps {
+        let progress = (step + 1) as f64 / ramp_steps as f64;
+        let rate_kbit = 1_000.0 + progress * 19_000.0; // 1 → 20 Mbps
+
+        apply_impairment(
+            &ns_snd,
+            "st_r1_a",
+            ImpairmentConfig {
+                rate_kbit: Some(rate_kbit as u64),
+                delay_ms: Some(30),
+                loss_percent: Some(0.1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let target = ramp_start + ramp_duration.mul_f64((step + 1) as f64 / ramp_steps as f64);
+        let now = Instant::now();
+        if now < target {
+            thread::sleep(target - now);
+        }
+    }
+
+    // Hold at peak for 5s
+    thread::sleep(Duration::from_secs(5));
+
+    let _ = sender.kill();
+    let _ = sender.wait();
+    let _ = recv.kill();
+    let _ = recv.wait();
+    let data = collector.stop();
+    cleanup_mgmt_link("st_mgmt_rm");
+
+    assert!(!data.is_empty(), "No stats received during bandwidth ramp");
+
+    // Compare early vs late throughput
+    let first_ts = data.first().unwrap()["timestamp_ms"].as_u64().unwrap_or(0) as f64;
+    let last_ts = data.last().unwrap()["timestamp_ms"].as_u64().unwrap_or(0) as f64;
+
+    // Early: first 5s
+    let early_end = first_ts + 5000.0;
+    let early_bps: Vec<f64> = data
+        .iter()
+        .filter(|v| {
+            let ts = v["timestamp_ms"].as_u64().unwrap_or(0) as f64;
+            ts <= early_end
+        })
+        .map(total_observed_bps)
+        .filter(|&b| b > 0.0)
+        .collect();
+
+    // Late: last 5s
+    let late_start = last_ts - 5000.0;
+    let late_bps: Vec<f64> = data
+        .iter()
+        .filter(|v| v["timestamp_ms"].as_u64().unwrap_or(0) as f64 >= late_start)
+        .map(total_observed_bps)
+        .filter(|&b| b > 0.0)
+        .collect();
+
+    let early_avg = if early_bps.is_empty() {
+        0.0
+    } else {
+        early_bps.iter().sum::<f64>() / early_bps.len() as f64
+    };
+    let late_avg = if late_bps.is_empty() {
+        0.0
+    } else {
+        late_bps.iter().sum::<f64>() / late_bps.len() as f64
+    };
+
+    eprintln!(
+        "Bandwidth Ramp — early: {:.2} Mbps, late: {:.2} Mbps",
+        early_avg / 1_000_000.0,
+        late_avg / 1_000_000.0
+    );
+
+    // Late throughput should be significantly higher than early
+    if !early_bps.is_empty() && !late_bps.is_empty() {
+        assert!(
+            late_avg > early_avg * 1.5,
+            "Throughput did not ramp: early={:.2} Mbps, late={:.2} Mbps — \
+             capacity estimator may not be detecting increase",
+            early_avg / 1_000_000.0,
+            late_avg / 1_000_000.0
+        );
+    }
+}

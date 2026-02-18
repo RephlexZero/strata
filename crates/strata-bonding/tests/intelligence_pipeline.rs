@@ -42,6 +42,9 @@ impl MockLink {
                 iface: None,
                 link_kind: None,
                 transport: None,
+                estimated_capacity_bps: 0.0,
+                owd_ms: 0.0,
+                receiver_report: None,
             }),
             sent_packets: Mutex::new(Vec::new()),
         }
