@@ -404,3 +404,31 @@ pub async fn switch_source(
         Err(parse_error(resp).await)
     }
 }
+
+/// List files on a sender device at the given path.
+pub async fn list_files(
+    token: &str,
+    sender_id: &str,
+    path: Option<&str>,
+) -> ApiResult<crate::types::FileBrowserResponse> {
+    let url = match path {
+        Some(p) => format!(
+            "/api/senders/{sender_id}/files?path={}",
+            js_sys::encode_uri_component(p)
+        ),
+        None => format!("/api/senders/{sender_id}/files"),
+    };
+    let resp = Request::get(&url)
+        .header("Authorization", &auth_header(token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json::<crate::types::FileBrowserResponse>()
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}

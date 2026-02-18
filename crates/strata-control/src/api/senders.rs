@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use strata_common::ids;
 use strata_common::protocol::{
-    ConfigSetPayload, ConfigUpdatePayload, Envelope, InterfaceCommandPayload,
+    ConfigSetPayload, ConfigUpdatePayload, Envelope, FilesListPayload, InterfaceCommandPayload,
     InterfacesScanPayload, SourceSwitchPayload, TestRunPayload,
 };
 
@@ -57,6 +57,7 @@ pub fn router() -> Router<AppState> {
             axum::routing::post(update_stream_config),
         )
         .route("/{id}/source", axum::routing::post(switch_source))
+        .route("/{id}/files", get(list_sender_files))
 }
 
 // ── List Senders ────────────────────────────────────────────────────
@@ -622,6 +623,54 @@ async fn switch_source(
         .map_err(|_| ApiError::internal("failed to send to agent"))?;
 
     Ok(StatusCode::OK)
+}
+
+// ── File Browser ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct FilesQuery {
+    path: Option<String>,
+}
+
+async fn list_sender_files(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    Query(q): Query<FilesQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    verify_ownership(&state, &user, &id).await?;
+
+    let request_id = Uuid::now_v7().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.pending_requests().insert(request_id.clone(), tx);
+
+    let agent = state
+        .agents()
+        .get(&id)
+        .ok_or_else(|| ApiError::bad_request("sender is offline"))?;
+
+    let payload = FilesListPayload {
+        request_id: request_id.clone(),
+        path: q.path,
+    };
+    let envelope = Envelope::new("files.list", &payload);
+    let json = serde_json::to_string(&envelope).map_err(|e| ApiError::internal(e.to_string()))?;
+
+    agent
+        .tx
+        .send(json)
+        .await
+        .map_err(|_| ApiError::internal("failed to send to agent"))?;
+    drop(agent);
+
+    match tokio::time::timeout(Duration::from_secs(10), rx).await {
+        Ok(Ok(value)) => Ok(Json(value)),
+        Ok(Err(_)) => Err(ApiError::internal("agent disconnected")),
+        Err(_) => {
+            state.pending_requests().remove(&request_id);
+            Err(ApiError::internal("request timed out"))
+        }
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

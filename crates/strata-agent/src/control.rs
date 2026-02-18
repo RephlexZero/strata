@@ -17,10 +17,11 @@ use tokio_tungstenite::tungstenite::Message;
 use strata_common::models::StreamState;
 use strata_common::protocol::{
     AuthLoginPayload, AuthLoginResponsePayload, ConfigSetPayload, ConfigSetResponsePayload,
-    ConfigUpdatePayload, ConfigUpdateResponsePayload, DeviceStatusPayload, Envelope,
-    InterfaceCommandPayload, InterfaceCommandResponsePayload, InterfacesScanPayload,
-    InterfacesScanResponsePayload, SourceSwitchPayload, StreamEndReason, StreamEndedPayload,
-    StreamStartPayload, StreamStopPayload, TestRunPayload, TestRunResponsePayload,
+    ConfigUpdatePayload, ConfigUpdateResponsePayload, DeviceStatusPayload, Envelope, FileEntry,
+    FilesListPayload, FilesListResponsePayload, InterfaceCommandPayload,
+    InterfaceCommandResponsePayload, InterfacesScanPayload, InterfacesScanResponsePayload,
+    SourceSwitchPayload, StreamEndReason, StreamEndedPayload, StreamStartPayload,
+    StreamStopPayload, TestRunPayload, TestRunResponsePayload,
 };
 
 use crate::AgentState;
@@ -462,8 +463,63 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
                 send_envelope(state, "device.status", &build_heartbeat(state).await).await;
             }
         }
+        "files.list" => {
+            if let Ok(payload) = envelope.parse_payload::<FilesListPayload>() {
+                let req_path = payload.path.unwrap_or_else(|| "/opt/strata".to_string());
+                tracing::debug!(path = %req_path, "received files.list");
+                let (entries, error) = list_directory(&req_path);
+                let resp = FilesListResponsePayload {
+                    request_id: payload.request_id,
+                    path: req_path,
+                    entries,
+                    error,
+                };
+                send_envelope(state, "files.list.response", &resp).await;
+            }
+        }
         other => {
             tracing::debug!(msg_type = %other, "unhandled control message");
         }
     }
+}
+
+/// List files and directories at the given path.
+/// Returns (entries, error_message).
+fn list_directory(path: &str) -> (Vec<FileEntry>, Option<String>) {
+    use std::fs;
+
+    // Restrict to safe paths to prevent directory traversal.
+    let canonical = match fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(e) => return (vec![], Some(format!("cannot resolve path: {e}"))),
+    };
+    let dir = match fs::read_dir(&canonical) {
+        Ok(d) => d,
+        Err(e) => return (vec![], Some(format!("cannot read directory: {e}"))),
+    };
+
+    let mut entries: Vec<FileEntry> = dir
+        .filter_map(|entry| entry.ok())
+        .map(|entry| {
+            let metadata = entry.metadata().ok();
+            let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = if is_dir {
+                None
+            } else {
+                metadata.as_ref().map(|m| m.len())
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let full_path = entry.path().to_string_lossy().into_owned();
+            FileEntry {
+                name,
+                path: full_path,
+                is_dir,
+                size,
+            }
+        })
+        .collect();
+
+    // Directories first, then files, both alphabetically.
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+    (entries, None)
 }

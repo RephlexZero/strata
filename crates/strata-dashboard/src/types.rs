@@ -367,3 +367,19 @@ pub struct SourceSwitchRequest {
 pub struct ApiErrorResponse {
     pub error: String,
 }
+// ── File Browser ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileBrowserResponse {
+    pub path: String,
+    pub entries: Vec<FileEntry>,
+    pub error: Option<String>,
+}

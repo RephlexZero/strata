@@ -115,13 +115,14 @@ impl CodecController {
                 )
             }
             CodecType::H265 => {
-                // x265enc uses option-string for VBV parameters.
-                // tune=zerolatency disables B-frame reordering and lookahead.
-                // vbv-bufsize and vbv-maxrate are in kbps.
+                // tune must be set as a native GStreamer property (tune=4 = zerolatency).
+                // Passing tune=zerolatency via option-string conflicts with the GStreamer
+                // property wrapper and causes x265 encoder init to fail.
+                // vbv-bufsize and vbv-maxrate (kbps) are only valid via option-string.
                 format!(
                     "x265enc name={name} bitrate={bps} \
-                     key-int-max={ki} \
-                     option-string=\"vbv-bufsize={max_bps}:vbv-maxrate={max_bps}:tune=zerolatency\"",
+                     key-int-max={ki} tune=4 \
+                     option-string=\"vbv-bufsize={max_bps}:vbv-maxrate={max_bps}\"",
                     name = name,
                     bps = bitrate_kbps,
                     max_bps = max_bitrate_kbps,

@@ -337,7 +337,8 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
         | "config.update.response"
         | "test.run.response"
         | "interfaces.scan.response"
-        | "interface.command.response" => {
+        | "interface.command.response"
+        | "files.list.response" => {
             if let Some(request_id) = envelope.payload.get("request_id").and_then(|v| v.as_str()) {
                 if let Some((_, tx)) = state.pending_requests().remove(request_id) {
                     let _ = tx.send(envelope.payload.clone());

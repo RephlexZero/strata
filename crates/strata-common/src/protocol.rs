@@ -311,6 +311,35 @@ pub struct InterfacesScanResponsePayload {
     pub total: usize,
 }
 
+/// Request agent to list files in a directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilesListPayload {
+    pub request_id: String,
+    /// Absolute path to list; defaults to a sensible root if absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// A single entry returned by `files.list.response`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+/// Response to a `files.list` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilesListResponsePayload {
+    pub request_id: String,
+    pub path: String,
+    pub entries: Vec<FileEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 // ── Dashboard WebSocket Events ──────────────────────────────────────
 
 /// Events pushed to dashboard WebSocket subscribers.

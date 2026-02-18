@@ -90,42 +90,32 @@ This starts PostgreSQL, the control plane, a simulated sender with tc-netem cell
 
 ## Architecture
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│                         EDGE NODE                             │
-│  ┌──────────┐   ┌────────────┐   ┌────────────┐   ┌─────────┐│
-│  │ Encoder  │──▶│  Media     │──▶│  FEC       │──▶│ Network ││
-│  │ (H.264/  │   │  Classifier│   │  Codec     │   │ Reactor ││
-│  │  H.265/  │   │  (NAL      │   │  (XOR +    │   │ (per-   ││
-│  │  AV1)    │   │   parse)   │   │   TAROT)   │   │  link)  ││
-│  └──────────┘   └────────────┘   └────────────┘   └────┬────┘│
-│  ┌─────────────────────────────────────────────────────┤     │
-│  │              Bonding Scheduler                      │     │
-│  │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐    │     │
-│  │  │Link 1  │  │Link 2  │  │Link 3  │  │Link N  │    │     │
-│  │  │DWRR Q  │  │DWRR Q  │  │DWRR Q  │  │DWRR Q  │    │     │
-│  │  └───┬────┘  └───┬────┘  └───┬────┘  └───┬────┘    │     │
-│  └──────┼───────────┼───────────┼───────────┼─────────┘     │
-│  ┌──────▼───────────▼───────────▼───────────▼─────────┐     │
-│  │           Modem Supervisor                          │     │
-│  │  QMI/MBIM → RSRP, RSRQ, SINR, CQI per link        │     │
-│  └─────────────────────────────────────────────────────┘     │
-└───────────────────────────────────────────────────────────────┘
-                              │ UDP × N links
-                              ▼
-┌────────────────────────────────────────────────────────────────┐
-│                       CLOUD GATEWAY                            │
-│  ┌──────────┐   ┌────────────┐   ┌────────────┐               │
-│  │ Network  │──▶│  FEC       │──▶│  Jitter    │──▶ RTMP/SRT/ │
-│  │ Receiver │   │  Decoder   │   │  Buffer    │   HLS/Record  │
-│  └──────────┘   └────────────┘   └────────────┘               │
-└────────────────────────────────────────────────────────────────┘
-                              │
-┌─────────────────────────────▼───────────────────────────────────┐
-│                      CONTROL PLANE                              │
-│  Web Dashboard (Leptos) · REST API (Axum) · Fleet Management    │
-│  PostgreSQL · WebSocket Telemetry · Remote Config               │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph Edge["EDGE NODE"]
+        Encoder["Encoder\nH.264 / H.265 / AV1"] --> Classifier["Media Classifier\nNAL parse"]
+        Classifier --> Coding["FEC Codec\nXOR + TAROT"]
+        Coding --> Reactor["Network Reactor\nper-link"]
+        Reactor --> L1["Link 1\nDWRR Q"]
+        Reactor --> L2["Link 2\nDWRR Q"]
+        Reactor --> L3["Link 3\nDWRR Q"]
+        Reactor --> LN["Link N\nDWRR Q"]
+        L1 & L2 & L3 & LN --> Modem["Modem Supervisor\nQMI/MBIM: RSRP · RSRQ · SINR · CQI"]
+    end
+
+    Modem -->|"UDP × N links"| Gateway
+
+    subgraph Gateway["CLOUD GATEWAY"]
+        NetRx["Network Receiver"] --> FECDec["FEC Decoder"]
+        FECDec --> Jitter["Jitter Buffer"]
+        Jitter --> Output["RTMP / SRT / HLS / Record"]
+    end
+
+    Gateway --> Control
+
+    subgraph Control["CONTROL PLANE"]
+        CP["Web Dashboard (Leptos) · REST API (Axum) · Fleet Management\nPostgreSQL · WebSocket Telemetry · Remote Config"]
+    end
 ```
 
 Strata is a **three-layer system**: a custom wire protocol (`strata-transport`), a multi-link bonding engine (`strata-bonding`), and a management platform. Each layer is a separate Rust crate.
@@ -180,14 +170,13 @@ docker-compose.yml           Full dev stack with simulated impaired networks
 
 ### Dependency Graph
 
-```
-strata-gst ──▶ strata-bonding ──▶ strata-transport
-                     │
-                     └──▶ strata-common
-
-strata-control ──▶ strata-common
-strata-agent   ──▶ strata-common
-strata-dashboard ──▶ strata-common (types only)
+```mermaid
+graph LR
+    strata-gst --> strata-bonding --> strata-transport
+    strata-bonding --> strata-common
+    strata-control --> strata-common
+    strata-agent --> strata-common
+    strata-dashboard -->|types only| strata-common
 ```
 
 ---

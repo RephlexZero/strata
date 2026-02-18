@@ -13,8 +13,8 @@ use wasm_bindgen::JsCast;
 
 use crate::api;
 use crate::types::{
-    DashboardEvent, EncoderConfigUpdate, LinkStats, MediaInput, NetworkInterface, SenderDetail,
-    SenderFullStatus, SourceSwitchRequest, StreamConfigUpdateRequest, StreamSummary,
+    DashboardEvent, EncoderConfigUpdate, FileEntry, LinkStats, MediaInput, NetworkInterface,
+    SenderDetail, SenderFullStatus, SourceSwitchRequest, StreamConfigUpdateRequest, StreamSummary,
     TestRunResponse,
 };
 use crate::ws::WsClient;
@@ -794,6 +794,37 @@ fn SourceTab(
     let (switching, set_switching) = signal(false);
     let (switch_msg, set_switch_msg) = signal(Option::<(String, &'static str)>::None);
 
+    // File browser modal
+    let (show_file_browser, set_show_file_browser) = signal(false);
+    let (browser_path, set_browser_path) = signal(String::new());
+    let (browser_entries, set_browser_entries) = signal(Vec::<FileEntry>::new());
+    let (browser_loading, set_browser_loading) = signal(false);
+    let (browser_error, set_browser_error) = signal(Option::<String>::None);
+
+    // Load directory when browser opens or user navigates
+    let auth_browse = auth.clone();
+    let browse_dir = move |path: Option<String>| {
+        let token = auth_browse.token.get_untracked().unwrap_or_default();
+        let id = sender_id.get_untracked();
+        set_browser_loading.set(true);
+        set_browser_error.set(None);
+        let path_clone = path.clone();
+        leptos::task::spawn_local(async move {
+            match api::list_files(&token, &id, path_clone.as_deref()).await {
+                Ok(resp) => {
+                    set_browser_path.set(resp.path);
+                    set_browser_entries.set(resp.entries);
+                    if let Some(err) = resp.error {
+                        set_browser_error.set(Some(err));
+                    }
+                }
+                Err(e) => set_browser_error.set(Some(e)),
+            }
+            set_browser_loading.set(false);
+        });
+    };
+    let browse_dir2 = browse_dir;
+
     let do_switch = move |_: web_sys::MouseEvent| {
         let token = auth.token.get_untracked().unwrap_or_default();
         let id = sender_id.get_untracked();
@@ -1028,13 +1059,25 @@ fn SourceTab(
                         >
                             <fieldset class="fieldset">
                                 <label class="fieldset-label">"Media URI"</label>
-                                <input
-                                    type="text"
-                                    class="input input-bordered w-full"
-                                    placeholder="file:///media/video.mp4 or https://example.com/stream.mp4"
-                                    prop:value=move || source_uri.get()
-                                    on:input=move |ev| set_source_uri.set(event_target_value(&ev))
-                                />
+                                <div class="flex gap-2">
+                                    <input
+                                        type="text"
+                                        class="input input-bordered flex-1"
+                                        placeholder="file:///media/video.mp4 or https://example.com/stream.mp4"
+                                        prop:value=move || source_uri.get()
+                                        on:input=move |ev| set_source_uri.set(event_target_value(&ev))
+                                    />
+                                    <button
+                                        class="btn btn-outline btn-sm self-end mb-0.5"
+                                        type="button"
+                                        on:click=move |_| {
+                                            set_show_file_browser.set(true);
+                                            browse_dir2(None);
+                                        }
+                                    >
+                                        "Browse…"
+                                    </button>
+                                </div>
                             </fieldset>
                             <p class="text-xs text-base-content/40 mt-1">
                                 "Supports file://, http://, https://, rtsp://, or any GStreamer-compatible URI. "
@@ -1054,6 +1097,145 @@ fn SourceTab(
                 >
                     {move || if switching.get() { "Switching…" } else { "Switch Source" }}
                 </button>
+            </div>
+
+            // File browser modal
+            <FileBrowserModal
+                show=show_file_browser
+                set_show=set_show_file_browser
+                path=browser_path
+                entries=browser_entries
+                loading=browser_loading
+                error=browser_error
+                on_navigate=move |p: String| browse_dir(Some(p))
+                on_select=move |p: String| {
+                    set_source_uri.set(format!("file://{p}"));
+                    set_source_type.set("uri".into());
+                    set_show_file_browser.set(false);
+                }
+            />
+        </div>
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// FILE BROWSER MODAL
+// ═══════════════════════════════════════════════════════════════════
+
+#[component]
+fn FileBrowserModal(
+    show: ReadSignal<bool>,
+    set_show: WriteSignal<bool>,
+    path: ReadSignal<String>,
+    entries: ReadSignal<Vec<FileEntry>>,
+    loading: ReadSignal<bool>,
+    error: ReadSignal<Option<String>>,
+    on_navigate: impl Fn(String) + 'static + Clone + Send + Sync,
+    on_select: impl Fn(String) + 'static + Clone + Send + Sync,
+) -> impl IntoView {
+    let on_navigate2 = on_navigate.clone();
+
+    // Navigate up one directory level
+    let go_up = move |_: web_sys::MouseEvent| {
+        let p = path.get_untracked();
+        if let Some(parent) = std::path::Path::new(&p).parent() {
+            on_navigate2(parent.to_string_lossy().into_owned());
+        }
+    };
+
+    view! {
+        // Backdrop
+        <div
+            class="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+            style:display=move || if show.get() { "flex" } else { "none" }
+            on:click=move |ev| {
+                // Close on backdrop click (not when clicking modal content)
+                if let Some(target) = ev.target() {
+                    if let Some(el) = target.dyn_ref::<web_sys::Element>() {
+                        if el.class_list().contains("fixed") {
+                            set_show.set(false);
+                        }
+                    }
+                }
+            }
+        >
+            <div class="card bg-base-100 shadow-xl w-full max-w-lg mx-4">
+                <div class="card-body p-0">
+                    // Header
+                    <div class="flex items-center gap-2 p-4 border-b border-base-300">
+                        <button class="btn btn-ghost btn-sm btn-square" on:click=go_up title="Up">
+                            "\u{2191}"
+                        </button>
+                        <span class="flex-1 font-mono text-sm truncate min-w-0">
+                            {move || if path.get().is_empty() { "/".to_string() } else { path.get() }}
+                        </span>
+                        <button class="btn btn-ghost btn-sm btn-square" on:click=move |_| set_show.set(false)>
+                            "\u{2715}"
+                        </button>
+                    </div>
+
+                    // Body
+                    <div class="overflow-y-auto max-h-80 p-2">
+                        {move || loading.get().then(||
+                            view! { <div class="flex justify-center py-8"><span class="loading loading-spinner"/></div> }
+                        )}
+                        {move || error.get().map(|e|
+                            view! { <div class="alert alert-error text-sm m-2">{e}</div> }
+                        )}
+                        {move || {
+                            let nav = on_navigate.clone();
+                            let sel = on_select.clone();
+                            let items = entries.get();
+                            if !loading.get() && items.is_empty() && error.get().is_none() {
+                                return view! { <p class="text-sm text-base-content/40 p-4 text-center">"Directory is empty"</p> }.into_any();
+                            }
+                            view! {
+                                <div class="flex flex-col">
+                                    {items.into_iter().map(|entry| {
+                                        let nav = nav.clone();
+                                        let sel = sel.clone();
+                                        let p = entry.path.clone();
+                                        let p2 = entry.path.clone();
+                                        let is_dir = entry.is_dir;
+                                        let size_str = entry.size.map(|s| {
+                                            if s >= 1_073_741_824 { format!("{:.1} GB", s as f64 / 1_073_741_824.0) }
+                                            else if s >= 1_048_576 { format!("{:.1} MB", s as f64 / 1_048_576.0) }
+                                            else if s >= 1_024 { format!("{:.1} KB", s as f64 / 1_024.0) }
+                                            else { format!("{s} B") }
+                                        });
+                                        view! {
+                                            <button
+                                                class="flex items-center gap-3 px-3 py-2 hover:bg-base-200 rounded text-left w-full"
+                                                on:click=move |_| {
+                                                    if is_dir {
+                                                        nav(p.clone());
+                                                    } else {
+                                                        sel(p2.clone());
+                                                    }
+                                                }
+                                            >
+                                                <span class="text-lg shrink-0">
+                                                    {if is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" }}
+                                                </span>
+                                                <span class="flex-1 font-mono text-sm truncate">{entry.name}</span>
+                                                {size_str.map(|s| view! {
+                                                    <span class="text-xs text-base-content/40 shrink-0">{s}</span>
+                                                })}
+                                            </button>
+                                        }
+                                    }).collect::<Vec<_>>()}
+                                </div>
+                            }.into_any()
+                        }}
+                    </div>
+
+                    // Footer
+                    <div class="flex justify-end gap-2 p-3 border-t border-base-300">
+                        <button class="btn btn-ghost btn-sm" on:click=move |_| set_show.set(false)>
+                            "Cancel"
+                        </button>
+                    </div>
+                </div>
             </div>
         </div>
     }
