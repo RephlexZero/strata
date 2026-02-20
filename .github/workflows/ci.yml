@@ -222,7 +222,7 @@ jobs:
           name: strata-${{ matrix.target }}
           path: dist/
 
-  # ── Security audit (non-blocking) ──────────────────────────
+  # ── Security audit (non-blocking, runs in parallel with lint) ─
   audit:
     name: Audit
     runs-on: ubuntu-24.04

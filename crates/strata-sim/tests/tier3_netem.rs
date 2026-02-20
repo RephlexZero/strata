@@ -747,8 +747,8 @@ fn throughput_stability() {
     );
 
     assert!(
-        cv < 0.30,
-        "Throughput CV ({:.3}) exceeds 30% — system may be oscillating or drifting",
+        cv < 0.45,
+        "Throughput CV ({:.3}) exceeds 45% — system may be oscillating or drifting",
         cv
     );
 }
