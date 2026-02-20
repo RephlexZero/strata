@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "[pre-commit] Running rustfmt..."
+# Pre-commit: fast checks only. Must not slow you down.
+# Clippy is a superset of `cargo check`, so we only run clippy.
+
+echo "[pre-commit] Formatting..."
 cargo fmt --all
 
-echo "[pre-commit] Checking compilation..."
-cargo check --workspace
-
-echo "[pre-commit] Running clippy..."
+echo "[pre-commit] Clippy..."
 cargo clippy --workspace --all-targets -- -D warnings
 
 exit 0

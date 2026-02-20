@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "[pre-push] Running rustfmt check..."
+# Pre-push: the real gate. Catches what would fail CI.
+# Format is checked (not auto-fixed) because this is about verification.
+
+echo "[pre-push] Format check..."
 cargo fmt --all -- --check
 
-echo "[pre-push] Checking compilation..."
-cargo check --workspace
-
-echo "[pre-push] Running clippy..."
+echo "[pre-push] Clippy..."
 cargo clippy --workspace --all-targets -- -D warnings
 
-echo "[pre-push] Running unit tests..."
+echo "[pre-push] Unit tests..."
 cargo test --workspace --lib
-cargo test --workspace --doc
 
 echo "[pre-push] ✓ All checks passed"
 exit 0

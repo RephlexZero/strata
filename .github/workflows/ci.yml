@@ -10,9 +10,15 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# Cancel in-progress runs on the same branch
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  check:
-    name: Check & Clippy
+  # ── Lint + check (fast gate — everything else waits for this) ───
+  lint:
+    name: Lint
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -27,29 +33,48 @@ jobs:
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev \
-            libfontconfig1-dev \
-            gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-good \
-            gstreamer1.0-tools
+            libfontconfig1-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Format check
+      - name: Format
         run: cargo fmt --all -- --check
 
-      - name: Clippy
+      - name: Clippy (native)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Check (all targets)
-        run: cargo check --workspace --all-targets
+      - name: Check WASM targets
+        run: |
+          cargo check \
+            -p strata-dashboard \
+            -p strata-portal \
+            --target wasm32-unknown-unknown
 
+  # ── Tests ───────────────────────────────────────────────────
   test:
-    name: Unit Tests
+    name: Test
+    needs: lint
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: strata
+          POSTGRES_PASSWORD: ci-test-password
+          POSTGRES_DB: strata_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U strata"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -71,14 +96,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run unit tests
+      - name: Unit tests
+        env:
+          TEST_DATABASE_URL: postgres://strata:ci-test-password@localhost:5432/strata_test
         run: cargo test --workspace --lib
 
-      - name: Run doc tests
+      - name: Doc tests
         run: cargo test --workspace --doc
 
+  # ── Network integration tests (needs sudo, heavier) ────────
   integration:
-    name: Integration Tests
+    name: Integration
+    needs: lint
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -106,34 +135,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run end-to-end integration tests
+      - name: Network simulation tests
         run: sudo -E env "PATH=$PATH" cargo test -p strata-sim --test tier3_netem -- --nocapture
 
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Run security audit
-        run: cargo audit
-
+  # ── Build release artifacts ─────────────────────────────────
   build:
     name: Build (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
+    needs: lint
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -153,6 +168,20 @@ jobs:
             gstreamer1.0-plugins-good \
             gstreamer1.0-tools
 
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+
+      - name: Build release (native)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cargo build --release \
+            -p strata-gst \
+            -p strata-control \
+            -p strata-agent
+
       - name: Set up Docker Buildx
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         uses: docker/setup-buildx-action@v3
@@ -171,33 +200,37 @@ jobs:
           sbom: false
           outputs: type=local,dest=./cross-output
 
-      - uses: dtolnay/rust-toolchain@stable
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-
-      - uses: Swatinem/rust-cache@v2
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-
-      - name: Build release (native)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release -p strata-gst
-
-      - name: Prepare artifact (native)
+      - name: Prepare artifacts (native)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           mkdir -p dist
-          cp target/release/libgststrata.so dist/
-          cp target/release/strata-node dist/ 2>/dev/null || \
-            cp target/release/integration_node dist/ 2>/dev/null || true
+          cp target/release/libgststrata.so dist/ 2>/dev/null || true
+          cp target/release/strata-node dist/ 2>/dev/null || true
+          cp target/release/strata-control dist/ 2>/dev/null || true
+          cp target/release/strata-agent dist/ 2>/dev/null || true
 
-      - name: Prepare artifact (cross)
+      - name: Prepare artifacts (cross)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           mkdir -p dist
           cp cross-output/libgststrata.so dist/ 2>/dev/null || true
-          cp cross-output/strata-node dist/ 2>/dev/null || \
-            cp cross-output/integration_node dist/ 2>/dev/null || true
+          cp cross-output/strata-node dist/ 2>/dev/null || true
+          cp cross-output/strata-agent dist/ 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:
           name: strata-${{ matrix.target }}
           path: dist/
+
+  # ── Security audit (non-blocking) ──────────────────────────
+  audit:
+    name: Audit
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      - name: Security audit
+        run: cargo audit

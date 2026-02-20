@@ -5,7 +5,6 @@
 
 <p align="center">
   <a href="https://github.com/RephlexZero/strata/actions/workflows/ci.yml"><img src="https://github.com/RephlexZero/strata/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/RephlexZero/strata/actions/workflows/platform.yml"><img src="https://github.com/RephlexZero/strata/actions/workflows/platform.yml/badge.svg" alt="Platform CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPL--2.1--or--later-blue.svg" alt="License"></a>
 </p>
 

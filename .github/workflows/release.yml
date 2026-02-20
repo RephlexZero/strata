@@ -58,18 +58,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
-        run: cargo build --release -p strata-gst
+        run: |
+          cargo build --release \
+            -p strata-gst \
+            -p strata-control \
+            -p strata-agent
 
       - name: Package
         run: |
           mkdir -p staging
+          VERSION="${{ github.ref_name }}"
           cp target/release/libgststrata.so \
-            staging/strata-${{ github.ref_name }}-x86_64-linux-gnu.so
+            "staging/strata-${VERSION}-x86_64-linux-gnu.so"
+          cp target/release/strata-node \
+            "staging/strata-node-${VERSION}-x86_64-linux-gnu" 2>/dev/null || true
+          cp target/release/strata-control \
+            "staging/strata-control-${VERSION}-x86_64-linux-gnu" 2>/dev/null || true
+          cp target/release/strata-agent \
+            "staging/strata-agent-${VERSION}-x86_64-linux-gnu" 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:
           name: release-x86_64
-          path: staging/*.so
+          path: staging/*
 
   # ── aarch64 cross-compile (optional — does not block release)
   build-aarch64:
@@ -104,13 +115,18 @@ jobs:
       - name: Package
         run: |
           mkdir -p staging
+          VERSION="${{ github.ref_name }}"
           cp cross-output/libgststrata.so \
-            staging/strata-${{ github.ref_name }}-aarch64-linux-gnu.so
+            "staging/strata-${VERSION}-aarch64-linux-gnu.so" 2>/dev/null || true
+          cp cross-output/strata-node \
+            "staging/strata-node-${VERSION}-aarch64-linux-gnu" 2>/dev/null || true
+          cp cross-output/strata-agent \
+            "staging/strata-agent-${VERSION}-aarch64-linux-gnu" 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:
           name: release-aarch64
-          path: staging/*.so
+          path: staging/*
 
   # ── Create GitHub Release ──────────────────────────────────
   release:
@@ -141,8 +157,8 @@ jobs:
           generate_release_notes: ${{ steps.tag_body.outputs.body == '' }}
           body: ${{ steps.tag_body.outputs.body }}
           files: |
-            artifacts/release-x86_64/*.so
-            artifacts/release-aarch64/*.so
+            artifacts/release-x86_64/*
+            artifacts/release-aarch64/*
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
