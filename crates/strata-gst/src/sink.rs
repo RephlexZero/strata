@@ -487,6 +487,7 @@ mod imp {
                                         alive: m.alive,
                                         loss_rate: m.loss_rate,
                                         rtt_ms: m.rtt_ms,
+                                        queue_depth: m.transport.as_ref().map(|_| m.queue_depth),
                                     });
                                     if m.alive {
                                         total_capacity += m.capacity_bps;

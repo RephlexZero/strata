@@ -80,7 +80,6 @@ jobs:
   integration:
     name: Integration Tests
     runs-on: ubuntu-24.04
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -108,7 +107,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run end-to-end integration tests
-        run: sudo -E env "PATH=$PATH" cargo test -p strata-gst --test end_to_end -- --nocapture
+        run: sudo -E env "PATH=$PATH" cargo test -p strata-sim --test tier3_netem -- --nocapture
 
   audit:
     name: Security Audit

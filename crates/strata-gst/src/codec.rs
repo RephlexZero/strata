@@ -11,6 +11,7 @@ use gst::prelude::*;
 pub enum CodecType {
     H264,
     H265,
+    Fake,
 }
 
 impl CodecType {
@@ -19,6 +20,7 @@ impl CodecType {
         match s.to_lowercase().as_str() {
             "h264" | "x264" | "avc" => Some(CodecType::H264),
             "h265" | "x265" | "hevc" => Some(CodecType::H265),
+            "fake" | "identity" => Some(CodecType::Fake),
             _ => None,
         }
     }
@@ -28,6 +30,7 @@ impl CodecType {
         match self {
             CodecType::H264 => "x264enc",
             CodecType::H265 => "x265enc",
+            CodecType::Fake => "identity",
         }
     }
 
@@ -36,6 +39,7 @@ impl CodecType {
         match self {
             CodecType::H264 => "h264parse",
             CodecType::H265 => "h265parse",
+            CodecType::Fake => "identity",
         }
     }
 
@@ -44,6 +48,7 @@ impl CodecType {
         match self {
             CodecType::H264 => "video/x-h264",
             CodecType::H265 => "video/x-h265",
+            CodecType::Fake => "video/x-raw",
         }
     }
 }
@@ -73,16 +78,25 @@ impl CodecController {
                 // x265enc "bitrate" property is in kbps
                 enc.set_property("bitrate", kbps);
             }
+            CodecType::Fake => {
+                // identity doesn't have a bitrate property
+            }
         }
     }
 
     /// Get the current encoder bitrate in kbps.
     pub fn get_bitrate_kbps(&self, enc: &gst::Element) -> u32 {
-        enc.property::<u32>("bitrate")
+        match self.codec {
+            CodecType::Fake => 0,
+            _ => enc.property::<u32>("bitrate"),
+        }
     }
 
     /// Force a keyframe on the encoder via a GStreamer force-keyunit event.
     pub fn force_keyframe(&self, enc: &gst::Element) {
+        if self.codec == CodecType::Fake {
+            return;
+        }
         let event = gst::event::CustomUpstream::builder(
             gst::Structure::builder("GstForceKeyUnit")
                 .field("all-headers", true)
@@ -106,11 +120,10 @@ impl CodecController {
         match self.codec {
             CodecType::H264 => {
                 format!(
-                    "x264enc name={name} tune=zerolatency bitrate={bps} \
-                     vbv-buf-capacity={max_bps} key-int-max={ki}",
+                    "x264enc name={name} tune=zerolatency speed-preset=ultrafast bitrate={bps} \
+                     key-int-max={ki}",
                     name = name,
                     bps = bitrate_kbps,
-                    max_bps = max_bitrate_kbps,
                     ki = key_int_max,
                 )
             }
@@ -129,6 +142,9 @@ impl CodecController {
                     ki = key_int_max,
                 )
             }
+            CodecType::Fake => {
+                format!("identity name={name} drop-probability=0.0")
+            }
         }
     }
 
@@ -137,9 +153,18 @@ impl CodecController {
     pub fn relay_muxer_fragment(&self) -> &'static str {
         match self.codec {
             CodecType::H264 => "flvmux name=fmux streamable=true",
-            // Enhanced FLV supports H.265 FourCC — available in GStreamer 1.24+.
-            // Falls back to regular flvmux which may not work for HEVC.
-            CodecType::H265 => "flvmux name=fmux streamable=true",
+            // Enhanced FLV (eflvmux) supports H.265 FourCC — available in GStreamer 1.24+.
+            CodecType::H265 => "eflvmux name=fmux streamable=true",
+            CodecType::Fake => "identity name=fmux",
+        }
+    }
+
+    /// Return just the factory name of the relay muxer element (for availability checks).
+    pub fn relay_muxer_factory_name(&self) -> &'static str {
+        match self.codec {
+            CodecType::H264 => "flvmux",
+            CodecType::H265 => "eflvmux",
+            CodecType::Fake => "identity",
         }
     }
 }
@@ -176,9 +201,9 @@ mod tests {
         let frag = ctrl.pipeline_fragment("enc", 2000, 60, 25000);
         assert!(frag.contains("x264enc"));
         assert!(frag.contains("bitrate=2000"));
-        assert!(frag.contains("vbv-buf-capacity=25000"));
         assert!(frag.contains("key-int-max=60"));
         assert!(frag.contains("tune=zerolatency"));
+        assert!(frag.contains("speed-preset=ultrafast"));
     }
 
     #[test]
@@ -189,12 +214,28 @@ mod tests {
         assert!(frag.contains("bitrate=2000"));
         assert!(frag.contains("vbv-bufsize=25000"));
         assert!(frag.contains("vbv-maxrate=25000"));
-        assert!(frag.contains("tune=zerolatency"));
+        // x265enc uses tune=4 (numeric) for zerolatency, not the string form
+        assert!(frag.contains("tune=4"));
     }
 
     #[test]
     fn caps_media_types() {
         assert_eq!(CodecType::H264.caps_media_type(), "video/x-h264");
         assert_eq!(CodecType::H265.caps_media_type(), "video/x-h265");
+    }
+
+    #[test]
+    fn relay_muxer_fragment_codecs() {
+        let h264 = CodecController::new(CodecType::H264);
+        assert_eq!(
+            h264.relay_muxer_fragment(),
+            "flvmux name=fmux streamable=true"
+        );
+
+        let h265 = CodecController::new(CodecType::H265);
+        assert_eq!(
+            h265.relay_muxer_fragment(),
+            "eflvmux name=fmux streamable=true"
+        );
     }
 }

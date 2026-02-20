@@ -193,6 +193,7 @@ impl ModemSupervisor {
                     alive: !state.degraded,
                     loss_rate: 0.0, // filled in by transport metrics separately
                     rtt_ms: 0.0,
+                    queue_depth: None,
                 }
             })
             .collect()

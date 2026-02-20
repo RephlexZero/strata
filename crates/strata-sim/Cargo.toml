@@ -5,6 +5,14 @@ edition = "2021"
 
 [dependencies]
 rand = { workspace = true }
+strata-bonding = { path = "../strata-bonding" }
+strata-transport = { path = "../strata-transport" }
+tokio = { version = "1", features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

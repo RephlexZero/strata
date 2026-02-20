@@ -23,16 +23,16 @@
 - GStreamer stratasink/stratasrc with stats thread → `bitrate-command` messages
 - Docker sim: 3 links with tc netem (8/5/6 Mbps, varied RTT and loss)
 - Control plane, dashboard, agent all running
+- BiscayController (BBR delivery-rate probing) wired for real capacity estimation
+- DegradationStage wired into scheduler and buffer depth alarm
+- Phase-shifted probing coordination
 
 **Implemented but NOT wired:**
-- BiscayController (full BBR state machine in `congestion.rs`) — not connected
-- DegradationStage (in BitrateAdapter) — computed but scheduler ignores it
 - Bonding-layer RaptorQ FEC (`scheduler/fec.rs`) — not encoding/decoding
 - GilbertElliott channel model — not driving FEC rate
 - ModemSupervisor, LinkHealth — no real hardware interface
 
 **Not implemented:**
-- BBR delivery-rate probing (Mathis formula still used for capacity)
 - Codec abstraction layer (x264/x265)
 - Enhanced RTMP / HLS output for H.265
 - Receiver → sender telemetry feedback (BITRATE_CMD from receiver)
@@ -40,7 +40,7 @@
 
 ---
 
-## Phase A: Real Capacity Estimation (replace Mathis)
+## Phase A: Real Capacity Estimation (replace Mathis) [COMPLETE]
 
 **Why first:** Both reports identify the Mathis formula as the biggest
 correctness gap. It produces fictional capacity values disconnected from actual
@@ -94,7 +94,7 @@ Mathis values.
 
 ---
 
-## Phase B: DegradationStage → Scheduler
+## Phase B: DegradationStage → Scheduler [COMPLETE]
 
 **Why next:** The BitrateAdapter already computes a `DegradationStage` but
 nothing acts on it. This is the missing link between bitrate adaptation and

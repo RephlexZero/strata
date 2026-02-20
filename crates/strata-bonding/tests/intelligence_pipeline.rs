@@ -163,6 +163,7 @@ fn full_pipeline_link_failure_and_recovery() {
             alive: true,
             loss_rate: 0.0,
             rtt_ms: 10.0,
+            queue_depth: None,
         },
         LinkCapacity {
             link_id: 2,
@@ -170,6 +171,7 @@ fn full_pipeline_link_failure_and_recovery() {
             alive: true,
             loss_rate: 0.0,
             rtt_ms: 15.0,
+            queue_depth: None,
         },
         LinkCapacity {
             link_id: 3,
@@ -177,6 +179,7 @@ fn full_pipeline_link_failure_and_recovery() {
             alive: false,
             loss_rate: 1.0,
             rtt_ms: 0.0,
+            queue_depth: None,
         },
     ];
     adapter.update(&caps);
@@ -234,6 +237,7 @@ fn adaptation_reduces_bitrate_on_capacity_drop() {
             alive: true,
             loss_rate: 0.0,
             rtt_ms: 10.0,
+            queue_depth: None,
         },
         LinkCapacity {
             link_id: 1,
@@ -241,6 +245,7 @@ fn adaptation_reduces_bitrate_on_capacity_drop() {
             alive: true,
             loss_rate: 0.0,
             rtt_ms: 15.0,
+            queue_depth: None,
         },
     ];
     adapter.update(&good_caps);
@@ -254,6 +259,7 @@ fn adaptation_reduces_bitrate_on_capacity_drop() {
             alive: true,
             loss_rate: 0.05,
             rtt_ms: 50.0,
+            queue_depth: None,
         },
         LinkCapacity {
             link_id: 1,
@@ -261,6 +267,7 @@ fn adaptation_reduces_bitrate_on_capacity_drop() {
             alive: false,
             loss_rate: 1.0,
             rtt_ms: 0.0,
+            queue_depth: None,
         },
     ];
     let cmd = adapter.update(&bad_caps);

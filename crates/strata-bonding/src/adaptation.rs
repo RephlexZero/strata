@@ -12,6 +12,7 @@
 //! capacity recovers, it ramps the encoder back up conservatively.
 
 use quanta::Instant;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::media::priority::DegradationStage;
@@ -117,6 +118,37 @@ pub struct LinkCapacity {
     pub loss_rate: f64,
     /// Current RTT in ms.
     pub rtt_ms: f64,
+    /// ARQ send-queue depth in packets. `None` when unavailable (e.g. from
+    /// the modem supervisor which lacks transport-layer visibility).
+    pub queue_depth: Option<usize>,
+}
+
+// ─── Queue Alarm (internal) ─────────────────────────────────────────────────
+
+/// Per-link state for the queue-depth alarm.
+#[derive(Default)]
+struct QueueState {
+    /// Rolling EWMA of ARQ queue depth (α=0.01, slow-moving baseline).
+    ///
+    /// As traffic builds up and the queue settles at a normal operating
+    /// level, the thresholds grow proportionally — preventing spurious
+    /// alarms during legitimate high-throughput sessions.  Absolute
+    /// minimums (50 / 200 packets) ensure the alarm fires immediately
+    /// in Docker/CI environments where the baseline is zero.
+    ewma: f64,
+}
+
+/// Result of the queue-depth alarm check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueAlarm {
+    /// Queues look normal — fall through to capacity-based logic.
+    None,
+    /// Heavy congestion: ARQ queue well above its rolling EWMA baseline.
+    /// Maps to belacoder’s `bs > bs_th2` tier.
+    Heavy,
+    /// Extreme congestion: ARQ queue has blown past the absolute hard limit.
+    /// Maps to belacoder’s `bs > bs_th3` tier — jump to min bitrate immediately.
+    Extreme,
 }
 
 /// Receiver-side telemetry feedback for the BitrateAdapter.
@@ -157,6 +189,8 @@ pub struct BitrateAdapter {
     consecutive_increases: u32,
     /// Number of consecutive capacity decreases.
     consecutive_decreases: u32,
+    /// Per-link queue EWMA state for the belacoder-inspired alarm.
+    queue_state: HashMap<usize, QueueState>,
 }
 
 impl BitrateAdapter {
@@ -172,6 +206,7 @@ impl BitrateAdapter {
             prev_capacity_kbps: 0.0,
             consecutive_increases: 0,
             consecutive_decreases: 0,
+            queue_state: HashMap::new(),
         }
     }
 
@@ -286,8 +321,31 @@ impl BitrateAdapter {
             self.config.max_bitrate_kbps
         };
 
+        // Queue-depth alarm (belacoder-inspired 3-tier congestion detection).
+        // Fires when a link's send queue is visibly growing relative to its own
+        // rolling baseline — catching congestion that capacity estimates miss.
+        // In Docker/CI without real queuing, EWMA stays ≈0 and minimum
+        // thresholds (50/200 packets) are never breached, so this is a no-op.
+        let queue_alarm = self.update_and_check_queues(links);
+
         // Determine if we need a bitrate change
-        let (new_target, reason) = self.compute_target(usable_kbps, pressure, alive_count);
+        let (new_target, reason) = match queue_alarm {
+            QueueAlarm::Extreme => {
+                // Rapid queue explosion — jump to minimum immediately
+                self.stage = self.stage.max(DegradationStage::KeyframeOnly);
+                (self.config.min_bitrate_kbps, AdaptationReason::Congestion)
+            }
+            QueueAlarm::Heavy => {
+                // Heavy queue buildup — fast decrement
+                self.stage = self.stage.max(DegradationStage::DropDisposable);
+                let t = (self.current_target_kbps as f64 * self.config.ramp_down_factor) as u32;
+                (
+                    t.max(self.config.min_bitrate_kbps),
+                    AdaptationReason::Congestion,
+                )
+            }
+            QueueAlarm::None => self.compute_target(usable_kbps, pressure, alive_count),
+        };
         let new_target = new_target.min(effective_max);
 
         // Track spare bandwidth
@@ -297,12 +355,15 @@ impl BitrateAdapter {
             0
         };
 
-        // Only issue command if target changed meaningfully and enough time passed
+        // Only issue command if target changed meaningfully and enough time passed.
+        // Extreme queue alarms bypass the rate limiter — they need to act immediately.
+        let alarm_urgent = matches!(queue_alarm, QueueAlarm::Extreme);
         let target_changed = (new_target as i64 - self.current_target_kbps as i64).unsigned_abs()
             > self.config.ramp_up_kbps_per_step as u64 / 2;
-        let interval_ok = self
-            .last_command_time
-            .is_none_or(|t| t.elapsed() >= self.config.min_interval);
+        let interval_ok = alarm_urgent
+            || self
+                .last_command_time
+                .is_none_or(|t| t.elapsed() >= self.config.min_interval);
 
         if target_changed && interval_ok {
             self.current_target_kbps = new_target;
@@ -420,6 +481,50 @@ impl BitrateAdapter {
         self.consecutive_decreases = 0;
         self.prev_capacity_kbps = 0.0;
         self.last_command_time = None;
+        self.queue_state.clear();
+    }
+
+    // ─── Queue Alarm ─────────────────────────────────────────────────────
+
+    /// Update per-link queue EWMAs and return the highest alarm tier.
+    ///
+    /// Two tiers, mirroring belacoder's buffer-size thresholds:
+    ///
+    /// | Tier    | Threshold               | Action              |
+    /// |---------|-------------------------|---------------------|
+    /// | Extreme | `depth > max(200, avg*4)` | jump to min bitrate |
+    /// | Heavy   | `depth > max(50, avg*2)`  | fast decrement      |
+    ///
+    /// EWMA (alpha=0.01) ensures thresholds scale with sustained load while
+    /// absolute minimums prevent false positives in Docker/CI environments
+    /// where ARQ queues remain near zero.
+    fn update_and_check_queues(&mut self, links: &[LinkCapacity]) -> QueueAlarm {
+        const MIN_HEAVY: f64 = 50.0;
+        const MIN_EXTREME: f64 = 200.0;
+
+        let mut alarm = QueueAlarm::None;
+
+        for l in links.iter().filter(|l| l.alive) {
+            let Some(depth) = l.queue_depth else {
+                continue;
+            };
+            let depth = depth as f64;
+
+            let state = self.queue_state.entry(l.link_id).or_default();
+            state.ewma = state.ewma * 0.99 + depth * 0.01;
+            let avg = state.ewma;
+
+            let th_extreme = (avg * 4.0).max(MIN_EXTREME);
+            let th_heavy = (avg * 2.0).max(MIN_HEAVY);
+
+            if depth > th_extreme {
+                alarm = QueueAlarm::Extreme;
+            } else if matches!(alarm, QueueAlarm::None) && depth > th_heavy {
+                alarm = QueueAlarm::Heavy;
+            }
+        }
+
+        alarm
     }
 }
 
@@ -443,6 +548,7 @@ mod tests {
                 alive,
                 loss_rate: 0.0,
                 rtt_ms: 20.0,
+                queue_depth: None,
             })
             .collect()
     }
@@ -579,6 +685,7 @@ mod tests {
             alive: true,
             loss_rate: 0.20,
             rtt_ms: 30.0,
+            queue_depth: None,
         }];
 
         adapter.update(&links);
@@ -897,5 +1004,179 @@ mod tests {
         adapter.reset();
         assert_eq!(adapter.mode(), ReliabilityMode::MaxQuality);
         assert_eq!(adapter.spare_bw_kbps(), 0);
+    }
+
+    // ─── Queue-Depth Alarm ────────────────────────────────────────────
+
+    fn make_links_with_queue(entries: &[(f64, bool, Option<usize>)]) -> Vec<LinkCapacity> {
+        entries
+            .iter()
+            .enumerate()
+            .map(|(i, &(cap, alive, queue_depth))| LinkCapacity {
+                link_id: i,
+                capacity_kbps: cap,
+                alive,
+                loss_rate: 0.0,
+                rtt_ms: 20.0,
+                queue_depth,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn queue_alarm_none_when_no_depth_provided() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_interval: Duration::ZERO,
+            quality_cap_kbps: 10_000, // disable MaxReliability reduction for this test
+            ..Default::default()
+        });
+
+        // Links without queue_depth: None — alarm must not fire
+        let links = make_links(&[(10_000.0, true), (10_000.0, true)]);
+        let before = adapter.current_target_kbps();
+        adapter.update(&links);
+        adapter.update(&links);
+        assert_eq!(
+            adapter.current_target_kbps(),
+            before,
+            "no queue_depth → alarm must never fire"
+        );
+    }
+
+    #[test]
+    fn queue_alarm_extreme_jumps_to_min() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_bitrate_kbps: 500,
+            min_interval: Duration::ZERO,
+            quality_cap_kbps: 10_000, // disable MaxReliability reduction for this test
+            ..Default::default()
+        });
+
+        // Warm up the adapter so target starts at 10_000
+        let normal = make_links_with_queue(&[(30_000.0, true, Some(0))]);
+        for _ in 0..5 {
+            adapter.update(&normal);
+        }
+
+        // Now slam in 300 packets on link 0 — well above MIN_EXTREME (200) and
+        // well above the EWMA-based threshold (EWMA≈0 → th_extreme = 200).
+        let alarm = make_links_with_queue(&[(30_000.0, true, Some(300))]);
+        let cmd = adapter.update(&alarm);
+        assert!(cmd.is_some(), "extreme queue alarm must emit a command");
+        assert_eq!(
+            adapter.current_target_kbps(),
+            500,
+            "extreme alarm must jump to min_bitrate: got {}",
+            adapter.current_target_kbps()
+        );
+        assert_eq!(cmd.unwrap().reason, AdaptationReason::Congestion);
+    }
+
+    #[test]
+    fn queue_alarm_heavy_decrements_fast() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_bitrate_kbps: 500,
+            ramp_down_factor: 0.7,
+            min_interval: Duration::ZERO,
+            quality_cap_kbps: 10_000, // disable MaxReliability reduction for this test
+            ..Default::default()
+        });
+
+        // Warm up at depth 0 so EWMA ≈ 0, then inject exactly 60 packets
+        // (> MIN_HEAVY=50, < MIN_EXTREME=200) → Heavy alarm only.
+        let normal = make_links_with_queue(&[(30_000.0, true, Some(0))]);
+        for _ in 0..20 {
+            adapter.update(&normal);
+        }
+        let before = adapter.current_target_kbps();
+
+        let heavy = make_links_with_queue(&[(30_000.0, true, Some(60))]);
+        let cmd = adapter.update(&heavy);
+        assert!(cmd.is_some(), "heavy queue alarm must emit a command");
+        assert!(
+            adapter.current_target_kbps() < before,
+            "heavy alarm must reduce bitrate: {} → {}",
+            before,
+            adapter.current_target_kbps()
+        );
+        // Should be ramp_down_factor × before, not dropped to min
+        assert!(
+            adapter.current_target_kbps() > 500,
+            "heavy alarm should not jump all the way to min: {}",
+            adapter.current_target_kbps()
+        );
+    }
+
+    #[test]
+    fn queue_alarm_respects_min_thresholds_at_low_depth() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_bitrate_kbps: 500,
+            min_interval: Duration::ZERO,
+            quality_cap_kbps: 10_000, // disable MaxReliability reduction for this test
+            ..Default::default()
+        });
+
+        // Queue depth of 5 — below MIN_HEAVY (50), alarm should not fire
+        let links = make_links_with_queue(&[(30_000.0, true, Some(5))]);
+        let before = adapter.current_target_kbps();
+
+        for _ in 0..10 {
+            adapter.update(&links);
+        }
+        // Should not have alarm-triggered reductions (only capacity might drive changes)
+        // With 30 Mbps capacity and 10k target the adapter won't reduce, confirm no crash
+        assert!(
+            adapter.current_target_kbps() >= before,
+            "low queue depth should not trigger alarm: {}",
+            adapter.current_target_kbps()
+        );
+    }
+
+    #[test]
+    fn queue_alarm_extreme_bypasses_min_interval() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_bitrate_kbps: 500,
+            min_interval: Duration::from_secs(100), // extremely long rate limit
+            quality_cap_kbps: 10_000, // disable MaxReliability reduction for this test
+            ..Default::default()
+        });
+
+        // Issue a command to set last_command_time
+        let links = make_links_with_queue(&[(1_000.0, true, None)]);
+        adapter.update(&links); // triggers capacity reduction, sets timer
+
+        // Now inject extreme queue depth — must bypass the 100s interval gate
+        let extreme = make_links_with_queue(&[(30_000.0, true, Some(300))]);
+        let cmd = adapter.update(&extreme);
+        assert!(cmd.is_some(), "extreme alarm must bypass min_interval gate");
+        assert_eq!(adapter.current_target_kbps(), 500);
+    }
+
+    #[test]
+    fn reset_clears_queue_state() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_bitrate_kbps: 500,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+
+        // Build up some queue EWMA state
+        let links = make_links_with_queue(&[(30_000.0, true, Some(10))]);
+        for _ in 0..50 {
+            adapter.update(&links);
+        }
+        assert!(!adapter.queue_state.is_empty(), "should have queue state");
+
+        adapter.reset();
+        assert!(
+            adapter.queue_state.is_empty(),
+            "reset should clear queue state"
+        );
     }
 }

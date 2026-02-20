@@ -22,6 +22,9 @@ fn adaptive_latency_spike_and_recovery() {
         skip_after: Some(Duration::from_millis(300)),
         jitter_latency_multiplier: 4.0,
         max_latency_ms: 200,
+        // Allow ramp-down after 500ms of stable jitter (shorter than default 2s
+        // so the 200-packet recovery phase is sufficient to demonstrate decrease).
+        stability_threshold_ms: 500,
         ..Default::default()
     };
     let mut buf = ReassemblyBuffer::with_config(0, config);
@@ -50,9 +53,10 @@ fn adaptive_latency_spike_and_recovery() {
     );
 
     // Phase 3: Recovery (steady 10ms IAT again)
-    // The jitter samples window (128 samples) will gradually flush the old spiky values.
+    // Push 200 packets over 2 seconds so the 128-sample jitter window fully flushes
+    // the spike data and the 500ms stability_threshold can be satisfied.
     let recovery_base = spike_base + Duration::from_secs(2);
-    for i in 100u64..250 {
+    for i in 100u64..300 {
         let t = recovery_base + Duration::from_millis((i - 100) * 10);
         buf.push(i, Bytes::from(vec![i as u8]), t);
     }
@@ -206,6 +210,9 @@ fn large_buffer_capacity_stress() {
         skip_after: None,
         jitter_latency_multiplier: 4.0,
         max_latency_ms: 500,
+        // min_latency_ms must not exceed start_latency or the buffer ramps up
+        // immediately on the first IAT=0 push (all same-timestamp packets).
+        min_latency_ms: 5,
         ..Default::default()
     };
     let mut buf = ReassemblyBuffer::with_config(0, config);
@@ -216,7 +223,7 @@ fn large_buffer_capacity_stress() {
         buf.push(i, Bytes::from(vec![0u8; 1400]), start);
     }
 
-    let out = buf.tick(start + Duration::from_millis(5));
+    let out = buf.tick(start + Duration::from_millis(10));
     assert_eq!(
         out.len(),
         count as usize,

@@ -124,6 +124,14 @@ pub struct BiscayController {
     created_at: Instant,
     /// Last time the state machine was evaluated.
     last_tick: Instant,
+
+    // ─── Phase-shifted probing ───
+    /// Whether this link holds the round-robin probe token.
+    ///
+    /// When `true`, ProbeBw applies a 1.25× gain (UP phase) to measure spare
+    /// capacity. When `false`, pacing stays at 1.0× (cruise) to avoid
+    /// simultaneous probing across all bonded links.
+    probe_allowed: bool,
 }
 
 impl BiscayController {
@@ -153,7 +161,18 @@ impl BiscayController {
 
             created_at: now,
             last_tick: now,
+
+            probe_allowed: true, // default: allowed until coordinator assigns tokens
         }
+    }
+
+    /// Allow or inhibit ProbeBw UP-gain for phase-shifted multi-link probing.
+    ///
+    /// When the bonding layer coordinates probing across links, only one link
+    /// at a time should hold `probe_allowed = true`. All others cruise at 1.0×
+    /// BtlBw until they receive the rotating probe token.
+    pub fn set_probe_allowed(&mut self, allowed: bool) {
+        self.probe_allowed = allowed;
     }
 
     // ─── Getters ────────────────────────────────────────────────────────
@@ -333,9 +352,12 @@ impl BiscayController {
                 }
             }
             BbrPhase::ProbeBw => {
-                // Pacing rate = BtlBw × pacing_gain
-                // BBRv3 uses gain cycling; simplified here
-                self.btl_bw * 1.0
+                // Pacing rate = BtlBw × pacing_gain.
+                // Only apply the UP-probe gain (1.25×) when this link holds the
+                // phase-shifted probe token; otherwise cruise at 1.0× to prevent
+                // simultaneous probing from all bonded links.
+                let gain = if self.probe_allowed { 1.25 } else { 1.0 };
+                self.btl_bw * gain
             }
             BbrPhase::ProbeRtt => {
                 // Minimal sending during RTT probe

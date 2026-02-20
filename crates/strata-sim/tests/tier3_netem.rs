@@ -39,29 +39,32 @@ fn strata_node_binary() -> PathBuf {
         }
     }
 
-    // Build if needed
-    let _ = Command::new("cargo")
-        .args(["build", "--bin", "strata-node"])
-        .status();
+    static BUILD: std::sync::Once = std::sync::Once::new();
+    BUILD.call_once(|| {
+        // Build if needed
+        let _ = Command::new("cargo")
+            .args(["build", "-p", "strata-sim", "--bin", "dummy_node"])
+            .status();
+    });
 
-    // Walk up from the test binary to find target/debug/strata-node
+    // Walk up from the test binary to find target/debug/dummy_node
     let mut path = std::env::current_exe().expect("current_exe");
     path.pop(); // deps
     path.pop(); // debug
-    path.push("strata-node");
+    path.push("dummy_node");
 
     if !path.exists() {
         // Fallback: workspace root
         let cwd = std::env::current_dir().unwrap();
-        let try_path = cwd.join("target/debug/strata-node");
+        let try_path = cwd.join("target/debug/dummy_node");
         if try_path.exists() {
             return try_path;
         }
-        let try_path2 = cwd.join("../../target/debug/strata-node");
+        let try_path2 = cwd.join("../../target/debug/dummy_node");
         if try_path2.exists() {
             return try_path2;
         }
-        panic!("strata-node binary not found at {:?}", path);
+        panic!("dummy_node binary not found at {:?}", path);
     }
     path
 }
@@ -72,7 +75,7 @@ fn spawn_in_ns(ns: &str, cmd: &str, args: &[&str]) -> std::process::Child {
         .args(["ip", "netns", "exec", ns, cmd])
         .args(args)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap_or_else(|e| panic!("Failed to spawn {cmd} in {ns}: {e}"))
 }
@@ -175,6 +178,39 @@ fn total_observed_bps(v: &Value) -> f64 {
     total
 }
 
+/// Extract the sender's current adapted bitrate from a stats Value.
+fn stats_current_bitrate_bps(v: &Value) -> f64 {
+    v.get("current_bitrate_bps")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+}
+
+/// Extract total estimated_capacity_bps (sum across all links) from a stats Value.
+fn total_estimated_capacity_bps(v: &Value) -> f64 {
+    let mut total = 0.0;
+    if let Some(links) = v.get("links").and_then(|l| l.as_array()) {
+        for link in links {
+            total += link
+                .get("estimated_capacity_bps")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+        }
+    }
+    total
+}
+
+/// Extract per-link cumulative sent_bytes from a single stats Value snapshot.
+fn link_sent_bytes(v: &Value) -> Vec<u64> {
+    if let Some(links) = v.get("links").and_then(|l| l.as_array()) {
+        links
+            .iter()
+            .map(|l| l.get("sent_bytes").and_then(|v| v.as_u64()).unwrap_or(0))
+            .collect()
+    } else {
+        vec![]
+    }
+}
+
 /// Guard that requires privileges. Returns binary path or skips the test.
 fn require_privileged_env() -> Option<PathBuf> {
     if !check_privileges() {
@@ -248,6 +284,8 @@ fn capacity_step_change() {
         bin_str,
         &[
             "sender",
+            "--codec",
+            "h264",
             "--dest",
             "10.60.1.2:7000?rtt-min=60&buffer=2000,10.60.2.2:7000?rtt-min=60&buffer=2000",
             "--stats-dest",
@@ -310,6 +348,41 @@ fn capacity_step_change() {
         "Throughput ({:.2} Mbps) did not recover after capacity drop",
         avg_mbps
     );
+
+    // Verify the adaptation loop responded: early bitrate should be higher than post-drop bitrate.
+    let first_ts = data.first().unwrap()["timestamp_ms"].as_u64().unwrap_or(0) as f64;
+    let early_end = first_ts + 5000.0;
+
+    let early_bitrate: Vec<f64> = data
+        .iter()
+        .filter(|v| v["timestamp_ms"].as_u64().unwrap_or(0) as f64 <= early_end)
+        .map(stats_current_bitrate_bps)
+        .filter(|&b| b > 0.0)
+        .collect();
+
+    let late_bitrate: Vec<f64> = data
+        .iter()
+        .filter(|v| v["timestamp_ms"].as_u64().unwrap_or(0) as f64 >= window_start)
+        .map(stats_current_bitrate_bps)
+        .filter(|&b| b > 0.0)
+        .collect();
+
+    if !early_bitrate.is_empty() && !late_bitrate.is_empty() {
+        let early_avg = early_bitrate.iter().sum::<f64>() / early_bitrate.len() as f64;
+        let late_avg = late_bitrate.iter().sum::<f64>() / late_bitrate.len() as f64;
+        eprintln!(
+            "Bitrate adaptation: pre-drop={:.2} Mbps \u{2192} post-drop={:.2} Mbps",
+            early_avg / 1_000_000.0,
+            late_avg / 1_000_000.0
+        );
+        assert!(
+            late_avg < early_avg * 0.95,
+            "Bitrate did not adapt after capacity drop: pre={:.2} Mbps, post={:.2} Mbps \u{2014} \
+             adaptation loop may not be closing",
+            early_avg / 1_000_000.0,
+            late_avg / 1_000_000.0
+        );
+    }
 }
 
 /// Link failure and recovery: one of two links goes down mid-stream,
@@ -372,6 +445,8 @@ fn link_failure_recovery() {
         bin_str,
         &[
             "sender",
+            "--codec",
+            "h264",
             "--dest",
             "10.61.1.2:7100?rtt-min=60&buffer=2000,10.61.2.2:7100?rtt-min=60&buffer=2000",
             "--stats-dest",
@@ -481,6 +556,8 @@ fn chaos_scenario() {
         bin_str,
         &[
             "sender",
+            "--codec",
+            "h264",
             "--dest",
             "10.62.1.2:7200,10.62.2.2:7200",
             "--stats-dest",
@@ -615,6 +692,8 @@ fn throughput_stability() {
         bin_str,
         &[
             "sender",
+            "--codec",
+            "h264",
             "--dest",
             "10.63.1.2:7300?rtt-min=60&buffer=2000",
             "--stats-dest",
@@ -752,6 +831,8 @@ fn asymmetric_rtt_bonding() {
         bin_str,
         &[
             "sender",
+            "--codec",
+            "h264",
             "--dest",
             "10.64.1.2:7400?rtt-min=40&buffer=2000,10.64.2.2:7400?rtt-min=300&buffer=2000",
             "--stats-dest",
@@ -776,24 +857,26 @@ fn asymmetric_rtt_bonding() {
     let last_ts = data.last().unwrap()["timestamp_ms"].as_u64().unwrap_or(0) as f64;
     let window_start = last_ts - 5000.0;
 
-    let mut link_bytes = [0u64; 2];
-    let mut sample_count = 0;
-
-    for v in &data {
-        if v["timestamp_ms"].as_u64().unwrap_or(0) as f64 >= window_start {
-            if let Some(links) = v.get("links").and_then(|l| l.as_array()) {
-                for (i, link) in links.iter().enumerate().take(2) {
-                    link_bytes[i] += link.get("sent_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-                }
-                sample_count += 1;
-            }
+    // Verify per-link utilization using the final stats snapshot.
+    // `sent_bytes` is cumulative from process start, so the last snapshot
+    // directly shows the total distribution across the run.
+    if let Some(last_snap) = data.last() {
+        let bytes = link_sent_bytes(last_snap);
+        if bytes.len() >= 2 {
+            eprintln!(
+                "Asymmetric RTT: link_a_bytes={}, link_b_bytes={}",
+                bytes[0], bytes[1]
+            );
+            assert!(
+                bytes[0] > 0,
+                "Link A (20ms) sent 0 bytes — low-latency link not utilized"
+            );
+            assert!(
+                bytes[1] > 0,
+                "Link B (150ms) sent 0 bytes — high-latency link not utilized"
+            );
         }
     }
-
-    eprintln!(
-        "Asymmetric RTT: link_a_bytes={}, link_b_bytes={}, samples={}",
-        link_bytes[0], link_bytes[1], sample_count
-    );
 
     // Both links should have sent data
     let total_bps: Vec<f64> = data
@@ -1040,6 +1123,8 @@ fn flapping_link() {
         bin_str,
         &[
             "sender",
+            "--codec",
+            "h264",
             "--dest",
             "10.71.1.2:7510?rtt-min=60&buffer=2000,10.71.2.2:7510?rtt-min=60&buffer=2000",
             "--stats-dest",
@@ -1182,6 +1267,8 @@ fn jitter_bomb() {
         bin_str,
         &[
             "sender",
+            "--codec",
+            "h264",
             "--dest",
             "10.72.1.2:7520?rtt-min=60&buffer=3000,10.72.2.2:7520?rtt-min=60&buffer=3000",
             "--stats-dest",
@@ -1233,10 +1320,22 @@ fn jitter_bomb() {
         jitter_bps.len()
     );
 
-    // Under extreme jitter, we just want the system to survive and deliver SOMETHING
+    // Under extreme jitter the system must still deliver a measurable bitstream.
     assert!(
-        !jitter_bps.is_empty() || data.len() >= 5,
-        "System appears to have collapsed under jitter bomb"
+        !jitter_bps.is_empty(),
+        "No throughput in final window \u{2014} system collapsed under jitter bomb \
+         ({} total stats collected)",
+        data.len()
+    );
+    let avg_jitter_mbps = jitter_bps.iter().sum::<f64>() / jitter_bps.len() as f64 / 1_000_000.0;
+    eprintln!(
+        "Jitter Bomb \u{2014} final window: {:.2} Mbps",
+        avg_jitter_mbps
+    );
+    assert!(
+        avg_jitter_mbps > 0.1,
+        "Throughput ({:.2} Mbps) too low under jitter bomb \u{2014} transport may have stalled",
+        avg_jitter_mbps
     );
 }
 
@@ -1301,6 +1400,8 @@ fn burst_loss() {
         bin_str,
         &[
             "sender",
+            "--codec",
+            "h264",
             "--dest",
             "10.73.1.2:7530?rtt-min=60&buffer=2000,10.73.2.2:7530?rtt-min=60&buffer=2000",
             "--stats-dest",
@@ -1432,6 +1533,8 @@ fn bandwidth_ramp() {
         bin_str,
         &[
             "sender",
+            "--codec",
+            "h264",
             "--dest",
             "10.74.1.2:7540?rtt-min=60&buffer=2000",
             "--stats-dest",
@@ -1535,4 +1638,136 @@ fn bandwidth_ramp() {
             late_avg / 1_000_000.0
         );
     }
+}
+
+// ─── Phase A validation: BiscayController end-to-end ────────────────
+
+/// Validates that the BiscayController (BBR-based capacity estimator wired
+/// into TransportLink) converges to approximately the actual link bandwidth.
+///
+/// Setup: single link capped at 5 Mbps by tc netem. Sender ceiling is set
+/// high (20 Mbps) so the link — not the sender — is the bottleneck.
+/// After the BBR STARTUP phase the windowed-max delivery rate (`btl_bw`)
+/// must stabilise within ±50% of 5 Mbps.
+///
+/// This is the key Phase A integration assertion: if `estimated_capacity_bps`
+/// is always 0 (ACK path broken) or wildly wrong, this test catches it.
+#[test]
+fn capacity_estimation_converges() {
+    let bin = match require_privileged_env() {
+        Some(b) => b,
+        None => return,
+    };
+    let bin_str = bin.to_str().unwrap();
+
+    let ns_snd = Arc::new(Namespace::new("st_cest_snd").unwrap());
+    let ns_rcv = Arc::new(Namespace::new("st_cest_rcv").unwrap());
+
+    ns_snd
+        .add_veth_link(
+            &ns_rcv,
+            "st_ce_a",
+            "st_ce_b",
+            "10.80.1.1/24",
+            "10.80.1.2/24",
+        )
+        .unwrap();
+
+    setup_mgmt_link(
+        "st_mgmt_ce",
+        "st_mgmt_cg",
+        "st_cest_snd",
+        "192.168.220.1/24",
+        "192.168.220.2/24",
+    );
+
+    // Link capped at exactly 5 Mbps — this is what estimated_capacity_bps must converge to.
+    apply_impairment(
+        &ns_snd,
+        "st_ce_a",
+        ImpairmentConfig {
+            rate_kbit: Some(5_000),
+            delay_ms: Some(30),
+            loss_percent: Some(0.1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut recv = spawn_in_ns(
+        &ns_rcv.name,
+        bin_str,
+        &["receiver", "--bind", "0.0.0.0:7600"],
+    );
+    let mut collector = StatsCollector::new("192.168.220.1:9820");
+
+    // --bitrate 20000: sender ceiling is well above the 5 Mbps link cap so
+    // the link is always the bottleneck and BBR must find the real rate.
+    let mut sender = spawn_in_ns(
+        &ns_snd.name,
+        bin_str,
+        &[
+            "sender",
+            "--dest",
+            "10.80.1.2:7600?rtt-min=60&buffer=2000",
+            "--stats-dest",
+            "192.168.220.1:9820",
+            "--bitrate",
+            "20000",
+        ],
+    );
+
+    // Run for 15s — BBR STARTUP converges within 3s at 30ms RTT;
+    // the extra time lets the max-filter stabilise.
+    thread::sleep(Duration::from_secs(15));
+
+    let _ = sender.kill();
+    let _ = sender.wait();
+    let _ = recv.kill();
+    let _ = recv.wait();
+    let data = collector.stop();
+    cleanup_mgmt_link("st_mgmt_ce");
+
+    assert!(
+        !data.is_empty(),
+        "No stats received during capacity estimation test"
+    );
+
+    // Examine the last 8s of samples (post-STARTUP, steady-state BBR).
+    let last_ts = data.last().unwrap()["timestamp_ms"].as_u64().unwrap_or(0) as f64;
+    let window_start = last_ts - 8000.0;
+
+    let capacity_samples: Vec<f64> = data
+        .iter()
+        .filter(|v| v["timestamp_ms"].as_u64().unwrap_or(0) as f64 >= window_start)
+        .map(total_estimated_capacity_bps)
+        .filter(|&c| c > 0.0)
+        .collect();
+
+    assert!(
+        !capacity_samples.is_empty(),
+        "estimated_capacity_bps was 0 throughout — ACK feedback path may be broken \
+         (BiscayController never received bandwidth samples)"
+    );
+
+    let avg_capacity_mbps =
+        capacity_samples.iter().sum::<f64>() / capacity_samples.len() as f64 / 1_000_000.0;
+
+    eprintln!(
+        "Capacity estimation: avg={:.2} Mbps over {} samples (target: ~5 Mbps)",
+        avg_capacity_mbps,
+        capacity_samples.len()
+    );
+
+    // Assert convergence within ±50% of the 5 Mbps netem limit.
+    assert!(
+        avg_capacity_mbps >= 2.5,
+        "Capacity estimate ({:.2} Mbps) too low — estimator may be under-counting ACKs",
+        avg_capacity_mbps
+    );
+    assert!(
+        avg_capacity_mbps <= 8.0,
+        "Capacity estimate ({:.2} Mbps) too high — estimator may be ignoring the netem rate limit",
+        avg_capacity_mbps
+    );
 }

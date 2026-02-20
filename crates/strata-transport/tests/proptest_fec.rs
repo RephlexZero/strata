@@ -6,7 +6,7 @@
 use bytes::Bytes;
 use proptest::prelude::*;
 use strata_transport::codec::{FecDecoder, FecEncoder, TarotOptimizer};
-use strata_transport::wire::FecRepairHeader;
+use strata_transport::wire::{FecRepairHeader, Packet};
 
 // ─── FEC Single-Symbol Recovery ──────────────────────────────────────────────
 
@@ -41,48 +41,34 @@ proptest! {
         }
         prop_assert!(!repairs.is_empty(), "encoder should emit repairs after K symbols");
 
-        // Parse the repair packet to extract the FEC repair data
-        // Repair packet format: PacketHeader + subtype(1) + FecRepairHeader(5) + repair_data
-        let _repair_pkt = &repairs[0]; // repair symbol 0
-        // Skip the packet header to get to the FEC data
-        // Header: flags(1) + payload_len(2) + varint(1-8) + timestamp(4)
-        // We need to find where the FEC repair header starts
-        // Rather than parsing the full packet, use the encoder's XOR directly:
-        // Compute XOR of all source symbols manually
-        let mut xor_data = vec![0u8; symbol_len];
-        for sym in &symbols {
-            for (j, &byte) in sym.iter().enumerate() {
-                xor_data[j] ^= byte;
-            }
-        }
+        // Parse the actual RLNC repair packet (uses GF(2^8) coding coefficients,
+        // not plain XOR — the decoder must use the same coefficient function).
+        let mut buf = repairs[0].clone();
+        let pkt = Packet::decode(&mut buf);
+        prop_assume!(pkt.is_some());
+        let pkt = pkt.unwrap();
+        let mut payload = pkt.payload;
+        let _subtype = payload.split_to(1);
+        let fec_hdr = FecRepairHeader::decode(&mut payload);
+        prop_assume!(fec_hdr.is_some());
+        let fec_hdr = fec_hdr.unwrap();
+        let repair_data = payload.to_vec();
 
-        // Decode: feed all symbols except the missing one, plus the repair
+        // Decode: feed all symbols except the missing one, plus the RLNC repair
         let mut decoder = FecDecoder::new(16);
-
         for (i, sym) in symbols.iter().enumerate().take(k) {
             if i == missing_idx {
                 continue; // simulate loss
             }
             decoder.add_source_symbol(0, i, k, 1, sym.clone());
         }
-
-        // Add repair symbol 0 (the XOR of all source symbols)
-        decoder.add_repair_symbol(
-            &FecRepairHeader {
-                generation_id: 0,
-                symbol_index: 0,
-                k: k as u8,
-                r: 1,
-            },
-            xor_data,
-        );
+        decoder.add_repair_symbol(&fec_hdr, repair_data);
 
         // Try recovery
         let recovered = decoder.try_recover(0);
         prop_assert_eq!(recovered.len(), 1, "should recover exactly 1 symbol");
         let (idx, data) = &recovered[0];
         prop_assert_eq!(*idx, missing_idx);
-        // Recovered data should match the original (may be padded to max len)
         for (j, &orig_byte) in symbols[missing_idx].iter().enumerate() {
             prop_assert_eq!(
                 data[j], orig_byte,
@@ -106,30 +92,33 @@ proptest! {
             .map(|i| Bytes::from(vec![(i + 1) as u8; symbol_len]))
             .collect();
 
-        // XOR all for repair
-        let mut xor_data = vec![0u8; symbol_len];
-        for sym in &symbols {
-            for (j, &byte) in sym.iter().enumerate() {
-                xor_data[j] ^= byte;
-            }
+        // Encode through the actual RLNC encoder (1 repair symbol)
+        let mut encoder = FecEncoder::new(k, 1);
+        let mut repair_packets = Vec::new();
+        for (i, sym) in symbols.iter().enumerate() {
+            let repairs = encoder.add_source_symbol(i as u64, sym.clone());
+            repair_packets.extend(repairs);
         }
+        prop_assume!(!repair_packets.is_empty());
+
+        // Parse the repair packet
+        let mut buf = repair_packets[0].clone();
+        let pkt = Packet::decode(&mut buf);
+        prop_assume!(pkt.is_some());
+        let pkt = pkt.unwrap();
+        let mut payload = pkt.payload;
+        let _subtype = payload.split_to(1);
+        let fec_hdr = FecRepairHeader::decode(&mut payload);
+        prop_assume!(fec_hdr.is_some());
+        let fec_hdr = fec_hdr.unwrap();
+        let repair_data = payload.to_vec();
 
         let mut decoder = FecDecoder::new(16);
-
         // Feed all except first two (2 losses)
         for (i, sym) in symbols.iter().enumerate().take(k).skip(2) {
             decoder.add_source_symbol(0, i, k, 1, sym.clone());
         }
-
-        decoder.add_repair_symbol(
-            &FecRepairHeader {
-                generation_id: 0,
-                symbol_index: 0,
-                k: k as u8,
-                r: 1,
-            },
-            xor_data,
-        );
+        decoder.add_repair_symbol(&fec_hdr, repair_data);
 
         let recovered = decoder.try_recover(0);
         prop_assert!(

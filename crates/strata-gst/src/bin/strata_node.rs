@@ -308,10 +308,25 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     //
     // When --relay-url is set, the encoded video and audio are teed:
     //   encoder → tee → queue → mpegtsmux → stratasink   (Strata)
-    //                 └→ queue → parser → flvmux → rtmpsink (RTMP)
+    //                 └→ queue → parser → [e]flvmux → rtmpsink (RTMP)
     //   voaacenc → tee → aacparse → queue → mpegtsmux         (Strata)
-    //                 └→ queue → aacparse → flvmux             (RTMP)
-    let use_relay = !relay_url.is_empty();
+    //                 └→ queue → aacparse → [e]flvmux          (RTMP)
+    let mut use_relay = !relay_url.is_empty();
+
+    // Validate that the relay muxer element is actually available before trying.
+    // eflvmux (for H.265) requires GStreamer 1.24+. If it's missing, disable the
+    // relay and log a warning rather than failing the whole pipeline.
+    if use_relay {
+        let muxer_factory = codec_ctrl.relay_muxer_factory_name();
+        if gst::ElementFactory::find(muxer_factory).is_none() {
+            eprintln!(
+                "Warning: relay muxer '{}' not available (requires GStreamer >= 1.24) — \
+                 RTMP relay disabled; stream will still start without relay",
+                muxer_factory
+            );
+            use_relay = false;
+        }
+    }
 
     // When relay is enabled, force audio on (RTMP requires it)
     if use_relay {
@@ -325,9 +340,10 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             ! tee name=atee \
             atee. ! queue ! aacparse ! mux. \
             atee. ! queue ! aacparse ! fmux.";
-        // RTMP mux + sink
+        // RTMP mux + sink — use codec-appropriate muxer (eflvmux for H.265, flvmux for H.264)
         let rtmp = format!(
-            " flvmux name=fmux streamable=true ! rtmpsink location=\"{url}\" sync=false",
+            " {mux} ! rtmpsink location=\"{url}\" sync=false",
+            mux = codec_ctrl.relay_muxer_fragment(),
             url = relay_url
         );
         (audio.to_string(), rtmp)
@@ -356,7 +372,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         codec_ctrl.pipeline_fragment("enc", bitrate_kbps, key_int, max_bitrate_kbps_val);
 
     let pipeline_str = format!(
-        "videotestsrc name=testsrc is-live=true pattern=smpte \
+        "videotestsrc name=testsrc is-live=true pattern=ball \
          ! video/x-raw,width={w},height={h},framerate={fps}/1 \
          ! queue name=testq max-size-buffers=3 ! sel. \
          input-selector name=sel \

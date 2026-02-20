@@ -65,6 +65,15 @@ pub struct BondingScheduler<L: LinkSender + ?Sized> {
     consecutive_dead_count: u64,
     /// Total packets dropped due to all links being dead
     pub total_dead_drops: Arc<AtomicU64>,
+
+    // ─── Phase-shifted probe coordination ───
+    /// ID of the link currently holding the BBR probe token.
+    ///
+    /// Only this link applies the 1.25× ProbeBw UP-gain; all others cruise at
+    /// 1.0× (no aggregate bandwidth overshoot across bonded cellular links).
+    probe_owner: Option<usize>,
+    /// When the probe token was last rotated.
+    last_probe_rotation: Instant,
 }
 
 impl<L: LinkSender + ?Sized> BondingScheduler<L> {
@@ -89,6 +98,8 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             prev_rtts: HashMap::new(),
             consecutive_dead_count: 0,
             total_dead_drops: Arc::new(AtomicU64::new(0)),
+            probe_owner: None,
+            last_probe_rotation: Instant::now(),
         }
     }
 
@@ -162,7 +173,52 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         // Decay BLEST penalties
         self.blest.decay_penalties();
 
+        // Rotate the BBR probe token every 1 second so only one link at a time
+        // applies the 1.25× ProbeBw UP-gain (phase-shifted probing).
+        self.rotate_probe_token(&metrics);
+
         self.check_failover_conditions();
+    }
+
+    /// Rotates the BBR probe token across alive links once per second.
+    ///
+    /// Only the link holding the probe token applies the 1.25× ProbeBw gain;
+    /// all others cruise at 1.0×. This prevents simultaneous probing across
+    /// all bonded cellular links, which would cause aggregate bandwidth overshoot.
+    fn rotate_probe_token(&mut self, metrics: &[(usize, crate::net::interface::LinkMetrics)]) {
+        if self.last_probe_rotation.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+
+        let mut alive_ids: Vec<usize> = metrics
+            .iter()
+            .filter(|(_, m)| m.alive)
+            .map(|(id, _)| *id)
+            .collect();
+
+        if alive_ids.is_empty() {
+            return;
+        }
+
+        // Sort for deterministic rotation order.
+        alive_ids.sort_unstable();
+
+        let next_owner = if let Some(current) = self.probe_owner {
+            let pos = alive_ids.iter().position(|&id| id == current).unwrap_or(0);
+            alive_ids[(pos + 1) % alive_ids.len()]
+        } else {
+            alive_ids[0]
+        };
+
+        // Apply probe_allowed to each alive link.
+        for &id in &alive_ids {
+            if let Some(link) = self.scheduler.get_link(id) {
+                link.set_probe_allowed(id == next_owner);
+            }
+        }
+
+        self.probe_owner = Some(next_owner);
+        self.last_probe_rotation = Instant::now();
     }
 
     /// Detects link instability (phase degradation or RTT spikes) and triggers fast-failover mode.
@@ -271,6 +327,18 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         alive_ids
             .first()
             .and_then(|&id| self.scheduler.get_link(id))
+    }
+
+    /// Forwards RF metrics from the modem supervisor to the matching link's
+    /// Biscay congestion controller. Call this whenever the modem poller
+    /// produces updated CQI/RSRP/SINR readings for a link.
+    ///
+    /// For test/mock links the call is a no-op — see
+    /// [`crate::net::interface::LinkSender::on_rf_metrics`].
+    pub fn notify_rf_metrics(&self, link_id: usize, rf: &crate::modem::health::RfMetrics) {
+        if let Some(link) = self.scheduler.get_link(link_id) {
+            link.on_rf_metrics(rf);
+        }
     }
 
     /// Returns a snapshot of metrics for all registered links.

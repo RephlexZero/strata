@@ -212,6 +212,10 @@ fn supervisor_adapter_to_wire_bitrate_cmd_pipeline() {
         max_bitrate_kbps: 10_000,
         min_interval: Duration::ZERO,
         ramp_down_factor: 0.7,
+        // Set quality_cap equal to max so MaxReliability mode doesn't reduce
+        // bitrate below target — this test exercises the degradation/recovery
+        // pipeline, not the quality-cap feature.
+        quality_cap_kbps: 10_000,
         ..Default::default()
     });
 

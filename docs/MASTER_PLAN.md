@@ -71,51 +71,33 @@ Strata bridges this gap by building a **pure Rust transport** that is:
 
 ## 2. Architecture Overview
 
-```
-┌───────────────────────────────────────────────────────────────┐
-│                         EDGE NODE                             │
-│                                                               │
-│  ┌──────────┐   ┌────────────┐   ┌────────────┐   ┌─────────┐ │
-│  │ Encoder  │─▶│  Media     │─▶│  Coding    │─▶│ Network │ │
-│  │ (H.264/  │   │  Classifier│   │  Engine    │   │ Reactor │ │
-│  │  H.265/  │   │  (NAL      │   │  (RLNC +   │   │ (per-   │ │
-│  │  AV1)    │   │   parse)   │   │   RS)      │   │  link)  │ │
-│  └──────────┘   └────────────┘   └────────────┘   └────┬────┘ │
-│                                                        │      │
-│  ┌─────────────────────────────────────────────────────┤      │
-│  │              Bonding Scheduler                      │      │
-│  │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐     │      │
-│  │  │Link 1  │  │Link 2  │  │Link 3  │  │Link N  │     │      │
-│  │  │DWRR Q  │  │DWRR Q  │  │DWRR Q  │  │DWRR Q  │     │      │
-│  │  └───┬────┘  └───┬────┘  └───┬────┘  └───┬────┘     │      │
-│  └──────┼───────────┼───────────┼───────────┼──────────┘      │
-│         │           │           │           │                 │
-│  ┌──────▼───────────▼───────────▼───────────▼──────────┐      │
-│  │           Modem Supervisor Daemon                   │      │
-│  │  QMI/MBIM → RSRP, RSRQ, SINR, CQI per link          │      │
-│  └─────────────────────────────────────────────────────┘      │
-└───────────────────────────────────────────────────────────────┘
-                              │ UDP × N links
-                              ▼
-┌────────────────────────────────────────────────────────────────┐
-│                       CLOUD GATEWAY                            │
-│                                                                │
-│  ┌──────────┐   ┌────────────┐   ┌────────────┐                │
-│  │ Network  │─▶│  Decoder   │─▶│  Jitter    │─▶ SRT/RTMP/   │
-│  │ Receiver │   │  (RLNC)    │   │  Buffer    │    NDI/MoQ     │
-│  └──────────┘   └────────────┘   └────────────┘                │
-│                                                                │
-│  ┌─────────────────────────────────────────────────────┐       │
-│  │        Link Quality Reports → Edge Node             │       │
-│  └─────────────────────────────────────────────────────┘       │
-└────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      CONTROL PLANE                              │
-│  Web Dashboard (Leptos) · REST API (Axum) · Fleet Mgmt          │
-│  Prometheus Metrics · WebSocket Telemetry · Remote Config       │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph Edge["EDGE NODE"]
+        Encoder["Encoder\nH.264 / H.265 / AV1"] --> Classifier["Media Classifier\nNAL parse"]
+        Classifier --> Coding["Coding Engine\nFEC + ARQ"]
+        Coding --> Reactor["Network Reactor\nper-link"]
+        Reactor --> L1["Link 1 DWRR Q"]
+        Reactor --> L2["Link 2 DWRR Q"]
+        Reactor --> L3["Link 3 DWRR Q"]
+        Reactor --> LN["Link N DWRR Q"]
+        L1 & L2 & L3 & LN --> Modem["Modem Supervisor\nQMI/MBIM: RSRP · RSRQ · SINR · CQI"]
+    end
+
+    Modem -->|"UDP × N links"| Gateway
+
+    subgraph Gateway["CLOUD GATEWAY"]
+        NetRx["Network Receiver"] --> Decoder["FEC Decoder"]
+        Decoder --> Jitter["Jitter Buffer"]
+        Jitter --> Output["SRT / RTMP / NDI / MoQ"]
+        Reports["Link Quality Reports"] -->|"LINK_REPORT"| Edge
+    end
+
+    Gateway --> Control
+
+    subgraph Control["CONTROL PLANE"]
+        CP["Web Dashboard (Leptos) · REST API (Axum) · Fleet Mgmt\nPrometheus Metrics · WebSocket Telemetry · Remote Config"]
+    end
 ```
 
 ### Actor Model
@@ -316,28 +298,17 @@ Where Biscay diverges from pure BBRv3:
 
 ### State Machine
 
-```
-                    ┌──────────┐
-          ┌───────▶│  NORMAL  │◀───────┐
-          │         └────┬─────┘         │
-          │              │               │
-     CQI stable    CQI dropping     Handover
-     & RSRP OK     (3 readings)     complete
-          │              │               │
-          │         ┌────▼─────┐         │
-          │         │ CAUTIOUS │         │
-          │         │ (-30%    │         │
-          │         │  pacing) │         │
-          │         └────┬─────┘         │
-          │              │               │
-          │         RSRP slope           │
-          │         < -2.5 dB/s          │
-          │              │               │
-          │         ┌────▼─────┐         │
-          └─────────│PRE_HAND- │─────────┘
-                    │  OVER    │
-                    │(drain Q) │
-                    └──────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> NORMAL
+    NORMAL --> CAUTIOUS : CQI dropping (3 readings)
+    CAUTIOUS --> PRE_HANDOVER : RSRP slope below -2.5 dB/s
+    PRE_HANDOVER --> NORMAL : Handover complete
+    CAUTIOUS --> NORMAL : CQI stable + RSRP OK
+
+    NORMAL : Full pacing rate
+    CAUTIOUS : -30% pacing
+    PRE_HANDOVER : Drain queue
 ```
 
 ---
@@ -720,15 +691,25 @@ Replace ns-3 (too CPU-heavy) with **tc netem + Linux network namespaces**:
 > faster to set up/tear down, and more controllable for CI. The `strata-sim`
 > crate wraps the `ip netns` / `tc netem` APIs directly.
 
-```
-┌─────────┐     veth pair (per link)     ┌─────────┐
-│  Sender │◀──── tc netem qdisc ────▶│Receiver │
-│   NS   │                            │   NS   │
-└─────────┘                            └─────────┘
-     │         strata-sim               │
-     │   Namespace / ImpairmentConfig    │
-     │   Scenario (random-walk)          │
-     └────────────────────────────────┘
+```mermaid
+graph LR
+    subgraph SenderNS["Sender Namespace"]
+        S["strata-bonding\nsender"]
+    end
+
+    subgraph VethPairs["veth pairs (strata-sim)"]
+        N1["Link 1 tc netem\nNS + ImpairmentConfig"]
+        N2["Link 2 tc netem\nNS + ImpairmentConfig"]
+        N3["Link N tc netem\nScenario random-walk"]
+    end
+
+    subgraph ReceiverNS["Receiver Namespace"]
+        R["strata-bonding\nreceiver"]
+    end
+
+    S --> N1 --> R
+    S --> N2 --> R
+    S --> N3 --> R
 ```
 
 Test scenarios (in `strata-sim/tests/tier3_netem.rs`):
@@ -973,23 +954,17 @@ crates/
 
 ### Dependency Graph
 
-```
-strata-gst ──▶ strata-bonding ──▶ strata-transport
-                     │
-                     ├──▶ strata-common
-                     ├──▶ raptorq (UEP FEC)
-                     └──▶ [modem supervisor uses QMI/MBIM]
-
-strata-control ──▶ strata-common (auth, IDs)
-                     ├──▶ axum + tower (REST + WebSocket)
-                     └──▶ rusqlite (SQLite persistence)
-
-strata-agent ──▶ strata-common (auth)
-               └──▶ tokio-tungstenite (WebSocket client)
-
-strata-dashboard ──▶ strata-control (REST API, WebSocket)
-strata-portal ────▶ strata-control (REST API)
-strata-sim ──────▶ strata-bonding (ImpairmentConfig reuse)
+```mermaid
+graph LR
+    strata-gst --> strata-bonding --> strata-transport
+    strata-bonding --> strata-common
+    strata-bonding --> raptorq
+    strata-control --> strata-common
+    strata-control --> axum
+    strata-agent --> strata-common
+    strata-dashboard -->|"REST + WebSocket"| strata-control
+    strata-portal -->|"REST API"| strata-control
+    strata-sim --> strata-bonding
 ```
 
 ### Key Dependencies

@@ -388,6 +388,11 @@ impl GenerationState {
 
     /// Attempt to recover all missing source symbols.
     /// Returns (index, data) pairs for recovered symbols.
+    ///
+    /// A symbol at `col` is only recovered when its pivot row has zero
+    /// coefficients for every other missing symbol — i.e. the system is fully
+    /// determined for that column.  Rows that still mix multiple unknowns
+    /// (under-determined) are skipped.
     fn try_recover(&self) -> Vec<(usize, Bytes)> {
         let mut recovered = Vec::new();
 
@@ -402,6 +407,18 @@ impl GenerationState {
                 if pivot_val == 0 {
                     continue;
                 }
+
+                // Only recover if all other UNKNOWN columns have zero coefficient
+                // in this row.  If another missing symbol still has a non-zero
+                // coefficient, the system is under-determined and we cannot
+                // isolate this symbol.
+                let fully_determined = (0..self.k).all(|other| {
+                    other == col || self.source_symbols.contains_key(&other) || row[other] == 0
+                });
+                if !fully_determined {
+                    continue;
+                }
+
                 let inv = gf_inv(pivot_val);
 
                 // Extract the data portion, scaled by the inverse of the pivot

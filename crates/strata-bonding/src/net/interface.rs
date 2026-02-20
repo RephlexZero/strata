@@ -155,4 +155,24 @@ pub trait LinkSender: Send + Sync {
     fn recv_feedback(&self) -> usize {
         0
     }
+
+    /// Forward RF metrics from the modem supervisor to this link's congestion
+    /// controller. Called whenever the modem poller produces updated
+    /// CQI/RSRP/SINR readings.
+    ///
+    /// The default is a no-op — mock links and non-cellular transports silently
+    /// ignore it. [`crate::net::transport::TransportLink`] overrides this to
+    /// feed [`strata_transport::congestion::BiscayController::on_radio_metrics`].
+    /// Without data, Biscay stays in `Normal` state with no SINR ceiling, so
+    /// Docker/CI environments are unaffected.
+    fn on_rf_metrics(&self, _rf: &crate::modem::health::RfMetrics) {}
+
+    /// Allow or inhibit the BBR UP-probe gain on this link.
+    ///
+    /// Called by the bonding scheduler's probe coordinator to ensure only one
+    /// link at a time actively probes for spare bandwidth. The default no-op
+    /// implementation is sufficient for mock links and simulation links; real
+    /// [`crate::net::transport::TransportLink`] instances forward this to their
+    /// [`strata_transport::congestion::BiscayController`].
+    fn set_probe_allowed(&self, _allowed: bool) {}
 }

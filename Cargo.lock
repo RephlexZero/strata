@@ -3813,8 +3813,15 @@ dependencies = [
 name = "strata-sim"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "bytes",
  "rand 0.10.0",
  "serde_json",
+ "strata-bonding",
+ "strata-transport",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

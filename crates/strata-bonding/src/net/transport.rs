@@ -236,14 +236,20 @@ impl TransportLink {
                         // Compute delivery rate over the inter-ACK interval
                         let now_us = self.clock.lock().unwrap().now_us() as u64;
                         let total_acked = self.bytes_acked.load(Ordering::Relaxed);
-                        let prev_bytes = self.prev_ack_bytes.swap(total_acked, Ordering::Relaxed);
-                        let prev_us = self.prev_ack_time_us.swap(now_us, Ordering::Relaxed);
+                        let prev_bytes = self.prev_ack_bytes.load(Ordering::Relaxed);
+                        let prev_us = self.prev_ack_time_us.load(Ordering::Relaxed);
                         let interval_us = now_us.saturating_sub(prev_us);
 
-                        if interval_us > 0 && prev_us > 0 {
+                        // Accumulate at least 10ms of ACKs to avoid ACK compression spikes
+                        if interval_us >= 10_000 && prev_us > 0 {
+                            self.prev_ack_bytes.store(total_acked, Ordering::Relaxed);
+                            self.prev_ack_time_us.store(now_us, Ordering::Relaxed);
                             let delta_bytes = total_acked.saturating_sub(prev_bytes);
                             let mut cc = self.congestion.lock().unwrap();
                             cc.on_bandwidth_sample(delta_bytes, interval_us);
+                        } else if prev_us == 0 {
+                            self.prev_ack_bytes.store(total_acked, Ordering::Relaxed);
+                            self.prev_ack_time_us.store(now_us, Ordering::Relaxed);
                         }
                     }
                 }
@@ -305,7 +311,6 @@ impl LinkSender for TransportLink {
     fn get_metrics(&self) -> LinkMetrics {
         let sender = self.sender.lock().unwrap();
         let rtt = self.rtt.lock().unwrap();
-        let stats = sender.stats();
         let rtt_ms = rtt.srtt_us() / 1000.0;
 
         // --- Socket-level rate (includes FEC/retransmit overhead) ---
@@ -340,12 +345,6 @@ impl LinkSender for TransportLink {
         let btl_bw_bps = cc.btl_bw() * 8.0;
         let capacity_bps = if btl_bw_bps > 0.0 {
             btl_bw_bps.clamp(100_000.0, 50_000_000.0)
-        } else if rtt_ms > 0.0 {
-            // Fallback: Mathis estimate until we have ACK-based samples
-            let mss = 1400.0_f64;
-            let rtt_s = (rtt_ms / 1000.0).max(0.001);
-            let loss = stats.loss_rate().max(0.001);
-            (1.3 * mss * 8.0 / (rtt_s * loss.sqrt())).clamp(100_000.0, 50_000_000.0)
         } else {
             0.0 // No data yet — scheduler will use capacity floor
         };
@@ -392,6 +391,21 @@ impl LinkSender for TransportLink {
                 }
             }),
         }
+    }
+
+    fn on_rf_metrics(&self, rf: &crate::modem::health::RfMetrics) {
+        let radio = strata_transport::congestion::RadioMetrics {
+            rsrp_dbm: rf.rsrp_dbm,
+            rsrq_db: rf.rsrq_db,
+            sinr_db: rf.sinr_db,
+            cqi: rf.cqi,
+            timestamp: Some(quanta::Instant::now()),
+        };
+        self.congestion.lock().unwrap().on_radio_metrics(&radio);
+    }
+
+    fn set_probe_allowed(&self, allowed: bool) {
+        self.congestion.lock().unwrap().set_probe_allowed(allowed);
     }
 
     fn recv_feedback(&self) -> usize {
