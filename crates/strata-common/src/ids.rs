@@ -38,7 +38,7 @@ pub fn destination_id() -> String {
 /// 32^8 ≈ 1.1 trillion combinations — more than sufficient for
 /// single-use, rate-limited enrollment tokens.
 pub fn enrollment_token() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     // Unambiguous charset: digits 2-9, letters A-Z minus I and O
     const CHARSET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
     let mut rng = rand::rng();

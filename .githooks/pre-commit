@@ -4,6 +4,9 @@ set -euo pipefail
 echo "[pre-commit] Running rustfmt..."
 cargo fmt --all
 
+echo "[pre-commit] Checking compilation..."
+cargo check --workspace
+
 echo "[pre-commit] Running clippy..."
 cargo clippy --workspace --all-targets -- -D warnings
 

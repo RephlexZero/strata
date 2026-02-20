@@ -4,7 +4,15 @@ set -euo pipefail
 echo "[pre-push] Running rustfmt check..."
 cargo fmt --all -- --check
 
+echo "[pre-push] Checking compilation..."
+cargo check --workspace
+
 echo "[pre-push] Running clippy..."
 cargo clippy --workspace --all-targets -- -D warnings
 
+echo "[pre-push] Running unit tests..."
+cargo test --workspace --lib
+cargo test --workspace --doc
+
+echo "[pre-push] ✓ All checks passed"
 exit 0

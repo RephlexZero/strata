@@ -189,9 +189,29 @@ The fastest path — zero local setup:
 
 1. Install the [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) extension (or open in Codespaces)
 2. "Reopen in Container"
-3. `cargo build`
+3. `make install-hooks` — set up git hooks (catches issues before push)
+4. `make check` — verify everything builds
 
 Includes Rust, GStreamer dev libs, network tooling (`iproute2`, `tc`, `tcpdump`), and all build dependencies.
+
+### Development Workflow
+
+**The Makefile catches issues before CI does:**
+
+```bash
+make help           # Show all commands
+make install-hooks  # Install git hooks (do this first!)
+make check          # Fast compilation check
+make test           # Run unit tests
+make pre-push       # Run all pre-push checks (format, lint, tests)
+make release-check  # Full release verification
+```
+
+**Git hooks run automatically:**
+- **Pre-commit**: Format code, check compilation, run clippy
+- **Pre-push**: All of the above + unit tests
+
+This catches compilation errors, formatting issues, test failures, and lint warnings **before** you push, saving CI time and avoiding "trivial fix" commits.
 
 ### Building
 
@@ -216,15 +236,24 @@ docker build -f docker/Dockerfile.cross-aarch64 -o dist/ .
 ### Testing
 
 ```bash
-cargo test --workspace --lib                          # Unit tests (no privileges)
+make test                                             # Unit tests (fast, pre-push runs these)
+cargo test --workspace --lib                          # Same, but via cargo
 cargo test -p strata-transport                        # Transport protocol tests
 cargo test -p strata-common                           # Platform model + protocol tests
 cargo test -p strata-control                          # API integration (needs PostgreSQL)
-sudo cargo test -p strata-gst --test end_to_end       # Transport integration (needs NET_ADMIN)
-sudo cargo test -p strata-gst --test video_output     # Produces reviewable MPEG-TS files
+sudo cargo test -p strata-sim --test tier3_netem      # Network simulation (needs NET_ADMIN)
+make test-all                                         # All tests including ignored ones
 ```
 
 ### Releasing
+
+Before creating a release tag:
+
+```bash
+make release-check  # Runs format, lint, tests, version consistency
+```
+
+Then:
 
 ```bash
 cargo release -p strata-gst patch --execute

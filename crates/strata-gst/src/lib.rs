@@ -217,6 +217,12 @@ mod tests {
     fn test_rtmp_relay_pipeline() {
         gst::init().unwrap();
 
+        // Skip if x264enc is not available (e.g., gstreamer1.0-plugins-ugly not installed)
+        if gst::ElementFactory::find("x264enc").is_none() {
+            eprintln!("Skipping test_rtmp_relay_pipeline: x264enc element not available");
+            return;
+        }
+
         gst::Element::register(
             None,
             "stratasink",
