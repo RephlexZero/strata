@@ -11,7 +11,7 @@ subgraph SND["⬇  SENDER"]
 
   subgraph GST_SND["strata-gst · StrataSink"]
     GBuf(["gst::Buffer"])
-    GProf["PacketProfile\nis_critical · can_drop"]
+    GProf["PacketProfile<br/>is_critical · can_drop"]
     GBuf --> GProf
   end
 
@@ -21,8 +21,8 @@ subgraph SND["⬇  SENDER"]
   subgraph BOND_SND["strata-bonding · BondingScheduler"]
     direction TB
     Nal["NAL Parser → NalClass"]
-    Pri["Priority Classifier\nParameterSet · Keyframe · Ref · NonRef"]
-    Deg["DegradationStage gate\nNormal → KeyframeOnly"]
+    Pri["Priority Classifier<br/>ParameterSet · Keyframe · Ref · NonRef"]
+    Deg["DegradationStage gate<br/>Normal → KeyframeOnly"]
     Sel{"critical or redundant?"}
     Bcast["Broadcast — all alive links"]
     Pick["IoDS ▸ BLEST ▸ DWRR ▸ Thompson"]
@@ -35,9 +35,9 @@ subgraph SND["⬇  SENDER"]
 
   subgraph T_SND["strata-transport · Sender"]
     direction TB
-    Frag["Fragment > 1200 B\nPacketHeader + VarInt seq"]
+    Frag["Fragment > 1200 B<br/>PacketHeader + VarInt seq"]
     Pool["PacketPool  (slab retransmit store)"]
-    FecE["FecEncoder  (RaptorQ)\nGilbert-Elliott  High 50% · Low 10% · Off"]
+    FecE["FecEncoder  (RaptorQ)<br/>Gilbert-Elliott  High 50% · Low 10% · Off"]
     Udp["UDP GSO send  quinn-udp · io_uring"]
 
     Frag --> Pool --> FecE --> Udp
@@ -58,7 +58,7 @@ subgraph RCV["⬆  RECEIVER"]
     URx["UDP recv · decode PacketHeader"]
     FecD["FecBlockDecoder  RaptorQ recovery"]
     Arq["LossDetector · coalesced NACKs"]
-    Rrp["ReceiverReport\ngoodput · fec_rate · jitter · loss"]
+    Rrp["ReceiverReport<br/>goodput · fec_rate · jitter · loss"]
 
     URx --> FecD
     URx --> Arq
@@ -68,7 +68,7 @@ subgraph RCV["⬆  RECEIVER"]
   subgraph BOND_RCV["strata-bonding · TransportBondingReceiver"]
     direction TB
     Strip["strip BondingHeader → seq_id"]
-    JBuf["ReassemblyBuffer\np95 jitter x4 + loss_penalty\nfast a=0.3 · slow a=0.02"]
+    JBuf["ReassemblyBuffer<br/>p95 jitter x4 + loss_penalty<br/>fast a=0.3 · slow a=0.02"]
     Strip --> JBuf
   end
 
@@ -85,11 +85,11 @@ end
 subgraph CTRL["ADAPTATION & CONGESTION CONTROL"]
   direction LR
 
-  Modem["ModemSupervisor\nRSRP · RSRQ · SINR · CQI\nLinkHealth state machine"]
+  Modem["ModemSupervisor<br/>RSRP · RSRQ · SINR · CQI<br/>LinkHealth state machine"]
 
-  Bisc["BiscayController  (per link)\nBBRv3 + radio feed-forward\nNormal → Cautious → PreHandover\nbtl_bw = windowed-max delivery rate"]
+  Bisc["BiscayController  (per link)<br/>BBRv3 + radio feed-forward<br/>Normal → Cautious → PreHandover<br/>btl_bw = windowed-max delivery rate"]
 
-  Adapt["BitrateAdapter  (1 Hz)\npressure = target / usable_capacity\nqueue alarm  Extreme / Heavy\nDegradationStage + BitrateCommand\nMaxQuality vs MaxReliability"]
+  Adapt["BitrateAdapter  (1 Hz)<br/>pressure = target / usable_capacity<br/>queue alarm  Extreme / Heavy<br/>DegradationStage + BitrateCommand<br/>MaxQuality vs MaxReliability"]
 
   Modem -->|"RfMetrics"| Bisc
   Modem -->|"LinkCapacity vec"| Adapt

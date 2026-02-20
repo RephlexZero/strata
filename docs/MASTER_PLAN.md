@@ -74,14 +74,14 @@ Strata bridges this gap by building a **pure Rust transport** that is:
 ```mermaid
 graph TB
     subgraph Edge["EDGE NODE"]
-        Encoder["Encoder\nH.264 / H.265 / AV1"] --> Classifier["Media Classifier\nNAL parse"]
-        Classifier --> Coding["Coding Engine\nFEC + ARQ"]
-        Coding --> Reactor["Network Reactor\nper-link"]
+        Encoder["Encoder<br/>H.264 / H.265 / AV1"] --> Classifier["Media Classifier<br/>NAL parse"]
+        Classifier --> Coding["Coding Engine<br/>FEC + ARQ"]
+        Coding --> Reactor["Network Reactor<br/>per-link"]
         Reactor --> L1["Link 1 DWRR Q"]
         Reactor --> L2["Link 2 DWRR Q"]
         Reactor --> L3["Link 3 DWRR Q"]
         Reactor --> LN["Link N DWRR Q"]
-        L1 & L2 & L3 & LN --> Modem["Modem Supervisor\nQMI/MBIM: RSRP · RSRQ · SINR · CQI"]
+        L1 & L2 & L3 & LN --> Modem["Modem Supervisor<br/>QMI/MBIM: RSRP · RSRQ · SINR · CQI"]
     end
 
     Modem -->|"UDP × N links"| Gateway
@@ -96,7 +96,7 @@ graph TB
     Gateway --> Control
 
     subgraph Control["CONTROL PLANE"]
-        CP["Web Dashboard (Leptos) · REST API (Axum) · Fleet Mgmt\nPrometheus Metrics · WebSocket Telemetry · Remote Config"]
+        CP["Web Dashboard (Leptos) · REST API (Axum) · Fleet Mgmt<br/>Prometheus Metrics · WebSocket Telemetry · Remote Config"]
     end
 ```
 
@@ -694,17 +694,17 @@ Replace ns-3 (too CPU-heavy) with **tc netem + Linux network namespaces**:
 ```mermaid
 graph LR
     subgraph SenderNS["Sender Namespace"]
-        S["strata-bonding\nsender"]
+        S["strata-bonding<br/>sender"]
     end
 
     subgraph VethPairs["veth pairs (strata-sim)"]
-        N1["Link 1 tc netem\nNS + ImpairmentConfig"]
-        N2["Link 2 tc netem\nNS + ImpairmentConfig"]
-        N3["Link N tc netem\nScenario random-walk"]
+        N1["Link 1 tc netem<br/>NS + ImpairmentConfig"]
+        N2["Link 2 tc netem<br/>NS + ImpairmentConfig"]
+        N3["Link N tc netem<br/>Scenario random-walk"]
     end
 
     subgraph ReceiverNS["Receiver Namespace"]
-        R["strata-bonding\nreceiver"]
+        R["strata-bonding<br/>receiver"]
     end
 
     S --> N1 --> R
@@ -719,7 +719,7 @@ Test scenarios (in `strata-sim/tests/tier3_netem.rs`):
 | `capacity_step_change` | Throughput recovers after mid-stream bandwidth drop |
 | `link_failure_recovery` | Survives link down/up cycle without crash |
 | `chaos_scenario` | 25s of evolving impairment via `Scenario` random-walk |
-| `throughput_stability` | CV < 30% over 20s proves no oscillation/drift |
+| `throughput_stability` | CV < 45% over 20s proves no oscillation/drift |
 | `asymmetric_rtt_bonding` | Both links carry traffic with 20ms vs 150ms RTT |
 
 #### Impairment Model
@@ -913,7 +913,7 @@ crates/
 │   ├── src/
 │   │   ├── main.rs
 │   │   ├── state.rs       # AppState (DB pool, JWT secret)
-│   │   ├── db.rs          # SQLite connection pool
+│   │   ├── db.rs          # PostgreSQL connection pool (sqlx)
 │   │   ├── ws_agent.rs    # WebSocket: agent → control plane
 │   │   ├── ws_dashboard.rs # WebSocket: dashboard → live updates
 │   │   └── api/
@@ -922,7 +922,7 @@ crates/
 │   │       ├── senders.rs     # Sender CRUD endpoints
 │   │       ├── streams.rs     # Stream start/stop/status
 │   │       └── destinations.rs # RTMP destination management
-│   ├── migrations/        # SQLite schema migrations
+│   ├── migrations/        # PostgreSQL schema migrations
 │   ├── tests/             # API integration tests
 │   └── Cargo.toml
 │
@@ -984,7 +984,7 @@ graph LR
 | `tokio` | 1.x | Control plane runtime | No (control) |
 | `axum` | 0.8 | REST API server | No (control) |
 | `leptos` | latest | Leptos WASM dashboard | No (UI) |
-| `rusqlite` | latest | SQLite persistence | No (control) |
+| `sqlx` | latest | PostgreSQL async driver | No (control) |
 | `jsonwebtoken` | latest | JWT auth tokens | No (control) |
 
 ---

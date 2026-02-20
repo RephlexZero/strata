@@ -134,6 +134,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false  # sudo creates root-owned files that break cache save
 
       - name: Network simulation tests
         run: sudo -E env "PATH=$PATH" cargo test -p strata-sim --test tier3_netem -- --nocapture

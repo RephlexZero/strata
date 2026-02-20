@@ -22,23 +22,23 @@ Strata is a userspace bonded video transport solution that aggregates bandwidth 
 ```mermaid
 graph TB
     subgraph Sender["SENDER (strata-gst + strata-bonding)"]
-        Src["Video Source\n(V4L2 / test / URI)"] --> Enc["Encoder\n(H.264 / H.265)"]
+        Src["Video Source<br/>(V4L2 / test / URI)"] --> Enc["Encoder<br/>(H.264 / H.265)"]
         Enc --> Mux["MPEG-TS Muxer"]
         Mux --> Sink["stratasink"]
-        Sink --> Classifier["Media Classifier\n(NAL parse + priority)"]
-        Classifier --> FEC["FEC Codec\n(XOR + TAROT)"]
-        FEC --> Sched["Bonding Scheduler\n(DWRR + IoDS + BLEST + Thompson)"]
+        Sink --> Classifier["Media Classifier<br/>(NAL parse + priority)"]
+        Classifier --> FEC["FEC Codec<br/>(XOR + TAROT)"]
+        FEC --> Sched["Bonding Scheduler<br/>(DWRR + IoDS + BLEST + Thompson)"]
         Sched --> L1["Link 1 UDP"]
         Sched --> L2["Link 2 UDP"]
         Sched --> LN["Link N UDP"]
     end
 
     subgraph Receiver["RECEIVER (strata-gst + strata-bonding)"]
-        R1["Link 1 UDP"] --> Agg["Aggregator\n(multi-link collect)"]
+        R1["Link 1 UDP"] --> Agg["Aggregator<br/>(multi-link collect)"]
         R2["Link 2 UDP"] --> Agg
         RN["Link N UDP"] --> Agg
-        Agg --> FECDec["FEC Decoder\n(repair + ARQ)"]
-        FECDec --> Reorder["Reorder Buffer\n(global seq#)"]
+        Agg --> FECDec["FEC Decoder<br/>(repair + ARQ)"]
+        FECDec --> Reorder["Reorder Buffer<br/>(global seq#)"]
         Reorder --> Src2["stratasrc"]
         Src2 --> Output["RTMP / SRT / HLS / File"]
     end
@@ -116,14 +116,14 @@ The intelligence layer of the sender.
 
 ```mermaid
 graph LR
-    Packet --> Priority["Priority classify\n(NAL parse)"]
+    Packet --> Priority["Priority classify<br/>(NAL parse)"]
     Priority --> Keyframe{"Keyframe?"}
     Keyframe -->|"Yes"| Broadcast["Broadcast to ALL links"]
-    Keyframe -->|"No"| Thompson["Thompson Sampling\n(link preference)"]
-    Thompson --> IoDS["IoDS\n(in-order arrival constraint)"]
-    IoDS --> BLEST["BLEST\n(HoL blocking guard)"]
-    BLEST --> DWRR["DWRR\n(weighted fair queue)"]
-    DWRR --> Send["Link send\n(UDP)"]
+    Keyframe -->|"No"| Thompson["Thompson Sampling<br/>(link preference)"]
+    Thompson --> IoDS["IoDS<br/>(in-order arrival constraint)"]
+    IoDS --> BLEST["BLEST<br/>(HoL blocking guard)"]
+    BLEST --> DWRR["DWRR<br/>(weighted fair queue)"]
+    DWRR --> Send["Link send<br/>(UDP)"]
 ```
 
 ### C. `TransportLink` (strata-transport)
@@ -179,13 +179,13 @@ The scheduler uses **Deficit Weighted Round Robin (DWRR)** with an IoDS/BLEST di
 
 ```mermaid
 flowchart TB
-    A["Incoming GStreamer buffer"] --> B["Parse NAL units\nassign Priority"]
+    A["Incoming GStreamer buffer"] --> B["Parse NAL units<br/>assign Priority"]
     B --> C{"Priority == Critical?"}
-    C -->|"Yes"| D["Broadcast to ALL alive links\n+ max FEC overhead"]
+    C -->|"Yes"| D["Broadcast to ALL alive links<br/>+ max FEC overhead"]
     C -->|"No"| E["Check DegradationStage"]
     E --> F{"Stage >= DropB?"}
     F -->|"Yes + Disposable"| G["Discard packet"]
-    F -->|"No"| H["Thompson Sampling\n→ select candidate link"]
+    F -->|"No"| H["Thompson Sampling<br/>→ select candidate link"]
     H --> I["IoDS: arrival constraint check"]
     I --> J["BLEST: HoL blocking check"]
     J --> K["DWRR queue enqueue"]
@@ -338,21 +338,21 @@ The `strata-sim` crate manages isolated Linux network namespaces with `veth` pai
 ```mermaid
 graph LR
     subgraph SenderNS["Sender Namespace"]
-        S["strata-bonding\nsender"]
+        S["strata-bonding<br/>sender"]
     end
 
     subgraph Link1["Link 1 veth pair"]
-        N1["tc netem\n40ms ±10ms · 1% loss · 8 Mbps"]
+        N1["tc netem<br/>40ms ±10ms · 1% loss · 8 Mbps"]
     end
     subgraph Link2["Link 2 veth pair"]
-        N2["tc netem\n60ms ±15ms · 2% loss · 5 Mbps"]
+        N2["tc netem<br/>60ms ±15ms · 2% loss · 5 Mbps"]
     end
     subgraph Link3["Link 3 veth pair"]
-        N3["tc netem\n35ms ±8ms · 0.5% loss · 6 Mbps"]
+        N3["tc netem<br/>35ms ±8ms · 0.5% loss · 6 Mbps"]
     end
 
     subgraph ReceiverNS["Receiver Namespace"]
-        R["strata-bonding\nreceiver"]
+        R["strata-bonding<br/>receiver"]
     end
 
     S --> N1 --> R
@@ -366,7 +366,7 @@ graph LR
 |---|---|---|
 | **Tier 1** | Deterministic seeded-RNG simulation | Packet delivery, sequence order |
 | **Tier 2** | Property-based testing (proptest) | VarInt roundtrip, FEC decode correctness, DWRR fairness |
-| **Tier 3** | tc netem + Linux network namespaces | Throughput stability CV < 30%, recovery within 2 GOPs |
+| **Tier 3** | tc netem + Linux network namespaces | Throughput stability CV < 45%, recovery within 2 GOPs |
 | **Tier 4** | cargo-fuzz on wire parser | No panic, no undefined behaviour on malformed input |
 
 ---

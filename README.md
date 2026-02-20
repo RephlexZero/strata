@@ -38,7 +38,7 @@ Built for field deployment on commodity ARM64 hardware (Orange Pi 5 Plus, Raspbe
 Pre-built binaries for **x86_64** and **aarch64** Linux are on the [Releases](https://github.com/RephlexZero/strata/releases) page.
 
 ```bash
-VERSION="v0.5.0"
+VERSION="v0.1.4"  # check Releases page for latest
 ARCH="$(uname -m)"
 curl -LO "https://github.com/RephlexZero/strata/releases/download/${VERSION}/strata-${VERSION}-${ARCH}-linux-gnu.so"
 sudo cp strata-*-linux-gnu.so /usr/lib/${ARCH}-linux-gnu/gstreamer-1.0/libgststrata.so
@@ -92,14 +92,14 @@ This starts PostgreSQL, the control plane, a simulated sender with tc-netem cell
 ```mermaid
 graph TB
     subgraph Edge["EDGE NODE"]
-        Encoder["Encoder\nH.264 / H.265 / AV1"] --> Classifier["Media Classifier\nNAL parse"]
-        Classifier --> Coding["FEC Codec\nXOR + TAROT"]
-        Coding --> Reactor["Network Reactor\nper-link"]
-        Reactor --> L1["Link 1\nDWRR Q"]
-        Reactor --> L2["Link 2\nDWRR Q"]
-        Reactor --> L3["Link 3\nDWRR Q"]
-        Reactor --> LN["Link N\nDWRR Q"]
-        L1 & L2 & L3 & LN --> Modem["Modem Supervisor\nQMI/MBIM: RSRP · RSRQ · SINR · CQI"]
+        Encoder["Encoder<br/>H.264 / H.265 / AV1"] --> Classifier["Media Classifier<br/>NAL parse"]
+        Classifier --> Coding["FEC Codec<br/>XOR + TAROT"]
+        Coding --> Reactor["Network Reactor<br/>per-link"]
+        Reactor --> L1["Link 1<br/>DWRR Q"]
+        Reactor --> L2["Link 2<br/>DWRR Q"]
+        Reactor --> L3["Link 3<br/>DWRR Q"]
+        Reactor --> LN["Link N<br/>DWRR Q"]
+        L1 & L2 & L3 & LN --> Modem["Modem Supervisor<br/>QMI/MBIM: RSRP · RSRQ · SINR · CQI"]
     end
 
     Modem -->|"UDP × N links"| Gateway
@@ -113,7 +113,7 @@ graph TB
     Gateway --> Control
 
     subgraph Control["CONTROL PLANE"]
-        CP["Web Dashboard (Leptos) · REST API (Axum) · Fleet Management\nPostgreSQL · WebSocket Telemetry · Remote Config"]
+        CP["Web Dashboard (Leptos) · REST API (Axum) · Fleet Management<br/>PostgreSQL · WebSocket Telemetry · Remote Config"]
     end
 ```
 
@@ -175,7 +175,7 @@ graph LR
     strata-bonding --> strata-common
     strata-control --> strata-common
     strata-agent --> strata-common
-    strata-dashboard -->|types only| strata-common
+    strata-sim --> strata-bonding
 ```
 
 ---
