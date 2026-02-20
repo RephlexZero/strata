@@ -1,6 +1,6 @@
 [package]
 name = "strata-gst"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "GStreamer plugin for Strata bonded transport"
 repository = "https://github.com/RephlexZero/strata"

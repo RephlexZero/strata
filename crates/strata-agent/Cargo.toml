@@ -1,6 +1,6 @@
 [package]
 name = "strata-agent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Strata sender agent — field device daemon with WSS control, hardware scanning, pipeline management"
 publish = false

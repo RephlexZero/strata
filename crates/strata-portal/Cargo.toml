@@ -1,6 +1,6 @@
 [package]
 name = "strata-portal"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Strata sender portal — Leptos CSR WASM app for field device management"
 publish = false
