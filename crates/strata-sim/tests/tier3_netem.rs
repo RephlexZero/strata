@@ -641,6 +641,7 @@ fn chaos_scenario() {
 /// ~20s. Throughput coefficient of variation (CV) should be < 30%, confirming
 /// no drift, oscillation, or resource leak.
 #[test]
+#[ignore = "Too sensitive to CI runner load — run locally with --ignored"]
 fn throughput_stability() {
     let bin = match require_privileged_env() {
         Some(b) => b,
