@@ -1,12 +1,13 @@
 {
-    "name": "Rust RIST Bonding",
-    "build": {
-        "dockerfile": "Dockerfile",
-        "context": "..",
-        "options": [
-            "--network=host"
-        ]
-    },
+    "name": "Strata Devcontainer",
+    // Pre-built image from GHCR (built by .github/workflows/devcontainer.yml).
+    // To build locally instead, comment out "image" and uncomment "build" below.
+    "image": "ghcr.io/rephlexzero/strata/devcontainer:latest",
+    // "build": {
+    //     "dockerfile": "Dockerfile",
+    //     "context": "..",
+    //     "options": ["--network=host"]
+    // },
     "customizations": {
         "vscode": {
             "extensions": [

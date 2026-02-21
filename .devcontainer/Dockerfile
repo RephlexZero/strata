@@ -1,8 +1,10 @@
 # ── Stage 1: Build GStreamer 1.28 from source ────────────────────────
-# Debian 12 ships GStreamer 1.22; we build 1.28 from the upstream mono-repo.
+# Ubuntu 24.04 ships GStreamer 1.24; we build 1.28 from the upstream mono-repo.
 # A separate builder stage keeps meson/ninja/nasm/flex/bison out of the
 # final image, saving ~400 MB.
-FROM ubuntu:25.10 AS gst-builder
+# NOTE: Both stages MUST use the same Ubuntu version so the compiled GStreamer
+# libraries don't reference GLIBC symbols newer than the runtime has.
+FROM ubuntu:24.04 AS gst-builder
 
 ARG GST_VERSION=1.28.0
 
@@ -33,7 +35,7 @@ RUN curl -fsSL \
     && DESTDIR=/gst-install ninja -C /tmp/build install
 
 # ── Stage 2: Dev container ───────────────────────────────────────────
-FROM mcr.microsoft.com/devcontainers/base:debian-12
+FROM mcr.microsoft.com/devcontainers/base:ubuntu-24.04
 
 # Runtime + dev libraries needed for Rust compilation against GStreamer.
 # GStreamer build-only tools (meson, ninja, nasm, flex, bison) are NOT included.
