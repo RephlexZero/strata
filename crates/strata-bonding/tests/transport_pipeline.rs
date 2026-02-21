@@ -124,9 +124,10 @@ fn runtime_to_receiver_multi_link() {
         let s = String::from_utf8(data.to_vec()).unwrap();
         if let Some(idx) = s.strip_prefix("multi-")
             && let Ok(i) = idx.parse::<usize>()
-                && i < count {
-                    found[i] = true;
-                }
+            && i < count
+        {
+            found[i] = true;
+        }
     }
     for (i, &f) in found.iter().enumerate() {
         assert!(f, "packet multi-{} was not received", i);
@@ -349,9 +350,10 @@ fn three_link_heterogeneous_all_delivered() {
         let s = String::from_utf8(data.to_vec()).unwrap();
         if let Some(idx) = s.strip_prefix("hetero-")
             && let Ok(i) = idx.parse::<usize>()
-                && i < count {
-                    found[i] = true;
-                }
+            && i < count
+        {
+            found[i] = true;
+        }
     }
     for (i, &f) in found.iter().enumerate() {
         assert!(f, "packet hetero-{i:03} was not received");

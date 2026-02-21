@@ -141,9 +141,10 @@ impl StatsCollector {
             let mut buf = [0u8; 65535];
             while r.load(Ordering::Relaxed) {
                 if let Ok((amt, _)) = socket.recv_from(&mut buf)
-                    && let Ok(val) = serde_json::from_slice::<Value>(&buf[..amt]) {
-                        d.lock().unwrap().push(val);
-                    }
+                    && let Ok(val) = serde_json::from_slice::<Value>(&buf[..amt])
+                {
+                    d.lock().unwrap().push(val);
+                }
             }
         });
 

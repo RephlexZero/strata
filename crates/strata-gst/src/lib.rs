@@ -162,10 +162,11 @@ mod tests {
                     MessageView::Element(m) => {
                         let s = m.structure();
                         if let Some(name) = s.map(|s| s.name())
-                            && name == "strata-stats" {
-                                println!("Got Stats: {:?}", s);
-                                stats_found = true;
-                            }
+                            && name == "strata-stats"
+                        {
+                            println!("Got Stats: {:?}", s);
+                            stats_found = true;
+                        }
                     }
                     _ => (),
                 }
