@@ -18,14 +18,14 @@ else
     echo "✓ GStreamer: $gst_version"
 fi
 
-# ── Cargo tools (cargo-binstall is baked into the image) ────────────
-if command -v cargo-binstall >/dev/null 2>&1; then
-    cargo binstall -y cargo-release trunk
-else
-    echo "WARNING: cargo-binstall not found, compiling tools from source…"
-    cargo install --locked cargo-release
-    cargo install --locked trunk
+# ── Cargo tools ─────────────────────────────────────────────────────
+# Install cargo-binstall first, then use it to grab tools as pre-built
+# binaries (~5s total vs ~5min compiling from source).
+if ! command -v cargo-binstall >/dev/null 2>&1; then
+    curl -fsSL "https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-x86_64-unknown-linux-musl.tgz" \
+        | tar -xz -C "${CARGO_HOME:-$HOME/.cargo}/bin" cargo-binstall
 fi
+cargo binstall -y cargo-release trunk
 
 echo "✓ Rust: $(rustc --version)"
 
