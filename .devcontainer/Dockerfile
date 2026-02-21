@@ -1,23 +1,22 @@
 # ── Stage 1: Build GStreamer 1.28 from source ────────────────────────
-# Ubuntu 24.04 ships GStreamer 1.24; we build 1.28 from the upstream mono-repo.
-# A separate builder stage keeps meson/ninja/nasm/flex/bison out of the
-# final image, saving ~400 MB.
-# NOTE: Both stages MUST use the same Ubuntu version so the compiled GStreamer
-# libraries don't reference GLIBC symbols newer than the runtime has.
-FROM ubuntu:24.04 AS gst-builder
+# Debian 12 ships GStreamer 1.22 and Meson 1.3; we need Meson ≥ 1.4 for
+# GStreamer 1.28, so we install a newer version via pip.
+# A separate builder stage keeps build-only tools out of the final image.
+FROM debian:12-slim AS gst-builder
 
 ARG GST_VERSION=1.28.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
     build-essential pkg-config \
-    meson ninja-build python3 nasm flex bison \
+    python3 python3-pip ninja-build nasm flex bison \
     libglib2.0-dev libfreetype-dev \
     libx264-dev libx265-dev \
     libvorbis-dev libopus-dev libogg-dev \
     libpng-dev libjpeg-dev \
     libavcodec-dev libavformat-dev libavutil-dev \
     libswresample-dev libswscale-dev \
+    && pip3 install --break-system-packages meson>=1.4 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL \
@@ -35,7 +34,7 @@ RUN curl -fsSL \
     && DESTDIR=/gst-install ninja -C /tmp/build install
 
 # ── Stage 2: Dev container ───────────────────────────────────────────
-FROM mcr.microsoft.com/devcontainers/base:ubuntu-24.04
+FROM mcr.microsoft.com/devcontainers/base:debian-12
 
 # Runtime + dev libraries needed for Rust compilation against GStreamer.
 # GStreamer build-only tools (meson, ninja, nasm, flex, bison) are NOT included.
@@ -60,4 +59,9 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
 COPY --from=gst-builder /gst-install/usr/ /usr/
 RUN ldconfig
 
-ENV PKG_CONFIG_PATH="/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+# cargo-binstall lets post-create.sh install tools as pre-built binaries
+# instead of compiling from source (~seconds vs ~minutes).
+RUN curl -fsSL https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+
+ENV PKG_CONFIG_PATH="/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" \
+    GST_PLUGIN_PATH="/workspaces/strata/target/debug"

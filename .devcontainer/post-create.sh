@@ -1,55 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "── Strata workspace setup (runs once per container create/rebuild) ──"
+echo "── Strata workspace setup ──"
 
-# Verify toolchain is available (should be pre-installed in image)
+# ── Verify core toolchains ──────────────────────────────────────────
 if ! cargo --version >/dev/null 2>&1; then
-    echo "ERROR: Rust toolchain not found. Image build may have failed."
+    echo "ERROR: Rust toolchain not found."
     exit 1
 fi
 
-ensure_cargo_tool() {
-    local check_cmd="$1"
-    local crate_name="$2"
-    if eval "$check_cmd" >/dev/null 2>&1; then
-        return
-    fi
-    echo "Installing $crate_name…"
-    if command -v cargo-binstall >/dev/null 2>&1; then
-        cargo binstall -y "$crate_name"
-    else
-        cargo install --locked "$crate_name"
-    fi
-}
-
-ensure_cargo_tool "cargo release -V" "cargo-release"
-ensure_cargo_tool "trunk -V" "trunk"
-
-echo "✓ Rust toolchain: $(rustc --version)"
-cargo_release_version="$(cargo release -V 2>/dev/null | awk '{print $2}' || true)"
-trunk_version="$(trunk -V 2>/dev/null | awk '{print $2}' || true)"
-echo "✓ Cargo tools: cargo-release=${cargo_release_version:-unknown}, trunk=${trunk_version:-unknown}"
-
-# Initialize git submodules
-echo "Initializing submodules…"
-git submodule update --init --recursive 2>/dev/null || true
-
-# Enable repository git hooks
-echo "Configuring git hooks…"
-git config core.hooksPath .githooks
-chmod +x .githooks/pre-commit .githooks/pre-push 2>/dev/null || true
-
-# Set GST_PLUGIN_PATH for debug builds
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-PROFILE_LINE="export GST_PLUGIN_PATH=\"${REPO_ROOT}/target/debug:${GST_PLUGIN_PATH:-}\""
-if ! grep -qF 'GST_PLUGIN_PATH' "$HOME/.bashrc" 2>/dev/null; then
-    echo "Setting GST_PLUGIN_PATH in ~/.bashrc…"
-    echo "$PROFILE_LINE" >> "$HOME/.bashrc"
+gst_version="$(pkg-config --modversion gstreamer-1.0 2>/dev/null || true)"
+if [ -z "$gst_version" ]; then
+    echo "WARNING: GStreamer pkg-config not found."
+elif ! gst-inspect-1.0 --version >/dev/null 2>&1; then
+    echo "WARNING: GStreamer $gst_version headers present but runtime broken (GLIBC mismatch?)."
+else
+    echo "✓ GStreamer: $gst_version"
 fi
 
-# Pre-build for rust-analyzer (done in background to not block container startup)
-echo "Running initial cargo check (background)…"
-nohup bash -c "cargo check --workspace 2>&1 | tail -5" >/tmp/cargo-check.log 2>&1 &
+# ── Cargo tools (cargo-binstall is baked into the image) ────────────
+cargo binstall -y --no-confirm cargo-release trunk 2>/dev/null \
+    || { cargo install --locked cargo-release; cargo install --locked trunk; }
 
-echo "── Setup complete. Run 'cargo build' to start. ──────────"
+echo "✓ Rust: $(rustc --version)"
+
+# ── Git setup ───────────────────────────────────────────────────────
+git submodule update --init --recursive 2>/dev/null || true
+git config core.hooksPath .githooks
+chmod +x .githooks/* 2>/dev/null || true
+
+# ── Background cargo check (feeds rust-analyzer) ───────────────────
+echo "Running cargo check (background)…"
+nohup cargo check --workspace >/tmp/cargo-check.log 2>&1 &
+
+echo "── Setup complete ──"

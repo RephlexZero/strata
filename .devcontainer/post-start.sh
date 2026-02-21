@@ -1,21 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if ! command -v docker >/dev/null 2>&1; then
-    exit 0
-fi
-
-if docker info >/dev/null 2>&1; then
-    exit 0
-fi
-
+# Load kernel modules needed for network-namespace simulation tests.
+# The docker-in-docker feature handles its own startup; we only need the
+# extra netfilter / overlay modules for strata-sim's tc/netem tests.
 if command -v modprobe >/dev/null 2>&1; then
-    sudo modprobe iptable_nat || true
-    sudo modprobe nf_nat || true
-    sudo modprobe br_netfilter || true
-    sudo modprobe overlay || true
-fi
-
-if [ -x /usr/local/share/docker-init.sh ]; then
-    sudo /usr/local/share/docker-init.sh >/tmp/docker-init.log 2>&1 || true
+    sudo modprobe iptable_nat  2>/dev/null || true
+    sudo modprobe nf_nat       2>/dev/null || true
+    sudo modprobe br_netfilter 2>/dev/null || true
+    sudo modprobe overlay      2>/dev/null || true
+    sudo modprobe sch_netem    2>/dev/null || true
 fi
