@@ -19,8 +19,13 @@ else
 fi
 
 # ── Cargo tools (cargo-binstall is baked into the image) ────────────
-cargo binstall -y --no-confirm cargo-release trunk 2>/dev/null \
-    || { cargo install --locked cargo-release; cargo install --locked trunk; }
+if command -v cargo-binstall >/dev/null 2>&1; then
+    cargo binstall -y cargo-release trunk
+else
+    echo "WARNING: cargo-binstall not found, compiling tools from source…"
+    cargo install --locked cargo-release
+    cargo install --locked trunk
+fi
 
 echo "✓ Rust: $(rustc --version)"
 

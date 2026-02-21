@@ -61,7 +61,10 @@ RUN ldconfig
 
 # cargo-binstall lets post-create.sh install tools as pre-built binaries
 # instead of compiling from source (~seconds vs ~minutes).
-RUN curl -fsSL https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+# Install to /usr/local/bin so it's on PATH for the vscode user
+# (Rust itself is added later by the devcontainer rust feature).
+RUN curl -fsSL https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+    | bash -s -- --install-path /usr/local/bin
 
 ENV PKG_CONFIG_PATH="/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" \
     GST_PLUGIN_PATH="/workspaces/strata/target/debug"
