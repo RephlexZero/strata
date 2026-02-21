@@ -81,8 +81,8 @@ impl PacketContext {
         self
     }
 
-    pub fn with_fec_generation(mut self, gen: u16) -> Self {
-        self.fec_generation = gen;
+    pub fn with_fec_generation(mut self, generation: u16) -> Self {
+        self.fec_generation = generation;
         self
     }
 }
@@ -222,7 +222,11 @@ impl PacketPool {
 
 // ─── Sequence Generator ─────────────────────────────────────────────────────
 
-/// Thread-safe monotonic sequence number generator.
+/// Monotonic sequence number generator.
+///
+/// **Not** thread-safe — intended for single-owner use within a `Sender` or
+/// `Receiver` state machine.  Wrap in a `Mutex` or use `AtomicU64` if
+/// concurrent access is required.
 pub struct SequenceGenerator {
     next: u64,
 }
@@ -332,11 +336,11 @@ mod tests {
 
     #[test]
     fn sequence_generator() {
-        let mut gen = SequenceGenerator::new();
-        assert_eq!(gen.next(), 0);
-        assert_eq!(gen.next(), 1);
-        assert_eq!(gen.next(), 2);
-        assert_eq!(gen.current(), 3);
+        let mut seq_gen = SequenceGenerator::new();
+        assert_eq!(seq_gen.next(), 0);
+        assert_eq!(seq_gen.next(), 1);
+        assert_eq!(seq_gen.next(), 2);
+        assert_eq!(seq_gen.current(), 3);
     }
 
     #[test]

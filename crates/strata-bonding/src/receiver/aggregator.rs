@@ -291,29 +291,29 @@ impl ReassemblyBuffer {
         loop {
             // Case 1: We have the next packet
             let idx = self.buffer_index(self.next_seq);
-            if let Some(packet) = &self.buffer[idx] {
-                if packet.seq_id == self.next_seq {
-                    // Check if it has satisfied the latency requirement
-                    if now.duration_since(packet.arrival_time) >= release_after {
-                        let p = self.buffer[idx].take().unwrap();
-                        self.buffered = self.buffered.saturating_sub(1);
-                        released.push(p.payload);
-                        self.next_seq += 1;
-                        continue;
-                    }
-                    // Not ready yet
-                    break;
+            if let Some(packet) = &self.buffer[idx]
+                && packet.seq_id == self.next_seq
+            {
+                // Check if it has satisfied the latency requirement
+                if now.duration_since(packet.arrival_time) >= release_after {
+                    let p = self.buffer[idx].take().unwrap();
+                    self.buffered = self.buffered.saturating_sub(1);
+                    released.push(p.payload);
+                    self.next_seq += 1;
+                    continue;
                 }
+                // Not ready yet
+                break;
             }
 
             // Case 2: We have a gap (missing next_seq)
-            if let Some((first_seq, first_arrival)) = self.find_next_available() {
-                if now.duration_since(first_arrival) >= skip_after {
-                    let skipped = first_seq.saturating_sub(self.next_seq);
-                    self.lost_packets += skipped;
-                    self.advance_window(first_seq);
-                    continue;
-                }
+            if let Some((first_seq, first_arrival)) = self.find_next_available()
+                && now.duration_since(first_arrival) >= skip_after
+            {
+                let skipped = first_seq.saturating_sub(self.next_seq);
+                self.lost_packets += skipped;
+                self.advance_window(first_seq);
+                continue;
             }
 
             // No packets or waiting for gap to fill
@@ -346,11 +346,11 @@ impl ReassemblyBuffer {
         }
         for seq in old_next..new_next {
             let idx = self.buffer_index(seq);
-            if let Some(packet) = &self.buffer[idx] {
-                if packet.seq_id == seq {
-                    self.buffer[idx] = None;
-                    self.buffered = self.buffered.saturating_sub(1);
-                }
+            if let Some(packet) = &self.buffer[idx]
+                && packet.seq_id == seq
+            {
+                self.buffer[idx] = None;
+                self.buffered = self.buffered.saturating_sub(1);
             }
         }
         self.next_seq = new_next;

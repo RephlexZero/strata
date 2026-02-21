@@ -249,8 +249,8 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
     };
 
     match envelope.msg_type.as_str() {
-        "stream.start" => {
-            if let Ok(payload) = envelope.parse_payload::<StreamStartPayload>() {
+        "stream.start" => match envelope.parse_payload::<StreamStartPayload>() {
+            Ok(payload) => {
                 tracing::info!(stream_id = %payload.stream_id, "received stream.start");
                 let mut pipeline = state.pipeline.lock().await;
                 if let Err(e) = pipeline.start(payload.clone()) {
@@ -264,7 +264,8 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
                     send_envelope(state, "stream.ended", &ended).await;
                 }
             }
-        }
+            Err(e) => tracing::warn!(error = %e, "failed to parse stream.start payload"),
+        },
         "stream.stop" => {
             if let Ok(payload) = envelope.parse_payload::<StreamStopPayload>() {
                 tracing::info!(stream_id = %payload.stream_id, "received stream.stop");
@@ -280,54 +281,57 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
             }
         }
         "config.update" => {
-            if let Ok(payload) = envelope.parse_payload::<ConfigUpdatePayload>() {
-                tracing::info!("received config.update");
-                let pipeline = state.pipeline.lock().await;
-                let mut errors: Vec<String> = Vec::new();
+            match envelope.parse_payload::<ConfigUpdatePayload>() {
+                Ok(payload) => {
+                    tracing::info!("received config.update");
+                    let pipeline = state.pipeline.lock().await;
+                    let mut errors: Vec<String> = Vec::new();
 
-                // Apply encoder changes
-                if let Some(enc) = &payload.encoder {
-                    let mut cmd = serde_json::json!({ "cmd": "set_encoder" });
-                    if let Some(bps) = enc.bitrate_kbps {
-                        cmd["bitrate_kbps"] = serde_json::json!(bps);
+                    // Apply encoder changes
+                    if let Some(enc) = &payload.encoder {
+                        let mut cmd = serde_json::json!({ "cmd": "set_encoder" });
+                        if let Some(bps) = enc.bitrate_kbps {
+                            cmd["bitrate_kbps"] = serde_json::json!(bps);
+                        }
+                        if let Some(ref tune) = enc.tune {
+                            cmd["tune"] = serde_json::json!(tune);
+                        }
+                        if let Some(ki) = enc.keyint_max {
+                            cmd["keyint_max"] = serde_json::json!(ki);
+                        }
+                        if !pipeline.send_command(&cmd) {
+                            errors.push("failed to send encoder update".into());
+                        }
                     }
-                    if let Some(ref tune) = enc.tune {
-                        cmd["tune"] = serde_json::json!(tune);
+
+                    // Apply scheduler/bonding changes
+                    if let Some(sched) = &payload.scheduler {
+                        let cmd = serde_json::json!({
+                            "cmd": "set_bonding_config",
+                            "config": sched,
+                        });
+                        if !pipeline.send_command(&cmd) {
+                            errors.push("failed to send scheduler update".into());
+                        }
                     }
-                    if let Some(ki) = enc.keyint_max {
-                        cmd["keyint_max"] = serde_json::json!(ki);
-                    }
-                    if !pipeline.send_command(&cmd) {
-                        errors.push("failed to send encoder update".into());
-                    }
+
+                    let request_id = envelope
+                        .payload
+                        .get("request_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let resp = ConfigUpdateResponsePayload {
+                        request_id,
+                        success: errors.is_empty(),
+                        error: if errors.is_empty() {
+                            None
+                        } else {
+                            Some(errors.join("; "))
+                        },
+                    };
+                    send_envelope(state, "config.update.response", &resp).await;
                 }
-
-                // Apply scheduler/bonding changes
-                if let Some(sched) = &payload.scheduler {
-                    let cmd = serde_json::json!({
-                        "cmd": "set_bonding_config",
-                        "config": sched,
-                    });
-                    if !pipeline.send_command(&cmd) {
-                        errors.push("failed to send scheduler update".into());
-                    }
-                }
-
-                let request_id = envelope
-                    .payload
-                    .get("request_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let resp = ConfigUpdateResponsePayload {
-                    request_id,
-                    success: errors.is_empty(),
-                    error: if errors.is_empty() {
-                        None
-                    } else {
-                        Some(errors.join("; "))
-                    },
-                };
-                send_envelope(state, "config.update.response", &resp).await;
+                Err(e) => tracing::warn!(error = %e, "failed to parse config.update payload"),
             }
         }
         "source.switch" => {
@@ -483,6 +487,9 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
     }
 }
 
+/// Allowed root directories for the files.list command.
+const ALLOWED_ROOTS: &[&str] = &["/opt/strata", "/var/log/strata", "/tmp"];
+
 /// List files and directories at the given path.
 /// Returns (entries, error_message).
 fn list_directory(path: &str) -> (Vec<FileEntry>, Option<String>) {
@@ -493,6 +500,16 @@ fn list_directory(path: &str) -> (Vec<FileEntry>, Option<String>) {
         Ok(p) => p,
         Err(e) => return (vec![], Some(format!("cannot resolve path: {e}"))),
     };
+
+    // Verify the resolved path is under an allowed root
+    let canonical_str = canonical.to_string_lossy();
+    let allowed = ALLOWED_ROOTS
+        .iter()
+        .any(|root| canonical_str.starts_with(root));
+    if !allowed {
+        return (vec![], Some("path is outside allowed directories".into()));
+    }
+
     let dir = match fs::read_dir(&canonical) {
         Ok(d) => d,
         Err(e) => return (vec![], Some(format!("cannot read directory: {e}"))),

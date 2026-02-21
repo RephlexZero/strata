@@ -2,9 +2,9 @@
 
 use leptos::prelude::*;
 
+use crate::AuthState;
 use crate::api;
 use crate::types::SenderSummary;
-use crate::AuthState;
 
 /// Displays all senders belonging to the authenticated user.
 #[component]

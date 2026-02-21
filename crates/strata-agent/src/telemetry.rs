@@ -10,8 +10,8 @@ use std::time::Duration;
 use strata_common::models::LinkStats;
 use strata_common::protocol::{Envelope, StreamStatsPayload};
 
-use crate::pipeline;
 use crate::AgentState;
+use crate::pipeline;
 
 /// Run the telemetry loop — sends stream.stats every second while streaming.
 pub async fn run(state: Arc<AgentState>) {
@@ -102,13 +102,15 @@ pub async fn run(state: Arc<AgentState>) {
             encoder_bitrate_kbps: encoder_kbps.max(1) as u32,
             timestamp_ms,
             links,
+            sender_metrics: None,
+            receiver_metrics: None,
         };
 
         let envelope = Envelope::new("stream.stats", &stats);
-        if let Ok(json) = serde_json::to_string(&envelope) {
-            if let Err(e) = state.control_tx.send(json).await {
-                tracing::warn!(error = %e, "failed to send stats to control channel");
-            }
+        if let Ok(json) = serde_json::to_string(&envelope)
+            && let Err(e) = state.control_tx.send(json).await
+        {
+            tracing::warn!(error = %e, "failed to send stats to control channel");
         }
     }
 }
@@ -164,6 +166,8 @@ fn parse_bonding_stats(data: &[u8]) -> Result<Vec<LinkStats>, String> {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+        let btlbw_bps = link.get("btlbw_bps").and_then(|v| v.as_u64());
+        let rtprop_ms = link.get("rtprop_ms").and_then(|v| v.as_f64());
 
         // Derive human-readable state from alive/phase/os_up
         let state = if !alive {
@@ -191,6 +195,12 @@ fn parse_bonding_stats(data: &[u8]) -> Result<Vec<LinkStats>, String> {
             observed_bps,
             signal_dbm: None,
             link_kind,
+            rsrp: None,
+            rsrq: None,
+            sinr: None,
+            cqi: None,
+            btlbw_bps,
+            rtprop_ms,
         });
     }
     Ok(stats)
@@ -213,6 +223,12 @@ fn generate_simulated_stats() -> Vec<LinkStats> {
             observed_bps: 3_000_000 + rng.random_range(0..1_000_000),
             signal_dbm: Some(-65 - rng.random_range(0..15)),
             link_kind: Some("cellular".into()),
+            rsrp: Some(-85.0 - rng.random_range(0.0..10.0_f32)),
+            rsrq: Some(-12.0 - rng.random_range(0.0..5.0_f32)),
+            sinr: Some(15.0 + rng.random_range(0.0..10.0_f32)),
+            cqi: Some(12 - rng.random_range(0..4)),
+            btlbw_bps: Some(8_500_000 + rng.random_range(0..1_000_000)),
+            rtprop_ms: Some(30.0 + rng.random_range(0.0..5.0_f64)),
         },
         LinkStats {
             id: 1,
@@ -225,6 +241,12 @@ fn generate_simulated_stats() -> Vec<LinkStats> {
             observed_bps: 4_000_000 + rng.random_range(0..2_000_000),
             signal_dbm: Some(-58 - rng.random_range(0..12)),
             link_kind: Some("cellular".into()),
+            rsrp: Some(-75.0 - rng.random_range(0.0..10.0_f32)),
+            rsrq: Some(-10.0 - rng.random_range(0.0..5.0_f32)),
+            sinr: Some(20.0 + rng.random_range(0.0..10.0_f32)),
+            cqi: Some(14 - rng.random_range(0..2)),
+            btlbw_bps: Some(12_500_000 + rng.random_range(0..2_000_000)),
+            rtprop_ms: Some(25.0 + rng.random_range(0.0..5.0_f64)),
         },
     ]
 }

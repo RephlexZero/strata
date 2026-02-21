@@ -53,6 +53,15 @@ pub fn router() -> Router<AppState> {
             axum::routing::post(disable_interface),
         )
         .route(
+            "/{id}/interfaces/{name}/lock_band",
+            axum::routing::post(lock_band),
+        )
+        .route(
+            "/{id}/interfaces/{name}/priority",
+            axum::routing::post(set_priority),
+        )
+        .route("/{id}/interfaces/{name}/apn", axum::routing::post(set_apn))
+        .route(
             "/{id}/stream/config",
             axum::routing::post(update_stream_config),
         )
@@ -120,6 +129,8 @@ async fn create_sender(
     user: AuthUser,
     Json(body): Json<CreateSenderRequest>,
 ) -> Result<(StatusCode, Json<CreateSenderResponse>), ApiError> {
+    user.require_role("admin")?;
+
     let sender_id = ids::sender_id();
     let enrollment_token = ids::enrollment_token();
 
@@ -201,6 +212,8 @@ async fn delete_sender(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    user.require_role("admin")?;
+
     let result = sqlx::query("DELETE FROM senders WHERE id = $1 AND owner_id = $2")
         .bind(&id)
         .bind(&user.user_id)
@@ -274,6 +287,8 @@ async fn unenroll_sender(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<UnenrollResponse>, ApiError> {
+    user.require_role("admin")?;
+
     // Verify ownership
     let exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM senders WHERE id = $1 AND owner_id = $2)",
@@ -334,7 +349,15 @@ async fn enable_interface(
     user: AuthUser,
     Path((id, iface_name)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    interface_command(&state, &user, &id, &iface_name, "enable").await
+    interface_command(
+        &state,
+        &user,
+        &id,
+        &iface_name,
+        "enable",
+        InterfaceCommandOptions::default(),
+    )
+    .await
 }
 
 async fn disable_interface(
@@ -342,7 +365,103 @@ async fn disable_interface(
     user: AuthUser,
     Path((id, iface_name)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    interface_command(&state, &user, &id, &iface_name, "disable").await
+    interface_command(
+        &state,
+        &user,
+        &id,
+        &iface_name,
+        "disable",
+        InterfaceCommandOptions::default(),
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LockBandRequest {
+    pub band: Option<String>,
+}
+
+async fn lock_band(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((id, iface_name)): Path<(String, String)>,
+    Json(body): Json<LockBandRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    interface_command(
+        &state,
+        &user,
+        &id,
+        &iface_name,
+        "lock_band",
+        InterfaceCommandOptions {
+            band: body.band,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetPriorityRequest {
+    pub priority: u32,
+}
+
+async fn set_priority(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((id, iface_name)): Path<(String, String)>,
+    Json(body): Json<SetPriorityRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    interface_command(
+        &state,
+        &user,
+        &id,
+        &iface_name,
+        "set_priority",
+        InterfaceCommandOptions {
+            priority: Some(body.priority),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetApnRequest {
+    pub apn: Option<String>,
+    pub sim_pin: Option<String>,
+    pub roaming: Option<bool>,
+}
+
+async fn set_apn(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((id, iface_name)): Path<(String, String)>,
+    Json(body): Json<SetApnRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    interface_command(
+        &state,
+        &user,
+        &id,
+        &iface_name,
+        "set_apn",
+        InterfaceCommandOptions {
+            apn: body.apn,
+            sim_pin: body.sim_pin,
+            roaming: body.roaming,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+#[derive(Default)]
+struct InterfaceCommandOptions {
+    band: Option<String>,
+    priority: Option<u32>,
+    apn: Option<String>,
+    sim_pin: Option<String>,
+    roaming: Option<bool>,
 }
 
 async fn interface_command(
@@ -351,7 +470,10 @@ async fn interface_command(
     sender_id: &str,
     iface_name: &str,
     action: &str,
+    opts: InterfaceCommandOptions,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("admin")?;
+
     // Verify ownership
     let exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM senders WHERE id = $1 AND owner_id = $2)",
@@ -375,6 +497,11 @@ async fn interface_command(
     let payload = InterfaceCommandPayload {
         interface: iface_name.to_string(),
         action: action.to_string(),
+        band: opts.band,
+        priority: opts.priority,
+        apn: opts.apn,
+        sim_pin: opts.sim_pin,
+        roaming: opts.roaming,
     };
     let envelope = Envelope::new("interface.command", &payload);
     let json = serde_json::to_string(&envelope).map_err(|e| ApiError::internal(e.to_string()))?;
@@ -412,6 +539,8 @@ async fn set_sender_config(
     Path(id): Path<String>,
     Json(body): Json<SetConfigRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("admin")?;
+
     verify_ownership(&state, &user, &id).await?;
 
     let request_id = Uuid::now_v7().to_string();
@@ -455,6 +584,8 @@ async fn run_sender_test(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("admin")?;
+
     verify_ownership(&state, &user, &id).await?;
 
     let request_id = Uuid::now_v7().to_string();
@@ -497,6 +628,8 @@ async fn scan_interfaces(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("admin")?;
+
     verify_ownership(&state, &user, &id).await?;
 
     let request_id = Uuid::now_v7().to_string();
@@ -544,6 +677,8 @@ async fn update_stream_config(
     Path(sender_id): Path<String>,
     Json(body): Json<ConfigUpdatePayload>,
 ) -> Result<StatusCode, ApiError> {
+    user.require_role("operator")?;
+
     verify_ownership(&state, &user, &sender_id).await?;
 
     let agent = state
@@ -605,6 +740,8 @@ async fn switch_source(
     Path(sender_id): Path<String>,
     Json(body): Json<SourceSwitchPayload>,
 ) -> Result<StatusCode, ApiError> {
+    user.require_role("operator")?;
+
     verify_ownership(&state, &user, &sender_id).await?;
 
     let agent = state
@@ -638,6 +775,8 @@ async fn list_sender_files(
     Path(id): Path<String>,
     Query(q): Query<FilesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("admin")?;
+
     verify_ownership(&state, &user, &id).await?;
 
     let request_id = Uuid::now_v7().to_string();

@@ -313,11 +313,16 @@ impl Receiver {
 
             // Attempt recovery for this generation
             let recovered = self.fec_decoder.try_recover(fec_hdr.generation_id);
-            for (idx, data) in recovered {
+            for (_idx, data) in recovered {
                 self.stats.fec_recoveries += 1;
-                // In a full implementation, the FEC generation would track
-                // the actual sequence numbers for proper reinsertion.
-                let _ = (idx, data);
+                // TODO: Map FEC generation index back to actual sequence numbers.
+                // For now, recovered data cannot be reinserted without sequence
+                // tracking in the FEC generation.  Log the recovery for stats.
+                tracing::trace!(
+                    "FEC recovered {} bytes (generation {})",
+                    data.len(),
+                    fec_hdr.generation_id
+                );
             }
         }
     }

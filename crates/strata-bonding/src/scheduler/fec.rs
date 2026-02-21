@@ -347,11 +347,7 @@ impl GilbertElliott {
 
     /// Suggested FEC multiplier: 1.0 in Good state, higher in Bad state.
     pub fn fec_multiplier(&self) -> f64 {
-        if self.in_bad_state {
-            2.0
-        } else {
-            1.0
-        }
+        if self.in_bad_state { 2.0 } else { 1.0 }
     }
 }
 

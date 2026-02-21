@@ -27,6 +27,8 @@ pub struct Envelope {
 
 impl Envelope {
     /// Create a new envelope with a fresh UUIDv7 and current timestamp.
+    ///
+    /// Returns `Err` if the payload cannot be serialized to JSON.
     pub fn new(msg_type: impl Into<String>, payload: impl Serialize) -> Self {
         Self {
             id: Uuid::now_v7().to_string(),
@@ -34,6 +36,20 @@ impl Envelope {
             ts: Utc::now(),
             payload: serde_json::to_value(payload).expect("payload serialization"),
         }
+    }
+
+    /// Fallible version of [`Envelope::new`] that returns an error on
+    /// serialization failure instead of panicking.
+    pub fn try_new(
+        msg_type: impl Into<String>,
+        payload: impl Serialize,
+    ) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            id: Uuid::now_v7().to_string(),
+            msg_type: msg_type.into(),
+            ts: Utc::now(),
+            payload: serde_json::to_value(payload)?,
+        })
     }
 
     /// Parse the payload into a concrete type.
@@ -99,6 +115,10 @@ pub struct StreamStatsPayload {
     #[serde(default)]
     pub timestamp_ms: u64,
     pub links: Vec<LinkStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_metrics: Option<crate::models::TransportSenderMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_metrics: Option<crate::models::TransportReceiverMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,8 +271,23 @@ pub struct SourceSwitchPayload {
 pub struct InterfaceCommandPayload {
     /// The interface name (e.g. "wwan0").
     pub interface: String,
-    /// Action: "enable", "disable".
+    /// Action: "enable", "disable", "lock_band", "set_priority".
     pub action: String,
+    /// Band to lock to (only used when action = "lock_band").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub band: Option<String>,
+    /// Priority to set (only used when action = "set_priority").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
+    /// APN to set (only used when action = "set_apn").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apn: Option<String>,
+    /// SIM PIN to set (only used when action = "set_apn").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sim_pin: Option<String>,
+    /// Roaming toggle (only used when action = "set_apn").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roaming: Option<bool>,
 }
 
 /// Response to an interface command.
@@ -469,7 +504,15 @@ mod tests {
                 observed_bps: 8_000_000,
                 signal_dbm: Some(-65),
                 link_kind: Some("cellular".into()),
+                rsrp: None,
+                rsrq: None,
+                sinr: None,
+                cqi: None,
+                btlbw_bps: Some(9_000_000),
+                rtprop_ms: Some(12.0),
             }],
+            sender_metrics: None,
+            receiver_metrics: None,
         });
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -679,6 +722,8 @@ mod tests {
             encoder_bitrate_kbps: 4500,
             timestamp_ms: 1700000000000,
             links: vec![],
+            sender_metrics: None,
+            receiver_metrics: None,
         });
 
         let json = serde_json::to_string(&event).unwrap();
@@ -701,6 +746,11 @@ mod tests {
         let cmd = InterfaceCommandPayload {
             interface: "wwan0".into(),
             action: "enable".into(),
+            band: None,
+            priority: None,
+            apn: None,
+            sim_pin: None,
+            roaming: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let parsed: InterfaceCommandPayload = serde_json::from_str(&json).unwrap();

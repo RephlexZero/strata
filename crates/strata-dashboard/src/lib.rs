@@ -29,27 +29,46 @@ const TOKEN_KEY: &str = "strata_token";
 pub struct AuthState {
     pub token: ReadSignal<Option<String>>,
     set_token: WriteSignal<Option<String>>,
+    pub role: ReadSignal<String>,
+    set_role: WriteSignal<String>,
 }
 
 impl AuthState {
     fn new() -> Self {
         let stored: Option<String> = LocalStorage::get(TOKEN_KEY).ok();
+        let stored_role: String =
+            LocalStorage::get("strata_role").unwrap_or_else(|_| "viewer".into());
         let (token, set_token) = signal(stored);
-        Self { token, set_token }
+        let (role, set_role) = signal(stored_role);
+        Self {
+            token,
+            set_token,
+            role,
+            set_role,
+        }
     }
 
-    pub fn login(&self, token: String) {
+    pub fn login(&self, token: String, role: String) {
         let _ = LocalStorage::set(TOKEN_KEY, &token);
+        let _ = LocalStorage::set("strata_role", &role);
         self.set_token.set(Some(token));
+        self.set_role.set(role);
     }
 
     pub fn logout(&self) {
         LocalStorage::delete(TOKEN_KEY);
+        LocalStorage::delete("strata_role");
         self.set_token.set(None);
+        self.set_role.set("viewer".into());
     }
 
     pub fn is_authenticated(&self) -> bool {
         self.token.get_untracked().is_some()
+    }
+
+    /// Every authenticated user has full access.
+    pub fn has_role(&self, _required: &str) -> bool {
+        true
     }
 }
 

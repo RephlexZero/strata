@@ -148,11 +148,11 @@ fn register_plugins() -> Result<(), gst::glib::BoolError> {
 /// In a bonding transport the receiver remuxes or writes to file, so we want to
 /// preserve original timestamps rather than correcting for clock drift.
 fn configure_mpegtsmux(pipeline: &gst::Pipeline) {
-    if let Some(mux) = pipeline.by_name("mux") {
-        if mux.find_property("skew-corrections").is_some() {
-            mux.set_property("skew-corrections", false);
-            eprintln!("mpegtsmux: disabled skew-corrections (GStreamer ≥1.28)");
-        }
+    if let Some(mux) = pipeline.by_name("mux")
+        && mux.find_property("skew-corrections").is_some()
+    {
+        mux.set_property("skew-corrections", false);
+        eprintln!("mpegtsmux: disabled skew-corrections (GStreamer ≥1.28)");
     }
 }
 
@@ -581,54 +581,54 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         handle_source_switch(
                             &pipeline, &selector, &test_pad, s, framerate, res_w, res_h,
                         );
-                    } else if s.name() == "toggle-link" {
-                        if let Some(sink) = pipeline.by_name("rsink") {
-                            handle_toggle_link(&sink, s, &disabled_links);
-                        }
+                    } else if s.name() == "toggle-link"
+                        && let Some(sink) = pipeline.by_name("rsink")
+                    {
+                        handle_toggle_link(&sink, s, &disabled_links);
                     }
                 }
             }
             MessageView::Element(element) => {
                 if let Some(s) = element.structure() {
                     if s.name() == "bitrate-command" {
-                        if let Ok(target_kbps) = s.get::<u32>("target-kbps") {
-                            if let Some(enc) = pipeline.by_name("enc") {
-                                let current = codec_ctrl.get_bitrate_kbps(&enc);
-                                // Limit step to +50% to avoid VBV shock
-                                let max_step = current + current / 2;
-                                let clamped = target_kbps.min(max_step).max(500);
-                                if (clamped as i32 - current as i32).unsigned_abs() > 50 {
-                                    let reason = s.get::<String>("reason").unwrap_or_default();
-                                    let stage = s.get::<String>("stage").unwrap_or_default();
-                                    eprintln!(
-                                        "Bitrate: {} -> {} kbps (reason={}, stage={})",
-                                        current, clamped, reason, stage
-                                    );
-                                    codec_ctrl.set_bitrate_kbps(&enc, clamped);
-                                }
+                        if let Ok(target_kbps) = s.get::<u32>("target-kbps")
+                            && let Some(enc) = pipeline.by_name("enc")
+                        {
+                            let current = codec_ctrl.get_bitrate_kbps(&enc);
+                            // Limit step to +50% to avoid VBV shock
+                            let max_step = current + current / 2;
+                            let clamped = target_kbps.min(max_step).max(500);
+                            if (clamped as i32 - current as i32).unsigned_abs() > 50 {
+                                let reason = s.get::<String>("reason").unwrap_or_default();
+                                let stage = s.get::<String>("stage").unwrap_or_default();
+                                eprintln!(
+                                    "Bitrate: {} -> {} kbps (reason={}, stage={})",
+                                    current, clamped, reason, stage
+                                );
+                                codec_ctrl.set_bitrate_kbps(&enc, clamped);
                             }
                         }
                         // Forward degradation stage to scheduler
-                        if let Ok(stage_str) = s.get::<String>("stage") {
-                            if let Some(sink) = pipeline.by_name("rsink") {
-                                let strata_sink = sink
-                                    .downcast::<gststrata::sink::StrataSink>()
-                                    .expect("rsink is not a StrataSink");
-                                let stage = match stage_str.as_str() {
+                        if let Ok(stage_str) = s.get::<String>("stage")
+                            && let Some(sink) = pipeline.by_name("rsink")
+                        {
+                            let strata_sink = sink
+                                .downcast::<gststrata::sink::StrataSink>()
+                                .expect("rsink is not a StrataSink");
+                            let stage = match stage_str.as_str() {
                                     "DropDisposable" => strata_bonding::media::priority::DegradationStage::DropDisposable,
                                     "ReduceBitrate" => strata_bonding::media::priority::DegradationStage::ReduceBitrate,
                                     "ProtectKeyframes" => strata_bonding::media::priority::DegradationStage::ProtectKeyframes,
                                     "KeyframeOnly" => strata_bonding::media::priority::DegradationStage::KeyframeOnly,
                                     _ => strata_bonding::media::priority::DegradationStage::Normal,
                                 };
-                                strata_sink.set_degradation_stage(stage);
-                            }
+                            strata_sink.set_degradation_stage(stage);
                         }
-                    } else if s.name() == "strata-stats" {
-                        if let Some(sock) = &stats_socket {
-                            let json = serialize_bonding_stats(s);
-                            let _ = sock.send_to(json.as_bytes(), stats_dest);
-                        }
+                    } else if s.name() == "strata-stats"
+                        && let Some(sock) = &stats_socket
+                    {
+                        let json = serialize_bonding_stats(s);
+                        let _ = sock.send_to(json.as_bytes(), stats_dest);
                     }
                 }
             }
@@ -782,15 +782,13 @@ fn run_sender_passthrough(
                 }
             }
             MessageView::Element(elem) => {
-                if let Some(s) = elem.structure() {
-                    if s.name() == "bonding-stats" {
-                        if let (Some(sock), Ok(addr)) =
-                            (&stats_socket, stats_dest.parse::<std::net::SocketAddr>())
-                        {
-                            let json = serialize_bonding_stats(s);
-                            let _ = sock.send_to(json.as_bytes(), addr);
-                        }
-                    }
+                if let Some(s) = elem.structure()
+                    && s.name() == "bonding-stats"
+                    && let (Some(sock), Ok(addr)) =
+                        (&stats_socket, stats_dest.parse::<std::net::SocketAddr>())
+                {
+                    let json = serialize_bonding_stats(s);
+                    let _ = sock.send_to(json.as_bytes(), addr);
                 }
             }
             _ => {}
@@ -1037,12 +1035,11 @@ fn add_source_branch(
             // uridecodebin has dynamic pads — connect later via pad-added
             let conv_weak = conv.downgrade();
             src.connect_pad_added(move |_, pad| {
-                if let Some(conv) = conv_weak.upgrade() {
-                    if let Some(sink_pad) = conv.static_pad("sink") {
-                        if !sink_pad.is_linked() {
-                            let _ = pad.link(&sink_pad);
-                        }
-                    }
+                if let Some(conv) = conv_weak.upgrade()
+                    && let Some(sink_pad) = conv.static_pad("sink")
+                    && !sink_pad.is_linked()
+                {
+                    let _ = pad.link(&sink_pad);
                 }
             });
             // Link conv→scale→filter→queue (src→conv linked via pad-added)
@@ -1415,13 +1412,13 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "Failed to cast to pipeline")?;
 
     // Apply TOML config file if provided
-    if !config_path.is_empty() {
-        if let Some(src_elem) = pipeline.by_name("src") {
-            let config_toml = std::fs::read_to_string(config_path)
-                .map_err(|e| format!("Failed to read config file '{}': {}", config_path, e))?;
-            src_elem.set_property("config", &config_toml);
-            eprintln!("Applied config from {}", config_path);
-        }
+    if !config_path.is_empty()
+        && let Some(src_elem) = pipeline.by_name("src")
+    {
+        let config_toml = std::fs::read_to_string(config_path)
+            .map_err(|e| format!("Failed to read config file '{}': {}", config_path, e))?;
+        src_elem.set_property("config", &config_toml);
+        eprintln!("Applied config from {}", config_path);
     }
 
     // Setup AppSink (only used for non-relay monitor/record modes)

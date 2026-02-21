@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7-labs
 
 # ── Stage 1: Build Strata for aarch64 ────────────────────────
-FROM debian:12 AS builder
+FROM debian:sid AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -10,8 +10,6 @@ RUN dpkg --add-architecture arm64 && \
     apt-get update && apt-get install -y --no-install-recommends \
     # Native build tools
     build-essential \
-    clang \
-    cmake \
     pkg-config \
     curl \
     git \
@@ -27,7 +25,7 @@ RUN dpkg --add-architecture arm64 && \
 
 # Install Rust with aarch64 target
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --default-toolchain stable
+    sh -s -- -y --default-toolchain nightly --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN rustup target add aarch64-unknown-linux-gnu
 

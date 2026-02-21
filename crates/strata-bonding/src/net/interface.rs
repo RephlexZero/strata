@@ -4,12 +4,24 @@ use std::net::IpAddr;
 /// Resolve a network interface name (e.g., "eth0") to its first IPv4 address.
 /// Returns `None` if the interface doesn't exist or has no IPv4 address.
 pub fn resolve_iface_ipv4(iface: &str) -> Option<IpAddr> {
+    // Validate interface name to prevent path traversal
+    if !iface
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return None;
+    }
+
     let path = format!("/sys/class/net/{}/", iface);
     if !std::path::Path::new(&path).exists() {
         return None;
     }
 
     // Use libc getifaddrs for reliable interface address resolution.
+    // SAFETY: `getifaddrs` is a POSIX API that allocates a linked list of
+    // `ifaddrs` structs. We iterate the list, read `ifa_name` (guaranteed
+    // non-null by POSIX) and `ifa_addr` (checked for null), then free the
+    // list with `freeifaddrs` before returning.
     unsafe {
         let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut ifaddrs) != 0 {

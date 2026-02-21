@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use super::health::{
-    cqi_to_throughput_kbps, sinr_to_capacity_kbps, LinkHealth, RfMetrics, TransportMetrics,
+    LinkHealth, RfMetrics, TransportMetrics, cqi_to_throughput_kbps, sinr_to_capacity_kbps,
 };
 
 /// Events emitted by the supervisor to drive scheduler decisions.

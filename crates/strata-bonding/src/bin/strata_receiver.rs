@@ -25,8 +25,8 @@
 use std::io::Write;
 use std::net::SocketAddr;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use strata_bonding::metrics::render_receiver_prometheus;
@@ -216,11 +216,11 @@ fn parse_args() -> anyhow::Result<Args> {
     }
 
     // Fallback: env vars
-    if bind_addrs.is_empty() {
-        if let Ok(val) = std::env::var("BIND_ADDRS") {
-            for part in val.split(',') {
-                bind_addrs.push(part.trim().parse()?);
-            }
+    if bind_addrs.is_empty()
+        && let Ok(val) = std::env::var("BIND_ADDRS")
+    {
+        for part in val.split(',') {
+            bind_addrs.push(part.trim().parse()?);
         }
     }
     if let Ok(val) = std::env::var("LATENCY_MS") {
@@ -229,14 +229,16 @@ fn parse_args() -> anyhow::Result<Args> {
     if relay_url.is_none() {
         relay_url = std::env::var("RELAY_URL").ok().filter(|s| !s.is_empty());
     }
-    if metrics_port.is_none() {
-        if let Ok(val) = std::env::var("METRICS_PORT") {
-            metrics_port = val.parse().ok();
-        }
+    if metrics_port.is_none()
+        && let Ok(val) = std::env::var("METRICS_PORT")
+    {
+        metrics_port = val.parse().ok();
     }
 
     if bind_addrs.is_empty() {
-        anyhow::bail!("no bind addresses specified. Use --bind or BIND_ADDRS env var.\nRun with --help for usage.");
+        anyhow::bail!(
+            "no bind addresses specified. Use --bind or BIND_ADDRS env var.\nRun with --help for usage."
+        );
     }
 
     Ok(Args {

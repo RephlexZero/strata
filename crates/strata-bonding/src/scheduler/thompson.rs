@@ -40,11 +40,7 @@ impl BetaParams {
         // Use gamma-based sampling: Beta(a,b) = Ga/(Ga+Gb) where Ga~Gamma(a,1), Gb~Gamma(b,1)
         let ga = gamma_sample(self.alpha, rng);
         let gb = gamma_sample(self.beta, rng);
-        if ga + gb == 0.0 {
-            0.5
-        } else {
-            ga / (ga + gb)
-        }
+        if ga + gb == 0.0 { 0.5 } else { ga / (ga + gb) }
     }
 
     /// Total observations.
@@ -177,8 +173,8 @@ impl Default for ThompsonSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     fn seeded_rng() -> StdRng {
         StdRng::seed_from_u64(42)

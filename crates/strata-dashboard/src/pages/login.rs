@@ -3,8 +3,8 @@
 use leptos::ev;
 use leptos::prelude::*;
 
-use crate::api;
 use crate::AuthState;
+use crate::api;
 
 /// Login page — email/password form.
 ///
@@ -25,7 +25,7 @@ pub fn LoginPage() -> impl IntoView {
         leptos::task::spawn_local(async move {
             match api::login(&email_val, &password_val).await {
                 Ok(resp) => {
-                    auth.login(resp.token);
+                    auth.login(resp.token, resp.role);
                 }
                 Err(e) => {
                     set_error.set(Some(e));

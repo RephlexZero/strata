@@ -233,15 +233,9 @@ impl RetransmitTracker {
 
     /// Drain all pending retransmit requests.
     pub fn drain_pending(&mut self) -> Vec<u64> {
-        self.pending
-            .iter()
-            .copied()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .inspect(|seq| {
-                self.pending.remove(seq);
-            })
-            .collect()
+        let pending: Vec<u64> = self.pending.iter().copied().collect();
+        self.pending.clear();
+        pending
     }
 
     /// Mark a sequence as successfully acknowledged (no more retransmits needed).

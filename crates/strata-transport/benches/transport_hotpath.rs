@@ -10,7 +10,7 @@
 //! Run with: cargo bench --package strata-transport
 
 use bytes::{Bytes, BytesMut};
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::time::Duration;
 
 use strata_transport::codec::FecEncoder;

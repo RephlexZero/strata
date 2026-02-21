@@ -52,6 +52,8 @@ async fn start_stream(
     Path(sender_id): Path<String>,
     Json(body): Json<StartStreamRequest>,
 ) -> Result<(StatusCode, Json<StartStreamResponse>), ApiError> {
+    user.require_role("operator")?;
+
     // Verify sender ownership
     let exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM senders WHERE id = $1 AND owner_id = $2)",
@@ -303,6 +305,8 @@ async fn stop_stream(
     user: AuthUser,
     Path(sender_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    user.require_role("operator")?;
+
     // Find the active stream for this sender
     let stream_id = sqlx::query_scalar::<_, String>(
         "SELECT s.id FROM streams s JOIN senders sn ON s.sender_id = sn.id \

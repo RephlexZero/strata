@@ -191,13 +191,15 @@ mod imp {
 
             PAD_TEMPLATES.get_or_init(|| {
                 let caps = gst::Caps::new_any();
-                vec![gst::PadTemplate::new(
-                    "src",
-                    gst::PadDirection::Src,
-                    gst::PadPresence::Always,
-                    &caps,
-                )
-                .unwrap()]
+                vec![
+                    gst::PadTemplate::new(
+                        "src",
+                        gst::PadDirection::Src,
+                        gst::PadPresence::Always,
+                        &caps,
+                    )
+                    .unwrap(),
+                ]
             });
             PAD_TEMPLATES.get().unwrap()
         }
@@ -242,31 +244,31 @@ mod imp {
                     while running.load(Ordering::Relaxed) {
                         if let Some(element) = element_weak.upgrade() {
                             let imp = element.imp();
-                            if let Ok(receiver_guard) = imp.receiver.lock() {
-                                if let Some(receiver) = &*receiver_guard {
-                                    let stats = receiver.get_stats();
-                                    let mono_time_ns = start.elapsed().as_nanos() as u64;
-                                    let wall_time_ms = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .map(|d| d.as_millis() as u64)
-                                        .unwrap_or(0);
-                                    let msg = gst::Structure::builder("strata-stats")
-                                        .field("schema_version", 1i32)
-                                        .field("stats_seq", stats_seq)
-                                        .field("heartbeat", true)
-                                        .field("mono_time_ns", mono_time_ns)
-                                        .field("wall_time_ms", wall_time_ms)
-                                        .field("total_capacity", 0.0f64)
-                                        .field("alive_links", 0u64)
-                                        .field("queue_depth", stats.queue_depth as u64)
-                                        .field("next_seq", stats.next_seq)
-                                        .field("lost_packets", stats.lost_packets)
-                                        .field("late_packets", stats.late_packets)
-                                        .field("current_latency_ms", stats.current_latency_ms)
-                                        .build();
-                                    let _ = element.post_message(gst::message::Element::new(msg));
-                                    stats_seq = stats_seq.wrapping_add(1);
-                                }
+                            if let Ok(receiver_guard) = imp.receiver.lock()
+                                && let Some(receiver) = &*receiver_guard
+                            {
+                                let stats = receiver.get_stats();
+                                let mono_time_ns = start.elapsed().as_nanos() as u64;
+                                let wall_time_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                let msg = gst::Structure::builder("strata-stats")
+                                    .field("schema_version", 1i32)
+                                    .field("stats_seq", stats_seq)
+                                    .field("heartbeat", true)
+                                    .field("mono_time_ns", mono_time_ns)
+                                    .field("wall_time_ms", wall_time_ms)
+                                    .field("total_capacity", 0.0f64)
+                                    .field("alive_links", 0u64)
+                                    .field("queue_depth", stats.queue_depth as u64)
+                                    .field("next_seq", stats.next_seq)
+                                    .field("lost_packets", stats.lost_packets)
+                                    .field("late_packets", stats.late_packets)
+                                    .field("current_latency_ms", stats.current_latency_ms)
+                                    .build();
+                                let _ = element.post_message(gst::message::Element::new(msg));
+                                stats_seq = stats_seq.wrapping_add(1);
                             }
                         } else {
                             break;

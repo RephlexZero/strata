@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 pub struct User {
     pub id: String,
     pub email: String,
-    #[serde(skip_serializing)]
+    #[serde(skip)]
     pub password_hash: String,
     pub role: UserRole,
     pub created_at: DateTime<Utc>,
@@ -90,10 +90,26 @@ pub struct NetworkInterface {
     pub carrier: Option<String>,
     pub signal_dbm: Option<i32>,
     pub technology: Option<String>,
+    pub cell_id: Option<String>,
+    pub band: Option<String>,
+    pub data_cap_mb: Option<u64>,
+    pub data_used_mb: Option<u64>,
+    /// Link priority (1 = highest, 100 = lowest). Default is 1.
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    pub apn: Option<String>,
+    #[serde(skip_serializing)]
+    pub sim_pin: Option<String>,
+    #[serde(default)]
+    pub roaming: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_priority() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,9 +297,19 @@ pub struct LinkStats {
     #[serde(default)]
     pub observed_bps: u64,
     pub signal_dbm: Option<i32>,
+    pub rsrp: Option<f32>,
+    pub rsrq: Option<f32>,
+    pub sinr: Option<f32>,
+    pub cqi: Option<u8>,
     /// Link technology kind (e.g. "ethernet", "cellular", "wifi").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_kind: Option<String>,
+    /// BBRv3 estimated bottleneck bandwidth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btlbw_bps: Option<u64>,
+    /// BBRv3 estimated minimum RTT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtprop_ms: Option<f64>,
 }
 
 #[cfg(test)]
@@ -415,6 +441,14 @@ mod tests {
             carrier: Some("T-Mobile".into()),
             signal_dbm: Some(-67),
             technology: Some("5G".into()),
+            cell_id: None,
+            band: None,
+            data_cap_mb: None,
+            data_used_mb: None,
+            priority: 1,
+            apn: None,
+            sim_pin: None,
+            roaming: false,
         };
         let json = serde_json::to_string(&iface).unwrap();
         let parsed: NetworkInterface = serde_json::from_str(&json).unwrap();
@@ -461,6 +495,12 @@ mod tests {
             observed_bps: 8_000_000,
             signal_dbm: Some(-72),
             link_kind: Some("cellular".into()),
+            rsrp: None,
+            rsrq: None,
+            sinr: None,
+            cqi: None,
+            btlbw_bps: Some(12_000_000),
+            rtprop_ms: Some(20.0),
         };
         let json = serde_json::to_string(&stats).unwrap();
         let parsed: LinkStats = serde_json::from_str(&json).unwrap();
@@ -469,6 +509,8 @@ mod tests {
         assert_eq!(parsed.capacity_bps, 15_000_000);
         assert_eq!(parsed.observed_bps, 8_000_000);
         assert_eq!(parsed.link_kind.as_deref(), Some("cellular"));
+        assert_eq!(parsed.btlbw_bps, Some(12_000_000));
+        assert_eq!(parsed.rtprop_ms, Some(20.0));
     }
 
     #[test]
@@ -544,6 +586,14 @@ mod tests {
                 carrier: None,
                 signal_dbm: None,
                 technology: None,
+                cell_id: None,
+                band: None,
+                data_cap_mb: None,
+                data_used_mb: None,
+                priority: 1,
+                apn: None,
+                sim_pin: None,
+                roaming: false,
             }],
             media_inputs: vec![],
             stream_state: StreamState::Live,

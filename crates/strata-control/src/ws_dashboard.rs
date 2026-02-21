@@ -10,8 +10,8 @@
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
-use futures::stream::StreamExt;
 use futures::SinkExt;
+use futures::stream::StreamExt;
 
 use strata_common::protocol::DashboardEvent;
 

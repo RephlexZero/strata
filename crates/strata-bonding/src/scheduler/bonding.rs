@@ -9,11 +9,11 @@ use crate::scheduler::thompson::ThompsonSelector;
 use anyhow::Result;
 use bytes::Bytes;
 use quanta::Instant;
-use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use rand::rngs::SmallRng;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{error, warn};
 
@@ -248,10 +248,11 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             }
 
             // Check for RTT spike (>Nx previous smoothed value)
-            if let Some(prev_rtt) = self.prev_rtts.get(id) {
-                if m.rtt_ms > prev_rtt * rtt_spike_factor && *prev_rtt > 0.0 {
-                    trigger_failover = true;
-                }
+            if let Some(prev_rtt) = self.prev_rtts.get(id)
+                && m.rtt_ms > prev_rtt * rtt_spike_factor
+                && *prev_rtt > 0.0
+            {
+                trigger_failover = true;
             }
 
             self.prev_phases.insert(*id, m.phase);

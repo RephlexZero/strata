@@ -5,7 +5,7 @@ use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
 use std::collections::HashMap;
-use std::sync::{atomic::AtomicBool, atomic::AtomicU32, atomic::Ordering, Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::AtomicBool, atomic::AtomicU32, atomic::Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use strata_bonding::adaptation::{
     AdaptationConfig, BitrateAdapter, LinkCapacity, ReceiverFeedback,

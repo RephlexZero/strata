@@ -4,7 +4,7 @@
 //! - **JWT**: Ed25519-signed tokens for session auth
 //! - **Device keys**: Ed25519 keypair generation for sender identity
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -29,8 +29,8 @@ pub enum AuthError {
 /// Hash a password using Argon2id with a random salt.
 pub fn hash_password(password: &str) -> Result<String, AuthError> {
     use argon2::{
-        password_hash::{rand_core::OsRng as PhcOsRng, SaltString},
         Argon2, PasswordHasher,
+        password_hash::{SaltString, rand_core::OsRng as PhcOsRng},
     };
 
     let salt = SaltString::generate(&mut PhcOsRng);
@@ -43,7 +43,7 @@ pub fn hash_password(password: &str) -> Result<String, AuthError> {
 
 /// Verify a password against an Argon2id hash.
 pub fn verify_password(password: &str, hash: &str) -> Result<bool, AuthError> {
-    use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
+    use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHash};
 
     let parsed_hash = PasswordHash::new(hash).map_err(|e| AuthError::HashError(e.to_string()))?;
     Ok(Argon2::default()

@@ -100,13 +100,13 @@ pub fn App() -> impl IntoView {
                     loop {
                         gloo_timers::future::TimeoutFuture::new(2_000).await;
                         tries += 1;
-                        if let Ok(s) = api::get_status().await {
-                            if s.enrolled {
-                                set_enroll_msg
-                                    .set(Some(("Device enrolled successfully!".into(), "ok")));
-                                set_status.set(Some(s));
-                                break;
-                            }
+                        if let Ok(s) = api::get_status().await
+                            && s.enrolled
+                        {
+                            set_enroll_msg
+                                .set(Some(("Device enrolled successfully!".into(), "ok")));
+                            set_status.set(Some(s));
+                            break;
                         }
                         if tries > 15 {
                             set_enroll_msg

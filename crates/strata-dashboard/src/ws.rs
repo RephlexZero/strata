@@ -5,8 +5,8 @@
 //! Reconnects automatically with a fixed 3-second delay on disconnect.
 
 use leptos::prelude::*;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 use web_sys::{MessageEvent, WebSocket};
 
 use crate::types::DashboardEvent;

@@ -152,10 +152,10 @@ pub fn scan_annex_b(data: &[u8], codec: Codec) -> Vec<NalInfo> {
                 continue;
             };
 
-            if payload_start < data.len() {
-                if let Some(info) = parse_nal(&data[payload_start..], codec) {
-                    nals.push(info);
-                }
+            if payload_start < data.len()
+                && let Some(info) = parse_nal(&data[payload_start..], codec)
+            {
+                nals.push(info);
             }
             i = payload_start;
         } else {

@@ -82,10 +82,28 @@ pub struct NetworkInterface {
     pub carrier: Option<String>,
     pub signal_dbm: Option<i32>,
     pub technology: Option<String>,
+    pub cell_id: Option<String>,
+    pub band: Option<String>,
+    #[serde(default)]
+    pub data_cap_mb: Option<u64>,
+    #[serde(default)]
+    pub data_used_mb: Option<u64>,
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    #[serde(default)]
+    pub apn: Option<String>,
+    #[serde(default)]
+    pub sim_pin: Option<String>,
+    #[serde(default)]
+    pub roaming: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_priority() -> u32 {
+    1
 }
 
 /// Media input.
@@ -151,6 +169,7 @@ pub struct StreamDetail {
     pub state: String,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
+    pub config_json: Option<String>,
     pub total_bytes: i64,
     pub error_message: Option<String>,
 }
@@ -277,6 +296,53 @@ pub struct CreateDestinationResponse {
 
 // ── Dashboard WebSocket Events ──────────────────────────────────────
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransportSenderMetrics {
+    pub packets_sent: u64,
+    pub bytes_sent: u64,
+    pub packets_acked: u64,
+    pub retransmissions: u64,
+    pub packets_expired: u64,
+    pub fec_repairs_sent: u64,
+    pub last_rtt_us: u64,
+    /// Current dynamic FEC overhead ratio (0.0–1.0).
+    #[serde(default)]
+    pub fec_overhead_ratio: Option<f64>,
+    /// Active FEC layer: "rlnc" (Layer 1) or "raptorq" (Layer 1b / UEP).
+    #[serde(default)]
+    pub fec_layer: Option<String>,
+    /// BLEST Head-of-Line blocking threshold in ms.
+    #[serde(default)]
+    pub blest_threshold_ms: Option<u32>,
+    /// Whether Shared Bottleneck Detection (RFC 8382) is enabled.
+    #[serde(default)]
+    pub shared_bottleneck_detection: Option<bool>,
+    /// NAL unit counters for media awareness.
+    #[serde(default)]
+    pub nal_critical_sent: Option<u64>,
+    #[serde(default)]
+    pub nal_reference_sent: Option<u64>,
+    #[serde(default)]
+    pub nal_standard_sent: Option<u64>,
+    #[serde(default)]
+    pub nal_disposable_sent: Option<u64>,
+    #[serde(default)]
+    pub nal_disposable_dropped: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransportReceiverMetrics {
+    pub packets_received: u64,
+    pub bytes_received: u64,
+    pub packets_delivered: u64,
+    pub duplicates: u64,
+    pub late_packets: u64,
+    pub fec_recoveries: u64,
+    pub nacks_sent: u64,
+    pub highest_delivered_seq: u64,
+    pub jitter_buffer_depth: u32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum DashboardEvent {
@@ -298,6 +364,10 @@ pub enum DashboardEvent {
         #[serde(default)]
         timestamp_ms: u64,
         links: Vec<LinkStats>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender_metrics: Option<TransportSenderMetrics>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receiver_metrics: Option<TransportReceiverMetrics>,
     },
 
     #[serde(rename = "stream.state")]
@@ -322,9 +392,18 @@ pub struct LinkStats {
     #[serde(default)]
     pub observed_bps: u64,
     pub signal_dbm: Option<i32>,
+    pub rsrp: Option<f32>,
+    pub rsrq: Option<f32>,
+    pub sinr: Option<f32>,
+    pub cqi: Option<u8>,
     /// Link technology kind (e.g. "ethernet", "cellular").
     #[serde(default)]
     pub link_kind: Option<String>,
+    pub btlbw_bps: Option<u64>,
+    pub rtprop_ms: Option<f64>,
+    /// Thompson Sampling scheduler preference score for this link.
+    #[serde(default)]
+    pub thompson_score: Option<f64>,
 }
 
 // ── Stream Config Update (Hot Reconfig) ─────────────────────────────
@@ -336,6 +415,22 @@ pub struct StreamConfigUpdateRequest {
     pub encoder: Option<EncoderConfigUpdate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fec: Option<FecConfigUpdate>,
+}
+
+/// Partial FEC / advanced transport update.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FecConfigUpdate {
+    /// "rlnc" for Sliding-Window RLNC (Layer 1) or "raptorq" for UEP/RaptorQ (Layer 1b).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// BLEST Head-of-Line blocking threshold in ms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blest_threshold_ms: Option<u32>,
+    /// Toggle Shared Bottleneck Detection (RFC 8382).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_bottleneck_detection: Option<bool>,
 }
 
 /// Partial encoder update — only set fields are applied.
@@ -366,6 +461,71 @@ pub struct SourceSwitchRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApiErrorResponse {
     pub error: String,
+}
+
+// ── OTA Updates ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateInfo {
+    pub current_version: String,
+    pub latest_version: Option<String>,
+    pub update_available: bool,
+    pub release_notes: Option<String>,
+    pub update_size_bytes: Option<u64>,
+}
+
+// ── Diagnostics ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LogsResponse {
+    pub lines: Vec<LogLine>,
+    pub service: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LogLine {
+    pub timestamp: Option<String>,
+    pub level: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NetworkToolResult {
+    pub tool: String,
+    pub output: String,
+    pub success: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PcapResponse {
+    pub download_url: String,
+    pub file_size_bytes: Option<u64>,
+    pub duration_secs: u32,
+}
+
+// ── Alerting ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertRule {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub name: String,
+    pub metric: String,
+    pub condition: String,
+    pub threshold: f64,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+// ── TLS ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsStatus {
+    pub enabled: bool,
+    pub cert_subject: Option<String>,
+    pub cert_issuer: Option<String>,
+    pub expiry: Option<String>,
+    pub self_signed: bool,
 }
 // ── File Browser ──────────────────────────────────────────────────
 

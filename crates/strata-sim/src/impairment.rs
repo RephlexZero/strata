@@ -68,10 +68,10 @@ pub fn apply_impairment(
         args_storage.push("delay".to_string());
         args_storage.push(format!("{}ms", delay));
 
-        if let Some(jitter) = config.jitter_ms {
-            if jitter > 0 {
-                args_storage.push(format!("{}ms", jitter));
-            }
+        if let Some(jitter) = config.jitter_ms
+            && jitter > 0
+        {
+            args_storage.push(format!("{}ms", jitter));
         }
     }
 

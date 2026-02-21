@@ -250,34 +250,34 @@ impl Sender {
                 }
 
                 // Look up the packet in the pool
-                if let Some(&handle) = self.seq_to_handle.get(&seq) {
-                    if let Some(entry) = self.pool.get_mut(handle) {
-                        entry.context.retry_count += 1;
+                if let Some(&handle) = self.seq_to_handle.get(&seq)
+                    && let Some(entry) = self.pool.get_mut(handle)
+                {
+                    entry.context.retry_count += 1;
 
-                        // Re-serialize the packet
-                        let header = PacketHeader::data(
-                            entry.context.sequence,
-                            entry.context.timestamp_us,
-                            entry.payload.len() as u16,
-                        )
-                        .with_fragment(entry.context.fragment);
+                    // Re-serialize the packet
+                    let header = PacketHeader::data(
+                        entry.context.sequence,
+                        entry.context.timestamp_us,
+                        entry.payload.len() as u16,
+                    )
+                    .with_fragment(entry.context.fragment);
 
-                        let pkt = Packet {
-                            header,
-                            payload: entry.payload.clone(),
-                        };
+                    let pkt = Packet {
+                        header,
+                        payload: entry.payload.clone(),
+                    };
 
-                        self.output_queue.push_back(OutputPacket {
-                            data: pkt.encode().freeze(),
-                            priority: entry.context.priority,
-                            sequence: seq,
-                            is_retransmit: true,
-                            is_fec_repair: false,
-                        });
+                    self.output_queue.push_back(OutputPacket {
+                        data: pkt.encode().freeze(),
+                        priority: entry.context.priority,
+                        sequence: seq,
+                        is_retransmit: true,
+                        is_fec_repair: false,
+                    });
 
-                        self.stats.retransmissions += 1;
-                        retransmitted += 1;
-                    }
+                    self.stats.retransmissions += 1;
+                    retransmitted += 1;
                 }
             }
         }
@@ -642,7 +642,7 @@ mod tests {
     #[test]
     fn flush_fec_emits_partial_generation() {
         let mut sender = Sender::new(test_config()); // K=4
-                                                     // Send 2 packets (partial generation)
+        // Send 2 packets (partial generation)
         sender.send(Bytes::from(vec![0; 10]), Priority::Standard);
         sender.send(Bytes::from(vec![1; 10]), Priority::Standard);
         sender.drain_output().for_each(drop);

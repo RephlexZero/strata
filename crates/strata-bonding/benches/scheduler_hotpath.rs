@@ -9,12 +9,12 @@
 //! Run with: cargo bench --package strata-bonding
 
 use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::sync::{Arc, Mutex};
 
 use strata_bonding::net::interface::{LinkMetrics, LinkPhase, LinkSender};
-use strata_bonding::scheduler::bonding::BondingScheduler;
 use strata_bonding::scheduler::PacketProfile;
+use strata_bonding::scheduler::bonding::BondingScheduler;
 
 struct MockLink {
     id: usize,

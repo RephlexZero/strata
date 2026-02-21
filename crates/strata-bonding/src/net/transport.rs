@@ -11,8 +11,8 @@ use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
 use strata_transport::congestion::BiscayController;

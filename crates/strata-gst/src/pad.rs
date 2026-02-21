@@ -49,10 +49,10 @@ mod imp {
                     *uri = new_uri;
                     drop(uri);
                     if should_notify {
-                        if let Some(parent) = self.obj().parent() {
-                            if let Ok(sink) = parent.downcast::<crate::sink::StrataSink>() {
-                                sink.imp().add_link_from_pad(&self.obj());
-                            }
+                        if let Some(parent) = self.obj().parent()
+                            && let Ok(sink) = parent.downcast::<crate::sink::StrataSink>()
+                        {
+                            sink.imp().add_link_from_pad(&self.obj());
                         }
                         self.obj().notify("uri");
                     }

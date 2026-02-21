@@ -12,8 +12,8 @@ use strata_bonding::media::priority::DegradationStage;
 use strata_bonding::modem::health::RfMetrics;
 use strata_bonding::modem::supervisor::{ModemSupervisor, SupervisorConfig, SupervisorEvent};
 use strata_bonding::net::interface::{LinkMetrics, LinkPhase, LinkSender};
-use strata_bonding::scheduler::bonding::BondingScheduler;
 use strata_bonding::scheduler::PacketProfile;
+use strata_bonding::scheduler::bonding::BondingScheduler;
 
 // ─── Mock Infrastructure ────────────────────────────────────────────────
 

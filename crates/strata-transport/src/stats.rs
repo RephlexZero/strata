@@ -5,6 +5,7 @@
 
 use quanta::Instant;
 use serde::Serialize;
+use std::collections::VecDeque;
 
 // ─── Sender Stats ───────────────────────────────────────────────────────────
 
@@ -128,7 +129,7 @@ pub struct LinkStats {
 /// Windowed rate counter for computing bytes/sec or packets/sec.
 pub struct RateCounter {
     /// Recent samples: (timestamp, value).
-    samples: Vec<(Instant, u64)>,
+    samples: VecDeque<(Instant, u64)>,
     /// Window duration.
     window: std::time::Duration,
 }
@@ -136,7 +137,7 @@ pub struct RateCounter {
 impl RateCounter {
     pub fn new(window: std::time::Duration) -> Self {
         RateCounter {
-            samples: Vec::with_capacity(128),
+            samples: VecDeque::with_capacity(128),
             window,
         }
     }
@@ -144,7 +145,7 @@ impl RateCounter {
     /// Record a sample.
     pub fn record(&mut self, value: u64) {
         let now = Instant::now();
-        self.samples.push((now, value));
+        self.samples.push_back((now, value));
         self.cleanup();
     }
 
@@ -173,7 +174,13 @@ impl RateCounter {
 
     fn cleanup(&mut self) {
         let cutoff = Instant::now() - self.window;
-        self.samples.retain(|(t, _)| *t >= cutoff);
+        while let Some(&(t, _)) = self.samples.front() {
+            if t < cutoff {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 }
 

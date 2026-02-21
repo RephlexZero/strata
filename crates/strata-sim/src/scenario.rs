@@ -1,7 +1,7 @@
 use crate::impairment::ImpairmentConfig;
-use rand::rngs::StdRng;
 use rand::RngExt as _;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use std::time::Duration;
 
 /// Configuration for a deterministic network impairment scenario.
@@ -127,11 +127,7 @@ fn rand_signed(rng: &mut StdRng, max_step: f64) -> f64 {
         return 0.0;
     }
     let mag = rng.random::<f64>() * max_step;
-    if rng.random::<bool>() {
-        mag
-    } else {
-        -mag
-    }
+    if rng.random::<bool>() { mag } else { -mag }
 }
 
 #[cfg(test)]

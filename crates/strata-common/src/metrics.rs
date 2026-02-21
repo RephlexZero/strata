@@ -394,6 +394,12 @@ mod tests {
                 observed_bps: 3_000_000,
                 signal_dbm: Some(-65),
                 link_kind: Some("cellular".into()),
+                rsrp: None,
+                rsrq: None,
+                sinr: None,
+                cqi: None,
+                btlbw_bps: Some(4_500_000),
+                rtprop_ms: Some(20.0),
             },
             LinkStats {
                 id: 1,
@@ -406,6 +412,12 @@ mod tests {
                 observed_bps: 1_500_000,
                 signal_dbm: Some(-72),
                 link_kind: Some("cellular".into()),
+                rsrp: None,
+                rsrq: None,
+                sinr: None,
+                cqi: None,
+                btlbw_bps: Some(1_800_000),
+                rtprop_ms: Some(45.0),
             },
         ]
     }

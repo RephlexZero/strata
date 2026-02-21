@@ -1,8 +1,8 @@
 use anyhow::Result;
 use bytes::Bytes;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use strata_bonding::config::LinkConfig;
 use strata_bonding::receiver::transport::TransportBondingReceiver;

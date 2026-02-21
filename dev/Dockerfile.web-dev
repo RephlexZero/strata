@@ -9,37 +9,54 @@
 #
 # Source code is bind-mounted from the host so changes trigger
 # an automatic trunk rebuild + browser hot-reload.  No scripts needed.
+#
+# Optimisation: trunk is downloaded as a pre-built binary instead of
+# compiled from source, and Cargo deps are cached in a separate layer
+# before real source is copied so they survive source-only changes.
 
-FROM rust:1.93-bookworm
+FROM rust:nightly-bookworm
 
 # Node.js for Tailwind CSS / DaisyUI
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-RUN rustup target add wasm32-unknown-unknown && \
-    cargo install trunk --version 0.21.14
+# Pre-built trunk binary (much faster than cargo install)
+ARG TRUNK_VERSION=0.21.14
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+    amd64) target="x86_64-unknown-linux-gnu" ;; \
+    arm64) target="aarch64-unknown-linux-gnu" ;; \
+    *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-${target}.tar.gz" \
+    | tar -xzf - -C /usr/local/bin trunk; \
+    chmod +x /usr/local/bin/trunk; \
+    trunk --version
+
+RUN rustup target add wasm32-unknown-unknown
 
 ARG CRATE
 WORKDIR /src
 
-# Minimal workspace manifest for just this crate
+# ── Layer 1: Cargo dep cache (only rebuilds when Cargo.toml/lock change) ──
 COPY Cargo.lock ./
 COPY crates/${CRATE}/Cargo.toml crates/${CRATE}/Cargo.toml
-
 RUN printf '[workspace]\nresolver = "2"\nmembers = ["crates/%s"]\n' "${CRATE}" > Cargo.toml
 
-# Install npm deps (Tailwind CSS + DaisyUI)
+# Stub lib.rs so cargo can resolve and fetch all deps + compile them
+RUN mkdir -p crates/${CRATE}/src && echo '' > crates/${CRATE}/src/lib.rs
+RUN cargo build --target wasm32-unknown-unknown -p ${CRATE} 2>/dev/null || true
+
+# ── Layer 2: npm deps (only rebuilds when style/ changes) ──
 COPY crates/${CRATE}/style crates/${CRATE}/style
 RUN cd crates/${CRATE} && npm init -y && npm install @tailwindcss/cli daisyui
 
-# Copy Trunk config and source for initial dep cache build
+# ── Layer 3: Real source (bind-mounted at runtime, this is just for initial start) ──
 COPY crates/${CRATE}/Trunk.toml crates/${CRATE}/Trunk.toml
 COPY crates/${CRATE}/index.html crates/${CRATE}/index.html
 COPY crates/${CRATE}/src crates/${CRATE}/src
-
-# Warm the cargo + wasm-bindgen cache (first build downloads all deps)
-RUN cd crates/${CRATE} && trunk build 2>/dev/null || true
 
 WORKDIR /src/crates/${CRATE}
 

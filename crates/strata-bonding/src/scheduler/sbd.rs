@@ -321,16 +321,16 @@ impl SbdEngine {
                 if *other_id == *link_id {
                     continue;
                 }
-                if let Some(&other_group) = groups.get(other_id) {
-                    if other_group > 0 {
-                        // Check similarity
-                        let skew_diff = (skew - other_skew).abs();
-                        let var_diff = (var - other_var).abs();
-                        if skew_diff < tolerance && var_diff < tolerance {
-                            groups.insert(*link_id, other_group);
-                            assigned = true;
-                            break;
-                        }
+                if let Some(&other_group) = groups.get(other_id)
+                    && other_group > 0
+                {
+                    // Check similarity
+                    let skew_diff = (skew - other_skew).abs();
+                    let var_diff = (var - other_var).abs();
+                    if skew_diff < tolerance && var_diff < tolerance {
+                        groups.insert(*link_id, other_group);
+                        assigned = true;
+                        break;
                     }
                 }
             }

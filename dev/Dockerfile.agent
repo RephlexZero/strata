@@ -2,7 +2,7 @@
 
 # ── Stage 1: Build portal WASM ───────────────────────────────
 FROM node:20-bookworm AS node-base
-FROM rust:1.93-bookworm AS portal
+FROM rust:nightly-bookworm AS portal
 
 # Node.js 20+ required for @tailwindcss/oxide native module
 COPY --from=node-base /usr/local/bin/node /usr/local/bin/node
@@ -35,16 +35,24 @@ RUN --mount=type=cache,target=/root/.npm \
     trunk build --release
 
 # ── Stage 2: Build GStreamer pipeline (integration_node + bonding plugin) ─
-FROM rust:1.93-bookworm AS pipeline
+# Debian sid ships GStreamer 1.28 which includes eflvmux for H.265 RTMP relay.
+FROM debian:sid AS pipeline
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config clang \
+    curl \
+    ca-certificates \
+    pkg-config \
     libgstreamer1.0-dev \
     libgstreamer-plugins-base1.0-dev \
     libgstreamer-plugins-bad1.0-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Rust nightly via rustup
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --default-toolchain nightly --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /src
 
@@ -71,9 +79,9 @@ members = [
 ]
 
 [workspace.dependencies]
-gst = { package = "gstreamer", version = "0.24.4" }
-gst-base = { package = "gstreamer-base", version = "0.24.4" }
-gst-app = { package = "gstreamer-app", version = "0.24.4" }
+gst = { package = "gstreamer", version = "0.25.0" }
+gst-base = { package = "gstreamer-base", version = "0.25.0" }
+gst-app = { package = "gstreamer-app", version = "0.25.0" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 toml = "0.9.8"
@@ -104,7 +112,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p strata-gst
 
 # ── Stage 3: Build strata-agent ──────────────────────────────
-FROM rust:1.93-bookworm AS builder
+FROM rust:nightly-bookworm AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -154,7 +162,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p strata-agent
 
 # ── Stage 4: Runtime ────────────────────────────────────────
-FROM debian:12-slim
+# Debian sid ships GStreamer 1.28 — includes eflvmux (Enhanced FLV) for H.265 RTMP.
+FROM debian:sid-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

@@ -2,9 +2,9 @@
 
 use leptos::prelude::*;
 
+use crate::AuthState;
 use crate::api;
 use crate::types::StreamSummary;
-use crate::AuthState;
 
 /// Lists active and recent streams.
 #[component]

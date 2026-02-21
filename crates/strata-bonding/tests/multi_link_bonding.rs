@@ -12,8 +12,8 @@ use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 
 use strata_bonding::net::interface::{LinkMetrics, LinkPhase, LinkSender};
-use strata_bonding::scheduler::bonding::BondingScheduler;
 use strata_bonding::scheduler::PacketProfile;
+use strata_bonding::scheduler::bonding::BondingScheduler;
 
 // ─── Mock Link (mirrors the one in bonding.rs unit tests) ────────────────
 

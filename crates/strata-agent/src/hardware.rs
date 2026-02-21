@@ -61,6 +61,14 @@ impl HardwareScanner {
                 carrier: Some("T-Mobile".into()),
                 signal_dbm: Some(-65 - rng.random_range(0..20)),
                 technology: Some("LTE".into()),
+                band: Some("B71".into()),
+                cell_id: Some("310260-1234567".into()),
+                data_cap_mb: Some(50_000),
+                data_used_mb: Some(12_500),
+                priority: 1,
+                apn: Some("fast.t-mobile.com".into()),
+                sim_pin: None,
+                roaming: false,
             },
             NetworkInterface {
                 name: "wwan1".into(),
@@ -71,6 +79,14 @@ impl HardwareScanner {
                 carrier: Some("Vodafone".into()),
                 signal_dbm: Some(-60 - rng.random_range(0..15)),
                 technology: Some("5G-NSA".into()),
+                band: Some("n41".into()),
+                cell_id: Some("310260-7654321".into()),
+                data_cap_mb: Some(100_000),
+                data_used_mb: Some(85_000),
+                priority: 2,
+                apn: Some("internet".into()),
+                sim_pin: None,
+                roaming: true,
             },
             NetworkInterface {
                 name: "eth0".into(),
@@ -81,6 +97,14 @@ impl HardwareScanner {
                 carrier: None,
                 signal_dbm: None,
                 technology: None,
+                band: None,
+                cell_id: None,
+                data_cap_mb: None,
+                data_used_mb: None,
+                priority: 1,
+                apn: None,
+                sim_pin: None,
+                roaming: false,
             },
         ];
 
@@ -214,6 +238,14 @@ fn scan_network_interfaces() -> Vec<NetworkInterface> {
             carrier: None, // TODO: read from ModemManager
             signal_dbm: None,
             technology: None,
+            band: None,
+            cell_id: None,
+            data_cap_mb: None,
+            data_used_mb: None,
+            priority: 1,
+            apn: None,
+            sim_pin: None,
+            roaming: false,
         });
     }
 

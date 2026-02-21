@@ -386,7 +386,10 @@ impl BitrateAdapter {
         links: &[LinkCapacity],
         feedback: &ReceiverFeedback,
     ) -> Option<BitrateCommand> {
-        // Start with normal capacity-based update
+        // Start with normal capacity-based update.
+        // NOTE: `update()` may already reduce via capacity pressure.
+        // The feedback reduction below can stack, which is intentional —
+        // receiver-side signals confirm congestion the sender sees locally.
         let mut result = self.update(links);
 
         // Apply receiver-side pressure signals

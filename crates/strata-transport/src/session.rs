@@ -183,10 +183,10 @@ impl Session {
             }
             // Link leave
             (SessionState::Established, SessionAction::LinkLeave) => {
-                if let Some(link_id) = pkt.link_id {
-                    if let Some(info) = self.links.get_mut(&link_id) {
-                        info.active = false;
-                    }
+                if let Some(link_id) = pkt.link_id
+                    && let Some(info) = self.links.get_mut(&link_id)
+                {
+                    info.active = false;
                 }
                 SessionEvent::LinkLeft(pkt.link_id.unwrap_or(0))
             }

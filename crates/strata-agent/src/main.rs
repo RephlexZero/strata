@@ -18,8 +18,8 @@ mod telemetry;
 pub(crate) mod util;
 
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use clap::Parser;
 use tokio::sync::{mpsc, watch};

@@ -120,6 +120,20 @@ pub async fn list_streams(token: &str) -> ApiResult<Vec<StreamSummary>> {
     }
 }
 
+pub async fn get_stream(token: &str, id: &str) -> ApiResult<StreamDetail> {
+    let resp = Request::get(&format!("/api/streams/{id}"))
+        .header("Authorization", &auth_header(token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
 pub async fn start_stream(
     token: &str,
     sender_id: &str,
@@ -294,6 +308,96 @@ pub async fn disable_interface(token: &str, sender_id: &str, iface: &str) -> Api
     }
 }
 
+/// Lock a cellular interface to a specific band.
+pub async fn lock_band(
+    token: &str,
+    sender_id: &str,
+    iface: &str,
+    band: Option<String>,
+) -> ApiResult<()> {
+    #[derive(serde::Serialize)]
+    struct Body {
+        band: Option<String>,
+    }
+    let resp = Request::post(&format!(
+        "/api/senders/{sender_id}/interfaces/{iface}/lock_band"
+    ))
+    .header("Authorization", &auth_header(token))
+    .json(&Body { band })
+    .map_err(|e| e.to_string())?
+    .send()
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Set priority for a network interface.
+pub async fn set_priority(
+    token: &str,
+    sender_id: &str,
+    iface: &str,
+    priority: u32,
+) -> ApiResult<()> {
+    #[derive(serde::Serialize)]
+    struct Body {
+        priority: u32,
+    }
+    let resp = Request::post(&format!(
+        "/api/senders/{sender_id}/interfaces/{iface}/priority"
+    ))
+    .header("Authorization", &auth_header(token))
+    .json(&Body { priority })
+    .map_err(|e| e.to_string())?
+    .send()
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Set APN and SIM settings for a cellular interface.
+pub async fn set_apn(
+    token: &str,
+    sender_id: &str,
+    iface: &str,
+    apn: Option<String>,
+    sim_pin: Option<String>,
+    roaming: Option<bool>,
+) -> ApiResult<()> {
+    #[derive(serde::Serialize)]
+    struct Body {
+        apn: Option<String>,
+        sim_pin: Option<String>,
+        roaming: Option<bool>,
+    }
+    let resp = Request::post(&format!("/api/senders/{sender_id}/interfaces/{iface}/apn"))
+        .header("Authorization", &auth_header(token))
+        .json(&Body {
+            apn,
+            sim_pin,
+            roaming,
+        })
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
 /// Set receiver config on a sender (proxied to agent).
 pub async fn set_sender_config(
     token: &str,
@@ -428,6 +532,360 @@ pub async fn list_files(
         resp.json::<crate::types::FileBrowserResponse>()
             .await
             .map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+// ── Power Controls ──────────────────────────────────────────────────
+
+/// Send a power command (reboot, shutdown, restart_agent) to a sender.
+pub async fn power_command(token: &str, sender_id: &str, action: &str) -> ApiResult<()> {
+    #[derive(serde::Serialize)]
+    struct Body<'a> {
+        action: &'a str,
+    }
+    let resp = Request::post(&format!("/api/senders/{sender_id}/power"))
+        .header("Authorization", &auth_header(token))
+        .json(&Body { action })
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+// ── Configuration Export/Import ─────────────────────────────────────
+
+/// Export the sender's full configuration as JSON.
+pub async fn export_config(token: &str, sender_id: &str) -> ApiResult<serde_json::Value> {
+    let resp = Request::get(&format!("/api/senders/{sender_id}/config/export"))
+        .header("Authorization", &auth_header(token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Import a configuration JSON to a sender.
+pub async fn import_config(
+    token: &str,
+    sender_id: &str,
+    config: &serde_json::Value,
+) -> ApiResult<()> {
+    let resp = Request::post(&format!("/api/senders/{sender_id}/config/import"))
+        .header("Authorization", &auth_header(token))
+        .json(config)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Set data cap for a cellular interface.
+pub async fn set_data_cap(
+    token: &str,
+    sender_id: &str,
+    iface: &str,
+    cap_mb: Option<u64>,
+) -> ApiResult<()> {
+    #[derive(serde::Serialize)]
+    struct Body {
+        data_cap_mb: Option<u64>,
+    }
+    let resp = Request::post(&format!(
+        "/api/senders/{sender_id}/interfaces/{iface}/data_cap"
+    ))
+    .header("Authorization", &auth_header(token))
+    .json(&Body {
+        data_cap_mb: cap_mb,
+    })
+    .map_err(|e| e.to_string())?
+    .send()
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+// ── Multi-Destination Routing ───────────────────────────────────────
+
+/// Set active destinations for a live stream (fan-out).
+pub async fn set_stream_destinations(
+    token: &str,
+    sender_id: &str,
+    destination_ids: &[String],
+) -> ApiResult<()> {
+    #[derive(serde::Serialize)]
+    struct Body<'a> {
+        destination_ids: &'a [String],
+    }
+    let resp = Request::post(&format!("/api/senders/{sender_id}/stream/destinations"))
+        .header("Authorization", &auth_header(token))
+        .json(&Body { destination_ids })
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+// ── Receiver Jitter Buffer ──────────────────────────────────────────
+
+/// Configure the receiver jitter buffer.
+pub async fn set_jitter_buffer(
+    token: &str,
+    sender_id: &str,
+    mode: &str,
+    static_ms: Option<u32>,
+) -> ApiResult<()> {
+    #[derive(serde::Serialize)]
+    struct Body<'a> {
+        mode: &'a str,
+        static_ms: Option<u32>,
+    }
+    let resp = Request::post(&format!("/api/senders/{sender_id}/stream/jitter_buffer"))
+        .header("Authorization", &auth_header(token))
+        .json(&Body { mode, static_ms })
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+// ── OTA Updates ─────────────────────────────────────────────────────
+
+/// Check for available firmware/software updates.
+pub async fn check_updates(token: &str, sender_id: &str) -> ApiResult<crate::types::UpdateInfo> {
+    let resp = Request::get(&format!("/api/senders/{sender_id}/updates/check"))
+        .header("Authorization", &auth_header(token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Trigger an OTA update on a sender.
+pub async fn trigger_update(token: &str, sender_id: &str) -> ApiResult<()> {
+    let resp = Request::post(&format!("/api/senders/{sender_id}/updates/install"))
+        .header("Authorization", &auth_header(token))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+// ── Diagnostics ─────────────────────────────────────────────────────
+
+/// Fetch live logs from the sender device.
+pub async fn get_logs(
+    token: &str,
+    sender_id: &str,
+    service: Option<&str>,
+    lines: Option<u32>,
+) -> ApiResult<crate::types::LogsResponse> {
+    let mut url = format!("/api/senders/{sender_id}/logs?");
+    if let Some(svc) = service {
+        url.push_str(&format!("service={svc}&"));
+    }
+    if let Some(n) = lines {
+        url.push_str(&format!("lines={n}&"));
+    }
+    let resp = Request::get(&url)
+        .header("Authorization", &auth_header(token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Run a network tool (ping, traceroute, speedtest) on the sender.
+pub async fn run_network_tool(
+    token: &str,
+    sender_id: &str,
+    tool: &str,
+    target: Option<&str>,
+) -> ApiResult<crate::types::NetworkToolResult> {
+    #[derive(serde::Serialize)]
+    struct Body<'a> {
+        tool: &'a str,
+        target: Option<&'a str>,
+    }
+    let resp = Request::post(&format!("/api/senders/{sender_id}/diagnostics/network"))
+        .header("Authorization", &auth_header(token))
+        .json(&Body { tool, target })
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Trigger a PCAP capture on the sender and return the download URL.
+pub async fn capture_pcap(
+    token: &str,
+    sender_id: &str,
+    duration_secs: u32,
+) -> ApiResult<crate::types::PcapResponse> {
+    #[derive(serde::Serialize)]
+    struct Body {
+        duration_secs: u32,
+    }
+    let resp = Request::post(&format!("/api/senders/{sender_id}/diagnostics/pcap"))
+        .header("Authorization", &auth_header(token))
+        .json(&Body { duration_secs })
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+// ── Alerting Rules ──────────────────────────────────────────────────
+
+/// Get alerting rules for a sender.
+pub async fn get_alert_rules(
+    token: &str,
+    sender_id: &str,
+) -> ApiResult<Vec<crate::types::AlertRule>> {
+    let resp = Request::get(&format!("/api/senders/{sender_id}/alerts"))
+        .header("Authorization", &auth_header(token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Create or update an alerting rule.
+pub async fn set_alert_rule(
+    token: &str,
+    sender_id: &str,
+    rule: &crate::types::AlertRule,
+) -> ApiResult<()> {
+    let resp = Request::post(&format!("/api/senders/{sender_id}/alerts"))
+        .header("Authorization", &auth_header(token))
+        .json(rule)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Delete an alerting rule.
+pub async fn delete_alert_rule(token: &str, sender_id: &str, rule_id: &str) -> ApiResult<()> {
+    let resp = Request::delete(&format!("/api/senders/{sender_id}/alerts/{rule_id}"))
+        .header("Authorization", &auth_header(token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+// ── TLS Certificate Management ──────────────────────────────────────
+
+/// Get TLS certificate status for a sender's local portal.
+pub async fn get_tls_status(token: &str, sender_id: &str) -> ApiResult<crate::types::TlsStatus> {
+    let resp = Request::get(&format!("/api/senders/{sender_id}/tls"))
+        .header("Authorization", &auth_header(token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+/// Generate or renew a self-signed TLS certificate.
+pub async fn renew_tls_cert(token: &str, sender_id: &str) -> ApiResult<()> {
+    let resp = Request::post(&format!("/api/senders/{sender_id}/tls/renew"))
+        .header("Authorization", &auth_header(token))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
     } else {
         Err(parse_error(resp).await)
     }

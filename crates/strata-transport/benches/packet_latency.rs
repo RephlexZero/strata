@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use strata_transport::pool::Priority;
 use strata_transport::receiver::{Receiver, ReceiverConfig};
 use strata_transport::sender::{Sender, SenderConfig};

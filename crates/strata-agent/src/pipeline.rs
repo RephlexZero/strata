@@ -36,6 +36,26 @@ pub struct PipelineStopStats {
     pub total_bytes: u64,
 }
 
+/// Send a JSON command string to the pipeline's Unix control socket.
+/// Returns `true` if the message was sent successfully.
+fn send_to_control_socket(msg: &str) -> bool {
+    match std::os::unix::net::UnixStream::connect(CONTROL_SOCK_PATH) {
+        Ok(mut stream) => {
+            use std::io::Write;
+            if let Err(e) = stream.write_all(msg.as_bytes()) {
+                tracing::warn!(error = %e, "failed to send command to pipeline control socket");
+                false
+            } else {
+                true
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to connect to pipeline control socket");
+            false
+        }
+    }
+}
+
 impl PipelineManager {
     pub fn new(simulate: bool) -> Self {
         Self {
@@ -126,8 +146,12 @@ impl PipelineManager {
             // Send SIGINT for graceful EOS shutdown
             #[cfg(unix)]
             {
+                let pid = child.id() as libc::pid_t;
+                // SAFETY: `child.id()` returns the OS process ID of our child.
+                // Sending SIGINT is safe; worst case is a no-op if the process
+                // already exited (kill returns -1 / ESRCH).
                 unsafe {
-                    libc::kill(child.id() as i32, libc::SIGINT);
+                    libc::kill(pid, libc::SIGINT);
                 }
             }
 
@@ -186,19 +210,9 @@ impl PipelineManager {
         }
 
         // Connect to the control socket and send the command
-        match std::os::unix::net::UnixStream::connect(CONTROL_SOCK_PATH) {
-            Ok(mut stream) => {
-                use std::io::Write;
-                let msg = format!("{}\n", cmd);
-                if let Err(e) = stream.write_all(msg.as_bytes()) {
-                    tracing::warn!(error = %e, "failed to send source switch command");
-                } else {
-                    tracing::info!(mode, "source switch command sent");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to connect to pipeline control socket");
-            }
+        let msg = format!("{}\n", cmd);
+        if send_to_control_socket(&msg) {
+            tracing::info!(mode, "source switch command sent");
         }
     }
 
@@ -220,19 +234,9 @@ impl PipelineManager {
             "enabled": enabled,
         });
 
-        match std::os::unix::net::UnixStream::connect(CONTROL_SOCK_PATH) {
-            Ok(mut stream) => {
-                use std::io::Write;
-                let msg = format!("{}\n", cmd);
-                if let Err(e) = stream.write_all(msg.as_bytes()) {
-                    tracing::warn!(error = %e, "failed to send toggle_link command");
-                } else {
-                    tracing::info!(iface, enabled, "toggle_link command sent");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to connect to pipeline control socket");
-            }
+        let msg = format!("{}\n", cmd);
+        if send_to_control_socket(&msg) {
+            tracing::info!(iface, enabled, "toggle_link command sent");
         }
     }
 
@@ -244,22 +248,8 @@ impl PipelineManager {
             tracing::debug!("no pipeline running, skip send_command");
             return false;
         }
-        match std::os::unix::net::UnixStream::connect(CONTROL_SOCK_PATH) {
-            Ok(mut stream) => {
-                use std::io::Write;
-                let msg = format!("{}\n", cmd);
-                if let Err(e) = stream.write_all(msg.as_bytes()) {
-                    tracing::warn!(error = %e, "failed to send command to pipeline");
-                    false
-                } else {
-                    true
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to connect to pipeline control socket");
-                false
-            }
-        }
+        let msg = format!("{}\n", cmd);
+        send_to_control_socket(&msg)
     }
 
     /// Check if the child process has exited unexpectedly.
@@ -377,18 +367,21 @@ fn spawn_strata_node(payload: &StreamStartPayload) -> anyhow::Result<Child> {
     }
 
     // RTMP relay URL — sender tees encoded output to RTMP in parallel
-    if let Some(ref relay) = payload.relay_url {
-        if !relay.is_empty() {
-            cmd.arg("--relay-url").arg(relay);
-        }
+    if let Some(ref relay) = payload.relay_url
+        && !relay.is_empty()
+    {
+        cmd.arg("--relay-url").arg(relay);
     }
 
     // Write bonding config to temp file if non-empty
     if !payload.bonding_config.is_null() {
         let config_path = format!("/tmp/strata-stream-{}.toml", payload.stream_id);
         if let Ok(toml_str) = toml::to_string_pretty(&payload.bonding_config) {
-            let _ = std::fs::write(&config_path, &toml_str);
-            cmd.arg("--config").arg(&config_path);
+            if let Err(e) = std::fs::write(&config_path, &toml_str) {
+                tracing::warn!(error = %e, path = %config_path, "failed to write bonding config");
+            } else {
+                cmd.arg("--config").arg(&config_path);
+            }
         }
     }
 

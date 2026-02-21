@@ -1,4 +1,4 @@
-.PHONY: up down logs clean build ps web-dev
+.PHONY: up down logs clean build ps web-dev web-up
 
 COMPOSE = docker compose -f ../docker-compose.yml
 
@@ -11,9 +11,13 @@ build:
 	$(COMPOSE) build
 
 # Start web dev hot-reload servers (dashboard on :8080, portal on :8081)
-# Edit .rs / .css files and the browser refreshes automatically.
+# First run builds images; subsequent runs reuse cached layers.
 web-dev:
 	$(COMPOSE) --profile web-dev up --build dashboard-dev portal-dev
+
+# Restart web dev servers without rebuilding (fast, reuses existing images)
+web-up:
+	$(COMPOSE) --profile web-dev up dashboard-dev portal-dev
 
 # Stop services (preserves data volume)
 down:

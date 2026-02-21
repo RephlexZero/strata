@@ -161,12 +161,11 @@ mod tests {
                     MessageView::Error(err) => panic!("Pipeline A Error: {}", err.error()),
                     MessageView::Element(m) => {
                         let s = m.structure();
-                        if let Some(name) = s.map(|s| s.name()) {
-                            if name == "strata-stats" {
+                        if let Some(name) = s.map(|s| s.name())
+                            && name == "strata-stats" {
                                 println!("Got Stats: {:?}", s);
                                 stats_found = true;
                             }
-                        }
                     }
                     _ => (),
                 }

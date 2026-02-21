@@ -9,12 +9,12 @@ use crate::protocol::header::BondingHeader;
 use crate::receiver::aggregator::{Packet, ReassemblyBuffer, ReassemblyConfig, ReassemblyStats};
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use quanta::Instant;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -259,11 +259,11 @@ async fn link_reader_async(
                         let _ = socket.send_to(pkt_bytes, addr).await;
                     }
                     // Also generate NACKs for missing packets.
-                    if let Some(nack) = transport_rx.generate_nacks() {
-                        if let Some(addr) = sender_addr {
-                            let pkt_bytes = encode_nack_packet(&nack, &clock);
-                            let _ = socket.send_to(pkt_bytes, addr).await;
-                        }
+                    if let Some(nack) = transport_rx.generate_nacks()
+                        && let Some(addr) = sender_addr
+                    {
+                        let pkt_bytes = encode_nack_packet(&nack, &clock);
+                        let _ = socket.send_to(pkt_bytes, addr).await;
                     }
                     last_ack = std::time::Instant::now();
                 }

@@ -115,17 +115,17 @@ impl IodsScheduler {
         for &(link_id, arrival) in &candidates {
             if arrival >= self.last_scheduled_arrival {
                 // Skip the last-used link if there's a tie to spread load
-                if let Some(last_id) = self.last_link_id {
-                    if link_id == last_id {
-                        // Check if any other candidate has the same arrival
-                        let has_tie = candidates.iter().any(|&(id, arr)| {
-                            id != link_id
-                                && (arr - arrival).abs() < tie_eps
-                                && arr >= self.last_scheduled_arrival
-                        });
-                        if has_tie {
-                            continue;
-                        }
+                if let Some(last_id) = self.last_link_id
+                    && link_id == last_id
+                {
+                    // Check if any other candidate has the same arrival
+                    let has_tie = candidates.iter().any(|&(id, arr)| {
+                        id != link_id
+                            && (arr - arrival).abs() < tie_eps
+                            && arr >= self.last_scheduled_arrival
+                    });
+                    if has_tie {
+                        continue;
                     }
                 }
                 self.last_scheduled_arrival = arrival;
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn predicted_arrival_includes_serialization() {
         let link = make_link(0, 0.010, 1_000_000.0); // 10ms RTT, 1 MBps
-                                                     // 1000 bytes at 1 MBps = 0.001s serialization
+        // 1000 bytes at 1 MBps = 0.001s serialization
         let arrival = link.predicted_arrival(1000);
         assert!(
             (arrival - 0.011).abs() < 0.0001,

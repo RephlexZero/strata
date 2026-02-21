@@ -1,10 +1,10 @@
 //! JWT bearer token extraction for authenticated routes.
 
-use axum::extract::FromRequestParts;
-use axum::http::request::Parts;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum::extract::FromRequestParts;
+use axum::http::StatusCode;
+use axum::http::request::Parts;
+use axum::response::{IntoResponse, Response};
 
 use crate::state::AppState;
 
@@ -12,8 +12,19 @@ use crate::state::AppState;
 /// provides the authenticated user's ID and role.
 pub struct AuthUser {
     pub user_id: String,
-    #[allow(dead_code)] // Field available for future role-based checks (operator/viewer)
     pub role: String,
+}
+
+impl AuthUser {
+    /// Every authenticated user has full access.  Data isolation is
+    /// enforced by `owner_id` WHERE clauses, not role checks.
+    pub fn has_role(&self, _required_role: &str) -> bool {
+        true
+    }
+
+    pub fn require_role(&self, _required_role: &str) -> Result<(), crate::api::auth::ApiError> {
+        Ok(())
+    }
 }
 
 impl<S> FromRequestParts<S> for AuthUser

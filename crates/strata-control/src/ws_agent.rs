@@ -13,8 +13,8 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use chrono::Utc;
-use futures::stream::StreamExt;
 use futures::SinkExt;
+use futures::stream::StreamExt;
 use tokio::sync::mpsc;
 
 use strata_common::auth;
@@ -339,10 +339,10 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
         | "interfaces.scan.response"
         | "interface.command.response"
         | "files.list.response" => {
-            if let Some(request_id) = envelope.payload.get("request_id").and_then(|v| v.as_str()) {
-                if let Some((_, tx)) = state.pending_requests().remove(request_id) {
-                    let _ = tx.send(envelope.payload.clone());
-                }
+            if let Some(request_id) = envelope.payload.get("request_id").and_then(|v| v.as_str())
+                && let Some((_, tx)) = state.pending_requests().remove(request_id)
+            {
+                let _ = tx.send(envelope.payload.clone());
             }
         }
         other => {

@@ -81,6 +81,8 @@ async fn create_destination(
     user: AuthUser,
     Json(body): Json<CreateDestinationRequest>,
 ) -> Result<(StatusCode, Json<CreateDestinationResponse>), ApiError> {
+    user.require_role("admin")?;
+
     let id = ids::destination_id();
 
     sqlx::query(
@@ -117,6 +119,8 @@ async fn update_destination(
     Path(id): Path<String>,
     Json(body): Json<UpdateDestinationRequest>,
 ) -> Result<StatusCode, ApiError> {
+    user.require_role("admin")?;
+
     // Build dynamic UPDATE (only set provided fields)
     let mut sets = Vec::new();
     let mut params: Vec<String> = Vec::new();
@@ -171,6 +175,8 @@ async fn delete_destination(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    user.require_role("admin")?;
+
     let result = sqlx::query("DELETE FROM destinations WHERE id = $1 AND owner_id = $2")
         .bind(&id)
         .bind(&user.user_id)

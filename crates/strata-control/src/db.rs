@@ -1,7 +1,7 @@
 //! Database connection pool and migrations.
 
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 
 /// Connect to PostgreSQL and return a connection pool.
 pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {

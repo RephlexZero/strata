@@ -124,10 +124,10 @@ pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
     // as a fallback using the render_prometheus function for any
     // individual sender that happens to be the only one.
     // For a single-sender deployment, also render the standard flat format.
-    if total_senders == 1 {
-        if let Some(entry) = state.stream_stats().iter().next() {
-            out.push_str(&render_prometheus(&entry.value().links));
-        }
+    if total_senders == 1
+        && let Some(entry) = state.stream_stats().iter().next()
+    {
+        out.push_str(&render_prometheus(&entry.value().links));
     }
 
     (
@@ -167,7 +167,15 @@ mod tests {
                         observed_bps: 3_000_000,
                         signal_dbm: Some(-65),
                         link_kind: Some("cellular".into()),
+                        rsrp: None,
+                        rsrq: None,
+                        sinr: None,
+                        cqi: None,
+                        btlbw_bps: Some(4_500_000),
+                        rtprop_ms: Some(20.0),
                     }],
+                    sender_metrics: None,
+                    receiver_metrics: None,
                 },
             ),
             (
@@ -190,6 +198,12 @@ mod tests {
                             observed_bps: 8_000_000,
                             signal_dbm: None,
                             link_kind: Some("ethernet".into()),
+                            rsrp: None,
+                            rsrq: None,
+                            sinr: None,
+                            cqi: None,
+                            btlbw_bps: Some(9_000_000),
+                            rtprop_ms: Some(8.0),
                         },
                         LinkStats {
                             id: 1,
@@ -202,8 +216,16 @@ mod tests {
                             observed_bps: 0,
                             signal_dbm: Some(-95),
                             link_kind: Some("cellular".into()),
+                            rsrp: None,
+                            rsrq: None,
+                            sinr: None,
+                            cqi: None,
+                            btlbw_bps: None,
+                            rtprop_ms: None,
                         },
                     ],
+                    sender_metrics: None,
+                    receiver_metrics: None,
                 },
             ),
         ];
@@ -281,6 +303,12 @@ mod tests {
             observed_bps: 3_000_000,
             signal_dbm: Some(-65),
             link_kind: Some("cellular".into()),
+            rsrp: None,
+            rsrq: None,
+            sinr: None,
+            cqi: None,
+            btlbw_bps: Some(4_500_000),
+            rtprop_ms: Some(20.0),
         };
         let link_without = LinkStats {
             id: 1,
@@ -293,6 +321,12 @@ mod tests {
             observed_bps: 8_000_000,
             signal_dbm: None,
             link_kind: Some("ethernet".into()),
+            rsrp: None,
+            rsrq: None,
+            sinr: None,
+            cqi: None,
+            btlbw_bps: Some(9_000_000),
+            rtprop_ms: Some(8.0),
         };
 
         let mut out = String::new();

@@ -8,8 +8,8 @@
 //!
 //! The tests create a temporary schema per test run to avoid collisions.
 
-use axum::body::Body;
 use axum::Router;
+use axum::body::Body;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
@@ -586,11 +586,13 @@ async fn users_cannot_see_each_others_senders() {
         .await
         .unwrap();
     let body = json_body(resp).await;
-    assert!(!body
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|s| s["id"] == sender_id));
+    assert!(
+        !body
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == sender_id)
+    );
 
     // User B cannot access it directly
     let resp = app

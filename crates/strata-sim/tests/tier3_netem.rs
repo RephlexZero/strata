@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use strata_sim::impairment::{apply_impairment, ImpairmentConfig};
+use strata_sim::impairment::{ImpairmentConfig, apply_impairment};
 use strata_sim::scenario::{LinkScenarioConfig, Scenario, ScenarioConfig};
 use strata_sim::test_util::check_privileges;
 use strata_sim::topology::Namespace;
@@ -140,11 +140,10 @@ impl StatsCollector {
         let handle = thread::spawn(move || {
             let mut buf = [0u8; 65535];
             while r.load(Ordering::Relaxed) {
-                if let Ok((amt, _)) = socket.recv_from(&mut buf) {
-                    if let Ok(val) = serde_json::from_slice::<Value>(&buf[..amt]) {
+                if let Ok((amt, _)) = socket.recv_from(&mut buf)
+                    && let Ok(val) = serde_json::from_slice::<Value>(&buf[..amt]) {
                         d.lock().unwrap().push(val);
                     }
-                }
             }
         });
 
@@ -997,12 +996,19 @@ fn the_cliff() {
     );
     let mut collector = StatsCollector::new("192.168.210.1:9810");
 
-    let mut sender = spawn_in_ns(&ns_snd.name, bin_str, &[
-        "sender", "--dest",
-        "10.70.1.2:7500?rtt-min=60&buffer=2000,10.70.2.2:7500?rtt-min=60&buffer=2000,10.70.3.2:7500?rtt-min=60&buffer=2000",
-        "--stats-dest", "192.168.210.1:9810",
-        "--bitrate", "15000",
-    ]);
+    let mut sender = spawn_in_ns(
+        &ns_snd.name,
+        bin_str,
+        &[
+            "sender",
+            "--dest",
+            "10.70.1.2:7500?rtt-min=60&buffer=2000,10.70.2.2:7500?rtt-min=60&buffer=2000,10.70.3.2:7500?rtt-min=60&buffer=2000",
+            "--stats-dest",
+            "192.168.210.1:9810",
+            "--bitrate",
+            "15000",
+        ],
+    );
 
     // Stabilize
     thread::sleep(Duration::from_secs(10));

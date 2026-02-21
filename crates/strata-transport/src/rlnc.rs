@@ -152,7 +152,7 @@ impl RlncEncoder {
         }
         self.window.push(WindowSymbol { seq, data });
         if self.window.len() > self.window_size {
-            self.window.remove(0);
+            self.window.remove(0); // VecDeque would be better for large windows
             self.window_start = self.window[0].seq;
         }
     }
@@ -450,13 +450,11 @@ impl RlncDecoder {
             }
             if let Some(prow) = pivot_cols[col] {
                 // Verify this row is fully reduced (only this column is nonzero)
-                let is_unit = matrix[prow].coeffs.iter().enumerate().all(|(j, &c)| {
-                    if j == col {
-                        c == 1
-                    } else {
-                        c == 0
-                    }
-                });
+                let is_unit = matrix[prow]
+                    .coeffs
+                    .iter()
+                    .enumerate()
+                    .all(|(j, &c)| if j == col { c == 1 } else { c == 0 });
                 if is_unit {
                     let data = matrix[prow].data.clone();
                     self.recovered.insert(seq, data.clone());

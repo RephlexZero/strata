@@ -8,10 +8,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 
 use crate::AgentState;
 

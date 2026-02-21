@@ -8,17 +8,23 @@
 //! components are mounted once and survive heartbeat updates (every 5s).
 
 use leptos::prelude::*;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 
+mod cards;
+mod helpers;
+mod tabs;
+
+use crate::AuthState;
 use crate::api;
 use crate::types::{
-    DashboardEvent, EncoderConfigUpdate, FileEntry, LinkStats, MediaInput, NetworkInterface,
-    SenderDetail, SenderFullStatus, SourceSwitchRequest, StreamConfigUpdateRequest, StreamSummary,
+    DashboardEvent, LinkStats, MediaInput, NetworkInterface, SenderDetail, StreamSummary,
     TestRunResponse,
 };
 use crate::ws::WsClient;
-use crate::AuthState;
+
+use helpers::{apply_full_status, format_duration};
+use tabs::{DestinationModal, DiagnosticsTab, NetworkTab, SettingsTab, SourceTab, StreamTab};
 
 // ═══════════════════════════════════════════════════════════════════
 // Page root
@@ -40,7 +46,17 @@ pub fn SenderDetailPage() -> impl IntoView {
     let (live_bitrate, set_live_bitrate) = signal(0u32);
     let (live_uptime, set_live_uptime) = signal(0u64);
     let (live_links, set_live_links) = signal(Vec::<LinkStats>::new());
+    let (live_sender_metrics, set_live_sender_metrics) =
+        signal(Option::<crate::types::TransportSenderMetrics>::None);
+    let (live_receiver_metrics, set_live_receiver_metrics) =
+        signal(Option::<crate::types::TransportReceiverMetrics>::None);
     let (stream_state, set_stream_state) = signal(String::from("idle"));
+    let (active_stream_id, set_active_stream_id) = signal(Option::<String>::None);
+    let (stream_detail, set_stream_detail) = signal(Option::<crate::types::StreamDetail>::None);
+
+    // History for graph
+    let (stats_history, set_stats_history) =
+        signal(std::collections::VecDeque::<(f64, Vec<LinkStats>)>::new());
 
     // Staleness detection
     let (last_stats_ms, set_last_stats_ms) = signal(0.0f64);
@@ -151,6 +167,7 @@ pub fn SenderDetailPage() -> impl IntoView {
                         .or(filtered.first());
                     if let Some(latest) = active {
                         set_stream_state.set(latest.state.clone());
+                        set_active_stream_id.set(Some(latest.id.clone()));
                     }
                     set_streams.set(filtered);
                 }
@@ -175,6 +192,19 @@ pub fn SenderDetailPage() -> impl IntoView {
         }
     });
 
+    let auth_stream_detail = auth.clone();
+    Effect::new(move || {
+        let stream_id = active_stream_id.get();
+        let token = auth_stream_detail.token.get();
+        if let (Some(stream_id), Some(token)) = (stream_id, token) {
+            leptos::task::spawn_local(async move {
+                if let Ok(detail) = api::get_stream(&token, &stream_id).await {
+                    set_stream_detail.set(Some(detail));
+                }
+            });
+        }
+    });
+
     // ── WebSocket events ─────────────────────────────────────────
     Effect::new(move || {
         if let Some(event) = ws.last_event.get() {
@@ -185,14 +215,29 @@ pub fn SenderDetailPage() -> impl IntoView {
                     uptime_s,
                     encoder_bitrate_kbps,
                     links,
+                    sender_metrics,
+                    receiver_metrics,
                     ..
                 } => {
                     if stats_sender_id == sender_id {
                         set_live_bitrate.set(encoder_bitrate_kbps);
                         set_live_uptime.set(uptime_s);
-                        set_live_links.set(links);
-                        set_last_stats_ms.set(js_sys::Date::now());
+                        set_live_links.set(links.clone());
+                        set_live_sender_metrics.set(sender_metrics);
+                        set_live_receiver_metrics.set(receiver_metrics);
+
+                        let now = js_sys::Date::now();
+                        set_last_stats_ms.set(now);
                         set_signal_lost.set(false);
+
+                        set_stats_history.update(|h| {
+                            h.push_back((now, links));
+                            if h.len() > 60 {
+                                // Keep last 60 seconds
+                                h.pop_front();
+                            }
+                        });
+
                         let st = stream_state.get_untracked();
                         if st == "starting" {
                             set_stream_state.set("live".into());
@@ -200,12 +245,16 @@ pub fn SenderDetailPage() -> impl IntoView {
                     }
                 }
                 DashboardEvent::StreamStateChanged {
+                    stream_id,
                     sender_id: sid,
                     state,
                     ..
                 } => {
                     if sid == sender_id {
-                        set_stream_state.set(state);
+                        set_stream_state.set(state.clone());
+                        if state == "starting" || state == "live" {
+                            set_active_stream_id.set(Some(stream_id));
+                        }
                     }
                 }
                 DashboardEvent::SenderStatus {
@@ -444,16 +493,19 @@ pub fn SenderDetailPage() -> impl IntoView {
                             })}
                         </div>
                         {move || {
+                            let auth = auth.clone();
                             if is_live.get() {
+                                let auth = auth.clone();
                                 view! {
-                                    <button class="btn btn-error btn-sm" on:click=stop_stream disabled=move || action_loading.get()>
+                                    <button class="btn btn-error" on:click=stop_stream disabled=move || action_loading.get() || !auth.has_role("operator")>
                                         "Stop Stream"
                                     </button>
                                 }.into_any()
                             } else {
+                                let auth = auth.clone();
                                 view! {
-                                    <button class="btn btn-primary btn-sm" on:click=open_start_modal
-                                        disabled=move || action_loading.get() || !is_online.get()>
+                                    <button class="btn btn-error font-bold" on:click=open_start_modal
+                                        disabled=move || action_loading.get() || !is_online.get() || !auth.has_role("operator")>
                                         "Go Live"
                                     </button>
                                 }.into_any()
@@ -473,6 +525,27 @@ pub fn SenderDetailPage() -> impl IntoView {
                                 {move || signal_lost.get().then(|| view! {
                                     <span class="badge badge-warning badge-sm animate-pulse">"Signal Lost"</span>
                                 })}
+                                {move || {
+                                    let sm = live_sender_metrics.get();
+                                    let rm = live_receiver_metrics.get();
+                                    let mut degraded = false;
+                                    if let Some(s) = sm.as_ref()
+                                        && s.packets_sent > 0
+                                    {
+                                        let pre_fec_loss = (s.retransmissions as f64 / s.packets_sent as f64) * 100.0;
+                                        if pre_fec_loss > 5.0 { degraded = true; }
+                                    }
+                                    if let (Some(s), Some(r)) = (sm.as_ref(), rm.as_ref())
+                                        && s.packets_sent > 0
+                                    {
+                                        let lost = s.packets_sent.saturating_sub(r.packets_delivered);
+                                        let post_fec_loss = (lost as f64 / s.packets_sent as f64) * 100.0;
+                                        if post_fec_loss > 1.0 { degraded = true; }
+                                    }
+                                    degraded.then(|| view! {
+                                        <span class="badge badge-warning badge-sm">"Degraded"</span>
+                                    })
+                                }}
                                 <span class=move || {
                                     let st = stream_state.get();
                                     match st.as_str() {
@@ -511,11 +584,12 @@ pub fn SenderDetailPage() -> impl IntoView {
 
                 // ── Tab bar ──────────────────────────────────────
                 <div role="tablist" class="tabs tabs-bordered mb-4">
-                    {["stream", "source", "network", "settings"].into_iter().map(|tab| {
+                    {["stream", "source", "network", "diagnostics", "settings"].into_iter().map(|tab| {
                         let label = match tab {
                             "stream" => "Stream",
                             "source" => "Source",
                             "network" => "Network",
+                            "diagnostics" => "Diagnostics",
                             "settings" => "Settings",
                             _ => tab,
                         };
@@ -539,7 +613,11 @@ pub fn SenderDetailPage() -> impl IntoView {
                         stream_state=stream_state
                         live_links=live_links
                         live_bitrate=live_bitrate
+                        stats_history=stats_history
+                        sender_metrics=live_sender_metrics
+                        receiver_metrics=live_receiver_metrics
                         sender_id=sender_id_memo
+                        stream_detail=stream_detail
                     />
                 </div>
 
@@ -566,6 +644,11 @@ pub fn SenderDetailPage() -> impl IntoView {
                     />
                 </div>
 
+                // DIAGNOSTICS TAB
+                <div style:display=move || if active_tab.get() == "diagnostics" { "block" } else { "none" }>
+                    <DiagnosticsTab sender_id=sender_id_memo is_online=is_online />
+                </div>
+
                 // SETTINGS TAB
                 <div style:display=move || if active_tab.get() == "settings" { "block" } else { "none" }>
                     <SettingsTab
@@ -590,1268 +673,5 @@ pub fn SenderDetailPage() -> impl IntoView {
                 </div>
             </div>
         </div>
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Destination picker modal
-// ═══════════════════════════════════════════════════════════════════
-
-#[component]
-fn DestinationModal(
-    show: ReadSignal<bool>,
-    set_show: WriteSignal<bool>,
-    destinations: ReadSignal<Vec<crate::types::DestinationSummary>>,
-    selected_dest: ReadSignal<Option<String>>,
-    set_selected_dest: WriteSignal<Option<String>>,
-    dests_loading: ReadSignal<bool>,
-    on_confirm: impl Fn(web_sys::MouseEvent) + 'static + Copy + Send,
-) -> impl IntoView {
-    view! {
-        {move || show.get().then(|| view! {
-            <div class="modal modal-open">
-                <div class="modal-box">
-                    <h3 class="font-bold text-lg">"Start Stream"</h3>
-                    <p class="text-sm text-base-content/60 mt-2">
-                        "Select a destination, or start without one for bonded RIST only."
-                    </p>
-                    <div class="mt-4">
-                        {move || {
-                            if dests_loading.get() {
-                                view! { <p class="text-sm text-base-content/40">"Loading destinations…"</p> }.into_any()
-                            } else {
-                                let dests = destinations.get();
-                                view! {
-                                    <div class="flex flex-col gap-2">
-                                        <label class="flex items-center gap-3 p-3 bg-base-300 rounded cursor-pointer hover:bg-base-content/10 border border-base-300"
-                                            class:border-primary=move || selected_dest.get().is_none()
-                                        >
-                                            <input type="radio" name="destination" class="radio radio-sm radio-primary"
-                                                checked=move || selected_dest.get().is_none()
-                                                on:change=move |_| set_selected_dest.set(None)
-                                            />
-                                            <div>
-                                                <div class="font-medium text-sm">"Bonded RIST Only"</div>
-                                                <div class="text-xs text-base-content/60">"No RTMP relay"</div>
-                                            </div>
-                                        </label>
-                                        {dests.iter().map(|d| {
-                                            let d_id = d.id.clone();
-                                            let d_id2 = d.id.clone();
-                                            let d_id3 = d.id.clone();
-                                            view! {
-                                                <label class="flex items-center gap-3 p-3 bg-base-300 rounded cursor-pointer hover:bg-base-content/10 border border-base-300"
-                                                    class:border-primary=move || selected_dest.get().as_deref() == Some(&d_id2)
-                                                >
-                                                    <input type="radio" name="destination" class="radio radio-sm radio-primary"
-                                                        checked=move || selected_dest.get().as_deref() == Some(&d_id3)
-                                                        on:change=move |_| set_selected_dest.set(Some(d_id.clone()))
-                                                    />
-                                                    <div>
-                                                        <div class="font-medium text-sm">{d.name.clone()}</div>
-                                                        <div class="text-xs text-base-content/60 font-mono">{d.platform.clone()} " · " {d.url.clone()}</div>
-                                                    </div>
-                                                </label>
-                                            }
-                                        }).collect::<Vec<_>>()}
-                                    </div>
-                                }.into_any()
-                            }
-                        }}
-                    </div>
-                    <div class="modal-action">
-                        <button class="btn btn-ghost" on:click=move |_| set_show.set(false)>"Cancel"</button>
-                        <button class="btn btn-primary" on:click=on_confirm disabled=move || dests_loading.get()>"Go Live"</button>
-                    </div>
-                </div>
-                <div class="modal-backdrop" on:click=move |_| set_show.set(false)><button>"close"</button></div>
-            </div>
-        })}
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// STREAM TAB
-// ═══════════════════════════════════════════════════════════════════
-
-#[component]
-fn StreamTab(
-    stream_state: ReadSignal<String>,
-    live_links: ReadSignal<Vec<LinkStats>>,
-    live_bitrate: ReadSignal<u32>,
-    sender_id: Memo<String>,
-) -> impl IntoView {
-    view! {
-        <div>
-            // Link performance cards
-            <div class="card bg-base-200 border border-base-300 mb-4">
-                <div class="card-body">
-                    <h3 class="card-title text-base">"Link Performance"</h3>
-                    {move || {
-                        let st = stream_state.get();
-                        if st != "live" && st != "starting" {
-                            return view! {
-                                <p class="text-sm text-base-content/40">"Start a stream to see link stats"</p>
-                            }.into_any();
-                        }
-
-                        let links = live_links.get();
-                        if links.is_empty() {
-                            return view! {
-                                <p class="text-sm text-base-content/40">"Waiting for link data…"</p>
-                            }.into_any();
-                        }
-
-                        view! {
-                            <div class="grid gap-3 mt-2">
-                                <For
-                                    each=move || live_links.get()
-                                    key=|l| l.id
-                                    children=move |link| {
-                                        let is_down = link.state == "Down" || link.state == "OS Down";
-                                        let state_cls = match link.state.as_str() {
-                                            "Live" => "badge badge-success badge-sm",
-                                            "Probing" => "badge badge-warning badge-sm",
-                                            "Down" | "OS Down" => "badge badge-error badge-sm",
-                                            _ => "badge badge-ghost badge-sm",
-                                        };
-                                        let iface_name = if link.interface.is_empty() || link.interface == "unknown" {
-                                            format!("Link {}", link.id)
-                                        } else {
-                                            link.interface.clone()
-                                        };
-
-                                        view! {
-                                            <div class=if is_down {
-                                                "bg-base-300 rounded-lg p-3 opacity-50"
-                                            } else {
-                                                "bg-base-300 rounded-lg p-3"
-                                            }>
-                                                <div class="flex justify-between items-center mb-2">
-                                                    <div class="flex items-center gap-2">
-                                                        <span class="font-semibold font-mono text-sm">{iface_name}</span>
-                                                        {link.link_kind.as_ref().map(|k| view! {
-                                                            <span class="badge badge-ghost badge-xs">{k.clone()}</span>
-                                                        })}
-                                                    </div>
-                                                    <span class=state_cls>{link.state.clone()}</span>
-                                                </div>
-                                                <div class="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs">
-                                                    <div>
-                                                        <div class="text-base-content/40 uppercase">"RTT"</div>
-                                                        <div class="font-mono font-semibold">{format!("{:.1} ms", link.rtt_ms)}</div>
-                                                    </div>
-                                                    <div>
-                                                        <div class="text-base-content/40 uppercase">"Loss"</div>
-                                                        <div class="font-mono font-semibold">{format!("{:.2}%", link.loss_rate * 100.0)}</div>
-                                                    </div>
-                                                    <div>
-                                                        <div class="text-base-content/40 uppercase">"Throughput"</div>
-                                                        <div class="font-mono font-semibold">{format_bps(link.observed_bps)}</div>
-                                                    </div>
-                                                    <div>
-                                                        <div class="text-base-content/40 uppercase">"Capacity"</div>
-                                                        <div class="font-mono font-semibold">{format_bps(link.capacity_bps)}</div>
-                                                    </div>
-                                                    <div>
-                                                        <div class="text-base-content/40 uppercase">"Sent"</div>
-                                                        <div class="font-mono font-semibold">{format_bytes(link.sent_bytes)}</div>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        }
-                                    }
-                                />
-                            </div>
-                        }.into_any()
-                    }}
-                </div>
-            </div>
-
-            // Encoder controls
-            <LiveSettingsCard sender_id=sender_id stream_state=stream_state live_bitrate=live_bitrate />
-        </div>
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// SOURCE TAB
-// ═══════════════════════════════════════════════════════════════════
-
-#[component]
-fn SourceTab(
-    sender_id: Memo<String>,
-    is_live: Memo<bool>,
-    hw_inputs: ReadSignal<Vec<MediaInput>>,
-) -> impl IntoView {
-    let auth = expect_context::<AuthState>();
-
-    // Source type: "test", "device", "uri"
-    let (source_type, set_source_type) = signal(String::from("test"));
-    let (test_pattern, set_test_pattern) = signal(String::from("smpte"));
-    let (selected_device, set_selected_device) = signal(String::new());
-    let (source_uri, set_source_uri) = signal(String::new());
-    let (switching, set_switching) = signal(false);
-    let (switch_msg, set_switch_msg) = signal(Option::<(String, &'static str)>::None);
-
-    // File browser modal
-    let (show_file_browser, set_show_file_browser) = signal(false);
-    let (browser_path, set_browser_path) = signal(String::new());
-    let (browser_entries, set_browser_entries) = signal(Vec::<FileEntry>::new());
-    let (browser_loading, set_browser_loading) = signal(false);
-    let (browser_error, set_browser_error) = signal(Option::<String>::None);
-
-    // Load directory when browser opens or user navigates
-    let auth_browse = auth.clone();
-    let browse_dir = move |path: Option<String>| {
-        let token = auth_browse.token.get_untracked().unwrap_or_default();
-        let id = sender_id.get_untracked();
-        set_browser_loading.set(true);
-        set_browser_error.set(None);
-        let path_clone = path.clone();
-        leptos::task::spawn_local(async move {
-            match api::list_files(&token, &id, path_clone.as_deref()).await {
-                Ok(resp) => {
-                    set_browser_path.set(resp.path);
-                    set_browser_entries.set(resp.entries);
-                    if let Some(err) = resp.error {
-                        set_browser_error.set(Some(err));
-                    }
-                }
-                Err(e) => set_browser_error.set(Some(e)),
-            }
-            set_browser_loading.set(false);
-        });
-    };
-    let browse_dir2 = browse_dir;
-
-    let do_switch = move |_: web_sys::MouseEvent| {
-        let token = auth.token.get_untracked().unwrap_or_default();
-        let id = sender_id.get_untracked();
-        let stype = source_type.get_untracked();
-        set_switching.set(true);
-        set_switch_msg.set(None);
-
-        let req = match stype.as_str() {
-            "device" => {
-                let dev = selected_device.get_untracked();
-                if dev.is_empty() {
-                    set_switch_msg.set(Some(("Select a device first".into(), "err")));
-                    set_switching.set(false);
-                    return;
-                }
-                SourceSwitchRequest {
-                    mode: "v4l2".into(),
-                    device: Some(dev),
-                    pattern: None,
-                    uri: None,
-                }
-            }
-            "uri" => {
-                let uri = source_uri.get_untracked();
-                if uri.is_empty() {
-                    set_switch_msg.set(Some(("Enter a URI first".into(), "err")));
-                    set_switching.set(false);
-                    return;
-                }
-                SourceSwitchRequest {
-                    mode: "uri".into(),
-                    uri: Some(uri),
-                    pattern: None,
-                    device: None,
-                }
-            }
-            _ => SourceSwitchRequest {
-                mode: "test".into(),
-                pattern: Some(test_pattern.get_untracked()),
-                uri: None,
-                device: None,
-            },
-        };
-
-        leptos::task::spawn_local(async move {
-            match api::switch_source(&token, &id, &req).await {
-                Ok(()) => set_switch_msg.set(Some(("Source switched successfully".into(), "ok"))),
-                Err(e) => set_switch_msg.set(Some((format!("Failed: {e}"), "err"))),
-            }
-            set_switching.set(false);
-        });
-    };
-
-    view! {
-        <div>
-            // Not-live hint
-            <div
-                class="alert alert-info text-sm mb-4"
-                style:display=move || if is_live.get() { "none" } else { "flex" }
-            >
-                "Source switching is available while a stream is running. Start a stream first."
-            </div>
-
-            {move || switch_msg.get().map(|(msg, kind)| {
-                let cls = match kind {
-                    "ok" => "alert alert-success text-sm mb-4",
-                    _ => "alert alert-error text-sm mb-4",
-                };
-                view! { <div class={cls}>{msg}</div> }
-            })}
-
-            // Source type cards — radio selection
-            <div class="grid gap-3 mb-4">
-
-                // ── Test Pattern ──
-                <div
-                    class=move || if source_type.get() == "test" {
-                        "card bg-base-200 border-2 border-primary cursor-pointer"
-                    } else {
-                        "card bg-base-200 border border-base-300 hover:border-base-content/20 cursor-pointer"
-                    }
-                    on:click=move |_| set_source_type.set("test".into())
-                >
-                    <div class="card-body p-4">
-                        <div class="flex items-center gap-3">
-                            <input type="radio" name="source_type" class="radio radio-primary radio-sm"
-                                checked=move || source_type.get() == "test"
-                                on:change=move |_| set_source_type.set("test".into())
-                            />
-                            <div class="flex-1">
-                                <div class="font-semibold text-sm">"Test Pattern"</div>
-                                <div class="text-xs text-base-content/60">"Built-in colour bars, bouncing ball, or noise"</div>
-                            </div>
-                        </div>
-                        <div
-                            class="mt-3 pl-8"
-                            style:display=move || if source_type.get() == "test" { "block" } else { "none" }
-                        >
-                            <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
-                                {[("smpte", "SMPTE Bars", "Classic colour bars"),
-                                  ("ball", "Bouncing Ball", "Moving target for latency"),
-                                  ("snow", "Snow", "Random noise"),
-                                  ("black", "Black", "Solid black frame"),
-                                ].into_iter().map(|(val, name, desc)| {
-                                    view! {
-                                        <label
-                                            class=move || if test_pattern.get() == val {
-                                                "cursor-pointer p-3 rounded-lg text-center border bg-primary/10 border-primary"
-                                            } else {
-                                                "cursor-pointer p-3 rounded-lg text-center border bg-base-300 border-base-300 hover:border-base-content/20"
-                                            }
-                                        >
-                                            <input type="radio" name="test_pattern" class="hidden"
-                                                checked=move || test_pattern.get() == val
-                                                on:change=move |_| set_test_pattern.set(val.into())
-                                            />
-                                            <div class="text-sm font-medium">{name}</div>
-                                            <div class="text-xs text-base-content/50 mt-0.5">{desc}</div>
-                                        </label>
-                                    }
-                                }).collect::<Vec<_>>()}
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                // ── Capture Device ──
-                <div
-                    class=move || if source_type.get() == "device" {
-                        "card bg-base-200 border-2 border-primary cursor-pointer"
-                    } else {
-                        "card bg-base-200 border border-base-300 hover:border-base-content/20 cursor-pointer"
-                    }
-                    on:click=move |_| set_source_type.set("device".into())
-                >
-                    <div class="card-body p-4">
-                        <div class="flex items-center gap-3">
-                            <input type="radio" name="source_type" class="radio radio-primary radio-sm"
-                                checked=move || source_type.get() == "device"
-                                on:change=move |_| set_source_type.set("device".into())
-                            />
-                            <div class="flex-1">
-                                <div class="font-semibold text-sm">"Capture Device"</div>
-                                <div class="text-xs text-base-content/60">"Camera or HDMI capture card (/dev/video*)"</div>
-                            </div>
-                        </div>
-                        <div
-                            class="mt-3 pl-8"
-                            style:display=move || if source_type.get() == "device" { "block" } else { "none" }
-                        >
-                            {move || {
-                                let inputs = hw_inputs.get();
-                                let video_inputs: Vec<_> = inputs.into_iter()
-                                    .filter(|i| i.device.starts_with("/dev/video"))
-                                    .collect();
-
-                                if video_inputs.is_empty() {
-                                    view! {
-                                        <p class="text-sm text-base-content/40">
-                                            "No video capture devices detected on this sender."
-                                        </p>
-                                    }.into_any()
-                                } else {
-                                    view! {
-                                        <div class="flex flex-col gap-2">
-                                            {video_inputs.into_iter().map(|input| {
-                                                let dev = input.device.clone();
-                                                let dev2 = input.device.clone();
-                                                let dev3 = input.device.clone();
-                                                let caps = input.capabilities.join(", ");
-                                                let status_badge = match input.status.as_str() {
-                                                    "available" => "badge badge-success badge-xs",
-                                                    "in_use" => "badge badge-warning badge-xs",
-                                                    _ => "badge badge-ghost badge-xs",
-                                                };
-                                                view! {
-                                                    <label
-                                                        class=move || if selected_device.get() == dev2 {
-                                                            "flex items-center gap-3 p-3 rounded-lg cursor-pointer border bg-primary/10 border-primary"
-                                                        } else {
-                                                            "flex items-center gap-3 p-3 rounded-lg cursor-pointer border bg-base-300 border-base-300 hover:border-base-content/20"
-                                                        }
-                                                    >
-                                                        <input type="radio" name="device" class="radio radio-sm radio-primary"
-                                                            checked=move || selected_device.get() == dev3
-                                                            on:change=move |_| set_selected_device.set(dev.clone())
-                                                        />
-                                                        <div class="flex-1">
-                                                            <div class="flex items-center gap-2">
-                                                                <span class="font-mono text-sm font-medium">{input.device.clone()}</span>
-                                                                <span class=status_badge>{input.status.clone()}</span>
-                                                            </div>
-                                                            <div class="text-xs text-base-content/60">
-                                                                {input.label}
-                                                                {(!caps.is_empty()).then(|| view! { <span>" · " {caps}</span> })}
-                                                            </div>
-                                                        </div>
-                                                    </label>
-                                                }
-                                            }).collect::<Vec<_>>()}
-                                        </div>
-                                    }.into_any()
-                                }
-                            }}
-                        </div>
-                    </div>
-                </div>
-
-                // ── Media File / URI ──
-                <div
-                    class=move || if source_type.get() == "uri" {
-                        "card bg-base-200 border-2 border-primary cursor-pointer"
-                    } else {
-                        "card bg-base-200 border border-base-300 hover:border-base-content/20 cursor-pointer"
-                    }
-                    on:click=move |_| set_source_type.set("uri".into())
-                >
-                    <div class="card-body p-4">
-                        <div class="flex items-center gap-3">
-                            <input type="radio" name="source_type" class="radio radio-primary radio-sm"
-                                checked=move || source_type.get() == "uri"
-                                on:change=move |_| set_source_type.set("uri".into())
-                            />
-                            <div class="flex-1">
-                                <div class="font-semibold text-sm">"Media File / URL"</div>
-                                <div class="text-xs text-base-content/60">"Play a file, HTTP URL, or RTSP stream"</div>
-                            </div>
-                        </div>
-                        <div
-                            class="mt-3 pl-8"
-                            style:display=move || if source_type.get() == "uri" { "block" } else { "none" }
-                        >
-                            <fieldset class="fieldset">
-                                <label class="fieldset-label">"Media URI"</label>
-                                <div class="flex gap-2">
-                                    <input
-                                        type="text"
-                                        class="input input-bordered flex-1"
-                                        placeholder="file:///media/video.mp4 or https://example.com/stream.mp4"
-                                        prop:value=move || source_uri.get()
-                                        on:input=move |ev| set_source_uri.set(event_target_value(&ev))
-                                    />
-                                    <button
-                                        class="btn btn-outline btn-sm self-end mb-0.5"
-                                        type="button"
-                                        on:click=move |_| {
-                                            set_show_file_browser.set(true);
-                                            browse_dir2(None);
-                                        }
-                                    >
-                                        "Browse…"
-                                    </button>
-                                </div>
-                            </fieldset>
-                            <p class="text-xs text-base-content/40 mt-1">
-                                "Supports file://, http://, https://, rtsp://, or any GStreamer-compatible URI. "
-                                "File paths are on the sender device."
-                            </p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            // Apply button
-            <div class="flex justify-end">
-                <button
-                    class="btn btn-primary"
-                    on:click=do_switch
-                    disabled=move || switching.get() || !is_live.get()
-                >
-                    {move || if switching.get() { "Switching…" } else { "Switch Source" }}
-                </button>
-            </div>
-
-            // File browser modal
-            <FileBrowserModal
-                show=show_file_browser
-                set_show=set_show_file_browser
-                path=browser_path
-                entries=browser_entries
-                loading=browser_loading
-                error=browser_error
-                on_navigate=move |p: String| browse_dir(Some(p))
-                on_select=move |p: String| {
-                    set_source_uri.set(format!("file://{p}"));
-                    set_source_type.set("uri".into());
-                    set_show_file_browser.set(false);
-                }
-            />
-        </div>
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// FILE BROWSER MODAL
-// ═══════════════════════════════════════════════════════════════════
-
-#[component]
-fn FileBrowserModal(
-    show: ReadSignal<bool>,
-    set_show: WriteSignal<bool>,
-    path: ReadSignal<String>,
-    entries: ReadSignal<Vec<FileEntry>>,
-    loading: ReadSignal<bool>,
-    error: ReadSignal<Option<String>>,
-    on_navigate: impl Fn(String) + 'static + Clone + Send + Sync,
-    on_select: impl Fn(String) + 'static + Clone + Send + Sync,
-) -> impl IntoView {
-    let on_navigate2 = on_navigate.clone();
-
-    // Navigate up one directory level
-    let go_up = move |_: web_sys::MouseEvent| {
-        let p = path.get_untracked();
-        if let Some(parent) = std::path::Path::new(&p).parent() {
-            on_navigate2(parent.to_string_lossy().into_owned());
-        }
-    };
-
-    view! {
-        // Backdrop
-        <div
-            class="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-            style:display=move || if show.get() { "flex" } else { "none" }
-            on:click=move |ev| {
-                // Close on backdrop click (not when clicking modal content)
-                if let Some(target) = ev.target() {
-                    if let Some(el) = target.dyn_ref::<web_sys::Element>() {
-                        if el.class_list().contains("fixed") {
-                            set_show.set(false);
-                        }
-                    }
-                }
-            }
-        >
-            <div class="card bg-base-100 shadow-xl w-full max-w-lg mx-4">
-                <div class="card-body p-0">
-                    // Header
-                    <div class="flex items-center gap-2 p-4 border-b border-base-300">
-                        <button class="btn btn-ghost btn-sm btn-square" on:click=go_up title="Up">
-                            "\u{2191}"
-                        </button>
-                        <span class="flex-1 font-mono text-sm truncate min-w-0">
-                            {move || if path.get().is_empty() { "/".to_string() } else { path.get() }}
-                        </span>
-                        <button class="btn btn-ghost btn-sm btn-square" on:click=move |_| set_show.set(false)>
-                            "\u{2715}"
-                        </button>
-                    </div>
-
-                    // Body
-                    <div class="overflow-y-auto max-h-80 p-2">
-                        {move || loading.get().then(||
-                            view! { <div class="flex justify-center py-8"><span class="loading loading-spinner"/></div> }
-                        )}
-                        {move || error.get().map(|e|
-                            view! { <div class="alert alert-error text-sm m-2">{e}</div> }
-                        )}
-                        {move || {
-                            let nav = on_navigate.clone();
-                            let sel = on_select.clone();
-                            let items = entries.get();
-                            if !loading.get() && items.is_empty() && error.get().is_none() {
-                                return view! { <p class="text-sm text-base-content/40 p-4 text-center">"Directory is empty"</p> }.into_any();
-                            }
-                            view! {
-                                <div class="flex flex-col">
-                                    {items.into_iter().map(|entry| {
-                                        let nav = nav.clone();
-                                        let sel = sel.clone();
-                                        let p = entry.path.clone();
-                                        let p2 = entry.path.clone();
-                                        let is_dir = entry.is_dir;
-                                        let size_str = entry.size.map(|s| {
-                                            if s >= 1_073_741_824 { format!("{:.1} GB", s as f64 / 1_073_741_824.0) }
-                                            else if s >= 1_048_576 { format!("{:.1} MB", s as f64 / 1_048_576.0) }
-                                            else if s >= 1_024 { format!("{:.1} KB", s as f64 / 1_024.0) }
-                                            else { format!("{s} B") }
-                                        });
-                                        view! {
-                                            <button
-                                                class="flex items-center gap-3 px-3 py-2 hover:bg-base-200 rounded text-left w-full"
-                                                on:click=move |_| {
-                                                    if is_dir {
-                                                        nav(p.clone());
-                                                    } else {
-                                                        sel(p2.clone());
-                                                    }
-                                                }
-                                            >
-                                                <span class="text-lg shrink-0">
-                                                    {if is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" }}
-                                                </span>
-                                                <span class="flex-1 font-mono text-sm truncate">{entry.name}</span>
-                                                {size_str.map(|s| view! {
-                                                    <span class="text-xs text-base-content/40 shrink-0">{s}</span>
-                                                })}
-                                            </button>
-                                        }
-                                    }).collect::<Vec<_>>()}
-                                </div>
-                            }.into_any()
-                        }}
-                    </div>
-
-                    // Footer
-                    <div class="flex justify-end gap-2 p-3 border-t border-base-300">
-                        <button class="btn btn-ghost btn-sm" on:click=move |_| set_show.set(false)>
-                            "Cancel"
-                        </button>
-                    </div>
-                </div>
-            </div>
-        </div>
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// NETWORK TAB
-// ═══════════════════════════════════════════════════════════════════
-
-#[component]
-fn NetworkTab(
-    sender_id: Memo<String>,
-    interfaces: ReadSignal<Vec<NetworkInterface>>,
-    is_online: Memo<bool>,
-    iface_loading: ReadSignal<Option<String>>,
-    set_iface_loading: WriteSignal<Option<String>>,
-    scan_msg: ReadSignal<Option<(String, &'static str)>>,
-    set_scan_msg: WriteSignal<Option<(String, &'static str)>>,
-    set_error: WriteSignal<Option<String>>,
-) -> impl IntoView {
-    let auth = expect_context::<AuthState>();
-
-    let auth_scan = auth.clone();
-    let do_scan = move |_| {
-        let token = auth_scan.token.get_untracked().unwrap_or_default();
-        let id = sender_id.get_untracked();
-        set_scan_msg.set(Some(("Scanning…".into(), "info")));
-        leptos::task::spawn_local(async move {
-            match api::scan_sender_interfaces(&token, &id).await {
-                Ok(r) => {
-                    if r.discovered.is_empty() {
-                        set_scan_msg.set(Some((
-                            format!("No new interfaces found. {} total.", r.total),
-                            "info",
-                        )));
-                    } else {
-                        set_scan_msg.set(Some((
-                            format!(
-                                "Found {} new: {}",
-                                r.discovered.len(),
-                                r.discovered.join(", ")
-                            ),
-                            "ok",
-                        )));
-                    }
-                }
-                Err(e) => set_scan_msg.set(Some((format!("Scan failed: {e}"), "err"))),
-            }
-        });
-    };
-
-    view! {
-        <div>
-            <div class="flex justify-between items-center mb-3">
-                <div class="flex items-center gap-2">
-                    <h3 class="text-lg font-semibold">"Network Interfaces"</h3>
-                    <span class="badge badge-ghost badge-sm">
-                        {move || interfaces.get().len()} " total"
-                    </span>
-                </div>
-                <button class="btn btn-ghost btn-sm" on:click=do_scan
-                    disabled=move || !is_online.get()
-                >
-                    "Scan for New"
-                </button>
-            </div>
-
-            {move || scan_msg.get().map(|(msg, kind)| {
-                let cls = match kind {
-                    "ok" => "alert alert-success text-sm mb-3",
-                    "err" => "alert alert-error text-sm mb-3",
-                    _ => "alert alert-info text-sm mb-3",
-                };
-                view! { <div class={cls}>{msg}</div> }
-            })}
-
-            {move || {
-                let ifaces = interfaces.get();
-                if ifaces.is_empty() {
-                    return view! {
-                        <p class="text-sm text-base-content/40">"No interface data — sender may be offline"</p>
-                    }.into_any();
-                }
-
-                view! {
-                    <div class="grid gap-2">
-                        {ifaces.into_iter().map(|iface| {
-                            let name = iface.name.clone();
-                            let name_toggle = iface.name.clone();
-                            let auth = auth.clone();
-                            let enabled = iface.enabled;
-                            let connected = iface.state == "connected";
-
-                            let (badge_cls, label) = if !enabled {
-                                ("badge badge-error badge-sm", "Disabled")
-                            } else if connected {
-                                ("badge badge-success badge-sm", "Up")
-                            } else {
-                                ("badge badge-ghost badge-sm", "Down")
-                            };
-
-                            let type_icon = match iface.iface_type.as_str() {
-                                "cellular" => "📶",
-                                "wifi" => "📡",
-                                _ => "🔌",
-                            };
-
-                            let mut meta = vec![format!("{type_icon} {}", iface.iface_type)];
-                            if let Some(t) = &iface.technology { meta.push(t.clone()); }
-                            if let Some(c) = &iface.carrier { meta.push(c.clone()); }
-                            if let Some(db) = iface.signal_dbm { meta.push(format!("{db} dBm")); }
-                            if let Some(ip) = &iface.ip { meta.push(ip.clone()); }
-
-                            let toggle = move |_| {
-                                let sid = sender_id.get_untracked();
-                                let iface_name = name_toggle.clone();
-                                let token = auth.token.get_untracked().unwrap_or_default();
-                                set_iface_loading.set(Some(iface_name.clone()));
-                                leptos::task::spawn_local(async move {
-                                    let result = if enabled {
-                                        api::disable_interface(&token, &sid, &iface_name).await
-                                    } else {
-                                        api::enable_interface(&token, &sid, &iface_name).await
-                                    };
-                                    if let Err(e) = result {
-                                        set_error.set(Some(e));
-                                    }
-                                    set_iface_loading.set(None);
-                                });
-                            };
-
-                            let is_loading = {
-                                let n = iface.name.clone();
-                                move || iface_loading.get().as_deref() == Some(&n)
-                            };
-                            let is_loading2 = {
-                                let n = iface.name.clone();
-                                move || iface_loading.get().as_deref() == Some(&n)
-                            };
-
-                            view! {
-                                <div class=if enabled {
-                                    "flex items-center justify-between p-3 bg-base-200 rounded-lg border border-base-300"
-                                } else {
-                                    "flex items-center justify-between p-3 bg-base-200 rounded-lg border border-base-300 opacity-50"
-                                }>
-                                    <div class="flex items-center gap-3">
-                                        <input
-                                            type="checkbox"
-                                            class=move || if is_loading() { "toggle toggle-success toggle-sm animate-pulse" } else { "toggle toggle-success toggle-sm" }
-                                            checked=enabled
-                                            on:change=toggle
-                                            disabled=move || is_loading2() || !is_online.get()
-                                        />
-                                        <div>
-                                            <span class="font-semibold font-mono text-sm">{name}</span>
-                                            <div class="flex gap-2 text-xs text-base-content/60">
-                                                {meta.into_iter().map(|p| view! {
-                                                    <span>{p}</span>
-                                                }).collect::<Vec<_>>()}
-                                            </div>
-                                        </div>
-                                    </div>
-                                    <span class=badge_cls>{label}</span>
-                                </div>
-                            }
-                        }).collect::<Vec<_>>()}
-                    </div>
-                }.into_any()
-            }}
-        </div>
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// SETTINGS TAB
-// ═══════════════════════════════════════════════════════════════════
-
-#[component]
-fn SettingsTab(
-    sender_id: Memo<String>,
-    is_online: Memo<bool>,
-    is_enrolled: Memo<bool>,
-    receiver_input: ReadSignal<String>,
-    set_receiver_input: WriteSignal<String>,
-    hw_receiver_url: ReadSignal<Option<String>>,
-    config_msg: ReadSignal<Option<(String, &'static str)>>,
-    save_config: impl Fn(web_sys::MouseEvent) + 'static + Copy + Send,
-    test_loading: ReadSignal<bool>,
-    test_result: ReadSignal<Option<TestRunResponse>>,
-    run_test: impl Fn(web_sys::MouseEvent) + 'static + Copy + Send,
-    unenroll_token: ReadSignal<Option<String>>,
-    show_unenroll_confirm: ReadSignal<bool>,
-    set_show_unenroll_confirm: WriteSignal<bool>,
-    do_unenroll: impl Fn(web_sys::MouseEvent) + 'static + Copy + Send,
-    action_loading: ReadSignal<bool>,
-    sender: ReadSignal<Option<SenderDetail>>,
-) -> impl IntoView {
-    view! {
-        <div class="flex flex-col gap-4">
-            // ── Receiver Config ──
-            <div class="card bg-base-200 border border-base-300">
-                <div class="card-body">
-                    <h3 class="card-title text-base">"Receiver Configuration"</h3>
-
-                    {move || config_msg.get().map(|(msg, kind)| {
-                        let cls = match kind {
-                            "ok" => "alert alert-success text-sm",
-                            "err" => "alert alert-error text-sm",
-                            _ => "alert alert-info text-sm",
-                        };
-                        view! { <div class={cls}>{msg}</div> }
-                    })}
-
-                    <p class="text-sm text-base-content/60 mb-3">
-                        "RIST receiver address for bonded transport."
-                    </p>
-
-                    <div class="flex gap-3 items-end">
-                        <fieldset class="fieldset flex-1">
-                            <label class="fieldset-label">"Receiver URL"</label>
-                            <input
-                                class="input input-bordered w-full"
-                                type="text"
-                                placeholder="receiver.example.com:5000"
-                                prop:value=move || receiver_input.get()
-                                disabled=move || !is_online.get()
-                                on:input=move |ev| set_receiver_input.set(event_target_value(&ev))
-                            />
-                        </fieldset>
-                        <button class="btn btn-primary" on:click=save_config disabled=move || !is_online.get()>
-                            "Save"
-                        </button>
-                    </div>
-
-                    {move || {
-                        let url = hw_receiver_url.get();
-                        view! {
-                            <p class="mt-2 text-xs text-base-content/40 font-mono">
-                                {url.map(|u| format!("Current: {u}")).unwrap_or_else(|| "No receiver configured".into())}
-                            </p>
-                        }
-                    }}
-                </div>
-            </div>
-
-            // ── Connectivity Test ──
-            <div class="card bg-base-200 border border-base-300">
-                <div class="card-body">
-                    <div class="flex justify-between items-center">
-                        <h3 class="card-title text-base">"Connectivity Test"</h3>
-                        <button
-                            class="btn btn-ghost btn-sm"
-                            on:click=run_test
-                            disabled=move || test_loading.get() || !is_online.get()
-                        >
-                            {move || if test_loading.get() { "Testing…" } else { "Run Test" }}
-                        </button>
-                    </div>
-                    {move || test_result.get().map(|r| view! {
-                        <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mt-3">
-                            <div class="bg-base-300 rounded p-3">
-                                <div class="text-xs text-base-content/40 uppercase">"Cloud"</div>
-                                <div class=if r.cloud_reachable { "font-semibold font-mono text-success text-sm" } else { "font-semibold font-mono text-error text-sm" }>
-                                    {if r.cloud_reachable { "Reachable" } else { "Unreachable" }}
-                                </div>
-                            </div>
-                            <div class="bg-base-300 rounded p-3">
-                                <div class="text-xs text-base-content/40 uppercase">"WebSocket"</div>
-                                <div class=if r.cloud_connected { "font-semibold font-mono text-success text-sm" } else { "font-semibold font-mono text-error text-sm" }>
-                                    {if r.cloud_connected { "Connected" } else { "Disconnected" }}
-                                </div>
-                            </div>
-                            <div class="bg-base-300 rounded p-3">
-                                <div class="text-xs text-base-content/40 uppercase">"Receiver"</div>
-                                <div class=if r.receiver_reachable {
-                                    "font-semibold font-mono text-success text-sm"
-                                } else if r.receiver_url.is_some() {
-                                    "font-semibold font-mono text-error text-sm"
-                                } else {
-                                    "font-semibold font-mono text-base-content/40 text-sm"
-                                }>
-                                    {if r.receiver_url.is_some() {
-                                        if r.receiver_reachable { "Reachable" } else { "Unreachable" }
-                                    } else {
-                                        "Not configured"
-                                    }}
-                                </div>
-                            </div>
-                            <div class="bg-base-300 rounded p-3">
-                                <div class="text-xs text-base-content/40 uppercase">"Enrolled"</div>
-                                <div class=if r.enrolled { "font-semibold font-mono text-success text-sm" } else { "font-semibold font-mono text-base-content/40 text-sm" }>
-                                    {if r.enrolled { "Yes" } else { "No" }}
-                                </div>
-                            </div>
-                        </div>
-                        {r.control_url.as_ref().map(|url| view! {
-                            <p class="text-xs text-base-content/40 mt-2 font-mono">"Control: " {url.clone()}</p>
-                        })}
-                        {r.receiver_url.as_ref().map(|url| view! {
-                            <p class="text-xs text-base-content/40 mt-1 font-mono">"Receiver: " {url.clone()}</p>
-                        })}
-                    })}
-                </div>
-            </div>
-
-            // ── Device Details ──
-            <div class="card bg-base-200 border border-base-300">
-                <div class="card-body">
-                    <h3 class="card-title text-base">"Device Details"</h3>
-                    <div class="overflow-x-auto">
-                        <table class="table table-sm">
-                            <tbody>
-                                <tr>
-                                    <td class="text-base-content/60 w-36">"ID"</td>
-                                    <td><code class="text-xs font-mono">{move || sender_id.get()}</code></td>
-                                </tr>
-                                <tr>
-                                    <td class="text-base-content/60">"Enrolled"</td>
-                                    <td>{move || if is_enrolled.get() { "Yes" } else { "No" }}</td>
-                                </tr>
-                                <tr>
-                                    <td class="text-base-content/60">"Created"</td>
-                                    <td>{move || sender.get().map(|s| s.created_at.clone()).unwrap_or_default()}</td>
-                                </tr>
-                                <tr>
-                                    <td class="text-base-content/60">"Last seen"</td>
-                                    <td>{move || sender.get().and_then(|s| s.last_seen_at.clone()).unwrap_or_else(|| "Never".into())}</td>
-                                </tr>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-
-            // ── Danger Zone ──
-            <div class="card bg-base-200 border border-error">
-                <div class="card-body">
-                    <h3 class="card-title text-base text-error">"Danger Zone"</h3>
-
-                    {move || unenroll_token.get().map(|token| view! {
-                        <div class="bg-base-300 rounded-lg p-4 mb-3">
-                            <p class="text-success mb-2">"Sender unenrolled. New enrollment token:"</p>
-                            <code class="text-lg tracking-widest">{token}</code>
-                        </div>
-                    })}
-
-                    <div class="flex items-center justify-between">
-                        <div>
-                            <p class="font-medium">"Unenroll Sender"</p>
-                            <p class="text-sm text-base-content/60 mt-1">
-                                "Disconnects and resets enrollment. A new token will be issued."
-                            </p>
-                        </div>
-                        {move || {
-                            let enrolled = is_enrolled.get();
-                            if !enrolled && unenroll_token.get().is_none() {
-                                view! {
-                                    <button class="btn btn-disabled" disabled=true>"Not Enrolled"</button>
-                                }.into_any()
-                            } else if show_unenroll_confirm.get() {
-                                view! {
-                                    <div class="flex gap-2">
-                                        <button class="btn btn-error" on:click=do_unenroll disabled=move || action_loading.get()>
-                                            "Confirm"
-                                        </button>
-                                        <button class="btn btn-ghost" on:click=move |_| set_show_unenroll_confirm.set(false)>
-                                            "Cancel"
-                                        </button>
-                                    </div>
-                                }.into_any()
-                            } else {
-                                view! {
-                                    <button class="btn btn-error" on:click=move |_| set_show_unenroll_confirm.set(true) disabled=move || action_loading.get()>
-                                        "Unenroll"
-                                    </button>
-                                }.into_any()
-                            }
-                        }}
-                    </div>
-                </div>
-            </div>
-        </div>
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// LIVE SETTINGS (encoder controls)
-// ═══════════════════════════════════════════════════════════════════
-
-#[component]
-fn LiveSettingsCard(
-    sender_id: Memo<String>,
-    stream_state: ReadSignal<String>,
-    live_bitrate: ReadSignal<u32>,
-) -> impl IntoView {
-    let auth = expect_context::<AuthState>();
-
-    let (manual_mode, set_manual_mode) = signal(false);
-    let (custom_bitrate, set_custom_bitrate) = signal(2500u32);
-    let (tune, set_tune) = signal(String::from("zerolatency"));
-    let (applying, set_applying) = signal(false);
-    let (apply_msg, set_apply_msg) = signal(Option::<(String, &'static str)>::None);
-
-    let toggle_manual = move |_| {
-        let entering = !manual_mode.get_untracked();
-        if entering {
-            let current = live_bitrate.get_untracked();
-            if current > 0 {
-                set_custom_bitrate.set(current);
-            }
-        }
-        set_manual_mode.set(entering);
-    };
-
-    let do_apply = move |_: web_sys::MouseEvent| {
-        let token = auth.token.get_untracked().unwrap_or_default();
-        let id = sender_id.get_untracked();
-        set_applying.set(true);
-        set_apply_msg.set(None);
-
-        let br = if manual_mode.get_untracked() {
-            Some(custom_bitrate.get_untracked())
-        } else {
-            None
-        };
-
-        let req = StreamConfigUpdateRequest {
-            encoder: Some(EncoderConfigUpdate {
-                bitrate_kbps: br,
-                tune: Some(tune.get_untracked()),
-                ..Default::default()
-            }),
-            scheduler: None,
-        };
-
-        leptos::task::spawn_local(async move {
-            match api::update_stream_config(&token, &id, &req).await {
-                Ok(()) => set_apply_msg.set(Some(("Applied".into(), "ok"))),
-                Err(e) => set_apply_msg.set(Some((format!("Failed: {e}"), "err"))),
-            }
-            set_applying.set(false);
-        });
-    };
-
-    view! {
-        <div
-            class="card bg-base-200 border border-base-300"
-            style:display=move || {
-                let st = stream_state.get();
-                if st == "live" || st == "starting" { "block" } else { "none" }
-            }
-        >
-            <div class="card-body">
-                <div class="flex justify-between items-center">
-                    <h3 class="card-title text-base">"Encoder Settings"</h3>
-                    <span class="badge badge-ghost badge-sm">"Hot Reconfig"</span>
-                </div>
-
-                {move || apply_msg.get().map(|(msg, kind)| {
-                    let cls = match kind {
-                        "ok" => "alert alert-success text-sm mt-2",
-                        _ => "alert alert-error text-sm mt-2",
-                    };
-                    view! { <div class={cls}>{msg}</div> }
-                })}
-
-                <div class="mt-3 flex flex-col gap-4">
-                    <div class="bg-base-300 rounded-lg p-4">
-                        <div class="flex justify-between items-center">
-                            <div>
-                                <div class="text-xs text-base-content/40 uppercase tracking-wide">"Current Encoder Bitrate"</div>
-                                <div class="text-2xl font-mono font-bold mt-1">
-                                    {move || live_bitrate.get()}
-                                    <span class="text-sm text-base-content/60 font-normal">" kbps"</span>
-                                </div>
-                            </div>
-                            <label class="flex items-center gap-2 cursor-pointer">
-                                <span class="text-sm text-base-content/60">"Manual Override"</span>
-                                <input
-                                    type="checkbox"
-                                    class="toggle toggle-sm toggle-primary"
-                                    prop:checked=move || manual_mode.get()
-                                    on:change=toggle_manual
-                                />
-                            </label>
-                        </div>
-                    </div>
-
-                    <div style:display=move || if manual_mode.get() { "block" } else { "none" }>
-                        <fieldset class="fieldset">
-                            <label class="fieldset-label">"Target Bitrate (kbps)"</label>
-                            <div class="flex items-center gap-3">
-                                <input
-                                    type="range" class="range range-sm range-primary flex-1"
-                                    min="500" max="15000" step="100"
-                                    prop:value=move || custom_bitrate.get().to_string()
-                                    on:input=move |ev| {
-                                        if let Ok(v) = event_target_value(&ev).parse::<u32>() {
-                                            set_custom_bitrate.set(v);
-                                        }
-                                    }
-                                />
-                                <input
-                                    type="number" class="input input-bordered input-sm w-24 font-mono text-right"
-                                    min="500" max="15000" step="100"
-                                    prop:value=move || custom_bitrate.get().to_string()
-                                    on:input=move |ev| {
-                                        if let Ok(v) = event_target_value(&ev).parse::<u32>() {
-                                            set_custom_bitrate.set(v.clamp(500, 15000));
-                                        }
-                                    }
-                                />
-                            </div>
-                            <div class="flex justify-between text-xs text-base-content/40 mt-0.5">
-                                <span>"500"</span>
-                                <span>"15,000"</span>
-                            </div>
-                        </fieldset>
-                    </div>
-
-                    <fieldset class="fieldset">
-                        <label class="fieldset-label">"Tune Preset"</label>
-                        <select
-                            class="select select-bordered select-sm w-full max-w-xs"
-                            on:change=move |ev| set_tune.set(event_target_value(&ev))
-                        >
-                            <option value="zerolatency" selected=move || tune.get() == "zerolatency">"Zero Latency"</option>
-                            <option value="fastdecode" selected=move || tune.get() == "fastdecode">"Fast Decode"</option>
-                            <option value="film" selected=move || tune.get() == "film">"Film"</option>
-                            <option value="animation" selected=move || tune.get() == "animation">"Animation"</option>
-                            <option value="stillimage" selected=move || tune.get() == "stillimage">"Still Image"</option>
-                        </select>
-                    </fieldset>
-
-                    <p class="text-xs text-base-content/40">
-                        "FEC and scheduling are managed automatically."
-                    </p>
-                </div>
-
-                <div class="card-actions justify-end mt-3">
-                    <button
-                        class="btn btn-primary btn-sm"
-                        on:click=do_apply
-                        disabled=move || applying.get()
-                    >
-                        {move || if applying.get() { "Applying…" } else { "Apply" }}
-                    </button>
-                </div>
-            </div>
-        </div>
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Helpers
-// ═══════════════════════════════════════════════════════════════════
-
-fn apply_full_status(
-    status: &SenderFullStatus,
-    set_ifaces: &WriteSignal<Vec<NetworkInterface>>,
-    set_inputs: &WriteSignal<Vec<MediaInput>>,
-    set_cpu: &WriteSignal<Option<f32>>,
-    set_mem: &WriteSignal<Option<u32>>,
-    set_uptime: &WriteSignal<Option<u64>>,
-    set_receiver_url: &WriteSignal<Option<String>>,
-) {
-    if let Some(ifaces) = &status.network_interfaces {
-        set_ifaces.set(ifaces.clone());
-    }
-    if let Some(inputs) = &status.media_inputs {
-        set_inputs.set(inputs.clone());
-    }
-    if status.cpu_percent.is_some() {
-        set_cpu.set(status.cpu_percent);
-    }
-    if status.mem_used_mb.is_some() {
-        set_mem.set(status.mem_used_mb);
-    }
-    if status.uptime_s.is_some() {
-        set_uptime.set(status.uptime_s);
-    }
-    if status.receiver_url.is_some() {
-        set_receiver_url.set(status.receiver_url.clone());
-    }
-}
-
-fn format_duration(secs: u64) -> String {
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
-    } else {
-        format!("{m}:{s:02}")
-    }
-}
-
-fn format_bps(bps: u64) -> String {
-    if bps >= 1_000_000 {
-        format!("{:.1} Mbps", bps as f64 / 1_000_000.0)
-    } else if bps >= 1_000 {
-        format!("{:.0} kbps", bps as f64 / 1_000.0)
-    } else {
-        format!("{bps} bps")
-    }
-}
-
-fn format_bytes(b: u64) -> String {
-    if b >= 1_073_741_824 {
-        format!("{:.1} GB", b as f64 / 1_073_741_824.0)
-    } else if b >= 1_048_576 {
-        format!("{:.1} MB", b as f64 / 1_048_576.0)
-    } else if b >= 1024 {
-        format!("{:.0} KB", b as f64 / 1024.0)
-    } else {
-        format!("{b} B")
     }
 }

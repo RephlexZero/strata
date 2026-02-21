@@ -327,41 +327,40 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         // Sort by quality score descending
         scored_links.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Select up to N links, preferring diversity
+        // First pass: select diverse links (one per link_kind)
         for (id, _score, link_kind) in &scored_links {
             if selected.len() >= n {
                 break;
             }
 
-            // Diversity preference: prefer new link_kind if we have multiple links
             let is_diverse = match link_kind {
                 None => true, // Unknown kind is always considered diverse
                 Some(kind) => !used_kinds.contains(kind.as_str()),
             };
 
-            // Always select if we haven't reached N, but prefer diverse links first
-            if is_diverse || selected.len() < n {
-                if let Some(state) = self.links.get_mut(id) {
-                    state.credits -= packet_cost;
-                    selected.push(state.link.clone());
-                    if let Some(kind) = link_kind {
-                        used_kinds.insert(kind.clone());
-                    }
+            // In this pass, only pick links that add diversity
+            if is_diverse && let Some(state) = self.links.get_mut(id) {
+                state.credits -= packet_cost;
+                selected.push(state.link.clone());
+                if let Some(kind) = link_kind {
+                    used_kinds.insert(kind.clone());
                 }
             }
         }
 
         // If we couldn't get N diverse links, fill with remaining best quality links
         if selected.len() < n {
+            let selected_ids: std::collections::HashSet<usize> =
+                selected.iter().map(|l| l.id()).collect();
             for (id, _score, _) in &scored_links {
                 if selected.len() >= n {
                     break;
                 }
-                if !selected.iter().any(|l| l.id() == *id) {
-                    if let Some(state) = self.links.get_mut(id) {
-                        state.credits -= packet_cost;
-                        selected.push(state.link.clone());
-                    }
+                if !selected_ids.contains(id)
+                    && let Some(state) = self.links.get_mut(id)
+                {
+                    state.credits -= packet_cost;
+                    selected.push(state.link.clone());
                 }
             }
         }
@@ -462,19 +461,20 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         let mut max_creds = f64::MIN;
 
         for &id in &self.sorted_ids {
-            if let Some(state) = self.links.get(&id) {
-                if (state.metrics.alive || !any_alive) && state.credits > max_creds {
-                    max_creds = state.credits;
-                    best_id = Some(id);
-                }
+            if let Some(state) = self.links.get(&id)
+                && (state.metrics.alive || !any_alive)
+                && state.credits > max_creds
+            {
+                max_creds = state.credits;
+                best_id = Some(id);
             }
         }
 
-        if let Some(id) = best_id {
-            if let Some(state) = self.links.get_mut(&id) {
-                state.credits -= packet_cost; // Goes negative
-                return Some(state.link.clone());
-            }
+        if let Some(id) = best_id
+            && let Some(state) = self.links.get_mut(&id)
+        {
+            state.credits -= packet_cost; // Goes negative
+            return Some(state.link.clone());
         }
 
         None

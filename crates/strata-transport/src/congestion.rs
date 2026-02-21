@@ -31,6 +31,7 @@
 //! Radio feed-forward adds SINR→capacity ceiling and CQI derivative tracking.
 
 use quanta::Instant;
+use std::collections::VecDeque;
 use std::time::Duration;
 
 // ─── Biscay State ───────────────────────────────────────────────────────────
@@ -96,13 +97,13 @@ pub struct BiscayController {
 
     // ─── Bandwidth tracking ───
     /// Recent bandwidth samples for BtlBw estimation.
-    bw_samples: Vec<f64>,
+    bw_samples: VecDeque<f64>,
     /// Max samples to keep.
     max_bw_samples: usize,
 
     // ─── RTT tracking ───
     /// Recent RTT samples (µs) for RTprop estimation.
-    rtt_samples: Vec<f64>,
+    rtt_samples: VecDeque<f64>,
     /// When RTprop was last updated.
     rt_prop_stamp: Instant,
     /// RTprop expiry — probe RTT if this old.
@@ -110,9 +111,9 @@ pub struct BiscayController {
 
     // ─── Radio state ───
     /// CQI history for derivative tracking.
-    cqi_history: Vec<(Instant, u8)>,
+    cqi_history: VecDeque<(Instant, u8)>,
     /// RSRP history for slope tracking.
-    rsrp_history: Vec<(Instant, f64)>,
+    rsrp_history: VecDeque<(Instant, f64)>,
     /// SINR → capacity ceiling (kbps).
     sinr_capacity_ceiling: Option<f64>,
     /// Number of consecutive CQI drops.
@@ -147,15 +148,15 @@ impl BiscayController {
             pacing_rate: 100_000.0, // 100 KB/s initial (conservative)
             cwnd: 14_000.0,         // ~10 packets initial window
 
-            bw_samples: Vec::with_capacity(16),
+            bw_samples: VecDeque::with_capacity(16),
             max_bw_samples: 16,
 
-            rtt_samples: Vec::with_capacity(32),
+            rtt_samples: VecDeque::with_capacity(32),
             rt_prop_stamp: now,
             rt_prop_expiry: Duration::from_secs(10),
 
-            cqi_history: Vec::with_capacity(16),
-            rsrp_history: Vec::with_capacity(16),
+            cqi_history: VecDeque::with_capacity(16),
+            rsrp_history: VecDeque::with_capacity(16),
             sinr_capacity_ceiling: None,
             consecutive_cqi_drops: 0,
 
@@ -208,9 +209,9 @@ impl BiscayController {
         }
         let bw = delivered_bytes as f64 / (interval_us as f64 / 1_000_000.0);
 
-        self.bw_samples.push(bw);
+        self.bw_samples.push_back(bw);
         if self.bw_samples.len() > self.max_bw_samples {
-            self.bw_samples.remove(0);
+            self.bw_samples.pop_front();
         }
 
         // BtlBw = max of recent samples (BBR approach)
@@ -225,9 +226,9 @@ impl BiscayController {
             return;
         }
 
-        self.rtt_samples.push(rtt_us);
+        self.rtt_samples.push_back(rtt_us);
         if self.rtt_samples.len() > 32 {
-            self.rtt_samples.remove(0);
+            self.rtt_samples.pop_front();
         }
 
         // RTprop = min RTT observed
@@ -255,9 +256,9 @@ impl BiscayController {
         self.sinr_capacity_ceiling = Some(sinr_to_capacity_kbps(metrics.sinr_db));
 
         // CQI derivative tracking
-        self.cqi_history.push((now, metrics.cqi));
+        self.cqi_history.push_back((now, metrics.cqi));
         if self.cqi_history.len() > 16 {
-            self.cqi_history.remove(0);
+            self.cqi_history.pop_front();
         }
 
         // Track consecutive CQI drops
@@ -272,9 +273,9 @@ impl BiscayController {
         }
 
         // RSRP slope tracking
-        self.rsrp_history.push((now, metrics.rsrp_dbm));
+        self.rsrp_history.push_back((now, metrics.rsrp_dbm));
         if self.rsrp_history.len() > 16 {
-            self.rsrp_history.remove(0);
+            self.rsrp_history.pop_front();
         }
 
         // Evaluate state transitions
@@ -298,9 +299,9 @@ impl BiscayController {
             BiscayState::Cautious => {
                 // RSRP slope < -2.5 dB/s AND RSRQ < -12 → PRE_HANDOVER
                 let rsrp_slope = self.rsrp_slope_db_per_sec();
-                let latest_rsrq = self.rsrp_history.last().map(|(_, v)| *v).unwrap_or(0.0);
+                let latest_rsrp = self.rsrp_history.back().map(|(_, v)| *v).unwrap_or(0.0);
 
-                if rsrp_slope < -2.5 && latest_rsrq < -12.0 {
+                if rsrp_slope < -2.5 && latest_rsrp < -12.0 {
                     self.state = BiscayState::PreHandover;
                 }
 
@@ -330,7 +331,7 @@ impl BiscayController {
             return 0.0;
         }
         let (t1, v1) = self.rsrp_history[0];
-        let (t2, v2) = self.rsrp_history[self.rsrp_history.len() - 1];
+        let (t2, v2) = *self.rsrp_history.back().unwrap();
         let dt = t2.duration_since(t1).as_secs_f64();
         if dt < 0.001 {
             return 0.0;
@@ -645,7 +646,7 @@ mod tests {
         let cc = BiscayController::new();
         let b1 = cc.bytes_to_send(1_000); // 1ms
         let b2 = cc.bytes_to_send(10_000); // 10ms
-                                           // 10× interval → ~10× bytes (not exact due to rounding)
+        // 10× interval → ~10× bytes (not exact due to rounding)
         assert!(b2 > b1);
     }
 
