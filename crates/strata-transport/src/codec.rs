@@ -103,11 +103,6 @@ fn gf_inv(a: u8) -> u8 {
     GF.inv[a as usize]
 }
 
-#[inline]
-fn gf_add(a: u8, b: u8) -> u8 {
-    a ^ b // addition in GF(2^8) is XOR
-}
-
 /// Deterministic coefficient generation from (window_start, repair_index, symbol_offset).
 /// Uses a simple but effective hash to produce well-distributed GF(2^8) coefficients.
 fn coding_coefficient(window_start: u16, repair_index: u8, symbol_offset: usize) -> u8 {
@@ -121,6 +116,162 @@ fn coding_coefficient(window_start: u16, repair_index: u8, symbol_offset: usize)
     h ^= h >> 16;
     // Map to non-zero GF(2^8) element (1..=255)
     ((h % 255) + 1) as u8
+}
+
+// ─── Vectorised GF(2^8) Multiply-Accumulate ────────────────────────────────
+
+/// dst[i] ^= gf_mul(coeff, src[i]) for i in 0..min(dst.len(), src.len()).
+///
+/// This is the hot inner loop for both FEC encoding (repair symbol generation)
+/// and decoding (Gaussian elimination). On x86_64 with SSSE3 and aarch64 with
+/// NEON, processes 16 bytes per cycle using the split-nibble table technique
+/// (VPSHUFB / TBL). Falls back to scalar 64KB-table lookup on other targets.
+///
+/// Technique (documented in Intel ISA-L, Backblaze Reed-Solomon):
+///   1. Precompute two 16-entry LUTs:  lo[i]=c×i, hi[i]=c×(i<<4) in GF(2^8)
+///   2. Split each source byte into low/high nibbles
+///   3. Parallel 16-byte table lookup via PSHUFB / TBL
+///   4. XOR the two halves → full GF(2^8) product
+///   5. XOR-accumulate into dst
+fn gf_mul_acc(dst: &mut [u8], coeff: u8, src: &[u8]) {
+    if coeff == 0 {
+        return;
+    }
+    let len = dst.len().min(src.len());
+    if len == 0 {
+        return;
+    }
+    if coeff == 1 {
+        for (d, &s) in dst[..len].iter_mut().zip(&src[..len]) {
+            *d ^= s;
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("ssse3") {
+            // SAFETY: SSSE3 support verified by runtime feature detection.
+            unsafe { gf_mul_acc_ssse3(&mut dst[..len], coeff, &src[..len]) };
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is mandatory on all aarch64 processors.
+        unsafe { gf_mul_acc_neon(&mut dst[..len], coeff, &src[..len]) };
+        return;
+    }
+
+    #[allow(unreachable_code)]
+    gf_mul_acc_scalar(&mut dst[..len], coeff, &src[..len]);
+}
+
+/// Scalar fallback using the precomputed 64KB multiplication table.
+fn gf_mul_acc_scalar(dst: &mut [u8], coeff: u8, src: &[u8]) {
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        *d ^= gf_mul(coeff, s);
+    }
+}
+
+/// Build the pair of 16-entry nibble LUTs for a GF(2^8) coefficient.
+///
+/// Returns (lo_lut, hi_lut) where:
+///   lo_lut[i] = coeff × i        for i in 0..16
+///   hi_lut[i] = coeff × (i << 4) for i in 0..16
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn build_mul_luts(coeff: u8) -> ([u8; 16], [u8; 16]) {
+    let mut lo = [0u8; 16];
+    let mut hi = [0u8; 16];
+    for i in 0..16u8 {
+        lo[i as usize] = gf_mul(coeff, i);
+        hi[i as usize] = gf_mul(coeff, i << 4);
+    }
+    (lo, hi)
+}
+
+/// SSSE3 vectorised multiply-accumulate (16 bytes/cycle).
+///
+/// Uses `_mm_shuffle_epi8` (PSHUFB) for parallel 16-byte GF(2^8) table lookup.
+/// The source byte is split into low and high nibbles, each used as an index
+/// into a 16-entry LUT, and the two partial products are XORed together.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn gf_mul_acc_ssse3(dst: &mut [u8], coeff: u8, src: &[u8]) {
+    use std::arch::x86_64::*;
+
+    let (lo_lut, hi_lut) = build_mul_luts(coeff);
+    // SAFETY: loads from stack-local 16-byte arrays — always valid and aligned.
+    let lo_vec = unsafe { _mm_loadu_si128(lo_lut.as_ptr() as *const __m128i) };
+    let hi_vec = unsafe { _mm_loadu_si128(hi_lut.as_ptr() as *const __m128i) };
+    let mask_0f = _mm_set1_epi8(0x0F);
+
+    let len = dst.len().min(src.len());
+    let mut i = 0;
+
+    while i + 16 <= len {
+        // SAFETY: i + 16 <= len bounds-checked above; unaligned load is fine.
+        let s = unsafe { _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i) };
+        let d = unsafe { _mm_loadu_si128(dst.as_ptr().add(i) as *const __m128i) };
+
+        // Split byte into nibbles (epi16 shift + mask is the standard idiom
+        // since SSE has no 8-bit shift; the mask clears stray cross-byte bits).
+        let lo_nibble = _mm_and_si128(s, mask_0f);
+        let hi_nibble = _mm_and_si128(_mm_srli_epi16(s, 4), mask_0f);
+
+        let product = _mm_xor_si128(
+            _mm_shuffle_epi8(lo_vec, lo_nibble),
+            _mm_shuffle_epi8(hi_vec, hi_nibble),
+        );
+
+        // SAFETY: i + 16 <= len bounds-checked above.
+        unsafe {
+            _mm_storeu_si128(
+                dst.as_mut_ptr().add(i) as *mut __m128i,
+                _mm_xor_si128(d, product),
+            );
+        }
+        i += 16;
+    }
+
+    for j in i..len {
+        dst[j] ^= gf_mul(coeff, src[j]);
+    }
+}
+
+/// NEON vectorised multiply-accumulate (16 bytes/cycle).
+///
+/// Uses `vqtbl1q_u8` (TBL) for parallel 16-byte GF(2^8) table lookup.
+/// Same split-nibble algorithm as the SSSE3 path. NEON has native 8-bit
+/// shift (`vshrq_n_u8`) so no masking trick is needed for the high nibble.
+#[cfg(target_arch = "aarch64")]
+unsafe fn gf_mul_acc_neon(dst: &mut [u8], coeff: u8, src: &[u8]) {
+    use std::arch::aarch64::*;
+
+    let (lo_lut, hi_lut) = build_mul_luts(coeff);
+    let lo_tbl = vld1q_u8(lo_lut.as_ptr());
+    let hi_tbl = vld1q_u8(hi_lut.as_ptr());
+    let mask_0f = vdupq_n_u8(0x0F);
+
+    let len = dst.len().min(src.len());
+    let mut i = 0;
+
+    while i + 16 <= len {
+        let s = vld1q_u8(src.as_ptr().add(i));
+        let d = vld1q_u8(dst.as_ptr().add(i));
+
+        let lo_nibble = vandq_u8(s, mask_0f);
+        let hi_nibble = vshrq_n_u8::<4>(s);
+
+        let product = veorq_u8(vqtbl1q_u8(lo_tbl, lo_nibble), vqtbl1q_u8(hi_tbl, hi_nibble));
+        vst1q_u8(dst.as_mut_ptr().add(i), veorq_u8(d, product));
+        i += 16;
+    }
+
+    for j in i..len {
+        dst[j] ^= gf_mul(coeff, src[j]);
+    }
 }
 
 // ─── FEC Encoder ─────────────────────────────────────────────────────────
@@ -199,10 +350,7 @@ impl FecEncoder {
 
             for (i, (_, symbol)) in self.window.iter().enumerate() {
                 let coeff = coding_coefficient(gen_id, repair_idx as u8, i);
-                for (j, &byte) in symbol.iter().enumerate() {
-                    // repair[j] += coeff * symbol[j]  in GF(2^8)
-                    repair_data[j] = gf_add(repair_data[j], gf_mul(coeff, byte));
-                }
+                gf_mul_acc(&mut repair_data, coeff, symbol);
             }
 
             // Serialize as a FEC repair control packet
@@ -351,9 +499,7 @@ impl GenerationState {
                 let factor = row[col]; // we need to eliminate this
                 let pivot_val = self.matrix_rows[pivot_row_idx][col];
                 let scale = gf_mul(factor, gf_inv(pivot_val));
-                for (j, r) in row.iter_mut().enumerate() {
-                    *r = gf_add(*r, gf_mul(scale, self.matrix_rows[pivot_row_idx][j]));
-                }
+                gf_mul_acc(&mut row, scale, &self.matrix_rows[pivot_row_idx]);
             }
         }
 
@@ -379,9 +525,7 @@ impl GenerationState {
                 // We need to clone the new row to avoid double borrow
                 let new_row_data: Vec<u8> = self.matrix_rows[row_idx].clone();
                 let other_row = &mut self.matrix_rows[other_row_idx];
-                for j in 0..other_row.len() {
-                    other_row[j] = gf_add(other_row[j], gf_mul(scale, new_row_data[j]));
-                }
+                gf_mul_acc(other_row, scale, &new_row_data);
             }
         }
     }
@@ -474,23 +618,23 @@ impl FecDecoder {
         r: usize,
         data: Bytes,
     ) {
-        let gen = self
+        let generation = self
             .generations
             .entry(generation_id)
             .or_insert_with(|| GenerationState::new(generation_id, k, r));
-        gen.add_source(index_in_gen, data);
+        generation.add_source(index_in_gen, data);
         self.enforce_limit();
     }
 
     /// Record a received repair symbol.
     pub fn add_repair_symbol(&mut self, header: &FecRepairHeader, repair_data: Vec<u8>) {
-        let gen = self
+        let generation = self
             .generations
             .entry(header.generation_id)
             .or_insert_with(|| {
                 GenerationState::new(header.generation_id, header.k as usize, header.r as usize)
             });
-        gen.add_repair(header.symbol_index, &repair_data);
+        generation.add_repair(header.symbol_index, &repair_data);
         self.enforce_limit();
     }
 
@@ -498,7 +642,7 @@ impl FecDecoder {
     pub fn is_complete(&self, generation_id: u16) -> bool {
         self.generations
             .get(&generation_id)
-            .map(|gen| gen.is_complete())
+            .map(|g| g.is_complete())
             .unwrap_or(false)
     }
 
@@ -510,11 +654,11 @@ impl FecDecoder {
     ///
     /// Returns recovered (index, data) pairs.
     pub fn try_recover(&mut self, generation_id: u16) -> Vec<(usize, Bytes)> {
-        let gen = match self.generations.get(&generation_id) {
+        let generation = match self.generations.get(&generation_id) {
             Some(g) => g,
             None => return Vec::new(),
         };
-        gen.try_recover()
+        generation.try_recover()
     }
 
     /// Remove a generation (after it's fully consumed or too old).
@@ -657,6 +801,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ─── Vectorised multiply-accumulate ───────────────────────────────────
+
+    #[test]
+    fn gf_mul_acc_matches_scalar_for_all_coefficients() {
+        let lens = [0, 1, 7, 15, 16, 17, 31, 32, 33, 100, 1200];
+        for &len in &lens {
+            let src: Vec<u8> = (0..len).map(|i| (i * 37 + 13) as u8).collect();
+            for coeff in 0..=255u8 {
+                let mut dst_scalar = vec![0xAB_u8; len];
+                let mut dst_simd = dst_scalar.clone();
+
+                gf_mul_acc_scalar(&mut dst_scalar, coeff, &src);
+                gf_mul_acc(&mut dst_simd, coeff, &src);
+
+                assert_eq!(dst_scalar, dst_simd, "mismatch at coeff={coeff}, len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn gf_mul_acc_accumulates_correctly() {
+        // Verify XOR-accumulate semantics: calling twice should stack
+        let src = vec![0xFF_u8; 32];
+        let mut dst = vec![0u8; 32];
+        gf_mul_acc(&mut dst, 3, &src);
+        let first = dst.clone();
+        gf_mul_acc(&mut dst, 3, &src);
+        // XOR same thing twice → back to zero
+        assert!(
+            dst.iter().all(|&b| b == 0),
+            "double acc should cancel via XOR"
+        );
+        // And first pass should match scalar
+        let mut expected = vec![0u8; 32];
+        for (d, &s) in expected.iter_mut().zip(src.iter()) {
+            *d ^= gf_mul(3, s);
+        }
+        assert_eq!(first, expected);
     }
 
     // ─── proptest: RLNC encode/decode correctness ───────────────────────

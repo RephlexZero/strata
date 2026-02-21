@@ -1,5 +1,5 @@
-use gst::prelude::*;
 use gst::MessageView;
+use gst::prelude::*;
 use std::env;
 use std::sync::{Arc, Mutex};
 use strata_bonding::metrics::MetricsServer;
@@ -141,6 +141,19 @@ fn register_plugins() -> Result<(), gst::glib::BoolError> {
     gststrata::sink::register(None)?;
     gststrata::src::register(None)?;
     Ok(())
+}
+
+/// Disable mpegtsmux skew corrections when the property is available (GStreamer ≥1.28).
+///
+/// In a bonding transport the receiver remuxes or writes to file, so we want to
+/// preserve original timestamps rather than correcting for clock drift.
+fn configure_mpegtsmux(pipeline: &gst::Pipeline) {
+    if let Some(mux) = pipeline.by_name("mux") {
+        if mux.find_property("skew-corrections").is_some() {
+            mux.set_property("skew-corrections", false);
+            eprintln!("mpegtsmux: disabled skew-corrections (GStreamer ≥1.28)");
+        }
+    }
 }
 
 fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -394,6 +407,8 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let pipeline = gst::parse::launch(&pipeline_str)?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "Failed to cast to pipeline")?;
+
+    configure_mpegtsmux(&pipeline);
 
     // Keep a handle to the input-selector and its test-source pad
     let selector = pipeline
@@ -662,6 +677,8 @@ fn run_sender_passthrough(
     let pipeline = gst::parse::launch(&pipeline_str)?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "Failed to cast to pipeline")?;
+
+    configure_mpegtsmux(&pipeline);
 
     // Wire up parsebin's dynamic pads to mpegtsmux
     let mux = pipeline.by_name("mux").ok_or("Failed to find mux")?;
@@ -1364,7 +1381,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
              tsdemux name=d \
              d. ! queue ! {parser} ! {relay} \
              rtmpsink location=\"{url}\" sync=false \
-             d. ! queue ! aacparse ! mux.",
+             d. ! queue ! aacparse ! fmux.",
             bind = bind_str,
             parser = video_parser,
             relay = relay_frag,
