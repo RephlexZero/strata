@@ -31,6 +31,11 @@
     "mounts": [
         "source=/lib/modules,target=/lib/modules,type=bind,readonly"
     ],
+    // GPU passthrough for hardware video encoding (VA-API: AMD / Intel).
+    // Harmless on hosts without /dev/dri — privileged mode still starts.
+    "runArgs": [
+        "--device=/dev/dri"
+    ],
     "features": {
         "ghcr.io/devcontainers/features/rust:1": {},
         "ghcr.io/devcontainers/features/docker-in-docker:2": {}

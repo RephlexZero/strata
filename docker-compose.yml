@@ -90,6 +90,10 @@ services:
       - strata-receiver
     cap_add:
       - NET_ADMIN
+    # GPU passthrough for hardware video encoding (VA-API: AMD / Intel).
+    # Remove or comment out if the host has no GPU / no /dev/dri.
+    devices:
+      - /dev/dri:/dev/dri
     environment:
       RUST_LOG: "info,strata_agent=debug"
       GST_PLUGIN_PATH: "/usr/lib/x86_64-linux-gnu/gstreamer-1.0"

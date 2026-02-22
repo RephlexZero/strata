@@ -177,7 +177,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gstreamer1.0-libav \
     gstreamer1.0-tools \
     libgstreamer1.0-0 \
+    # VA-API core libraries (hardware video encoding)
+    libva2 libva-drm2 \
     && rm -rf /var/lib/apt/lists/*
+
+# VA-API GPU drivers — installed separately because Debian sid packages
+# can have transient dependency conflicts.  The build succeeds either way;
+# auto-detection in codec.rs falls back to software encoding.
+#   mesa-va-drivers       → AMD GPUs
+#   intel-media-va-driver → Intel GPUs (iGPU / Arc)
+#   gstreamer1.0-vaapi    → legacy VA-API GStreamer elements
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    mesa-va-drivers \
+    intel-media-va-driver \
+    gstreamer1.0-vaapi \
+    2>/dev/null; \
+    rm -rf /var/lib/apt/lists/*
 
 # Bundle a sample video for dev testing (Big Buck Bunny 30s 1080p30, ~7MB, CC BY 3.0)
 RUN mkdir -p /opt/strata/test-media && \

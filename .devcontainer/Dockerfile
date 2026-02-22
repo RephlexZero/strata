@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpng-dev libjpeg-dev \
     libavcodec-dev libavformat-dev libavutil-dev \
     libswresample-dev libswscale-dev \
+    # VA-API (hardware encoding support for AMD / Intel GPUs)
+    libva-dev libdrm-dev \
     && pip3 install --break-system-packages meson>=1.4 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -50,6 +52,9 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     libpng-dev libjpeg-dev \
     libavcodec-dev libavformat-dev libavutil-dev \
     libswresample-dev libswscale-dev \
+    # VA-API hardware encoding drivers (AMD / Intel)
+    mesa-va-drivers intel-media-va-driver \
+    libva2 libva-drm2 vainfo \
     # Network / system tools
     iproute2 iputils-ping net-tools tcpdump kmod \
     && rm -rf /var/lib/apt/lists/*
