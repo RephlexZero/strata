@@ -132,9 +132,12 @@ impl CodecController {
                 // Passing tune=zerolatency via option-string conflicts with the GStreamer
                 // property wrapper and causes x265 encoder init to fail.
                 // vbv-bufsize and vbv-maxrate (kbps) are only valid via option-string.
+                // speed-preset=ultrafast is required so the encoder produces frames fast
+                // enough to prevent hlssink2's splitmuxsink from starving on the video
+                // stream while audio fills its internal queues.
                 format!(
                     "x265enc name={name} bitrate={bps} \
-                     key-int-max={ki} tune=4 \
+                     key-int-max={ki} tune=4 speed-preset=ultrafast \
                      option-string=\"vbv-bufsize={max_bps}:vbv-maxrate={max_bps}\"",
                     name = name,
                     bps = bitrate_kbps,
@@ -216,6 +219,7 @@ mod tests {
         assert!(frag.contains("vbv-maxrate=25000"));
         // x265enc uses tune=4 (numeric) for zerolatency, not the string form
         assert!(frag.contains("tune=4"));
+        assert!(frag.contains("speed-preset=ultrafast"));
     }
 
     #[test]
