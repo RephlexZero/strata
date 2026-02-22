@@ -1,8 +1,9 @@
 //! # Codec Controller Abstraction
 //!
-//! Provides a uniform interface for controlling H.264 (x264enc) and
-//! H.265 (x265enc) GStreamer encoders. This allows the bitrate adaptation
-//! and pipeline construction to work identically regardless of codec.
+//! Provides a uniform interface for controlling H.264 and H.265 GStreamer
+//! encoders — both software (x264enc/x265enc) and hardware (NVENC, VA-API,
+//! QSV). This allows the bitrate adaptation and pipeline construction to
+//! work identically regardless of codec or encoder backend.
 
 use gst::prelude::*;
 
@@ -25,7 +26,7 @@ impl CodecType {
         }
     }
 
-    /// GStreamer encoder element factory name.
+    /// GStreamer software encoder element factory name (fallback).
     pub fn encoder_factory(&self) -> &'static str {
         match self {
             CodecType::H264 => "x264enc",
@@ -53,34 +54,109 @@ impl CodecType {
     }
 }
 
+/// Detected encoder backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderBackend {
+    /// Software encoder (x264enc / x265enc).
+    Software,
+    /// NVIDIA NVENC hardware encoder.
+    Nvenc,
+    /// VA-API hardware encoder (Intel/AMD, new `va` plugin).
+    Vaapi,
+    /// Intel Quick Sync Video.
+    Qsv,
+}
+
+impl std::fmt::Display for EncoderBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncoderBackend::Software => write!(f, "software"),
+            EncoderBackend::Nvenc => write!(f, "NVENC"),
+            EncoderBackend::Vaapi => write!(f, "VA-API"),
+            EncoderBackend::Qsv => write!(f, "QSV"),
+        }
+    }
+}
+
+/// Probe GStreamer for the best available encoder for the given codec.
+///
+/// Priority: NVENC → VA-API → QSV → software.
+/// Returns `(factory_name, backend)`.
+fn resolve_encoder(codec: CodecType) -> (&'static str, EncoderBackend) {
+    let candidates: &[(&str, EncoderBackend)] = match codec {
+        CodecType::H264 => &[
+            ("nvh264enc", EncoderBackend::Nvenc),
+            ("vah264enc", EncoderBackend::Vaapi),
+            ("qsvh264enc", EncoderBackend::Qsv),
+            ("x264enc", EncoderBackend::Software),
+        ],
+        CodecType::H265 => &[
+            ("nvh265enc", EncoderBackend::Nvenc),
+            ("vah265enc", EncoderBackend::Vaapi),
+            ("qsvh265enc", EncoderBackend::Qsv),
+            ("x265enc", EncoderBackend::Software),
+        ],
+        CodecType::Fake => return ("identity", EncoderBackend::Software),
+    };
+    for &(factory, backend) in candidates {
+        if gst::ElementFactory::find(factory).is_some() {
+            return (factory, backend);
+        }
+    }
+    // Last-resort fallback (may fail at pipeline creation if not installed).
+    (codec.encoder_factory(), EncoderBackend::Software)
+}
+
 /// Uniform codec controller for encoder runtime operations.
 pub struct CodecController {
     codec: CodecType,
+    encoder_factory: &'static str,
+    backend: EncoderBackend,
 }
 
 impl CodecController {
+    /// Create with software encoder (no hardware probing).
+    /// Suitable for tests or when GStreamer may not be initialised.
     pub fn new(codec: CodecType) -> Self {
-        Self { codec }
+        Self {
+            codec,
+            encoder_factory: codec.encoder_factory(),
+            backend: EncoderBackend::Software,
+        }
+    }
+
+    /// Create with automatic hardware encoder detection.
+    ///
+    /// Probes GStreamer for available hardware encoders (NVENC, VA-API, QSV)
+    /// and selects the highest-priority one. Falls back to software if none
+    /// are found.
+    pub fn with_auto_backend(codec: CodecType) -> Self {
+        let (factory, backend) = resolve_encoder(codec);
+        Self {
+            codec,
+            encoder_factory: factory,
+            backend,
+        }
     }
 
     pub fn codec(&self) -> CodecType {
         self.codec
     }
 
+    pub fn backend(&self) -> EncoderBackend {
+        self.backend
+    }
+
+    /// The GStreamer element factory name of the selected encoder.
+    pub fn encoder_factory_name(&self) -> &'static str {
+        self.encoder_factory
+    }
+
     /// Set the encoder bitrate in kbps.
+    /// All supported backends (software + HW) expose `bitrate` in kbps.
     pub fn set_bitrate_kbps(&self, enc: &gst::Element, kbps: u32) {
-        match self.codec {
-            CodecType::H264 => {
-                // x264enc "bitrate" property is in kbps
-                enc.set_property("bitrate", kbps);
-            }
-            CodecType::H265 => {
-                // x265enc "bitrate" property is in kbps
-                enc.set_property("bitrate", kbps);
-            }
-            CodecType::Fake => {
-                // identity doesn't have a bitrate property
-            }
+        if self.codec != CodecType::Fake {
+            enc.set_property("bitrate", kbps);
         }
     }
 
@@ -106,10 +182,10 @@ impl CodecController {
         enc.send_event(event);
     }
 
-    /// Build the GStreamer pipeline fragment string for this codec.
+    /// Build the GStreamer pipeline fragment string for this codec + backend.
     ///
-    /// Returns the encoder + parser section, e.g.:
-    /// `x264enc name=enc tune=zerolatency bitrate=2000 vbv-buf-capacity=25000 key-int-max=60`
+    /// Returns the encoder element, e.g.:
+    /// `x264enc name=enc tune=zerolatency speed-preset=ultrafast bitrate=2000 key-int-max=60`
     pub fn pipeline_fragment(
         &self,
         name: &str,
@@ -117,8 +193,41 @@ impl CodecController {
         key_int_max: u32,
         max_bitrate_kbps: u32,
     ) -> String {
-        match self.codec {
-            CodecType::H264 => {
+        let factory = self.encoder_factory;
+        match (self.backend, self.codec) {
+            // ── NVENC (NVIDIA GPU) ──────────────────────────────────────
+            (EncoderBackend::Nvenc, _) => {
+                format!(
+                    "{factory} name={name} bitrate={bps} gop-size={ki} \
+                     preset=low-latency-hq rc-mode=cbr zerolatency=true",
+                    factory = factory,
+                    name = name,
+                    bps = bitrate_kbps,
+                    ki = key_int_max,
+                )
+            }
+            // ── VA-API (Intel/AMD) ──────────────────────────────────────
+            (EncoderBackend::Vaapi, _) => {
+                format!(
+                    "{factory} name={name} bitrate={bps} key-int-max={ki} rate-control=cbr",
+                    factory = factory,
+                    name = name,
+                    bps = bitrate_kbps,
+                    ki = key_int_max,
+                )
+            }
+            // ── QSV (Intel Quick Sync) ──────────────────────────────────
+            (EncoderBackend::Qsv, _) => {
+                format!(
+                    "{factory} name={name} bitrate={bps} gop-size={ki} low-latency=true",
+                    factory = factory,
+                    name = name,
+                    bps = bitrate_kbps,
+                    ki = key_int_max,
+                )
+            }
+            // ── Software H.264 (x264enc) ────────────────────────────────
+            (EncoderBackend::Software, CodecType::H264) => {
                 format!(
                     "x264enc name={name} tune=zerolatency speed-preset=ultrafast bitrate={bps} \
                      key-int-max={ki}",
@@ -127,11 +236,9 @@ impl CodecController {
                     ki = key_int_max,
                 )
             }
-            CodecType::H265 => {
-                // tune must be set as a native GStreamer property (tune=4 = zerolatency).
-                // Passing tune=zerolatency via option-string conflicts with the GStreamer
-                // property wrapper and causes x265 encoder init to fail.
-                // vbv-bufsize and vbv-maxrate (kbps) are only valid via option-string.
+            // ── Software H.265 (x265enc) ────────────────────────────────
+            (EncoderBackend::Software, CodecType::H265) => {
+                // tune=4 = zerolatency (must be numeric, not string).
                 // speed-preset=ultrafast is required so the encoder produces frames fast
                 // enough to prevent hlssink2's splitmuxsink from starving on the video
                 // stream while audio fills its internal queues.
@@ -145,7 +252,8 @@ impl CodecController {
                     ki = key_int_max,
                 )
             }
-            CodecType::Fake => {
+            // ── Fake / identity ─────────────────────────────────────────
+            (_, CodecType::Fake) => {
                 format!("identity name={name} drop-probability=0.0")
             }
         }
@@ -223,6 +331,13 @@ mod tests {
     }
 
     #[test]
+    fn new_defaults_to_software() {
+        let ctrl = CodecController::new(CodecType::H264);
+        assert_eq!(ctrl.backend(), EncoderBackend::Software);
+        assert_eq!(ctrl.encoder_factory_name(), "x264enc");
+    }
+
+    #[test]
     fn caps_media_types() {
         assert_eq!(CodecType::H264.caps_media_type(), "video/x-h264");
         assert_eq!(CodecType::H265.caps_media_type(), "video/x-h265");
@@ -241,5 +356,13 @@ mod tests {
             h265.relay_muxer_fragment(),
             "eflvmux name=fmux streamable=true"
         );
+    }
+
+    #[test]
+    fn encoder_backend_display() {
+        assert_eq!(format!("{}", EncoderBackend::Software), "software");
+        assert_eq!(format!("{}", EncoderBackend::Nvenc), "NVENC");
+        assert_eq!(format!("{}", EncoderBackend::Vaapi), "VA-API");
+        assert_eq!(format!("{}", EncoderBackend::Qsv), "QSV");
     }
 }

@@ -311,21 +311,32 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Unknown codec '{}', defaulting to h264", codec_str);
         gststrata::codec::CodecType::H264
     });
-    // Validate that the encoder plugin is installed (e.g. x265enc needs gst-plugins-bad)
-    let enc_factory = codec_type.encoder_factory();
-    let (codec_type, codec_ctrl) = if gst::ElementFactory::find(enc_factory).is_none() {
+    // Probe for the best available encoder (HW → SW fallback).
+    let codec_ctrl = gststrata::codec::CodecController::with_auto_backend(codec_type);
+    let codec_type = if codec_ctrl.encoder_factory_name() == "identity" {
+        // Fake codec doesn't need a real encoder
+        codec_type
+    } else if gst::ElementFactory::find(codec_ctrl.encoder_factory_name()).is_none() {
+        // Selected encoder not available — fall back to H.264 software
         eprintln!(
             "Warning: encoder '{}' not available — falling back to h264",
-            enc_factory
+            codec_ctrl.encoder_factory_name()
         );
-        let ct = gststrata::codec::CodecType::H264;
-        (ct, gststrata::codec::CodecController::new(ct))
+        gststrata::codec::CodecType::H264
     } else {
-        (
-            codec_type,
-            gststrata::codec::CodecController::new(codec_type),
-        )
+        codec_type
     };
+    // Re-resolve if we changed codec type above
+    let codec_ctrl = if codec_ctrl.codec() != codec_type {
+        gststrata::codec::CodecController::with_auto_backend(codec_type)
+    } else {
+        codec_ctrl
+    };
+    eprintln!(
+        "Encoder: {} ({} backend)",
+        codec_ctrl.encoder_factory_name(),
+        codec_ctrl.backend()
+    );
 
     // Resolve min/max from CLI or profile defaults
     let profile =
