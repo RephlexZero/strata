@@ -15,6 +15,18 @@ use super::cards::{
 };
 use super::helpers::{format_bps, format_bytes};
 
+/// Human-readable platform label with protocol hint.
+fn platform_display_label(p: &str) -> &str {
+    match p {
+        "youtube" => "YouTube (RTMP)",
+        "youtube_hls" => "YouTube (HLS)",
+        "twitch" => "Twitch (RTMP)",
+        "custom_rtmp" => "Custom RTMP",
+        "srt" => "SRT",
+        _ => p,
+    }
+}
+
 #[component]
 pub fn DestinationModal(
     show: ReadSignal<bool>,
@@ -22,6 +34,8 @@ pub fn DestinationModal(
     destinations: ReadSignal<Vec<crate::types::DestinationSummary>>,
     selected_dest: ReadSignal<Option<String>>,
     set_selected_dest: WriteSignal<Option<String>>,
+    selected_codec: ReadSignal<String>,
+    set_selected_codec: WriteSignal<String>,
     dests_loading: ReadSignal<bool>,
     on_confirm: impl Fn(web_sys::MouseEvent) + 'static + Copy + Send,
 ) -> impl IntoView {
@@ -61,6 +75,9 @@ pub fn DestinationModal(
                                             let d_id = d.id.clone();
                                             let d_id2 = d.id.clone();
                                             let d_id3 = d.id.clone();
+                                            let d_name = d.name.clone();
+                                            let d_label = platform_display_label(&d.platform).to_string();
+                                            let d_url = d.url.clone();
                                             view! {
                                                 <label class="flex items-center gap-3 p-3 bg-base-300 rounded cursor-pointer hover:bg-base-content/10 border border-base-300"
                                                     class:border-primary=move || selected_dest.get().as_deref() == Some(&d_id2)
@@ -70,8 +87,10 @@ pub fn DestinationModal(
                                                         on:change=move |_| set_selected_dest.set(Some(d_id.clone()))
                                                     />
                                                     <div>
-                                                        <div class="font-medium text-sm">{d.name.clone()}</div>
-                                                        <div class="text-xs text-base-content/60 font-mono">{d.platform.clone()} " · " {d.url.clone()}</div>
+                                                        <div class="font-medium text-sm">{d_name}</div>
+                                                        <div class="text-xs text-base-content/60 font-mono">
+                                                            {d_label} " · " {d_url}
+                                                        </div>
                                                     </div>
                                                 </label>
                                             }
@@ -81,6 +100,88 @@ pub fn DestinationModal(
                             }
                         }}
                     </div>
+
+                    // Encoder selection
+                    <div class="divider text-xs text-base-content/40">"Encoder"</div>
+                    <div class="flex gap-3">
+                        <label class="flex items-center gap-2 p-2 px-3 bg-base-300 rounded cursor-pointer border border-base-300"
+                            class:border-primary=move || selected_codec.get() == "h265"
+                        >
+                            <input type="radio" name="codec" class="radio radio-sm radio-primary"
+                                checked=move || selected_codec.get() == "h265"
+                                on:change=move |_| set_selected_codec.set(String::from("h265"))
+                            />
+                            <div>
+                                <div class="font-medium text-sm">"H.265 / HEVC"</div>
+                                <div class="text-xs text-base-content/60">"Better compression"</div>
+                            </div>
+                        </label>
+                        <label class="flex items-center gap-2 p-2 px-3 bg-base-300 rounded cursor-pointer border border-base-300"
+                            class:border-primary=move || selected_codec.get() == "h264"
+                        >
+                            <input type="radio" name="codec" class="radio radio-sm radio-primary"
+                                checked=move || selected_codec.get() == "h264"
+                                on:change=move |_| set_selected_codec.set(String::from("h264"))
+                            />
+                            <div>
+                                <div class="font-medium text-sm">"H.264 / AVC"</div>
+                                <div class="text-xs text-base-content/60">"Max compatibility"</div>
+                            </div>
+                        </label>
+                    </div>
+
+                    // Codec ↔ destination compatibility guard
+                    {move || {
+                        let codec = selected_codec.get();
+                        let dest_id = selected_dest.get();
+                        // Look up the selected destination's platform
+                        let platform = dest_id.as_ref().and_then(|id| {
+                            destinations.get().iter().find(|d| &d.id == id).map(|d| d.platform.clone())
+                        });
+
+                        match (codec.as_str(), platform.as_deref()) {
+                            // H.265 + Twitch → error: not supported
+                            ("h265", Some("twitch")) => Some(view! {
+                                <div class="alert alert-error text-sm mt-3">
+                                    <span>"⚠ Twitch does not support H.265. Switch to H.264 or choose a different destination."</span>
+                                </div>
+                            }),
+                            // H.265 + RTMP YouTube → warning: Enhanced RTMP may not work
+                            ("h265", Some("youtube")) => Some(view! {
+                                <div class="alert alert-warning text-sm mt-3">
+                                    <div>
+                                        <div class="font-semibold">"H.265 via RTMP requires Enhanced RTMP (eflvmux)"</div>
+                                        <div class="text-xs mt-1">
+                                            "Not all YouTube channels support HEVC over RTMP. "
+                                            "If your stream shows \"excellent\" connection but no video, switch to "
+                                            <span class="font-semibold">"YouTube (HLS)"</span>
+                                            " destination which natively supports H.265, or use H.264."
+                                        </div>
+                                    </div>
+                                </div>
+                            }),
+                            // H.265 + custom RTMP → info
+                            ("h265", Some("custom_rtmp")) => Some(view! {
+                                <div class="alert alert-info text-sm mt-3">
+                                    <span>"H.265 over RTMP uses Enhanced FLV (eflvmux). Ensure your server supports HEVC in FLV containers."</span>
+                                </div>
+                            }),
+                            // H.265 + YouTube HLS → great match, show positive hint
+                            ("h265", Some("youtube_hls")) => Some(view! {
+                                <div class="alert alert-success text-sm mt-3">
+                                    <span>"✓ YouTube HLS natively supports H.265 — best option for HEVC streaming."</span>
+                                </div>
+                            }),
+                            // H.264 + YouTube HLS → works but wastes bandwidth
+                            ("h264", Some("youtube_hls")) => Some(view! {
+                                <div class="alert alert-info text-sm mt-3">
+                                    <span>"H.264 works over HLS, but consider H.265 for better compression at the same quality."</span>
+                                </div>
+                            }),
+                            _ => None,
+                        }
+                    }}
+
                     <div class="modal-action">
                         <button class="btn btn-ghost" on:click=move |_| set_show.set(false)>"Cancel"</button>
                         <button class="btn btn-primary" on:click=on_confirm disabled=move || dests_loading.get() || !auth.has_role("operator")>"Go Live"</button>

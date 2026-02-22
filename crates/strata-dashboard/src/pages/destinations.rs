@@ -21,6 +21,28 @@ pub fn DestinationsPage() -> impl IntoView {
     let (new_url, set_new_url) = signal(String::new());
     let (new_key, set_new_key) = signal(String::new());
 
+    // Derived: URL placeholder and help text based on selected platform
+    let url_placeholder = Memo::new(move |_| match new_platform.get().as_str() {
+        "youtube" => "rtmp://a.rtmp.youtube.com/live2".to_string(),
+        "youtube_hls" => {
+            "https://a.upload.youtube.com/http_upload_hls?cid=STREAM_KEY&copy=0&file=".to_string()
+        }
+        "twitch" => "rtmp://live.twitch.tv/app".to_string(),
+        "srt" => "srt://host:port".to_string(),
+        _ => "rtmp://your-server/live".to_string(),
+    });
+    let platform_help = Memo::new(move |_| {
+        match new_platform.get().as_str() {
+            "youtube" => "Standard RTMP ingest. H.265 requires Enhanced RTMP (eflvmux) — not all YouTube channels support this. Use YouTube HLS for reliable H.265.".to_string(),
+            "youtube_hls" => "Paste the full HLS ingest URL from YouTube Studio → Go Live → Stream settings. It looks like: https://a.upload.youtube.com/http_upload_hls?cid=xxxx&copy=0&file=".to_string(),
+            "twitch" => "Twitch only supports H.264 via RTMP. H.265 is not supported.".to_string(),
+            "srt" => "SRT transport — supports both H.264 and H.265.".to_string(),
+            _ => "Enter your RTMP server URL.".to_string(),
+        }
+    });
+    // Whether the current platform needs a separate stream key field
+    let show_stream_key = Memo::new(move |_| new_platform.get().as_str() != "youtube_hls");
+
     // Load destinations
     let auth_load = auth.clone();
     Effect::new(move || {
@@ -115,8 +137,9 @@ pub fn DestinationsPage() -> impl IntoView {
                                 class="select select-bordered w-full"
                                 on:change=move |ev| set_new_platform.set(event_target_value(&ev))
                             >
-                                <option value="youtube">"YouTube"</option>
-                                <option value="twitch">"Twitch"</option>
+                                <option value="youtube">"YouTube (RTMP)"</option>
+                                <option value="youtube_hls">"YouTube (HLS — H.265 Native)"</option>
+                                <option value="twitch">"Twitch (RTMP — H.264 Only)"</option>
                                 <option value="custom_rtmp">"Custom RTMP"</option>
                                 <option value="srt">"SRT"</option>
                             </select>
@@ -136,21 +159,26 @@ pub fn DestinationsPage() -> impl IntoView {
                             <input
                                 class="input input-bordered w-full"
                                 type="text"
-                                placeholder="rtmp://a.rtmp.youtube.com/live2"
+                                placeholder=move || url_placeholder.get()
                                 prop:value=move || new_url.get()
                                 on:input=move |ev| set_new_url.set(event_target_value(&ev))
                             />
                         </fieldset>
-                        <fieldset class="fieldset mb-3">
-                            <label class="fieldset-label">"Stream Key (optional)"</label>
-                            <input
-                                class="input input-bordered w-full"
-                                type="password"
-                                placeholder="xxxx-xxxx-xxxx-xxxx"
-                                prop:value=move || new_key.get()
-                                on:input=move |ev| set_new_key.set(event_target_value(&ev))
-                            />
-                        </fieldset>
+                        <p class="text-xs text-base-content/50 -mt-2 mb-3 px-1">
+                            {move || platform_help.get()}
+                        </p>
+                        {move || show_stream_key.get().then(|| view! {
+                            <fieldset class="fieldset mb-3">
+                                <label class="fieldset-label">"Stream Key (optional)"</label>
+                                <input
+                                    class="input input-bordered w-full"
+                                    type="password"
+                                    placeholder="xxxx-xxxx-xxxx-xxxx"
+                                    prop:value=move || new_key.get()
+                                    on:input=move |ev| set_new_key.set(event_target_value(&ev))
+                                />
+                            </fieldset>
+                        })}
                         <div class="modal-action">
                             <button class="btn btn-ghost" on:click=move |_| set_show_create.set(false)>
                                 "Cancel"
@@ -221,10 +249,13 @@ pub fn DestinationsPage() -> impl IntoView {
 
 fn platform_label(p: &str) -> &str {
     match p {
-        "youtube" => "YouTube",
+        "youtube" => "YouTube (RTMP)",
+        "youtube_hls" => "YouTube (HLS)",
         "twitch" => "Twitch",
         "custom_rtmp" => "Custom RTMP",
         "srt" => "SRT",
         _ => p,
     }
 }
+
+

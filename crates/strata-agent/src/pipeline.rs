@@ -1,8 +1,6 @@
 //! Pipeline manager — spawns and manages GStreamer sender pipelines.
 //!
 //! The agent spawns `strata-node` as a child process for clean isolation.
-//! In simulation mode, it runs a lightweight fake pipeline that generates
-//! synthetic stats without actual media processing.
 //!
 //! Stats are relayed from strata-node via UDP to 127.0.0.1:9100,
 //! where the telemetry module reads and forwards them to the control plane.
@@ -23,7 +21,6 @@ pub const CONTROL_SOCK_PATH: &str = "/tmp/strata-pipeline.sock";
 
 /// Pipeline manager state.
 pub struct PipelineManager {
-    simulate: bool,
     child: Option<Child>,
     stream_id: Option<String>,
     started_at: Option<Instant>,
@@ -57,9 +54,8 @@ fn send_to_control_socket(msg: &str) -> bool {
 }
 
 impl PipelineManager {
-    pub fn new(simulate: bool) -> Self {
+    pub fn new() -> Self {
         Self {
-            simulate,
             child: None,
             stream_id: None,
             started_at: None,
@@ -83,8 +79,8 @@ impl PipelineManager {
                     Ok(None) => {} // Still running
                     Err(_) => {}   // Error checking — assume still running
                 }
-            } else if !self.simulate {
-                // No child process and not simulating — not really running
+            } else {
+                // No child process — not really running
                 return false;
             }
         }
@@ -116,24 +112,15 @@ impl PipelineManager {
             stream_id = %payload.stream_id,
             source_mode = %payload.source.mode,
             bitrate_kbps = payload.encoder.bitrate_kbps,
-            simulate = self.simulate,
             "starting pipeline"
         );
 
-        if self.simulate {
-            // Simulation mode — no actual child process
-            self.stream_id = Some(payload.stream_id);
-            self.started_at = Some(Instant::now());
-            self.total_bytes = 0;
-            tracing::info!("simulated pipeline started");
-        } else {
-            // Real mode — spawn strata-node
-            let child = spawn_strata_node(&payload)?;
-            self.child = Some(child);
-            self.stream_id = Some(payload.stream_id);
-            self.started_at = Some(Instant::now());
-            self.total_bytes = 0;
-        }
+        // Spawn strata-node
+        let child = spawn_strata_node(&payload)?;
+        self.child = Some(child);
+        self.stream_id = Some(payload.stream_id);
+        self.started_at = Some(Instant::now());
+        self.total_bytes = 0;
 
         Ok(())
     }
@@ -297,7 +284,8 @@ impl PipelineManager {
 
 /// Spawn the `strata-node` binary as a child process.
 fn spawn_strata_node(payload: &StreamStartPayload) -> anyhow::Result<Child> {
-    let mut cmd = std::process::Command::new("strata-node");
+    let node_bin = std::env::var("STRATA_NODE_BIN").unwrap_or_else(|_| "strata-node".to_string());
+    let mut cmd = std::process::Command::new(&node_bin);
     cmd.arg("sender");
 
     // Source flags

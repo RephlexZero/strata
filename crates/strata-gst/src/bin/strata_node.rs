@@ -4,6 +4,8 @@ use std::env;
 use std::sync::{Arc, Mutex};
 use strata_bonding::metrics::MetricsServer;
 
+use gststrata::hls_upload;
+
 const SENDER_HELP: &str = r#"
 USAGE: strata-node sender [OPTIONS] --dest <ADDR[,ADDR...]>
 
@@ -309,7 +311,22 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Unknown codec '{}', defaulting to h264", codec_str);
         gststrata::codec::CodecType::H264
     });
-    let codec_ctrl = gststrata::codec::CodecController::new(codec_type);
+    // Validate that the encoder plugin is installed (e.g. x265enc needs gst-plugins-bad)
+    let enc_factory = codec_type.encoder_factory();
+    let (codec_type, codec_ctrl) = if gst::ElementFactory::find(enc_factory).is_none() {
+        eprintln!(
+            "Warning: encoder '{}' not available — falling back to h264",
+            enc_factory
+        );
+        let ct = gststrata::codec::CodecType::H264;
+        (ct, gststrata::codec::CodecController::new(ct))
+    } else {
+        (
+            codec_type,
+            gststrata::codec::CodecController::new(codec_type),
+        )
+    };
+
     // Resolve min/max from CLI or profile defaults
     let profile =
         strata_common::profiles::lookup_profile(Some(resolution), Some(framerate), Some(codec_str));
@@ -324,12 +341,19 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     //                 └→ queue → parser → [e]flvmux → rtmpsink (RTMP)
     //   voaacenc → tee → aacparse → queue → mpegtsmux         (Strata)
     //                 └→ queue → aacparse → [e]flvmux          (RTMP)
+    //
+    // For HLS relay (YouTube HLS ingest):
+    //   encoder → tee → queue → mpegtsmux → stratasink         (Strata)
+    //                 └→ queue → parser → hlssink2.video        (HLS)
+    //   voaacenc → tee → aacparse → queue → mpegtsmux          (Strata)
+    //                 └→ queue → aacparse → hlssink2.audio      (HLS)
     let mut use_relay = !relay_url.is_empty();
+    let use_hls_relay = use_relay && hls_upload::is_hls_url(relay_url);
 
     // Validate that the relay muxer element is actually available before trying.
     // eflvmux (for H.265) requires GStreamer 1.24+. If it's missing, disable the
     // relay and log a warning rather than failing the whole pipeline.
-    if use_relay {
+    if use_relay && !use_hls_relay {
         let muxer_factory = codec_ctrl.relay_muxer_factory_name();
         if gst::ElementFactory::find(muxer_factory).is_none() {
             eprintln!(
@@ -340,13 +364,52 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             use_relay = false;
         }
     }
+    if use_hls_relay && gst::ElementFactory::find("hlssink2").is_none() {
+        eprintln!(
+            "Warning: hlssink2 not available — HLS relay disabled; \
+             stream will still start without relay"
+        );
+        use_relay = false;
+    }
 
-    // When relay is enabled, force audio on (RTMP requires it)
+    // When relay is enabled, force audio on (RTMP requires it, HLS expects it)
     if use_relay {
         add_audio = true;
     }
 
-    let (audio_fragment, rtmp_fragment) = if use_relay {
+    // For HLS, create a temp directory for segment files.
+    // Prefer /dev/shm (RAM-backed tmpfs) to avoid flash/eMMC wear on SBCs.
+    let hls_tmp_dir = if use_hls_relay {
+        let dir = hls_upload::tmpfs_segment_dir(&format!("strata-hls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("failed to create HLS temp dir");
+        eprintln!(
+            "HLS temp dir: {} (tmpfs={})",
+            dir.display(),
+            dir.starts_with("/dev/shm")
+        );
+        Some(dir)
+    } else {
+        None
+    };
+
+    let (audio_fragment, relay_fragment) = if use_hls_relay {
+        let hls_dir = hls_tmp_dir.as_ref().unwrap();
+        let seg_location = hls_dir.join("segment%05d.ts");
+        let pl_location = hls_dir.join("playlist.m3u8");
+        // Audio with tee — one path to Strata mux, another to hlssink2
+        let audio = " audiotestsrc is-live=true wave=silence \
+            ! audioconvert ! audioresample ! voaacenc bitrate=128000 \
+            ! tee name=atee \
+            atee. ! queue ! aacparse ! mux. \
+            atee. ! queue ! aacparse ! hls.audio";
+        let hls = format!(
+            " hlssink2 name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
+             target-duration=2 max-files=10 send-keyframe-requests=true",
+            seg = seg_location.display(),
+            pl = pl_location.display(),
+        );
+        (audio.to_string(), hls)
+    } else if use_relay {
         // Audio with tee — one path to Strata mux, another to FLV mux
         let audio = " audiotestsrc is-live=true wave=silence \
             ! audioconvert ! audioresample ! voaacenc bitrate=128000 \
@@ -371,7 +434,13 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     // Video path: with relay, tee after encoder; without, straight to mux
     let parser = codec_type.parser_factory();
-    let video_to_mux = if use_relay {
+    let video_to_mux = if use_hls_relay {
+        format!(
+            "! tee name=vtee \
+             vtee. ! queue ! mux. \
+             vtee. ! queue ! {parser} ! hls.video"
+        )
+    } else if use_relay {
         format!(
             "! tee name=vtee \
              vtee. ! queue ! mux. \
@@ -392,14 +461,14 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
          ! {enc_fragment} \
          {video_to_mux}{audio} \
          mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 \
-         ! stratasink name=rsink{rtmp}",
+         ! stratasink name=rsink{relay}",
         w = res_w,
         h = res_h,
         fps = framerate,
         enc_fragment = enc_fragment,
         video_to_mux = video_to_mux,
         audio = audio_fragment,
-        rtmp = rtmp_fragment,
+        relay = relay_fragment,
     );
 
     eprintln!("Sender Pipeline: {}", pipeline_str);
@@ -409,6 +478,21 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "Failed to cast to pipeline")?;
 
     configure_mpegtsmux(&pipeline);
+
+    // Start HLS segment uploader if in HLS relay mode
+    let _hls_uploader = if use_hls_relay {
+        let hls_dir = hls_tmp_dir.as_ref().unwrap().clone();
+        let base_url = hls_upload::hls_base_url(relay_url).to_string();
+        Some(hls_upload::start_hls_uploader(
+            hls_upload::HlsUploaderConfig {
+                segment_dir: hls_dir,
+                base_url,
+                playlist_filename: "playlist.m3u8".into(),
+            },
+        ))
+    } else {
+        None
+    };
 
     // Keep a handle to the input-selector and its test-source pad
     let selector = pipeline
@@ -638,6 +722,12 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     pipeline.set_state(gst::State::Null)?;
     let _ = std::fs::remove_file(control_sock_path);
+
+    // Clean up HLS temp directory
+    if let Some(ref dir) = hls_tmp_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     Ok(())
 }
 
@@ -1166,6 +1256,9 @@ fn run_control_socket(path: &str, pipeline_weak: gst::glib::WeakRef<gst::Pipelin
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
 
+    // Remove stale socket file from previous run (crash recovery)
+    let _ = std::fs::remove_file(path);
+
     let listener = match UnixListener::bind(path) {
         Ok(l) => l,
         Err(e) => {
@@ -1369,8 +1462,41 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     //   stratasrc ! appsink
 
     let use_relay = !relay_url.is_empty();
+    let use_hls_relay = use_relay && hls_upload::is_hls_url(relay_url);
 
-    let pipeline_str = if use_relay {
+    // For HLS receiver relay, create a temp directory for segment files.
+    // Prefer /dev/shm (RAM-backed tmpfs) to avoid flash/eMMC wear on SBCs.
+    let hls_tmp_dir = if use_hls_relay {
+        let dir = hls_upload::tmpfs_segment_dir(&format!("strata-hls-rx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("failed to create HLS temp dir");
+        eprintln!(
+            "HLS temp dir: {} (tmpfs={})",
+            dir.display(),
+            dir.starts_with("/dev/shm")
+        );
+        Some(dir)
+    } else {
+        None
+    };
+
+    let pipeline_str = if use_hls_relay {
+        let hls_dir = hls_tmp_dir.as_ref().unwrap();
+        let seg_location = hls_dir.join("segment%05d.ts");
+        let pl_location = hls_dir.join("playlist.m3u8");
+        format!(
+            "stratasrc links=\"{bind}\" name=src latency=200 ! \
+             queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
+             tsdemux name=d \
+             d. ! queue ! {parser} ! hls.video \
+             d. ! queue ! aacparse ! hls.audio \
+             hlssink2 name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
+             target-duration=2 max-files=10 send-keyframe-requests=true",
+            bind = bind_str,
+            parser = video_parser,
+            seg = seg_location.display(),
+            pl = pl_location.display(),
+        )
+    } else if use_relay {
         let relay_frag = gststrata::codec::CodecController::new(codec_type).relay_muxer_fragment();
         format!(
             "stratasrc links=\"{bind}\" name=src latency=200 ! \
@@ -1467,6 +1593,21 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     pipeline.set_state(gst::State::Playing)?;
 
+    // Start HLS segment uploader if in HLS relay mode (receiver)
+    let _hls_uploader = if use_hls_relay {
+        let hls_dir = hls_tmp_dir.as_ref().unwrap().clone();
+        let base_url = hls_upload::hls_base_url(relay_url).to_string();
+        Some(hls_upload::start_hls_uploader(
+            hls_upload::HlsUploaderConfig {
+                segment_dir: hls_dir,
+                base_url,
+                playlist_filename: "playlist.m3u8".into(),
+            },
+        ))
+    } else {
+        None
+    };
+
     // ── Prometheus metrics server (receiver) ──
     let _metrics_server = if let Some(port) = metrics_port {
         let src_element = pipeline.by_name("src");
@@ -1536,6 +1677,11 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     pipeline.set_state(gst::State::Null)?;
+
+    // Clean up HLS temp directory
+    if let Some(ref dir) = hls_tmp_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     eprintln!(
         "Receiver Final Stats: Count={}, Bytes={}",

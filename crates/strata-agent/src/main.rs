@@ -6,7 +6,6 @@
 //! - Reports hardware state (network interfaces, media inputs)
 //! - Starts/stops GStreamer sender pipelines on command
 //! - Relays real-time bonding telemetry to the control plane
-//! - In `--simulate` mode, generates fake hardware data for local dev
 
 mod control;
 mod hardware;
@@ -37,10 +36,6 @@ struct Cli {
     #[arg(long)]
     enrollment_token: Option<String>,
 
-    /// Run in simulation mode (fake hardware, videotestsrc).
-    #[arg(long, default_value_t = false)]
-    simulate: bool,
-
     /// Onboarding portal listen address.
     #[arg(long, default_value = "0.0.0.0:3001")]
     portal_addr: String,
@@ -60,7 +55,6 @@ struct Cli {
 
 /// Shared agent state accessible from all tasks.
 pub struct AgentState {
-    pub simulate: bool,
     pub sender_id: tokio::sync::Mutex<Option<String>>,
     pub session_token: tokio::sync::Mutex<Option<String>>,
     pub hardware: hardware::HardwareScanner,
@@ -79,6 +73,8 @@ pub struct AgentState {
     pub reconnect_tx: tokio::sync::watch::Sender<()>,
     /// Receiver URL — where to send bonded traffic (set via portal or control plane).
     pub receiver_url: tokio::sync::Mutex<Option<String>>,
+    /// Sender for triggering graceful shutdown.
+    pub shutdown_tx: watch::Sender<bool>,
     /// Latest link stats from the bonding engine (updated by telemetry loop).
     pub latest_link_stats: tokio::sync::RwLock<Vec<strata_common::models::LinkStats>>,
 }
@@ -98,7 +94,6 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(
         hostname = %hostname,
-        simulate = cli.simulate,
         control_url = %cli.control_url,
         "strata-agent starting"
     );
@@ -114,11 +109,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Build shared state
     let state = Arc::new(AgentState {
-        simulate: cli.simulate,
         sender_id: tokio::sync::Mutex::new(None),
         session_token: tokio::sync::Mutex::new(None),
-        hardware: hardware::HardwareScanner::new(cli.simulate),
-        pipeline: tokio::sync::Mutex::new(pipeline::PipelineManager::new(cli.simulate)),
+        hardware: hardware::HardwareScanner::new(),
+        pipeline: tokio::sync::Mutex::new(pipeline::PipelineManager::new()),
         control_tx: control_tx.clone(),
         shutdown: shutdown_rx.clone(),
         control_connected: AtomicBool::new(false),
@@ -127,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
         pending_control_url: tokio::sync::Mutex::new(None),
         reconnect_tx,
         receiver_url: tokio::sync::Mutex::new(None),
+        shutdown_tx,
         latest_link_stats: tokio::sync::RwLock::new(Vec::new()),
     });
 
@@ -180,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("received SIGINT, shutting down");
-            let _ = shutdown_tx.send(true);
+            let _ = state.shutdown_tx.send(true);
         }
         result = control_handle => {
             if let Err(e) = result {

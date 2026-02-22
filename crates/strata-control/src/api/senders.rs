@@ -23,8 +23,11 @@ use uuid::Uuid;
 
 use strata_common::ids;
 use strata_common::protocol::{
-    ConfigSetPayload, ConfigUpdatePayload, Envelope, FilesListPayload, InterfaceCommandPayload,
-    InterfacesScanPayload, SourceSwitchPayload, TestRunPayload,
+    ConfigExportPayload, ConfigImportPayload, ConfigSetPayload, ConfigUpdatePayload, Envelope,
+    FilesListPayload, InterfaceCommandPayload, InterfacesScanPayload, JitterBufferPayload,
+    LogsRequestPayload, NetworkToolPayload, PcapCapturePayload, PowerCommandPayload,
+    SourceSwitchPayload, StreamDestinationsPayload, TestRunPayload, TlsRenewPayload,
+    TlsStatusPayload, UpdatesCheckPayload, UpdatesInstallPayload,
 };
 
 use crate::api::auth::ApiError;
@@ -67,6 +70,39 @@ pub fn router() -> Router<AppState> {
         )
         .route("/{id}/source", axum::routing::post(switch_source))
         .route("/{id}/files", get(list_sender_files))
+        // Diagnostics
+        .route(
+            "/{id}/diagnostics/network",
+            axum::routing::post(run_network_tool),
+        )
+        .route("/{id}/diagnostics/pcap", axum::routing::post(capture_pcap))
+        .route("/{id}/logs", get(get_logs))
+        // Power
+        .route("/{id}/power", axum::routing::post(power_command))
+        // TLS
+        .route("/{id}/tls", get(get_tls_status))
+        .route("/{id}/tls/renew", axum::routing::post(renew_tls_cert))
+        // Config export/import
+        .route("/{id}/config/export", get(export_config))
+        .route("/{id}/config/import", axum::routing::post(import_config))
+        // OTA updates
+        .route("/{id}/updates/check", get(check_updates))
+        .route("/{id}/updates/install", axum::routing::post(install_update))
+        // Stream routing & jitter buffer
+        .route(
+            "/{id}/stream/destinations",
+            axum::routing::post(set_stream_destinations),
+        )
+        .route(
+            "/{id}/stream/jitter_buffer",
+            axum::routing::post(set_jitter_buffer),
+        )
+        // Alerting
+        .route("/{id}/alerts", get(get_alert_rules).post(set_alert_rule))
+        .route(
+            "/{id}/alerts/{rule_id}",
+            axum::routing::delete(delete_alert_rule),
+        )
 }
 
 // ── List Senders ────────────────────────────────────────────────────
@@ -812,7 +848,343 @@ async fn list_sender_files(
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
+// ── Diagnostics: Network Tool ───────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct NetworkToolRequest {
+    tool: String,
+    target: Option<String>,
+}
+
+async fn run_network_tool(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    Json(body): Json<NetworkToolRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("operator")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    let request_id = Uuid::now_v7().to_string();
+    let payload = NetworkToolPayload {
+        request_id,
+        tool: body.tool,
+        target: body.target,
+    };
+    proxy_to_agent(&state, &id, "diagnostics.network", &payload, 30).await
+}
+
+// ── Diagnostics: PCAP ───────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct PcapRequest {
+    duration_secs: u32,
+}
+
+async fn capture_pcap(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    Json(body): Json<PcapRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("admin")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    let request_id = Uuid::now_v7().to_string();
+    let payload = PcapCapturePayload {
+        request_id,
+        duration_secs: body.duration_secs.min(60),
+    };
+    proxy_to_agent(&state, &id, "diagnostics.pcap", &payload, 70).await
+}
+
+// ── Diagnostics: Logs ───────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    service: Option<String>,
+    lines: Option<u32>,
+}
+
+async fn get_logs(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    Query(q): Query<LogsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("operator")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    let request_id = Uuid::now_v7().to_string();
+    let payload = LogsRequestPayload {
+        request_id,
+        service: q.service,
+        lines: q.lines,
+    };
+    proxy_to_agent(&state, &id, "logs.get", &payload, 10).await
+}
+
+// ── Power ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct PowerRequest {
+    action: String,
+}
+
+async fn power_command(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    Json(body): Json<PowerRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("admin")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    let request_id = Uuid::now_v7().to_string();
+    let payload = PowerCommandPayload {
+        request_id,
+        action: body.action,
+    };
+    proxy_to_agent(&state, &id, "power.command", &payload, 10).await
+}
+
+// ── TLS ─────────────────────────────────────────────────────────────
+
+async fn get_tls_status(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("operator")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    let request_id = Uuid::now_v7().to_string();
+    let payload = TlsStatusPayload { request_id };
+    proxy_to_agent(&state, &id, "tls.status", &payload, 10).await
+}
+
+async fn renew_tls_cert(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("admin")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    let request_id = Uuid::now_v7().to_string();
+    let payload = TlsRenewPayload { request_id };
+    proxy_to_agent(&state, &id, "tls.renew", &payload, 15).await
+}
+
+// ── Config Export/Import ────────────────────────────────────────────
+
+async fn export_config(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("operator")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    let request_id = Uuid::now_v7().to_string();
+    let payload = ConfigExportPayload { request_id };
+    proxy_to_agent(&state, &id, "config.export", &payload, 10).await
+}
+
+async fn import_config(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("admin")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    let request_id = Uuid::now_v7().to_string();
+    let payload = ConfigImportPayload {
+        request_id,
+        config: body,
+    };
+    proxy_to_agent(&state, &id, "config.import", &payload, 10).await
+}
+
+// ── OTA Updates ─────────────────────────────────────────────────────
+
+async fn check_updates(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("operator")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    let request_id = Uuid::now_v7().to_string();
+    let payload = UpdatesCheckPayload { request_id };
+    proxy_to_agent(&state, &id, "updates.check", &payload, 15).await
+}
+
+async fn install_update(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("admin")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    let request_id = Uuid::now_v7().to_string();
+    let payload = UpdatesInstallPayload { request_id };
+    proxy_to_agent(&state, &id, "updates.install", &payload, 30).await
+}
+
+// ── Stream Destinations ─────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct DestinationsRequest {
+    destination_ids: Vec<String>,
+}
+
+async fn set_stream_destinations(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    Json(body): Json<DestinationsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("operator")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    let request_id = Uuid::now_v7().to_string();
+    let payload = StreamDestinationsPayload {
+        request_id,
+        destination_ids: body.destination_ids,
+    };
+    proxy_to_agent(&state, &id, "stream.destinations", &payload, 10).await
+}
+
+// ── Jitter Buffer ───────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct JitterBufferRequest {
+    mode: String,
+    static_ms: Option<u32>,
+}
+
+async fn set_jitter_buffer(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    Json(body): Json<JitterBufferRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user.require_role("operator")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    let request_id = Uuid::now_v7().to_string();
+    let payload = JitterBufferPayload {
+        request_id,
+        mode: body.mode,
+        static_ms: body.static_ms,
+    };
+    proxy_to_agent(&state, &id, "stream.jitter_buffer", &payload, 10).await
+}
+
+// ── Alerting ────────────────────────────────────────────────────────
+
+async fn get_alert_rules(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    user.require_role("operator")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    let rules = state
+        .alert_rules()
+        .get(&id)
+        .map(|r| r.clone())
+        .unwrap_or_default();
+    Ok(Json(rules))
+}
+
+async fn set_alert_rule(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    Json(mut body): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    user.require_role("operator")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    // Ensure the rule has an ID
+    if body.get("id").and_then(|v| v.as_str()).is_none() {
+        body["id"] = serde_json::json!(Uuid::now_v7().to_string());
+    }
+    let rule_id = body["id"].as_str().unwrap_or("").to_string();
+
+    let mut rules = state.alert_rules().entry(id).or_default();
+    if let Some(pos) = rules
+        .iter()
+        .position(|r| r.get("id").and_then(|v| v.as_str()) == Some(&rule_id))
+    {
+        rules[pos] = body;
+    } else {
+        rules.push(body);
+    }
+    Ok(StatusCode::OK)
+}
+
+async fn delete_alert_rule(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((id, rule_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    user.require_role("operator")?;
+    verify_ownership(&state, &user, &id).await?;
+
+    if let Some(mut rules) = state.alert_rules().get_mut(&id) {
+        rules.retain(|r| r.get("id").and_then(|v| v.as_str()) != Some(&rule_id));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn proxy_to_agent(
+    state: &AppState,
+    sender_id: &str,
+    msg_type: &str,
+    payload: &impl serde::Serialize,
+    timeout_secs: u64,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let agent = state
+        .agents()
+        .get(sender_id)
+        .ok_or_else(|| ApiError::bad_request("sender is not connected"))?;
+
+    let envelope = Envelope::new(msg_type, payload);
+    let json = serde_json::to_string(&envelope).map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Extract request_id from the payload (convention: all request payloads have one)
+    let request_id = serde_json::to_value(payload)
+        .ok()
+        .and_then(|v| v.get("request_id")?.as_str().map(String::from))
+        .unwrap_or_else(|| envelope.id.clone());
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.pending_requests().insert(request_id.clone(), tx);
+
+    agent
+        .tx
+        .send(json)
+        .await
+        .map_err(|_| ApiError::internal("failed to send command to agent"))?;
+
+    drop(agent);
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+        Ok(Ok(value)) => Ok(Json(value)),
+        Ok(Err(_)) => Err(ApiError::internal("agent disconnected")),
+        Err(_) => {
+            state.pending_requests().remove(&request_id);
+            Err(ApiError::internal("request timed out"))
+        }
+    }
+}
 
 /// Verify the authenticated user owns the given sender.
 async fn verify_ownership(

@@ -1,8 +1,19 @@
 # Strata Platform — Full Dev Stack
 #
-#   docker compose up --build -d    # build & start everything
-#   docker compose logs -f          # tail logs
-#   docker compose down -v          # tear down (delete data)
+# ── Fastest iteration (native Rust, auto-restart on save) ──────────
+#
+#   docker compose up -d postgres strata-receiver   # infra (once)
+#
+#   # Terminal 1 — control plane:
+#   cargo watch -x 'run -p strata-control'
+#
+#   # Terminal 2 — sender agent:
+#   cargo watch -x 'run -p strata-agent -- --control-url ws://localhost:3000/agent/ws --enrollment-token DEV1-TEST --hostname sim-sender-01'
+#
+# ── Full Docker stack (no cargo needed) ────────────────────────────
+#
+#   cargo build -p strata-gst -p strata-agent -p strata-control
+#   docker compose up -d
 #
 # Dashboard:  http://localhost:3000
 # Login:      dev@strata.local / development
@@ -128,6 +139,7 @@ services:
       RUST_LOG: "info"
       GST_PLUGIN_PATH: "/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
       RELAY_URL: "${RELAY_URL:-}"
+      STRATA_CODEC: "${STRATA_CODEC:-h265}"
       STRATA_LINK_COUNT: "3"
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -140,22 +152,15 @@ services:
           if [ -n "$$BIND" ]; then BIND="$$BIND,"; fi
           BIND="$${BIND}0.0.0.0:$$PORT"
         done
-        echo "=== Receiver: binding $$BIND ==="
+        echo "=== Receiver: binding $$BIND (codec=$$STRATA_CODEC) ==="
+        ARGS="--bind $$BIND --codec $${STRATA_CODEC:-h265}"
         if [ -n "$$RELAY_URL" ]; then
-          echo "=== Receiver: RTMP relay → $$RELAY_URL ==="
-          exec gst-launch-1.0 -e \
-            stratasrc links="$$BIND" latency=200 ! \
-            queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
-            tsdemux name=d \
-            d. ! queue ! h264parse ! flvmux name=mux streamable=true ! \
-            rtmpsink location="$$RELAY_URL" sync=false \
-            d. ! queue ! aacparse ! mux.
+          echo "=== Receiver: relay → $$RELAY_URL ==="
+          ARGS="$$ARGS --relay-url $$RELAY_URL"
         else
           echo "=== Receiver: monitor mode (set RELAY_URL to relay) ==="
-          exec gst-launch-1.0 -e -v \
-            stratasrc links="$$BIND" latency=200 ! \
-            fakesink sync=false
         fi
+        exec strata-node receiver $$ARGS
     ports:
       - "5000:5000/udp"
       - "5002:5002/udp"
@@ -197,17 +202,25 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        cat >> Trunk.toml <<'PROXY'
+        cp index.html index.html.bak 2>/dev/null || true
+        cat > Trunk.toml <<'EOF'
+        [build]
+        dist = "dist"
+
+        [[hooks]]
+        stage = "pre_build"
+        command = "npx"
+        command_arguments = ["@tailwindcss/cli", "-i", "style/input.css", "-o", "style/main.css", "--minify"]
 
         [[proxy]]
         rewrite = "/api/"
         backend = "http://strata-control:3000/api/"
 
         [[proxy]]
-        rewrite = "/dashboard/"
-        backend = "http://strata-control:3000/dashboard/"
+        rewrite = "/ws"
+        backend = "ws://strata-control:3000/ws"
         ws = true
-        PROXY
+        EOF
         exec trunk serve --address 0.0.0.0 --port 8080
     restart: unless-stopped
 
@@ -235,12 +248,19 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        cat >> Trunk.toml <<'PROXY'
+        cat > Trunk.toml <<'EOF'
+        [build]
+        dist = "dist"
+
+        [[hooks]]
+        stage = "pre_build"
+        command = "npx"
+        command_arguments = ["@tailwindcss/cli", "-i", "style/input.css", "-o", "style/main.css", "--minify"]
 
         [[proxy]]
         rewrite = "/api/"
         backend = "http://strata-sender-sim:3001/api/"
-        PROXY
+        EOF
         exec trunk serve --address 0.0.0.0 --port 8080
     restart: unless-stopped
 

@@ -350,11 +350,12 @@ impl LinkSender for TransportLink {
         };
 
         // Only report transport-level loss when we have receiver feedback
-        // (packets_acked > 0). Without ACK channel, the unacked ratio is
-        // always 100% which is misleading — report 0.0 instead.
+        // (packets_acked > 0). Use retransmission ratio instead of the
+        // unacked ratio — unacked counts in-flight packets as "lost" which
+        // is misleading on high-BDP links.
         let stats = sender.stats();
-        let loss_rate = if stats.packets_acked > 0 {
-            stats.loss_rate()
+        let loss_rate = if stats.packets_acked > 0 && stats.packets_sent > 0 {
+            stats.retransmit_ratio()
         } else {
             0.0
         };

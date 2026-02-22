@@ -375,6 +375,207 @@ pub struct FilesListResponsePayload {
     pub error: Option<String>,
 }
 
+// ── Diagnostics Protocol ────────────────────────────────────────────
+
+/// Run a network diagnostic tool (ping, traceroute, speedtest).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkToolPayload {
+    pub request_id: String,
+    pub tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkToolResponsePayload {
+    pub request_id: String,
+    pub tool: String,
+    pub output: String,
+    pub success: bool,
+}
+
+/// Capture network packets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PcapCapturePayload {
+    pub request_id: String,
+    pub duration_secs: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PcapCaptureResponsePayload {
+    pub request_id: String,
+    pub download_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_size_bytes: Option<u64>,
+    pub duration_secs: u32,
+}
+
+/// Fetch device logs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogsRequestPayload {
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogLineEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogsResponsePayload {
+    pub request_id: String,
+    pub service: String,
+    pub lines: Vec<LogLineEntry>,
+}
+
+/// Send a power command (reboot, shutdown, restart_agent).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowerCommandPayload {
+    pub request_id: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowerCommandResponsePayload {
+    pub request_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// TLS certificate status query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsStatusPayload {
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsStatusResponsePayload {
+    pub request_id: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert_subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert_issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expiry: Option<String>,
+    pub self_signed: bool,
+}
+
+/// TLS certificate renewal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsRenewPayload {
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsRenewResponsePayload {
+    pub request_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Export agent configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigExportPayload {
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigExportResponsePayload {
+    pub request_id: String,
+    pub config: serde_json::Value,
+}
+
+/// Import agent configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigImportPayload {
+    pub request_id: String,
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigImportResponsePayload {
+    pub request_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Check for OTA updates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatesCheckPayload {
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatesCheckResponsePayload {
+    pub request_id: String,
+    pub current_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    pub update_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_size_bytes: Option<u64>,
+}
+
+/// Install OTA update.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatesInstallPayload {
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatesInstallResponsePayload {
+    pub request_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Set stream destinations (fan-out).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamDestinationsPayload {
+    pub request_id: String,
+    pub destination_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamDestinationsResponsePayload {
+    pub request_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Configure receiver jitter buffer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JitterBufferPayload {
+    pub request_id: String,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub static_ms: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JitterBufferResponsePayload {
+    pub request_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 // ── Dashboard WebSocket Events ──────────────────────────────────────
 
 /// Events pushed to dashboard WebSocket subscribers.

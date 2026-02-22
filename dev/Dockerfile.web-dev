@@ -14,7 +14,7 @@
 # compiled from source, and Cargo deps are cached in a separate layer
 # before real source is copied so they survive source-only changes.
 
-FROM rust:nightly-bookworm
+FROM rust:bookworm
 
 # Node.js for Tailwind CSS / DaisyUI
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
@@ -48,6 +48,16 @@ RUN printf '[workspace]\nresolver = "2"\nmembers = ["crates/%s"]\n' "${CRATE}" >
 # Stub lib.rs so cargo can resolve and fetch all deps + compile them
 RUN mkdir -p crates/${CRATE}/src && echo '' > crates/${CRATE}/src/lib.rs
 RUN cargo build --target wasm32-unknown-unknown -p ${CRATE} 2>/dev/null || true
+
+# Remove stub-specific build artifacts so Cargo recompiles from real source
+# (deps stay cached, only the crate itself rebuilds)
+RUN set -eux; \
+    crate_us="$(printf '%s' "${CRATE}" | tr '-' '_')"; \
+    rm -rf target/wasm32-unknown-unknown/debug/.fingerprint/${CRATE}-* \
+    target/wasm32-unknown-unknown/debug/deps/${crate_us}-* \
+    target/wasm32-unknown-unknown/debug/incremental/${crate_us}-* \
+    target/wasm32-unknown-unknown/debug/${crate_us}.wasm \
+    target/wasm32-unknown-unknown/debug/${crate_us}.d
 
 # ── Layer 2: npm deps (only rebuilds when style/ changes) ──
 COPY crates/${CRATE}/style crates/${CRATE}/style

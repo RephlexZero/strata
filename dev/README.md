@@ -1,63 +1,57 @@
-# dev/ — Local Docker Compose Stack
+# dev/ — Development Workflows
 
-Quick-start for validating the full containerised platform.
+All commands run from the **project root** (`/workspaces/strata`).
 
-## Usage
+## Native Dev (fastest — auto-restart on save)
+
+Run Rust services directly with `cargo watch`. Only Postgres and the
+receiver stay in Docker. Edit → save → auto-rebuild+restart (~5s).
 
 ```bash
-# Build and start everything (from project root)
-docker compose up --build -d
+# 1. Start infrastructure (once):
+docker compose up -d postgres strata-receiver
 
-# Tail logs
-docker compose logs -f
+# 2. Terminal 1 — control plane:
+cargo watch -x 'run -p strata-control'
 
-# Tear down (preserves data volume)
-docker compose down
+# 3. Terminal 2 — sender agent:
+cargo watch -x 'run -p strata-agent -- --control-url ws://localhost:3000/agent/ws --enrollment-token DEV1-TEST --hostname sim-sender-01'
+```
 
-# Tear down and delete all data
-docker compose down -v --remove-orphans
+Environment variables are preset in `.cargo/config.toml` — no env vars
+needed on the command line.
+
+Dashboard: http://localhost:3000 — Login: `dev@strata.local` / `development`
+
+## Docker Dev (full stack in containers)
+
+Host-compiled binaries are bind-mounted into containers via
+`docker-compose.override.yml` (auto-loaded by Docker Compose).
+
+```bash
+# First time (force-recreate ensures clean container networking):
+cargo build -p strata-gst -p strata-agent -p strata-control
+docker compose up -d --force-recreate
+
+# After code changes (~5s build + ~2s restart):
+cargo build -p strata-gst -p strata-agent -p strata-control
+docker compose restart -t 1 strata-sender-sim strata-receiver strata-control
 ```
 
 ## Web Development (Hot Reload)
 
-Iterate on the dashboard or portal with live hot-reload — no manual
-builds or restarts needed.  Source files are bind-mounted and Trunk
-watches for changes, automatically rebuilding WASM and refreshing the
-browser.
+Live-reloading Trunk dev servers — edit `.rs` / `.css` files and the
+browser refreshes automatically.
 
 ```bash
-# Start the full stack + dashboard dev server on :8080
-docker compose --profile web-dev up --build dashboard-dev
-
-# Start the full stack + portal dev server on :8081
-docker compose --profile web-dev up --build portal-dev
-
-# Start both web dev servers at once
-docker compose --profile web-dev up --build dashboard-dev portal-dev
+docker compose --profile web-dev up --build dashboard-dev   # :8080
+docker compose --profile web-dev up --build portal-dev      # :8081
 ```
-
-API and WebSocket requests are proxied to the backend services
-automatically — the WASM apps work identically to production.
 
 | Dev Server | URL | Proxies to |
 |---|---|---|
 | `dashboard-dev` | http://localhost:8080 | `strata-control:3000` |
 | `portal-dev` | http://localhost:8081 | `strata-sender-sim:3001` |
-
-## Rust Binary Iteration (Dev Overlay)
-
-For iterating on the Rust services, use the dev overlay which
-bind-mounts host-built debug binaries into the containers:
-
-```bash
-# Start with dev overlay
-docker compose -f docker-compose.yml -f dev/docker-compose.dev.yml up -d
-
-# Rebuild and restart a single service
-cargo build -p strata-control && docker compose restart strata-control
-cargo build -p strata-agent  && docker compose restart strata-sender-sim
-cargo build -p strata-gst    && docker compose restart strata-sender-sim strata-receiver
-```
 
 ## Services
 
@@ -80,5 +74,6 @@ On startup with `DEV_SEED=1`, `strata-control` inserts:
 ## Notes
 
 - This runs inside Docker-in-Docker within the devcontainer
-- For daily Rust development, use `cargo run` directly — much faster iteration
+- `docker-compose.override.yml` is auto-loaded by `docker compose` — no `-f` flags needed
+- Host binaries are ABI-compatible with containers (both Debian, GStreamer 1.28)
 - Web dev profiles give trunk hot-reload without leaving Docker

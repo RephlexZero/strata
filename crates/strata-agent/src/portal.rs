@@ -85,7 +85,6 @@ async fn api_status(State(state): State<Arc<AgentState>>) -> Json<serde_json::Va
         "sender_id": sender_id,
         "enrolled": sender_id.is_some(),
         "cloud_connected": control_connected,
-        "simulate": state.simulate,
         "streaming": pipeline.is_running(),
         "stream_id": pipeline.stream_id(),
         "uptime_s": hw.uptime_s,

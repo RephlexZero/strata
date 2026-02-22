@@ -113,6 +113,7 @@ pub fn SenderDetailPage() -> impl IntoView {
     let (show_start_modal, set_show_start_modal) = signal(false);
     let (destinations, set_destinations) = signal(Vec::<crate::types::DestinationSummary>::new());
     let (selected_dest, set_selected_dest) = signal(Option::<String>::None);
+    let (selected_codec, set_selected_codec) = signal(String::from("h265"));
     let (dests_loading, set_dests_loading) = signal(false);
 
     // Receiver URL change confirm
@@ -290,6 +291,7 @@ pub fn SenderDetailPage() -> impl IntoView {
     let open_start_modal = move |_| {
         set_show_start_modal.set(true);
         set_selected_dest.set(None);
+        set_selected_codec.set(String::from("h265"));
         set_dests_loading.set(true);
         let token = auth_open.token.get_untracked().unwrap_or_default();
         leptos::task::spawn_local(async move {
@@ -306,10 +308,19 @@ pub fn SenderDetailPage() -> impl IntoView {
         let id = params.get().get("id").unwrap_or_default();
         let token = auth_start2.token.get_untracked().unwrap_or_default();
         let dest_id = selected_dest.get_untracked();
+        let codec = selected_codec.get_untracked();
+        let encoder = Some(crate::types::EncoderConfig {
+            bitrate_kbps: 0,
+            tune: None,
+            keyint_max: None,
+            codec: Some(codec),
+            min_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+        });
         set_action_loading.set(true);
         set_show_start_modal.set(false);
         leptos::task::spawn_local(async move {
-            match api::start_stream(&token, &id, dest_id, None, None).await {
+            match api::start_stream(&token, &id, dest_id, None, encoder).await {
                 Ok(resp) => {
                     set_stream_state.set(resp.state);
                     set_action_loading.set(false);
@@ -439,6 +450,8 @@ pub fn SenderDetailPage() -> impl IntoView {
                 destinations=destinations
                 selected_dest=selected_dest
                 set_selected_dest=set_selected_dest
+                selected_codec=selected_codec
+                set_selected_codec=set_selected_codec
                 dests_loading=dests_loading
                 on_confirm=confirm_start_stream
             />

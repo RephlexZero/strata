@@ -1,0 +1,10 @@
+# Preset dev environment variables so `cargo run` just works
+# without needing env var prefixes on every command.
+
+[env]
+DATABASE_URL = "postgres://strata:dev-only-password@localhost/strata"
+DEV_SEED = "1"
+RUST_LOG = "info,strata_control=debug,strata_agent=debug"
+LISTEN_ADDR = "0.0.0.0:3000"
+RECEIVER_HOST = "strata-receiver"
+RECEIVER_LINKS = "172.30.0.20:5000,172.30.1.20:5002,172.30.2.20:5004"

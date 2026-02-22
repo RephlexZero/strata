@@ -1,0 +1,31 @@
+# Auto-loaded by `docker compose` — bind-mounts host-compiled binaries
+# into runtime containers so code changes only require `cargo build`
+# + container restart (no image rebuild).
+#
+# Workflow:
+#   cargo build                          # compile locally (~5s incremental)
+#   docker compose restart strata-sender-sim   # pick up new binaries
+
+services:
+  strata-control:
+    # Run host-compiled control binary instead of the one baked into the image.
+    volumes:
+      - ./target/debug/strata-control:/usr/local/bin/strata-control:ro
+      # Dashboard WASM is still served from the image's baked copy.
+      # Use `dashboard-dev` (profile web-dev) for live-reload during UI work.
+
+  strata-sender-sim:
+    volumes:
+      # Agent binary
+      - ./target/debug/strata-agent:/usr/local/bin/strata-agent:ro
+      # Pipeline binary (strata-node sender)
+      - ./target/debug/strata-node:/usr/local/bin/strata-node:ro
+      # GStreamer bonding plugin
+      - ./target/debug/libgststrata.so:/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgststrata.so:ro
+
+  strata-receiver:
+    volumes:
+      # GStreamer bonding plugin (stratasrc element)
+      - ./target/debug/libgststrata.so:/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgststrata.so:ro
+      # If using strata-node as receiver:
+      - ./target/debug/strata-node:/usr/local/bin/strata-node:ro

@@ -33,4 +33,5 @@ services:
 
   strata-receiver:
     volumes:
+      - ${PWD}/target/debug/strata-node:/usr/local/bin/strata-node:ro
       - ${PWD}/target/debug/libgststrata.so:/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgststrata.so:ro

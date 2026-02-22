@@ -6,6 +6,7 @@
 use gst::glib;
 
 pub mod codec;
+pub mod hls_upload;
 pub mod pad;
 pub mod sink;
 pub mod src;

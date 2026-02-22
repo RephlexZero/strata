@@ -1,7 +1,6 @@
 //! Hardware scanner — enumerates network interfaces, media inputs, and system stats.
 //!
-//! In simulation mode, generates realistic fake data for local development.
-//! In production mode, reads from /sys, /proc, v4l2, and ModemManager.
+//! Reads from /sys, /proc, v4l2, and ModemManager.
 //! A synthetic "GStreamer Test Source" input is always available regardless
 //! of whether real capture devices are present.
 
@@ -21,116 +20,22 @@ pub struct HardwareScan {
     pub uptime_s: u64,
 }
 
-/// Scans hardware state — real or simulated.
+/// Scans hardware state.
 pub struct HardwareScanner {
-    simulate: bool,
     /// Tracks enabled/disabled state per interface name.
     interface_enabled: std::sync::Mutex<std::collections::HashMap<String, bool>>,
 }
 
 impl HardwareScanner {
-    pub fn new(simulate: bool) -> Self {
+    pub fn new() -> Self {
         Self {
-            simulate,
             interface_enabled: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     /// Perform a hardware scan.
     pub async fn scan(&self) -> HardwareScan {
-        if self.simulate {
-            self.scan_simulated().await
-        } else {
-            self.scan_real().await
-        }
-    }
-
-    /// Simulated hardware scan — generates fake but realistic data.
-    async fn scan_simulated(&self) -> HardwareScan {
-        use rand::Rng;
-        let mut rng = rand::rng();
-        let enabled_map = self.interface_enabled.lock().unwrap();
-
-        let mut interfaces = vec![
-            NetworkInterface {
-                name: "wwan0".into(),
-                iface_type: InterfaceType::Cellular,
-                state: InterfaceState::Connected,
-                enabled: *enabled_map.get("wwan0").unwrap_or(&true),
-                ip: Some("10.45.0.2".into()),
-                carrier: Some("T-Mobile".into()),
-                signal_dbm: Some(-65 - rng.random_range(0..20)),
-                technology: Some("LTE".into()),
-                band: Some("B71".into()),
-                cell_id: Some("310260-1234567".into()),
-                data_cap_mb: Some(50_000),
-                data_used_mb: Some(12_500),
-                priority: 1,
-                apn: Some("fast.t-mobile.com".into()),
-                sim_pin: None,
-                roaming: false,
-            },
-            NetworkInterface {
-                name: "wwan1".into(),
-                iface_type: InterfaceType::Cellular,
-                state: InterfaceState::Connected,
-                enabled: *enabled_map.get("wwan1").unwrap_or(&true),
-                ip: Some("10.46.0.3".into()),
-                carrier: Some("Vodafone".into()),
-                signal_dbm: Some(-60 - rng.random_range(0..15)),
-                technology: Some("5G-NSA".into()),
-                band: Some("n41".into()),
-                cell_id: Some("310260-7654321".into()),
-                data_cap_mb: Some(100_000),
-                data_used_mb: Some(85_000),
-                priority: 2,
-                apn: Some("internet".into()),
-                sim_pin: None,
-                roaming: true,
-            },
-            NetworkInterface {
-                name: "eth0".into(),
-                iface_type: InterfaceType::Ethernet,
-                state: InterfaceState::Disconnected,
-                enabled: *enabled_map.get("eth0").unwrap_or(&true),
-                ip: None,
-                carrier: None,
-                signal_dbm: None,
-                technology: None,
-                band: None,
-                cell_id: None,
-                data_cap_mb: None,
-                data_used_mb: None,
-                priority: 1,
-                apn: None,
-                sim_pin: None,
-                roaming: false,
-            },
-        ];
-
-        // Apply enabled state: if disabled, force state to Disconnected
-        for iface in &mut interfaces {
-            if !iface.enabled {
-                iface.state = InterfaceState::Disconnected;
-                iface.ip = None;
-            }
-        }
-
-        let inputs = vec![MediaInput {
-            device: "/dev/video0".into(),
-            input_type: MediaInputType::Test,
-            label: "Simulated HDMI Capture".into(),
-            capabilities: vec!["1920x1080@30".into(), "1280x720@60".into()],
-            status: MediaInputStatus::Available,
-        }];
-
-        HardwareScan {
-            interfaces,
-            inputs,
-            cpu_percent: 8.0 + rng.random_range(0.0..15.0_f32),
-            mem_used_mb: 180 + rng.random_range(0..50),
-            uptime_s: get_uptime_s(),
-        }
+        self.scan_real().await
     }
 
     /// Real hardware scan — reads from system interfaces.

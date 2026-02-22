@@ -47,7 +47,6 @@ services:
     environment:
       RUST_LOG: "info,strata_agent=debug"
     command:
-      - "--simulate"
       - "--control-url"
       - "ws://strata-control:3000/agent/ws"
       - "--enrollment-token"

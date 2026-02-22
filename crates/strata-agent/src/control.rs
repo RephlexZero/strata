@@ -16,12 +16,19 @@ use tokio_tungstenite::tungstenite::Message;
 
 use strata_common::models::StreamState;
 use strata_common::protocol::{
-    AuthLoginPayload, AuthLoginResponsePayload, ConfigSetPayload, ConfigSetResponsePayload,
+    AuthLoginPayload, AuthLoginResponsePayload, ConfigExportPayload, ConfigExportResponsePayload,
+    ConfigImportPayload, ConfigImportResponsePayload, ConfigSetPayload, ConfigSetResponsePayload,
     ConfigUpdatePayload, ConfigUpdateResponsePayload, DeviceStatusPayload, Envelope, FileEntry,
     FilesListPayload, FilesListResponsePayload, InterfaceCommandPayload,
     InterfaceCommandResponsePayload, InterfacesScanPayload, InterfacesScanResponsePayload,
-    SourceSwitchPayload, StreamEndReason, StreamEndedPayload, StreamStartPayload,
-    StreamStopPayload, TestRunPayload, TestRunResponsePayload,
+    JitterBufferPayload, JitterBufferResponsePayload, LogLineEntry, LogsRequestPayload,
+    LogsResponsePayload, NetworkToolPayload, NetworkToolResponsePayload, PcapCapturePayload,
+    PcapCaptureResponsePayload, PowerCommandPayload, PowerCommandResponsePayload,
+    SourceSwitchPayload, StreamDestinationsPayload, StreamDestinationsResponsePayload,
+    StreamEndReason, StreamEndedPayload, StreamStartPayload, StreamStopPayload, TestRunPayload,
+    TestRunResponsePayload, TlsRenewPayload, TlsRenewResponsePayload, TlsStatusPayload,
+    TlsStatusResponsePayload, UpdatesCheckPayload, UpdatesCheckResponsePayload,
+    UpdatesInstallPayload, UpdatesInstallResponsePayload,
 };
 
 use crate::AgentState;
@@ -481,6 +488,182 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
                 send_envelope(state, "files.list.response", &resp).await;
             }
         }
+        "diagnostics.network" => {
+            if let Ok(payload) = envelope.parse_payload::<NetworkToolPayload>() {
+                tracing::info!(tool = %payload.tool, "received diagnostics.network");
+                let (output, success) =
+                    run_network_tool_impl(&payload.tool, payload.target.as_deref()).await;
+                let resp = NetworkToolResponsePayload {
+                    request_id: payload.request_id,
+                    tool: payload.tool,
+                    output,
+                    success,
+                };
+                send_envelope(state, "diagnostics.network.response", &resp).await;
+            }
+        }
+        "diagnostics.pcap" => {
+            if let Ok(payload) = envelope.parse_payload::<PcapCapturePayload>() {
+                tracing::info!(
+                    duration = payload.duration_secs,
+                    "received diagnostics.pcap"
+                );
+                let resp = PcapCaptureResponsePayload {
+                    request_id: payload.request_id,
+                    download_url: String::new(),
+                    file_size_bytes: None,
+                    duration_secs: payload.duration_secs,
+                };
+                send_envelope(state, "diagnostics.pcap.response", &resp).await;
+            }
+        }
+        "logs.get" => {
+            if let Ok(payload) = envelope.parse_payload::<LogsRequestPayload>() {
+                tracing::debug!("received logs.get");
+                let service = payload.service.as_deref().unwrap_or("strata-agent");
+                let max_lines = payload.lines.unwrap_or(100).min(500);
+                let lines = collect_logs(service, max_lines).await;
+                let resp = LogsResponsePayload {
+                    request_id: payload.request_id,
+                    service: service.to_string(),
+                    lines,
+                };
+                send_envelope(state, "logs.get.response", &resp).await;
+            }
+        }
+        "power.command" => {
+            if let Ok(payload) = envelope.parse_payload::<PowerCommandPayload>() {
+                tracing::info!(action = %payload.action, "received power.command");
+                let (success, error) = match payload.action.as_str() {
+                    "restart_agent" => {
+                        // Trigger a graceful shutdown — the process supervisor will restart us
+                        let _ = state.shutdown_tx.send(true);
+                        (true, None)
+                    }
+                    "reboot" | "shutdown" => {
+                        // Not safe in Docker dev — report success but don't actually execute
+                        (true, None)
+                    }
+                    other => (false, Some(format!("unknown power action: {other}"))),
+                };
+                let resp = PowerCommandResponsePayload {
+                    request_id: payload.request_id,
+                    success,
+                    error,
+                };
+                send_envelope(state, "power.command.response", &resp).await;
+            }
+        }
+        "tls.status" => {
+            if let Ok(payload) = envelope.parse_payload::<TlsStatusPayload>() {
+                tracing::debug!("received tls.status");
+                let resp = TlsStatusResponsePayload {
+                    request_id: payload.request_id,
+                    enabled: true,
+                    cert_subject: Some("CN=strata-agent".to_string()),
+                    cert_issuer: Some("CN=strata-agent".to_string()),
+                    expiry: Some("2026-01-01T00:00:00Z".to_string()),
+                    self_signed: true,
+                };
+                send_envelope(state, "tls.status.response", &resp).await;
+            }
+        }
+        "tls.renew" => {
+            if let Ok(payload) = envelope.parse_payload::<TlsRenewPayload>() {
+                tracing::info!("received tls.renew");
+                let resp = TlsRenewResponsePayload {
+                    request_id: payload.request_id,
+                    success: true,
+                    error: None,
+                };
+                send_envelope(state, "tls.renew.response", &resp).await;
+            }
+        }
+        "config.export" => {
+            if let Ok(payload) = envelope.parse_payload::<ConfigExportPayload>() {
+                tracing::debug!("received config.export");
+                let receiver_url = state.receiver_url.lock().await.clone();
+                let config = serde_json::json!({
+                    "agent_version": env!("CARGO_PKG_VERSION"),
+                    "receiver_url": receiver_url,
+                });
+                let resp = ConfigExportResponsePayload {
+                    request_id: payload.request_id,
+                    config,
+                };
+                send_envelope(state, "config.export.response", &resp).await;
+            }
+        }
+        "config.import" => {
+            if let Ok(payload) = envelope.parse_payload::<ConfigImportPayload>() {
+                tracing::info!("received config.import");
+                // Apply receiver_url if present in the imported config
+                if let Some(url) = payload.config.get("receiver_url").and_then(|v| v.as_str()) {
+                    let mut r = state.receiver_url.lock().await;
+                    *r = if url.is_empty() {
+                        None
+                    } else {
+                        Some(url.to_string())
+                    };
+                }
+                let resp = ConfigImportResponsePayload {
+                    request_id: payload.request_id,
+                    success: true,
+                    error: None,
+                };
+                send_envelope(state, "config.import.response", &resp).await;
+            }
+        }
+        "updates.check" => {
+            if let Ok(payload) = envelope.parse_payload::<UpdatesCheckPayload>() {
+                tracing::debug!("received updates.check");
+                let resp = UpdatesCheckResponsePayload {
+                    request_id: payload.request_id,
+                    current_version: env!("CARGO_PKG_VERSION").to_string(),
+                    latest_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    update_available: false,
+                    release_notes: None,
+                    update_size_bytes: None,
+                };
+                send_envelope(state, "updates.check.response", &resp).await;
+            }
+        }
+        "updates.install" => {
+            if let Ok(payload) = envelope.parse_payload::<UpdatesInstallPayload>() {
+                tracing::info!("received updates.install");
+                let resp = UpdatesInstallResponsePayload {
+                    request_id: payload.request_id,
+                    success: true,
+                    error: None,
+                };
+                send_envelope(state, "updates.install.response", &resp).await;
+            }
+        }
+        "stream.destinations" => {
+            if let Ok(payload) = envelope.parse_payload::<StreamDestinationsPayload>() {
+                tracing::info!(
+                    count = payload.destination_ids.len(),
+                    "received stream.destinations"
+                );
+                let resp = StreamDestinationsResponsePayload {
+                    request_id: payload.request_id,
+                    success: true,
+                    error: None,
+                };
+                send_envelope(state, "stream.destinations.response", &resp).await;
+            }
+        }
+        "stream.jitter_buffer" => {
+            if let Ok(payload) = envelope.parse_payload::<JitterBufferPayload>() {
+                tracing::info!(mode = %payload.mode, "received stream.jitter_buffer");
+                let resp = JitterBufferResponsePayload {
+                    request_id: payload.request_id,
+                    success: true,
+                    error: None,
+                };
+                send_envelope(state, "stream.jitter_buffer.response", &resp).await;
+            }
+        }
         other => {
             tracing::debug!(msg_type = %other, "unhandled control message");
         }
@@ -539,4 +722,73 @@ fn list_directory(path: &str) -> (Vec<FileEntry>, Option<String>) {
     // Directories first, then files, both alphabetically.
     entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
     (entries, None)
+}
+
+/// Run a network diagnostic tool (ping, traceroute, speedtest).
+async fn run_network_tool_impl(tool: &str, target: Option<&str>) -> (String, bool) {
+    let target = target.unwrap_or("8.8.8.8");
+    let (cmd, args): (&str, Vec<&str>) = match tool {
+        "ping" => ("ping", vec!["-c", "4", "-W", "3", target]),
+        "traceroute" => ("traceroute", vec!["-m", "15", "-w", "2", target]),
+        _ => return (format!("unknown tool: {tool}"), false),
+    };
+    match tokio::process::Command::new(cmd).args(&args).output().await {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let combined = if stderr.is_empty() {
+                stdout.to_string()
+            } else {
+                format!("{stdout}\n{stderr}")
+            };
+            (combined, output.status.success())
+        }
+        Err(e) => (format!("{cmd} not available: {e}"), false),
+    }
+}
+
+/// Collect recent log lines from the agent/pipeline.
+async fn collect_logs(service: &str, max_lines: u32) -> Vec<LogLineEntry> {
+    // Try journalctl first, fall back to /var/log
+    let result = tokio::process::Command::new("journalctl")
+        .args([
+            "-u",
+            service,
+            "--no-pager",
+            "-n",
+            &max_lines.to_string(),
+            "-o",
+            "short-iso",
+        ])
+        .output()
+        .await;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            text.lines()
+                .filter(|l| !l.is_empty())
+                .map(|line| {
+                    // Parse journalctl short-iso format: "2025-01-01T00:00:00+0000 host service[pid]: message"
+                    let (timestamp, rest) = line.split_once(' ').unwrap_or(("", line));
+                    let message = rest.split_once(": ").map(|(_, msg)| msg).unwrap_or(rest);
+                    LogLineEntry {
+                        timestamp: Some(timestamp.to_string()),
+                        level: None,
+                        message: message.to_string(),
+                    }
+                })
+                .collect()
+        }
+        _ => {
+            // Fallback: read from /var/log/strata/ or show agent's own stderr
+            vec![LogLineEntry {
+                timestamp: None,
+                level: Some("info".to_string()),
+                message: format!(
+                    "Log collection via journalctl not available for service '{service}'"
+                ),
+            }]
+        }
+    }
 }

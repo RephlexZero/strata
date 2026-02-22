@@ -1,8 +1,7 @@
 //! Telemetry — collects pipeline stats and sends them to the control plane.
 //!
-//! In simulation mode, generates synthetic link stats that look realistic.
-//! In production mode, reads stats from strata-node's UDP relay on
-//! 127.0.0.1:9100 (bonding stats JSON forwarded from the GStreamer bus).
+//! Reads stats from strata-node's UDP relay on 127.0.0.1:9100
+//! (bonding stats JSON forwarded from the GStreamer bus).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,16 +43,12 @@ pub async fn run(state: Arc<AgentState>) {
         let mut pipeline = state.pipeline.lock().await;
         if !pipeline.is_running() {
             last_real_stats = None;
-            tracing::trace!("telemetry: pipeline not running");
             continue;
         }
 
         let stream_id = match pipeline.stream_id() {
             Some(id) => id.to_string(),
-            None => {
-                tracing::trace!("telemetry: no stream_id");
-                continue;
-            }
+            None => continue,
         };
 
         let elapsed_s = pipeline.elapsed_s();
@@ -74,12 +69,7 @@ pub async fn run(state: Arc<AgentState>) {
             }
         }
 
-        // Build stats
-        let links = if state.simulate {
-            generate_simulated_stats()
-        } else {
-            last_real_stats.clone().unwrap_or_default()
-        };
+        let links = last_real_stats.clone().unwrap_or_default();
 
         // Update shared link stats for Prometheus /metrics endpoint
         {
@@ -204,49 +194,4 @@ fn parse_bonding_stats(data: &[u8]) -> Result<Vec<LinkStats>, String> {
         });
     }
     Ok(stats)
-}
-
-/// Generate realistic simulated link stats.
-fn generate_simulated_stats() -> Vec<LinkStats> {
-    use rand::Rng;
-    let mut rng = rand::rng();
-
-    vec![
-        LinkStats {
-            id: 0,
-            interface: "wwan0".into(),
-            state: "Live".into(),
-            rtt_ms: 35.0 + rng.random_range(0.0..20.0_f64),
-            loss_rate: rng.random_range(0.0..0.005_f64),
-            capacity_bps: 8_000_000 + rng.random_range(0..2_000_000),
-            sent_bytes: rng.random_range(10_000_000..500_000_000),
-            observed_bps: 3_000_000 + rng.random_range(0..1_000_000),
-            signal_dbm: Some(-65 - rng.random_range(0..15)),
-            link_kind: Some("cellular".into()),
-            rsrp: Some(-85.0 - rng.random_range(0.0..10.0_f32)),
-            rsrq: Some(-12.0 - rng.random_range(0.0..5.0_f32)),
-            sinr: Some(15.0 + rng.random_range(0.0..10.0_f32)),
-            cqi: Some(12 - rng.random_range(0..4)),
-            btlbw_bps: Some(8_500_000 + rng.random_range(0..1_000_000)),
-            rtprop_ms: Some(30.0 + rng.random_range(0.0..5.0_f64)),
-        },
-        LinkStats {
-            id: 1,
-            interface: "wwan1".into(),
-            state: "Live".into(),
-            rtt_ms: 28.0 + rng.random_range(0.0..15.0_f64),
-            loss_rate: rng.random_range(0.0..0.003_f64),
-            capacity_bps: 12_000_000 + rng.random_range(0..3_000_000),
-            sent_bytes: rng.random_range(10_000_000..500_000_000),
-            observed_bps: 4_000_000 + rng.random_range(0..2_000_000),
-            signal_dbm: Some(-58 - rng.random_range(0..12)),
-            link_kind: Some("cellular".into()),
-            rsrp: Some(-75.0 - rng.random_range(0.0..10.0_f32)),
-            rsrq: Some(-10.0 - rng.random_range(0.0..5.0_f32)),
-            sinr: Some(20.0 + rng.random_range(0.0..10.0_f32)),
-            cqi: Some(14 - rng.random_range(0..2)),
-            btlbw_bps: Some(12_500_000 + rng.random_range(0..2_000_000)),
-            rtprop_ms: Some(25.0 + rng.random_range(0.0..5.0_f64)),
-        },
-    ]
 }

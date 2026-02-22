@@ -338,7 +338,19 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
         | "test.run.response"
         | "interfaces.scan.response"
         | "interface.command.response"
-        | "files.list.response" => {
+        | "files.list.response"
+        | "diagnostics.network.response"
+        | "diagnostics.pcap.response"
+        | "logs.get.response"
+        | "power.command.response"
+        | "tls.status.response"
+        | "tls.renew.response"
+        | "config.export.response"
+        | "config.import.response"
+        | "updates.check.response"
+        | "updates.install.response"
+        | "stream.destinations.response"
+        | "stream.jitter_buffer.response" => {
             if let Some(request_id) = envelope.payload.get("request_id").and_then(|v| v.as_str())
                 && let Some((_, tx)) = state.pending_requests().remove(request_id)
             {

@@ -2,7 +2,7 @@
 
 # ── Stage 1: Build dashboard WASM ────────────────────────────
 FROM node:20-bookworm AS node-base
-FROM rust:nightly-bookworm AS dashboard
+FROM rust:bookworm AS dashboard
 
 # Node.js 20+ required for @tailwindcss/oxide native module
 COPY --from=node-base /usr/local/bin/node /usr/local/bin/node
@@ -35,7 +35,7 @@ RUN --mount=type=cache,target=/root/.npm \
     trunk build --release
 
 # ── Stage 2: Build strata-control ────────────────────────────
-FROM rust:nightly-bookworm AS builder
+FROM rust:bookworm AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 

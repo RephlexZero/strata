@@ -99,7 +99,12 @@ async fn start_stream(
             .ok_or_else(|| ApiError::not_found("destination not found"))?;
 
             let (_platform, dest_url, stream_key) = dest_row;
-            if let Some(ref key) = stream_key {
+            // For HLS ingest URLs (e.g. YouTube HLS), the URL is used as-is.
+            // The CID/key is already embedded in the URL query parameters and
+            // segment filenames are appended to the `file=` parameter.
+            if dest_url.contains("http_upload_hls") && dest_url.contains("file=") {
+                dest_url
+            } else if let Some(ref key) = stream_key {
                 if dest_url.ends_with('/') {
                     format!("{dest_url}{key}")
                 } else {
@@ -123,9 +128,6 @@ async fn start_stream(
 
     // Create stream record
     let stream_id = ids::stream_id();
-
-    // Serialize request before consuming body fields
-    let request_json = serde_json::to_value(&body).unwrap_or_default();
 
     // Build stream.start command and send to agent.
     //
@@ -203,7 +205,8 @@ async fn start_stream(
                     min_bitrate_kbps: None,
                     max_bitrate_kbps: None,
                 });
-            // Resolve codec (default h265)
+            // Resolve codec (default h265). YouTube and other modern
+            // platforms accept H.265 via Enhanced RTMP / eflvmux.
             let codec = enc.codec.clone().unwrap_or_else(|| "h265".into());
             // Resolution + framerate come from the source config above
             let source_res = body_source_resolution.as_deref();
@@ -243,9 +246,13 @@ async fn start_stream(
         },
     };
 
-    // Store the relay URL and request in the stream config for operational visibility.
+    // Store the resolved payload (with defaults applied) so the dashboard
+    // can display accurate stream metadata (codec, resolution, framerate, etc).
     let full_config = serde_json::json!({
-        "request": request_json,
+        "request": {
+            "source": serde_json::to_value(&start_payload.source).unwrap_or_default(),
+            "encoder": serde_json::to_value(&start_payload.encoder).unwrap_or_default(),
+        },
         "relay_url": relay_url,
     });
     let config_json_final = serde_json::to_string(&full_config).ok();
@@ -437,6 +444,7 @@ pub struct StreamDetail {
     pub state: String,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub config_json: Option<String>,
     pub total_bytes: i64,
     pub error_message: Option<String>,
 }
@@ -446,8 +454,8 @@ async fn get_stream(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<StreamDetail>, ApiError> {
-    let row = sqlx::query_as::<_, (String, String, Option<String>, String, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, i64, Option<String>)>(
-        "SELECT s.id, s.sender_id, s.destination_id, s.state, s.started_at, s.ended_at, s.total_bytes, s.error_message \
+    let row = sqlx::query_as::<_, (String, String, Option<String>, String, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, i64, Option<String>)>(
+        "SELECT s.id, s.sender_id, s.destination_id, s.state, s.started_at, s.ended_at, s.config_json, s.total_bytes, s.error_message \
          FROM streams s JOIN senders sn ON s.sender_id = sn.id \
          WHERE s.id = $1 AND sn.owner_id = $2",
     )
@@ -465,6 +473,7 @@ async fn get_stream(
         state_str,
         started_at,
         ended_at,
+        config_json,
         total_bytes,
         error_message,
     ) = row;
@@ -476,6 +485,7 @@ async fn get_stream(
         state: state_str,
         started_at,
         ended_at,
+        config_json,
         total_bytes,
         error_message,
     }))

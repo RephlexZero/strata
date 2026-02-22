@@ -2,7 +2,7 @@
 
 # ── Stage 1: Build portal WASM ───────────────────────────────
 FROM node:20-bookworm AS node-base
-FROM rust:nightly-bookworm AS portal
+FROM rust:bookworm AS portal
 
 # Node.js 20+ required for @tailwindcss/oxide native module
 COPY --from=node-base /usr/local/bin/node /usr/local/bin/node
@@ -43,15 +43,16 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
+    build-essential \
     pkg-config \
     libgstreamer1.0-dev \
     libgstreamer-plugins-base1.0-dev \
     libgstreamer-plugins-bad1.0-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust nightly via rustup
+# Install Rust stable via rustup
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --default-toolchain nightly --profile minimal
+    sh -s -- -y --default-toolchain stable --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /src
@@ -112,7 +113,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p strata-gst
 
 # ── Stage 3: Build strata-agent ──────────────────────────────
-FROM rust:nightly-bookworm AS builder
+FROM rust:bookworm AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 

@@ -36,5 +36,4 @@ clap = { version = "4", features = ["derive"] }
 
 # System info
 sysinfo = "0.35"
-rand = "0.9"
 libc = "0.2"

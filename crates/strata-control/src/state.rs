@@ -32,6 +32,8 @@ struct Inner {
     /// Cached latest stream stats per sender, keyed by sender_id.
     /// Updated on each `stream.stats` message from agents.
     pub stream_stats: DashMap<String, StreamStatsPayload>,
+    /// In-memory alerting rules per sender.
+    pub alert_rules: DashMap<String, Vec<serde_json::Value>>,
 }
 
 /// Handle to a connected sender agent.
@@ -56,6 +58,7 @@ impl AppState {
                 dashboard_tx,
                 live_streams: DashSet::new(),
                 stream_stats: DashMap::new(),
+                alert_rules: DashMap::new(),
             }),
         }
     }
@@ -90,6 +93,11 @@ impl AppState {
     /// Cached latest stream stats per sender (keyed by sender_id).
     pub fn stream_stats(&self) -> &DashMap<String, StreamStatsPayload> {
         &self.inner.stream_stats
+    }
+
+    /// In-memory alert rules per sender.
+    pub fn alert_rules(&self) -> &DashMap<String, Vec<serde_json::Value>> {
+        &self.inner.alert_rules
     }
 
     /// Broadcast a dashboard event to all subscribed browsers.
