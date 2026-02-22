@@ -1195,19 +1195,15 @@ fn handle_source_switch(
             selector.set_property("active-pad", test_pad);
             if let Ok(pattern) = structure.get::<&str>("pattern") {
                 if let Some(testsrc) = pipeline.by_name("testsrc") {
-                    let pattern_enum = match pattern {
-                        "smpte" => 0i32,
-                        "snow" => 1,
-                        "black" | "solid-color" => 2,
-                        "ball" => 18,
-                        "smpte100" => 13,
-                        "bar" | "colors" => 14,
-                        _ => {
-                            eprintln!("Unknown test pattern: {pattern}, using smpte");
-                            0
-                        }
+                    // GStreamer's videotestsrc `pattern` property is a GstVideoTestSrcPattern
+                    // enum.  set_property_from_str lets GStreamer do the string→enum conversion
+                    // so we don't need to match on integer values (which panics with newer bindings).
+                    let gst_name = match pattern {
+                        "black" | "solid-color" => "black",
+                        "bar" | "colors" => "bar",
+                        other => other, // smpte, snow, ball, smpte100, etc. match GStreamer names
                     };
-                    testsrc.set_property("pattern", pattern_enum);
+                    testsrc.set_property_from_str("pattern", gst_name);
                     eprintln!("Switched to test source (pattern={})", pattern);
                 }
             } else {

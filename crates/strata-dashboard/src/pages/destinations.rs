@@ -257,5 +257,3 @@ fn platform_label(p: &str) -> &str {
         _ => p,
     }
 }
-
-
