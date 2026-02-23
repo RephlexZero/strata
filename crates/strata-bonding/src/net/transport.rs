@@ -286,13 +286,13 @@ impl TransportLink {
                             self.prev_ack_time_us.store(now_us, Ordering::Relaxed);
                             let delta_bytes = total_acked.saturating_sub(prev_bytes);
                             let mut cc = self.congestion.lock().unwrap();
-                            
+
                             // Determine if we are app-limited (in-flight bytes < BDP)
                             let in_flight_bytes = sender.in_flight() as f64 * avg_payload as f64;
                             let bdp = cc.btl_bw() * (cc.rt_prop_us() / 1_000_000.0);
                             // Add a small margin (e.g., 1.2x) to avoid false positives
                             let is_app_limited = in_flight_bytes < (bdp * 1.2).max(10_000.0);
-                            
+
                             cc.on_bandwidth_sample(delta_bytes, interval_us, is_app_limited);
                         } else if prev_us == 0 {
                             self.prev_ack_bytes.store(total_acked, Ordering::Relaxed);

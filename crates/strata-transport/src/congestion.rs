@@ -212,7 +212,12 @@ impl BiscayController {
     /// `delivered_bytes`: bytes acknowledged in this interval.
     /// `interval_us`: time interval in µs.
     /// `is_app_limited`: true if the sender did not have enough data in flight to fill the pipe.
-    pub fn on_bandwidth_sample(&mut self, delivered_bytes: u64, interval_us: u64, is_app_limited: bool) {
+    pub fn on_bandwidth_sample(
+        &mut self,
+        delivered_bytes: u64,
+        interval_us: u64,
+        is_app_limited: bool,
+    ) {
         if interval_us == 0 {
             return;
         }

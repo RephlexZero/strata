@@ -298,10 +298,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         };
 
         // Step 3: DWRR primary selection (capacity-proportional) from filtered candidates
-        if let Some(link) = self
-            .scheduler
-            .select_from_links(packet_len, &candidates)
-        {
+        if let Some(link) = self.scheduler.select_from_links(packet_len, &candidates) {
             let link_id = link.id();
             // IoDS bookkeeping — track for observability
             self.iods.commit_link(link_id, packet_len);
