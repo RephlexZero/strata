@@ -524,6 +524,14 @@ mod imp {
                                         .field(format!("link_{}_mtu", id), mtu)
                                         .field(format!("link_{}_iface", id), iface)
                                         .field(format!("link_{}_kind", id), link_kind);
+                                    if let Some(bw) = m.btlbw_bps {
+                                        msg_struct =
+                                            msg_struct.field(format!("link_{}_btlbw_bps", id), bw);
+                                    }
+                                    if let Some(rtp) = m.rtprop_ms {
+                                        msg_struct =
+                                            msg_struct.field(format!("link_{}_rtprop_ms", id), rtp);
+                                    }
                                 }
                                 let _ = element
                                     .post_message(gst::message::Element::new(msg_struct.build()));
@@ -587,8 +595,12 @@ mod imp {
             let data = bytes::Bytes::copy_from_slice(&map);
 
             let flags = buffer.flags();
-            let is_critical = !flags.contains(gst::BufferFlags::DELTA_UNIT)
-                || flags.contains(gst::BufferFlags::HEADER);
+            // Only stream headers (SPS/PPS/VPS, PAT/PMT) are truly critical
+            // and worth broadcasting to all links.  The DELTA_UNIT flag is
+            // unreliable for muxed streams — mpegtsmux never sets it, so
+            // `!DELTA_UNIT` was true for every buffer, causing ALL data to
+            // be broadcast to every link (nullifying DWRR differentiation).
+            let is_critical = flags.contains(gst::BufferFlags::HEADER);
             let can_drop = flags.contains(gst::BufferFlags::DROPPABLE);
 
             let profile = PacketProfile {

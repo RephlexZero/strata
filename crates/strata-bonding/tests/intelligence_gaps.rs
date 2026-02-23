@@ -24,7 +24,7 @@ fn biscay_full_state_cycle_normal_cautious_prehandover_normal() {
     assert_eq!(cc.state, BiscayState::Normal);
 
     // Give the controller a bandwidth estimate so pacing is meaningful
-    cc.on_bandwidth_sample(500_000, 1_000_000);
+    cc.on_bandwidth_sample(500_000, 1_000_000, false);
     cc.on_rtt_sample(20_000.0);
 
     // ── Step 1: Normal → Cautious via CQI drops ──

@@ -88,6 +88,25 @@ impl IodsScheduler {
         }
     }
 
+    /// Returns a list of link IDs that satisfy the monotonic constraint
+    /// for a packet of the given size.
+    pub fn filter_valid_links(&self, packet_size_bytes: usize) -> Vec<usize> {
+        self.links
+            .iter()
+            .filter(|l| l.available)
+            .filter(|l| l.predicted_arrival(packet_size_bytes) >= self.last_scheduled_arrival)
+            .map(|l| l.link_id)
+            .collect()
+    }
+
+    /// Commits a link selection, updating the monotonic constraint state.
+    pub fn commit_link(&mut self, link_id: usize, packet_size_bytes: usize) {
+        if let Some(link) = self.links.iter().find(|l| l.link_id == link_id) {
+            self.last_scheduled_arrival = link.predicted_arrival(packet_size_bytes);
+            self.last_link_id = Some(link_id);
+        }
+    }
+
     /// Select the best link for a packet of the given size.
     ///
     /// Returns the link_id of the chosen link, or `None` if no link is available.

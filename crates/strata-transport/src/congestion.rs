@@ -126,6 +126,13 @@ pub struct BiscayController {
     /// Last time the state machine was evaluated.
     last_tick: Instant,
 
+    // ─── Bufferbloat drain ───
+    /// Multiplicative factor applied to pacing rate when bufferbloat is
+    /// detected (RTT >> RTprop). Decays toward 0.1 on bloat, recovers
+    /// toward 1.0 when RTT normalises. Persists across `update_pacing_rate`
+    /// calls so the reduction actually sticks.
+    drain_factor: f64,
+
     // ─── Phase-shifted probing ───
     /// Whether this link holds the round-robin probe token.
     ///
@@ -163,6 +170,7 @@ impl BiscayController {
             created_at: now,
             last_tick: now,
 
+            drain_factor: 1.0,
             probe_allowed: true, // default: allowed until coordinator assigns tokens
         }
     }
@@ -203,11 +211,19 @@ impl BiscayController {
     /// Process a bandwidth sample (from ACK feedback).
     /// `delivered_bytes`: bytes acknowledged in this interval.
     /// `interval_us`: time interval in µs.
-    pub fn on_bandwidth_sample(&mut self, delivered_bytes: u64, interval_us: u64) {
+    /// `is_app_limited`: true if the sender did not have enough data in flight to fill the pipe.
+    pub fn on_bandwidth_sample(&mut self, delivered_bytes: u64, interval_us: u64, is_app_limited: bool) {
         if interval_us == 0 {
             return;
         }
         let bw = delivered_bytes as f64 / (interval_us as f64 / 1_000_000.0);
+
+        // If app-limited, only use the sample if it's higher than our current estimate.
+        // Otherwise, we'd artificially lower our capacity estimate just because the app
+        // isn't sending enough data.
+        if is_app_limited && bw < self.btl_bw {
+            return;
+        }
 
         self.bw_samples.push_back(bw);
         if self.bw_samples.len() > self.max_bw_samples {
@@ -237,10 +253,30 @@ impl BiscayController {
             self.rt_prop_stamp = Instant::now();
         }
 
-        // Detect bufferbloat: RTT > 1.5× RTprop without throughput increase
-        if self.rt_prop_us > 0.0 && rtt_us > self.rt_prop_us * 1.5 {
-            // Drain modem buffer — reduce pacing
-            self.pacing_rate *= 0.9;
+        // Detect bufferbloat: RTT >> RTprop → reduce drain_factor.
+        // RTT recovering toward RTprop → restore drain_factor.
+        // drain_factor is applied inside update_pacing_rate() so the
+        // reduction persists across recalculations.
+        //
+        // Thresholds are generous (4× / 2× RTprop) because bonded cellular
+        // links typically have 50-200ms base RTT and moderate queuing is
+        // normal. Aggressive drain at 1.5× would starve BBR of samples.
+        if self.rt_prop_us > 0.0 && self.rt_prop_us < f64::MAX {
+            // Only update drain_factor periodically to avoid per-ACK overreaction
+            let now = Instant::now();
+            if now.duration_since(self.last_tick) > Duration::from_millis(100) {
+                if rtt_us > self.rt_prop_us * 4.0 {
+                    // Severe bloat — aggressive drain
+                    self.drain_factor = (self.drain_factor * 0.85).max(0.2);
+                } else if rtt_us > self.rt_prop_us * 2.0 {
+                    // Moderate bloat — gentle drain
+                    self.drain_factor = (self.drain_factor * 0.95).max(0.2);
+                } else if rtt_us < self.rt_prop_us * 1.5 {
+                    // RTT is near baseline — recover
+                    self.drain_factor = (self.drain_factor + 0.05).min(1.0);
+                }
+                self.last_tick = now;
+            }
         }
 
         self.update_pacing_rate();
@@ -348,8 +384,11 @@ impl BiscayController {
                     self.bbr_phase = BbrPhase::ProbeBw;
                     self.btl_bw
                 } else {
-                    // Exponential ramp: double pacing rate
-                    self.pacing_rate * 2.0
+                    // No bandwidth data yet — keep current pacing_rate.
+                    // Don't ramp: we don't know the link speed yet, and
+                    // the initial 100 KB/s is a safe bootstrap rate that
+                    // lets enough data flow for ACK-based btl_bw measurement.
+                    return;
                 }
             }
             BbrPhase::ProbeBw => {
@@ -378,6 +417,9 @@ impl BiscayController {
             let ceiling_bps = ceiling_kbps * 1000.0 / 8.0; // kbps → bytes/sec
             rate = rate.min(ceiling_bps);
         }
+
+        // Apply bufferbloat drain factor
+        rate *= self.drain_factor;
 
         // Minimum pacing rate: 10 KB/s
         self.pacing_rate = rate.max(10_000.0);
@@ -495,7 +537,7 @@ mod tests {
     fn cautious_reduces_pacing_rate() {
         let mut cc = BiscayController::new();
         // Give it a bandwidth estimate first so pacing rate is meaningful
-        cc.on_bandwidth_sample(500_000, 1_000_000); // 500 KB/s
+        cc.on_bandwidth_sample(500_000, 1_000_000, false); // 500 KB/s
         cc.on_rtt_sample(20_000.0);
 
         // Record rate before entering Cautious — use high SINR so ceiling doesn't interfere
@@ -542,7 +584,7 @@ mod tests {
         assert_eq!(cc.btl_bw(), 0.0);
 
         // 1 MB in 1 second = 1 MB/s
-        cc.on_bandwidth_sample(1_000_000, 1_000_000);
+        cc.on_bandwidth_sample(1_000_000, 1_000_000, false);
         assert!(cc.btl_bw() > 0.0);
         assert!((cc.btl_bw() - 1_000_000.0).abs() < 1.0);
     }
@@ -552,24 +594,24 @@ mod tests {
         let mut cc = BiscayController::new();
 
         // Low sample
-        cc.on_bandwidth_sample(100_000, 1_000_000); // 100 KB/s
+        cc.on_bandwidth_sample(100_000, 1_000_000, false); // 100 KB/s
         let bw1 = cc.btl_bw();
 
         // High sample
-        cc.on_bandwidth_sample(500_000, 1_000_000); // 500 KB/s
+        cc.on_bandwidth_sample(500_000, 1_000_000, false); // 500 KB/s
         let bw2 = cc.btl_bw();
 
         assert!(bw2 > bw1, "BtlBw should take max");
 
         // Low sample again — max shouldn't decrease
-        cc.on_bandwidth_sample(50_000, 1_000_000);
+        cc.on_bandwidth_sample(50_000, 1_000_000, false);
         assert_eq!(cc.btl_bw(), bw2);
     }
 
     #[test]
     fn zero_interval_ignored() {
         let mut cc = BiscayController::new();
-        cc.on_bandwidth_sample(1000, 0); // division by zero guard
+        cc.on_bandwidth_sample(1000, 0, false); // division by zero guard
         assert_eq!(cc.btl_bw(), 0.0);
     }
 
@@ -604,7 +646,7 @@ mod tests {
         let mut cc = BiscayController::new();
 
         // Give it a high bandwidth estimate
-        cc.on_bandwidth_sample(10_000_000, 1_000_000); // 10 MB/s
+        cc.on_bandwidth_sample(10_000_000, 1_000_000, false); // 10 MB/s
         cc.on_rtt_sample(10_000.0);
 
         let uncapped_rate = cc.pacing_rate();
@@ -666,7 +708,7 @@ mod tests {
         let mut cc = BiscayController::new();
         assert_eq!(cc.bbr_phase, BbrPhase::SlowStart);
 
-        cc.on_bandwidth_sample(100_000, 1_000_000);
+        cc.on_bandwidth_sample(100_000, 1_000_000, false);
         assert_eq!(
             cc.bbr_phase,
             BbrPhase::ProbeBw,
@@ -679,7 +721,7 @@ mod tests {
     #[test]
     fn bufferbloat_reduces_rate() {
         let mut cc = BiscayController::new();
-        cc.on_bandwidth_sample(500_000, 1_000_000);
+        cc.on_bandwidth_sample(500_000, 1_000_000, false);
         cc.on_rtt_sample(20_000.0); // 20ms baseline
 
         let rate_before = cc.pacing_rate();

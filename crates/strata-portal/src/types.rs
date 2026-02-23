@@ -12,6 +12,7 @@ pub struct DeviceStatus {
     pub sender_id: Option<String>,
     pub enrolled: bool,
     pub cloud_connected: bool,
+    #[serde(default)]
     pub simulate: bool,
     pub streaming: bool,
     pub stream_id: Option<String>,

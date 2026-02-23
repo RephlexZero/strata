@@ -111,6 +111,10 @@ pub struct LinkMetrics {
     pub link_kind: Option<String>,
     /// Transport-layer statistics (FEC, ARQ, retransmissions).
     pub transport: Option<TransportMetrics>,
+    /// BBR estimated bottleneck bandwidth (bits/sec), if available.
+    pub btlbw_bps: Option<f64>,
+    /// BBR estimated minimum RTT (ms), if available.
+    pub rtprop_ms: Option<f64>,
     /// AIMD delay-gradient capacity estimate (0.0 if estimator disabled).
     pub estimated_capacity_bps: f64,
     /// One-way delay estimate in milliseconds (0.0 if not available).

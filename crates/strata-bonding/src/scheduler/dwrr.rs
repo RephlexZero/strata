@@ -178,10 +178,6 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 state.spare_capacity_bps = 0.0;
             }
 
-            if state.metrics.observed_bps > 0.0 {
-                state.metrics.alive = true;
-            }
-
             if state.metrics.capacity_bps < 1_000_000.0 {
                 // Bandwidth hasn't converged yet — use the capacity floor.
                 // Avoid using `measured_bps * 2.0` because the scheduler distributes
@@ -189,7 +185,11 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 // the same 2×throughput, a feedback loop forms and all link stats
                 // converge to identical values with no way to differentiate them.
                 // The flat floor lets RTT/loss quality factors drive divergence.
-                state.metrics.capacity_bps = capacity_floor;
+                // Only apply the floor if the link is in a probing or warm phase,
+                // otherwise we artificially inflate genuinely slow links.
+                if matches!(state.metrics.phase, LinkPhase::Probe | LinkPhase::Warm) {
+                    state.metrics.capacity_bps = capacity_floor;
+                }
             }
             let prev_capacity = state.prev_capacity_bps;
             let curr_capacity = state.metrics.capacity_bps;
@@ -252,6 +252,22 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         if let Some(state) = self.links.get_mut(&id) {
             state.failed_bytes = state.failed_bytes.saturating_add(bytes);
             state.has_traffic = true;
+        }
+    }
+
+    /// Refunds credits to a link. Used when a higher-level scheduler (like BLEST)
+    /// rejects a link selected by DWRR.
+    pub fn refund_credits(&mut self, id: usize, bytes: usize) {
+        if let Some(state) = self.links.get_mut(&id) {
+            state.credits += bytes as f64;
+        }
+    }
+
+    /// Deducts credits from a link. Used when a higher-level scheduler (like Thompson)
+    /// selects a link instead of DWRR.
+    pub fn deduct_credits(&mut self, id: usize, bytes: usize) {
+        if let Some(state) = self.links.get_mut(&id) {
+            state.credits -= bytes as f64;
         }
     }
 
@@ -359,8 +375,12 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 if !selected_ids.contains(id)
                     && let Some(state) = self.links.get_mut(id)
                 {
-                    state.credits -= packet_cost;
-                    selected.push(state.link.clone());
+                    // Only deduct credits if the link actually has enough,
+                    // otherwise we drive it into infinite debt.
+                    if state.credits >= packet_cost {
+                        state.credits -= packet_cost;
+                        selected.push(state.link.clone());
+                    }
                 }
             }
         }
@@ -369,7 +389,12 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
     }
 
     pub fn select_link(&mut self, packet_len: usize) -> Option<Arc<L>> {
-        if self.sorted_ids.is_empty() {
+        let candidates = self.sorted_ids.clone();
+        self.select_from_links(packet_len, &candidates)
+    }
+
+    pub fn select_from_links(&mut self, packet_len: usize, candidates: &[usize]) -> Option<Arc<L>> {
+        if self.sorted_ids.is_empty() || candidates.is_empty() {
             return None;
         }
 
@@ -392,7 +417,13 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 let predicted_rtt = (metrics.rtt_ms + state.rtt_slope_ms_s * horizon_s).max(0.0);
 
                 let quality_factor = (1.0 - predicted_loss).powi(4);
-                let rtt_factor = 1.0 / (1.0 + predicted_rtt / 200.0);
+                // NOTE: rtt_factor removed.  capacity_bps is already derived
+                // from BiscayController's pacing_rate which accounts for
+                // congestion and bufferbloat.  An additional RTT penalty
+                // destroyed credit differentiation when queues were deep
+                // (7-12s RTTs → factor ≈ 0.02 → all links get equal near-zero
+                // credits → DWRR falls through to the unconstrained fallback).
+                let _predicted_rtt = predicted_rtt;
 
                 let phase_factor = match metrics.phase {
                     LinkPhase::Probe => 0.5,
@@ -416,8 +447,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                     * quality_factor
                     * state.penalty_factor
                     * phase_factor
-                    * os_up_factor
-                    * rtt_factor;
+                    * os_up_factor;
                 // Capacity is in bps (bits per sec). Convert to bytes per sec.
                 let bytes_per_sec = effective_bps / 8.0;
 
@@ -434,33 +464,21 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             state.last_update = now;
         }
 
-        // 2. Select Link (DWRR)
-        let start_idx = self.current_rr_idx;
-        let count = self.sorted_ids.len();
-
-        for i in 0..count {
-            let idx = (start_idx + i) % count;
-            let id = self.sorted_ids[idx];
-
-            if let Some(state) = self.links.get_mut(&id) {
-                let metrics = state.metrics.clone();
-                if !metrics.alive && any_alive {
-                    continue;
-                }
-
-                if state.credits >= packet_cost {
-                    state.credits -= packet_cost;
-                    self.current_rr_idx = (idx + 1) % count;
-                    return Some(state.link.clone());
-                }
-            }
-        }
-
-        // Fallback: Pick link with max credits (best effort)
+        // 2. Select Link — always pick the link with the most credits.
+        //
+        // Classic DWRR uses round-robin with a credit threshold, but that
+        // degrades to pure round-robin when demand << total capacity (all
+        // links have enough credits for every packet).  In bonded video
+        // streaming the bitrate adapter keeps demand ≤ capacity, so the
+        // threshold check almost never differentiates.
+        //
+        // Max-credits selection naturally distributes traffic proportional
+        // to each link's effective capacity because higher-capacity links
+        // accumulate credits faster and thus win the comparison more often.
         let mut best_id = None;
         let mut max_creds = f64::MIN;
 
-        for &id in &self.sorted_ids {
+        for &id in candidates {
             if let Some(state) = self.links.get(&id)
                 && (state.metrics.alive || !any_alive)
                 && state.credits > max_creds
@@ -520,6 +538,8 @@ mod tests {
                     iface: None,
                     link_kind: None,
                     transport: None,
+                    btlbw_bps: None,
+                    rtprop_ms: None,
                     estimated_capacity_bps: 0.0,
                     owd_ms: 0.0,
                     receiver_report: None,
@@ -614,9 +634,8 @@ mod tests {
         let live_burst = compute_burst_window_s(LinkPhase::Live, 0.0);
         let probe_burst = compute_burst_window_s(LinkPhase::Probe, 0.0);
 
-        let rtt_factor = 1.0 / (1.0 + 10.0 / 200.0);
-        let live_max = (1_000_000.0 * rtt_factor / 8.0) * live_burst;
-        let probe_max = (1_000_000.0 * rtt_factor * 0.5 / 8.0) * probe_burst;
+        let live_max = (1_000_000.0 / 8.0) * live_burst;
+        let probe_max = (1_000_000.0 * 0.5 / 8.0) * probe_burst;
 
         assert!(live_state.credits <= live_max + 1.0);
         assert!(probe_state.credits <= probe_max + 1.0);

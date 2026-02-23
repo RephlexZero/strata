@@ -16,6 +16,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
 use strata_transport::congestion::BiscayController;
+
+/// Per-link token bucket for send-path pacing.
+///
+/// Refills at the BiscayController's pacing_rate (bytes/sec) with a burst cap
+/// of 100 ms worth of data.  Tokens are deducted after each send based on
+/// actual wire bytes (including FEC/ARQ overhead).  When tokens are negative
+/// the next send is rejected, which the DWRR records as a failed send and
+/// feeds into congestion detection.
+struct PacingState {
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
 use strata_transport::pool::Priority;
 use strata_transport::pool::TimestampClock;
 use strata_transport::sender::{Sender, SenderConfig};
@@ -63,6 +75,8 @@ pub struct TransportLink {
     receiver_report: Mutex<Option<ReceiverReportPacket>>,
     /// Network interface name (e.g. "eth1").
     iface: Option<String>,
+    /// Token bucket pacer — limits per-link send rate to pacing_rate.
+    pacing: Mutex<PacingState>,
 }
 
 impl TransportLink {
@@ -96,6 +110,10 @@ impl TransportLink {
             prev_ack_bytes: AtomicU64::new(0),
             receiver_report: Mutex::new(None),
             iface,
+            pacing: Mutex::new(PacingState {
+                tokens: 10_000.0, // Bootstrap burst — enough for initial probes
+                last_refill: std::time::Instant::now(),
+            }),
         }
     }
 
@@ -103,12 +121,34 @@ impl TransportLink {
     ///
     /// Uses GSO batching when outputs have uniform segment size.
     fn transport_send(&self, data: &[u8], priority: Priority) -> Result<usize> {
+        // ── Pacing bookkeeping ──────────────────────────────────────
+        // Track token budget for monitoring, but do NOT hard-block sends.
+        // BBR discovers btl_bw from ACK-based delivery rates, which requires
+        // actual data flow. Hard-blocking creates a starvation spiral:
+        // low pacing → no sends → no ACKs → btl_bw drops → pacing drops.
+        let pacing_rate = self.congestion.lock().unwrap().pacing_rate();
+        {
+            let mut p = self.pacing.lock().unwrap();
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(p.last_refill).as_secs_f64();
+            p.tokens += pacing_rate * elapsed;
+            // Burst cap: 100 ms of data (or 10 KB minimum for startup)
+            p.tokens = p.tokens.min((pacing_rate * 0.1).max(10_000.0));
+            p.last_refill = now;
+        }
+
         let mut sender = self.sender.lock().unwrap();
 
         sender.send(Bytes::copy_from_slice(data), priority);
 
         let outputs: Vec<_> = sender.drain_output().collect();
         let total_bytes = self.send_batch(&outputs);
+
+        // Deduct actual wire bytes (may go negative → next send blocked)
+        {
+            let mut p = self.pacing.lock().unwrap();
+            p.tokens -= total_bytes as f64;
+        }
 
         self.bytes_sent
             .fetch_add(total_bytes as u64, Ordering::Relaxed);
@@ -246,7 +286,14 @@ impl TransportLink {
                             self.prev_ack_time_us.store(now_us, Ordering::Relaxed);
                             let delta_bytes = total_acked.saturating_sub(prev_bytes);
                             let mut cc = self.congestion.lock().unwrap();
-                            cc.on_bandwidth_sample(delta_bytes, interval_us);
+                            
+                            // Determine if we are app-limited (in-flight bytes < BDP)
+                            let in_flight_bytes = sender.in_flight() as f64 * avg_payload as f64;
+                            let bdp = cc.btl_bw() * (cc.rt_prop_us() / 1_000_000.0);
+                            // Add a small margin (e.g., 1.2x) to avoid false positives
+                            let is_app_limited = in_flight_bytes < (bdp * 1.2).max(10_000.0);
+                            
+                            cc.on_bandwidth_sample(delta_bytes, interval_us, is_app_limited);
                         } else if prev_us == 0 {
                             self.prev_ack_bytes.store(total_acked, Ordering::Relaxed);
                             self.prev_ack_time_us.store(now_us, Ordering::Relaxed);
@@ -283,6 +330,13 @@ impl TransportLink {
 
         let outputs: Vec<_> = sender.drain_output().collect();
         let total_bytes = self.send_batch(&outputs);
+
+        // Charge FEC repair bytes against the pacing budget so they
+        // don't cause uncontrolled queue buildup.
+        if total_bytes > 0 {
+            let mut p = self.pacing.lock().unwrap();
+            p.tokens -= total_bytes as f64;
+        }
 
         Ok(total_bytes)
     }
@@ -334,19 +388,44 @@ impl LinkSender for TransportLink {
             } else {
                 *ewma = 0.2 * socket_rate_bps + 0.8 * *ewma;
             }
+        } else if *ewma > 0.0 {
+            // Gentle decay when no data flows — slow enough to survive
+            // normal DWRR idle gaps (multi-link round-robin) but will
+            // eventually reach 0 if a link is truly idle for seconds.
+            *ewma *= 0.98;
+            if *ewma < 1000.0 {
+                *ewma = 0.0;
+            }
         }
         let observed_bps = *ewma;
 
         // --- Capacity estimate from BiscayController (BBR-based) ---
-        // Uses delivery-rate measurement from ACK feedback rather than
-        // the Mathis formula. BtlBw is the windowed max of recent
-        // delivery rate samples (bytes/sec), converted to bits/sec.
+        // Use btl_bw (discovered bottleneck bandwidth) as the capacity
+        // signal for DWRR credits.  btl_bw is derived from peak ACK-based
+        // delivery rates, so it discovers the actual link speed even when
+        // the scheduler only sends a fraction of the link's capacity
+        // (burst delivery rates at the bottleneck reflect the true rate).
+        //
+        // Using pacing_rate would create a feedback loop: low pacing →
+        // low DWRR credits → less traffic → btl_bw stays low → pacing
+        // stays low.  btl_bw breaks this loop by reflecting what the link
+        // CAN do, not what the CC is currently allowing.
         let cc = self.congestion.lock().unwrap();
         let btl_bw_bps = cc.btl_bw() * 8.0;
         let capacity_bps = if btl_bw_bps > 0.0 {
             btl_bw_bps.clamp(100_000.0, 50_000_000.0)
         } else {
             0.0 // No data yet — scheduler will use capacity floor
+        };
+        let btlbw_bps = if btl_bw_bps > 0.0 {
+            Some(btl_bw_bps)
+        } else {
+            None
+        };
+        let rtprop_ms = if cc.rt_prop_us() < f64::MAX {
+            Some(cc.rt_prop_us() / 1000.0)
+        } else {
+            None
         };
 
         // Only report transport-level loss when we have receiver feedback
@@ -374,6 +453,8 @@ impl LinkSender for TransportLink {
             mtu: None,
             iface: self.iface.clone(),
             link_kind: Some("strata-transport".into()),
+            btlbw_bps,
+            rtprop_ms,
             transport: Some(crate::net::interface::TransportMetrics {
                 packets_sent: stats.packets_sent,
                 packets_acked: stats.packets_acked,

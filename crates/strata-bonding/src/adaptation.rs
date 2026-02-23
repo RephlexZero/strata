@@ -346,7 +346,9 @@ impl BitrateAdapter {
             }
             QueueAlarm::None => self.compute_target(usable_kbps, pressure, alive_count),
         };
-        let new_target = new_target.min(effective_max);
+        let new_target = new_target
+            .min(effective_max)
+            .max(self.config.min_bitrate_kbps);
 
         // Track spare bandwidth
         self.spare_bw_kbps = if usable_kbps > new_target as f64 {

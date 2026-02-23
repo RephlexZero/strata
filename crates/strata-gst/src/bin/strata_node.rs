@@ -1057,19 +1057,28 @@ fn serialize_bonding_stats(s: &gst::StructureRef) -> String {
             let os_up = s.get::<i32>(&format!("link_{}_os_up", id)).unwrap_or(-1);
             let kind = s.get::<&str>(&format!("link_{}_kind", id)).unwrap_or("");
 
-            links.push(serde_json::json!({
-                "id": id,
-                "rtt_us": (rtt_ms * 1000.0) as u64,
-                "loss_rate": loss,
-                "capacity_bps": capacity.round() as u64,
-                "sent_bytes": observed_bytes,
-                "observed_bps": observed_bps.round() as u64,
-                "interface": iface,
-                "alive": alive,
-                "phase": phase,
-                "os_up": os_up,
-                "link_kind": kind,
-            }));
+            links.push({
+                let mut obj = serde_json::json!({
+                    "id": id,
+                    "rtt_us": (rtt_ms * 1000.0) as u64,
+                    "loss_rate": loss,
+                    "capacity_bps": capacity.round() as u64,
+                    "sent_bytes": observed_bytes,
+                    "observed_bps": observed_bps.round() as u64,
+                    "interface": iface,
+                    "alive": alive,
+                    "phase": phase,
+                    "os_up": os_up,
+                    "link_kind": kind,
+                });
+                if let Ok(bw) = s.get::<f64>(&format!("link_{}_btlbw_bps", id)) {
+                    obj["btlbw_bps"] = serde_json::json!(bw.round() as u64);
+                }
+                if let Ok(rtp) = s.get::<f64>(&format!("link_{}_rtprop_ms", id)) {
+                    obj["rtprop_ms"] = serde_json::json!(rtp);
+                }
+                obj
+            });
         }
     }
 

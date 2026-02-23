@@ -5,12 +5,9 @@ use crate::scheduler::blest::BlestGuard;
 use crate::scheduler::dwrr::Dwrr;
 use crate::scheduler::iods::{IodsLinkState, IodsScheduler};
 use crate::scheduler::kalman::{KalmanConfig, KalmanFilter};
-use crate::scheduler::thompson::ThompsonSelector;
 use anyhow::Result;
 use bytes::Bytes;
 use quanta::Instant;
-use rand::SeedableRng;
-use rand::rngs::SmallRng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,7 +19,6 @@ use tracing::{error, warn};
 /// Wraps the [`Dwrr`] scheduler with intelligence overlays:
 /// - **IoDS** — in-order delivery constraint (reduces receiver-side jitter by 71%)
 /// - **BLEST** — head-of-line blocking guard for heterogeneous links
-/// - **Thompson Sampling** — reward-based exploration/exploitation for link preference
 /// - **Kalman filters** — per-link RTT smoothing for stable IoDS/BLEST inputs
 /// - Critical packet broadcast (keyframes sent to all alive links)
 /// - Fast-failover mode (broadcasts all traffic on link instability)
@@ -32,9 +28,8 @@ use tracing::{error, warn};
 /// **Scheduling pipeline** (for standard, non-broadcast packets):
 /// ```text
 /// 1. BLEST guard filters out links that would cause HoL blocking
-/// 2. IoDS selects link maintaining receiver-order constraint
-/// 3. Thompson Sampling breaks ties / provides exploration
-/// 4. DWRR adjusts credit and tracks per-link byte accounting
+/// 2. DWRR selects the best link proportionally to capacity
+/// 3. IoDS tracks monotonic state (bookkeeping only)
 /// ```
 pub struct BondingScheduler<L: LinkSender + ?Sized> {
     scheduler: Dwrr<L>,
@@ -45,12 +40,8 @@ pub struct BondingScheduler<L: LinkSender + ?Sized> {
     iods: IodsScheduler,
     /// BLEST head-of-line blocking guard.
     blest: BlestGuard,
-    /// Thompson Sampling link selector.
-    thompson: ThompsonSelector,
     /// Per-link Kalman filters for RTT smoothing.
     kalman_rtt: HashMap<usize, KalmanFilter>,
-    /// RNG for Thompson Sampling.
-    rng: SmallRng,
 
     // ─── Degradation ────────────────────────────────────────────────
     /// Current degradation stage from BitrateAdapter.
@@ -89,9 +80,7 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             next_seq: 0,
             iods: IodsScheduler::new(),
             blest: BlestGuard::default(),
-            thompson: ThompsonSelector::new(),
             kalman_rtt: HashMap::new(),
-            rng: SmallRng::seed_from_u64(0xB04D),
             degradation_stage: DegradationStage::Normal,
             failover_until: None,
             prev_phases: HashMap::new(),
@@ -129,7 +118,6 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         self.scheduler.add_link(link);
         self.iods.add_link(IodsLinkState::new(id));
         self.blest.update_link_owd(id, 0.025); // 25ms default OWD
-        self.thompson.add_link(id);
         self.kalman_rtt
             .insert(id, KalmanFilter::new(&KalmanConfig::for_rtt()));
     }
@@ -139,7 +127,6 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         self.scheduler.remove_link(id);
         self.iods.remove_link(id);
         self.blest.remove_link(id);
-        self.thompson.remove_link(id);
         self.kalman_rtt.remove(&id);
     }
 
@@ -275,10 +262,13 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         }
     }
 
-    /// Intelligence pipeline: BLEST filter → DWRR primary → Thompson explore.
+    /// Intelligence pipeline: BLEST filter → DWRR primary.
     ///
-    /// IoDS is consulted as a tie-breaker when DWRR has multiple equally
-    /// eligible links. BLEST pre-filters links that would cause HoL blocking.
+    /// BLEST pre-filters links that would cause HoL blocking.
+    /// DWRR selects the best link proportionally to capacity.
+    /// IoDS tracks monotonic state for observability but does NOT filter,
+    /// because its strict arrival-time constraint monopolises traffic to
+    /// whichever slow link wins the first selection, defeating load balancing.
     fn intelligent_select(&mut self, packet_len: usize) -> Option<Arc<L>> {
         // Step 1: Get available links
         let active = self.scheduler.get_active_links();
@@ -299,32 +289,26 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             .filter(|&id| self.blest.allows_assignment(id))
             .collect();
 
-        // Step 3: DWRR primary selection (capacity-proportional)
-        if let Some(link) = self.scheduler.select_link(packet_len) {
-            let link_id = link.id();
-            // Accept DWRR's pick if it passes BLEST (or BLEST filtered everything)
-            if blest_ok.is_empty() || blest_ok.contains(&link_id) {
-                // Update IoDS monotonic state for bookkeeping
-                self.iods.select_link(packet_len);
-                return Some(link);
-            }
-            // DWRR picked a BLEST-blocked link — undo credit and try Thompson
-            self.scheduler
-                .record_send_failed(link_id, packet_len as u64);
-        }
-
-        // Step 4: Thompson Sampling from BLEST-approved candidates
         let candidates = if blest_ok.is_empty() {
-            &alive_ids
+            // Fallback: if BLEST blocks everything, use all alive links
+            // and let Biscay's graceful degradation handle congestion.
+            alive_ids.clone()
         } else {
-            &blest_ok
+            blest_ok
         };
-        if let Some(thompson_pick) = self.thompson.select_from(candidates, &mut self.rng) {
-            self.iods.select_link(packet_len);
-            return self.scheduler.get_link(thompson_pick);
+
+        // Step 3: DWRR primary selection (capacity-proportional) from filtered candidates
+        if let Some(link) = self
+            .scheduler
+            .select_from_links(packet_len, &candidates)
+        {
+            let link_id = link.id();
+            // IoDS bookkeeping — track for observability
+            self.iods.commit_link(link_id, packet_len);
+            return Some(link);
         }
 
-        // Step 5: Last resort — any alive link
+        // Step 4: Last resort — any alive link
         alive_ids
             .first()
             .and_then(|&id| self.scheduler.get_link(id))
@@ -462,10 +446,8 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         }
 
         // Standard Load Balancing — Intelligence Pipeline:
-        // 1. IoDS selects link for in-order delivery constraint
-        // 2. BLEST checks for HoL blocking
-        // 3. Thompson Sampling explores/exploits
-        // 4. DWRR fallback for credit accounting
+        // 1. BLEST guard filters out links that would cause HoL blocking
+        // 2. DWRR selects the best link proportionally to capacity
         let selected_link = self.intelligent_select(packet_len);
 
         if let Some(link) = selected_link {
@@ -473,20 +455,40 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
             self.next_seq += 1;
 
             let header = crate::protocol::header::BondingHeader::new(seq);
-            let wrapped = header.wrap(payload);
+            let wrapped = header.wrap(payload.clone());
 
             let link_id = link.id();
             match link.send(&wrapped) {
                 Ok(_) => {
                     self.scheduler.record_send(link_id, packet_len as u64);
-                    self.thompson.record_success(link_id);
                     self.consecutive_dead_count = 0;
+
+                    // BBR Probing Starvation Fix:
+                    // If another link holds the probe token, send a duplicate of this packet
+                    // to that link to provide useful redundant data for probing, instead of
+                    // relying on dummy packets.
+                    if let Some(probe_id) = self.probe_owner
+                        && probe_id != link_id
+                        && let Some(probe_link) = self.scheduler.get_link(probe_id)
+                        && let Some(state) = self
+                            .scheduler
+                            .get_active_links()
+                            .iter()
+                            .find(|(id, _)| *id == probe_id)
+                        && state.1.alive
+                    {
+                        // Send the duplicate packet
+                        let _ = probe_link.send(&wrapped);
+                        // We don't record this send in DWRR to avoid double-counting
+                        // the primary payload's cost against the probe link's credits,
+                        // but the transport layer will still observe the bytes for BBR.
+                    }
+
                     return Ok(());
                 }
                 Err(_) => {
                     self.scheduler
                         .record_send_failed(link_id, packet_len as u64);
-                    self.thompson.record_failure(link_id);
                     // Fall through to dead-links path
                 }
             }
@@ -555,6 +557,8 @@ mod tests {
                     iface: None,
                     link_kind: None,
                     transport: None,
+                    btlbw_bps: None,
+                    rtprop_ms: None,
                     estimated_capacity_bps: 0.0,
                     owd_ms: 0.0,
                     receiver_report: None,
@@ -1080,34 +1084,6 @@ mod tests {
     }
 
     #[test]
-    fn test_thompson_learns_from_failures() {
-        // Thompson Sampling should learn to avoid a link that fails
-        let mut scheduler = BondingScheduler::new();
-        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
-        let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
-
-        scheduler.add_link(l1.clone());
-        scheduler.add_link(l2.clone());
-        scheduler.refresh_metrics();
-
-        // Manually record many failures for link 2
-        for _ in 0..50 {
-            scheduler.thompson.record_failure(2);
-        }
-        for _ in 0..50 {
-            scheduler.thompson.record_success(1);
-        }
-
-        // Thompson should now strongly prefer link 1
-        let rate1 = scheduler.thompson.estimated_success_rate(1).unwrap();
-        let rate2 = scheduler.thompson.estimated_success_rate(2).unwrap();
-        assert!(
-            rate1 > rate2 * 2.0,
-            "link 1 should have much better estimated rate: l1={rate1}, l2={rate2}"
-        );
-    }
-
-    #[test]
     fn test_kalman_smooths_rtt_updates() {
         let mut scheduler = BondingScheduler::new();
         let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
@@ -1139,7 +1115,6 @@ mod tests {
         scheduler.add_link(l2);
 
         assert_eq!(scheduler.iods.link_count(), 2);
-        assert_eq!(scheduler.thompson.link_count(), 2);
         assert!(scheduler.kalman_rtt.contains_key(&1));
         assert!(scheduler.kalman_rtt.contains_key(&2));
     }
@@ -1155,7 +1130,6 @@ mod tests {
         scheduler.remove_link(2);
 
         assert_eq!(scheduler.iods.link_count(), 1);
-        assert_eq!(scheduler.thompson.link_count(), 1);
         assert!(!scheduler.kalman_rtt.contains_key(&2));
     }
 
