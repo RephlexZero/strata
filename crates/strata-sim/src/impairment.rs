@@ -14,17 +14,149 @@ pub struct GemodelConfig {
 ///
 /// All fields are optional — only non-`None` parameters are passed to netem.
 /// If all fields are `None`, any existing qdisc is removed (clearing impairments).
+///
+/// Use the provided presets ([`ImpairmentConfig::lte_urban`], etc.) as starting
+/// points for realistic cellular simulation.  They include correlated loss,
+/// normal-distributed jitter, packet corruption/reorder, and queue limits
+/// calibrated to prevent unrealistic bufferbloat.
 #[derive(Debug, Clone, Default)]
 pub struct ImpairmentConfig {
     pub delay_ms: Option<u32>,
     pub jitter_ms: Option<u32>,
+    /// Use normal distribution for jitter (requires kernel `normal` table).
+    /// When `true`, `delay Xms Yms distribution normal` is emitted.
+    /// Default `false` uses uniform jitter.
+    pub delay_distribution_normal: bool,
     pub loss_percent: Option<f32>,
     pub loss_correlation: Option<f32>,
     pub gemodel: Option<GemodelConfig>, // If set, overrides loss_percent
     pub rate_kbit: Option<u64>,
     pub duplicate_percent: Option<f32>,
     pub reorder_percent: Option<f32>,
+    pub reorder_correlation: Option<f32>,
     pub corrupt_percent: Option<f32>,
+    /// Max packets in the netem queue.  Kernel default is 1000, which creates
+    /// unrealistic multi-second buffers on slow links.  When `None` and
+    /// `rate_kbit` is set, [`apply_impairment`] auto-computes a limit
+    /// targeting ~100ms of buffering at the configured rate.
+    pub limit: Option<u32>,
+}
+
+/// Assumed MTU for queue-depth calculations (bytes).
+const ASSUMED_MTU: u64 = 1200;
+
+/// Target queue depth in seconds for auto-computed `limit`.
+const QUEUE_TARGET_SECS: f64 = 0.100;
+
+impl ImpairmentConfig {
+    /// Compute a reasonable netem `limit` (in packets) for the configured rate,
+    /// targeting [`QUEUE_TARGET_SECS`] of buffering.  Returns `None` if
+    /// `rate_kbit` is not set.
+    pub fn auto_limit(&self) -> Option<u32> {
+        self.rate_kbit.map(|rate| {
+            let bytes_per_sec = rate as f64 * 1000.0 / 8.0;
+            let pkts = (bytes_per_sec * QUEUE_TARGET_SECS / ASSUMED_MTU as f64).ceil() as u32;
+            pkts.max(10) // floor — allow at least a small burst
+        })
+    }
+
+    // ── Realistic cellular presets ───────────────────────────────────
+    //
+    // These model **uplink** conditions (what tc shapes on the sender's
+    // egress).  Half-RTT is used for the one-way delay since netem adds
+    // delay on egress only; the full RTT is 2× the configured value.
+
+    /// Average urban LTE uplink.
+    ///
+    /// * 8 Mbps rate (good signal, dedicated SIM)
+    /// * 22 ms one-way delay (45 ms RTT)
+    /// * ±8 ms jitter, normal distribution
+    /// * 0.5% loss with 25% burst correlation
+    /// * 0.05% corruption, 0.1% reorder
+    pub fn lte_urban() -> Self {
+        Self {
+            rate_kbit: Some(8_000),
+            delay_ms: Some(22),
+            jitter_ms: Some(8),
+            delay_distribution_normal: true,
+            loss_percent: Some(0.5),
+            loss_correlation: Some(25.0),
+            corrupt_percent: Some(0.05),
+            reorder_percent: Some(0.1),
+            reorder_correlation: Some(20.0),
+            ..Default::default()
+        }
+    }
+
+    /// Poor / congested LTE uplink.
+    ///
+    /// * 5 Mbps rate
+    /// * 30 ms one-way delay (60 ms RTT)
+    /// * ±15 ms jitter, normal distribution
+    /// * 2.0% loss with 30% burst correlation
+    /// * 0.1% corruption, 0.3% reorder
+    pub fn lte_poor() -> Self {
+        Self {
+            rate_kbit: Some(5_000),
+            delay_ms: Some(30),
+            jitter_ms: Some(15),
+            delay_distribution_normal: true,
+            loss_percent: Some(2.0),
+            loss_correlation: Some(30.0),
+            corrupt_percent: Some(0.1),
+            reorder_percent: Some(0.3),
+            reorder_correlation: Some(25.0),
+            ..Default::default()
+        }
+    }
+
+    /// Good-signal LTE uplink (rural/suburban, low contention).
+    ///
+    /// * 6 Mbps rate
+    /// * 18 ms one-way delay (35 ms RTT)
+    /// * ±5 ms jitter, normal distribution
+    /// * 0.3% loss with 15% correlation
+    pub fn lte_good() -> Self {
+        Self {
+            rate_kbit: Some(6_000),
+            delay_ms: Some(18),
+            jitter_ms: Some(5),
+            delay_distribution_normal: true,
+            loss_percent: Some(0.3),
+            loss_correlation: Some(15.0),
+            ..Default::default()
+        }
+    }
+
+    /// 5G NSA uplink with good signal.
+    ///
+    /// * 40 Mbps rate
+    /// * 12 ms one-way delay (25 ms RTT)
+    /// * ±4 ms jitter, normal distribution
+    /// * 0.1% loss with 10% correlation
+    pub fn fiveg_good() -> Self {
+        Self {
+            rate_kbit: Some(40_000),
+            delay_ms: Some(12),
+            jitter_ms: Some(4),
+            delay_distribution_normal: true,
+            loss_percent: Some(0.1),
+            loss_correlation: Some(10.0),
+            ..Default::default()
+        }
+    }
+
+    /// Idealised low-impairment link for unit/integration tests where
+    /// you want to isolate transport logic without cellular noise.
+    /// Still rate-limited but no loss, corruption, or reorder.
+    pub fn ideal(rate_kbit: u64, delay_ms: u32) -> Self {
+        Self {
+            rate_kbit: Some(rate_kbit),
+            delay_ms: Some(delay_ms),
+            loss_percent: Some(0.0),
+            ..Default::default()
+        }
+    }
 }
 
 /// Applies network impairment to an interface inside a namespace using `tc netem`.
@@ -64,6 +196,13 @@ pub fn apply_impairment(
         "netem".to_string(),
     ];
 
+    // Queue limit: use explicit value, or auto-compute from rate.
+    let effective_limit = config.limit.or_else(|| config.auto_limit());
+    if let Some(limit) = effective_limit {
+        args_storage.push("limit".to_string());
+        args_storage.push(limit.to_string());
+    }
+
     if let Some(delay) = config.delay_ms {
         args_storage.push("delay".to_string());
         args_storage.push(format!("{}ms", delay));
@@ -72,6 +211,10 @@ pub fn apply_impairment(
             && jitter > 0
         {
             args_storage.push(format!("{}ms", jitter));
+            if config.delay_distribution_normal {
+                args_storage.push("distribution".to_string());
+                args_storage.push("normal".to_string());
+            }
         }
     }
 
@@ -98,6 +241,9 @@ pub fn apply_impairment(
     if let Some(reorder) = config.reorder_percent {
         args_storage.push("reorder".to_string());
         args_storage.push(format!("{}%", reorder));
+        if let Some(corr) = config.reorder_correlation {
+            args_storage.push(format!("{}%", corr));
+        }
     }
 
     if let Some(corrupt) = config.corrupt_percent {

@@ -352,14 +352,28 @@ impl Receiver {
     /// Generate NACKs for detected losses.
     /// Call periodically (e.g., every 10-50ms).
     pub fn generate_nacks(&mut self) -> Option<NackPacket> {
-        let nack = self.loss_detector.generate_nacks()?;
-        self.stats.nacks_sent += 1;
-        self.events.push(ReceiverEvent::SendNack(nack.clone()));
-        Some(nack)
+        let nack = self.loss_detector.generate_nacks();
+        // Advance cumulative sequence past packets whose NACK budget is
+        // exhausted.  Without this, a single unrecoverable loss early in
+        // the stream permanently stalls the cumulative ACK, capping the
+        // 64-bit SACK window and breaking sender-side delivery-rate
+        // measurement.
+        self.loss_detector.advance_past_irrecoverable();
+        if let Some(nack) = nack {
+            self.stats.nacks_sent += 1;
+            self.events.push(ReceiverEvent::SendNack(nack.clone()));
+            Some(nack)
+        } else {
+            None
+        }
     }
 
     /// Generate an ACK packet for the current state.
     pub fn generate_ack(&mut self) -> AckPacket {
+        // Advance past irrecoverable gaps before reading the cumulative
+        // so that ACKs always reflect the latest recoverable frontier.
+        self.loss_detector.advance_past_irrecoverable();
+
         let cum_seq = self.loss_detector.highest_contiguous();
 
         // Build SACK bitmap from reorder buffer
@@ -374,6 +388,7 @@ impl Receiver {
         let ack = AckPacket {
             cumulative_seq: VarInt::from_u64(cum_seq),
             sack_bitmap: bitmap,
+            total_received: VarInt::from_u64(self.loss_detector.total_received()),
         };
 
         self.events.push(ReceiverEvent::SendAck(ack.clone()));

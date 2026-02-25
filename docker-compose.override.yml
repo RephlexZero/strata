@@ -15,6 +15,8 @@ services:
       # Use `dashboard-dev` (profile web-dev) for live-reload during UI work.
 
   strata-sender-sim:
+    environment:
+      RUST_LOG: "info,strata_agent=debug,strata::cc=debug,strata::transport=debug,strata::adapt=debug,strata::sink=debug,strata::runtime=debug,strata::scheduler=debug"
     volumes:
       # Agent binary
       - ./target/debug/strata-agent:/usr/local/bin/strata-agent:ro

@@ -33,6 +33,7 @@
 use quanta::Instant;
 use std::collections::VecDeque;
 use std::time::Duration;
+use tracing::debug;
 
 // ─── Biscay State ───────────────────────────────────────────────────────────
 
@@ -96,10 +97,12 @@ pub struct BiscayController {
     cwnd: f64,
 
     // ─── Bandwidth tracking ───
-    /// Recent bandwidth samples for BtlBw estimation.
-    bw_samples: VecDeque<f64>,
+    /// Recent bandwidth samples with timestamps for BtlBw estimation.
+    bw_samples: VecDeque<(Instant, f64)>,
     /// Max samples to keep.
     max_bw_samples: usize,
+    /// Window duration for bandwidth samples — peaks older than this expire.
+    bw_window: Duration,
 
     // ─── RTT tracking ───
     /// Recent RTT samples (µs) for RTprop estimation.
@@ -155,8 +158,9 @@ impl BiscayController {
             pacing_rate: 100_000.0, // 100 KB/s initial (conservative)
             cwnd: 14_000.0,         // ~10 packets initial window
 
-            bw_samples: VecDeque::with_capacity(16),
-            max_bw_samples: 16,
+            bw_samples: VecDeque::with_capacity(64),
+            max_bw_samples: 64,
+            bw_window: Duration::from_secs(10),
 
             rtt_samples: VecDeque::with_capacity(32),
             rt_prop_stamp: now,
@@ -206,6 +210,11 @@ impl BiscayController {
         self.cwnd
     }
 
+    /// Get the bufferbloat drain factor (0.2–1.0).
+    pub fn drain_factor(&self) -> f64 {
+        self.drain_factor
+    }
+
     // ─── BBR feedback processing ────────────────────────────────────────
 
     /// Process a bandwidth sample (from ACK feedback).
@@ -221,22 +230,74 @@ impl BiscayController {
         if interval_us == 0 {
             return;
         }
+        let now = Instant::now();
         let bw = delivered_bytes as f64 / (interval_us as f64 / 1_000_000.0);
 
-        // If app-limited, only use the sample if it's higher than our current estimate.
-        // Otherwise, we'd artificially lower our capacity estimate just because the app
-        // isn't sending enough data.
+        // If app-limited, only use the sample if it's higher than our
+        // current estimate. Otherwise, we'd artificially lower our
+        // capacity estimate just because the app isn't sending enough.
         if is_app_limited && bw < self.btl_bw {
+            debug!(
+                target: "strata::cc",
+                bw_sample_Bps = bw,
+                btl_bw_Bps = self.btl_bw,
+                app_limited = is_app_limited,
+                "BW sample REJECTED (app-limited & below btl_bw)"
+            );
             return;
         }
 
-        self.bw_samples.push_back(bw);
+        let prev_btl_bw = self.btl_bw;
+
+        // Expire samples older than the bandwidth window.
+        let cutoff = now - self.bw_window;
+        while let Some(&(ts, _)) = self.bw_samples.front() {
+            if ts < cutoff {
+                self.bw_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        self.bw_samples.push_back((now, bw));
         if self.bw_samples.len() > self.max_bw_samples {
             self.bw_samples.pop_front();
         }
 
-        // BtlBw = max of recent samples (BBR approach)
-        self.btl_bw = self.bw_samples.iter().cloned().fold(0.0f64, f64::max);
+        // BtlBw estimation uses a two-phase strategy:
+        //  - Startup (< MIN_STARTUP_SAMPLES): use max of all samples so the
+        //    estimator discovers the peak delivery rate quickly.  Without this,
+        //    early low samples (timing-dependent) can trap btl_bw in a low
+        //    equilibrium: low btl_bw → low capacity → sender throttles →
+        //    only low samples → btl_bw stays low.
+        //  - Steady state (≥ MIN_STARTUP_SAMPLES): 75th-percentile filters
+        //    ACK-burst outliers while still capturing genuine capacity changes.
+        const MIN_STARTUP_SAMPLES: usize = 8;
+        let mut sorted: Vec<f64> = self.bw_samples.iter().map(|&(_, v)| v).collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        self.btl_bw = if sorted.len() < MIN_STARTUP_SAMPLES {
+            // Startup: max — discover peak quickly
+            sorted.last().copied().unwrap_or(0.0)
+        } else {
+            // Stable: 75th percentile — filter outliers
+            let idx = ((sorted.len() as f64 * 0.75) as usize).min(sorted.len().saturating_sub(1));
+            sorted.get(idx).copied().unwrap_or(0.0)
+        };
+
+        debug!(
+            target: "strata::cc",
+            bw_sample_Bps = bw,
+            bw_sample_kbps = bw * 8.0 / 1000.0,
+            prev_btl_bw_Bps = prev_btl_bw,
+            new_btl_bw_Bps = self.btl_bw,
+            btl_bw_kbps = self.btl_bw * 8.0 / 1000.0,
+            app_limited = is_app_limited,
+            delivered_bytes = delivered_bytes,
+            interval_us = interval_us,
+            num_samples = self.bw_samples.len(),
+            phase = ?self.bbr_phase,
+            "BW sample ACCEPTED"
+        );
 
         self.update_pacing_rate();
     }
@@ -253,10 +314,21 @@ impl BiscayController {
         }
 
         // RTprop = min RTT observed
+        let prev_rt_prop = self.rt_prop_us;
         if rtt_us < self.rt_prop_us {
             self.rt_prop_us = rtt_us;
             self.rt_prop_stamp = Instant::now();
         }
+
+        debug!(
+            target: "strata::cc",
+            rtt_us = rtt_us,
+            rtt_ms = rtt_us / 1000.0,
+            rt_prop_us = self.rt_prop_us,
+            prev_rt_prop_us = prev_rt_prop,
+            drain_factor = self.drain_factor,
+            "RTT sample"
+        );
 
         // Detect bufferbloat: RTT >> RTprop → reduce drain_factor.
         // RTT recovering toward RTprop → restore drain_factor.
@@ -266,20 +338,33 @@ impl BiscayController {
         // Thresholds are generous (4× / 2× RTprop) because bonded cellular
         // links typically have 50-200ms base RTT and moderate queuing is
         // normal. Aggressive drain at 1.5× would starve BBR of samples.
-        if self.rt_prop_us > 0.0 && self.rt_prop_us < f64::MAX {
+        //
+        // Guard: require rt_prop_us ≥ 1 ms to avoid drain_factor collapse
+        // from artificially low initial RTTs (e.g. first ping on docker
+        // networks before real traffic). Sub-millisecond RTTs are not
+        // realistic for cellular links and indicate a measurement artifact.
+        if self.rt_prop_us >= 1_000.0 && self.rt_prop_us < f64::MAX {
             // Only update drain_factor periodically to avoid per-ACK overreaction
             let now = Instant::now();
             if now.duration_since(self.last_tick) > Duration::from_millis(100) {
                 if rtt_us > self.rt_prop_us * 4.0 {
                     // Severe bloat — aggressive drain
-                    self.drain_factor = (self.drain_factor * 0.85).max(0.2);
+                    self.drain_factor = (self.drain_factor * 0.85).max(0.05);
                 } else if rtt_us > self.rt_prop_us * 2.0 {
                     // Moderate bloat — gentle drain
-                    self.drain_factor = (self.drain_factor * 0.95).max(0.2);
+                    self.drain_factor = (self.drain_factor * 0.95).max(0.05);
                 } else if rtt_us < self.rt_prop_us * 1.5 {
                     // RTT is near baseline — recover
                     self.drain_factor = (self.drain_factor + 0.05).min(1.0);
                 }
+                self.last_tick = now;
+            }
+        } else if self.drain_factor < 1.0 {
+            // Time-based recovery: if rt_prop_us is stale/invalid, slowly
+            // restore drain_factor so we don't stay permanently throttled.
+            let now = Instant::now();
+            if now.duration_since(self.last_tick) > Duration::from_millis(100) {
+                self.drain_factor = (self.drain_factor + 0.02).min(1.0);
                 self.last_tick = now;
             }
         }
@@ -360,6 +445,7 @@ impl BiscayController {
                     // Reset BBR state for re-probing
                     self.bbr_phase = BbrPhase::SlowStart;
                     self.bw_samples.clear();
+                    self.btl_bw = 0.0;
                     self.update_pacing_rate();
                 }
             }
@@ -384,15 +470,28 @@ impl BiscayController {
     fn update_pacing_rate(&mut self) {
         let mut rate = match self.bbr_phase {
             BbrPhase::SlowStart => {
-                if self.btl_bw > 0.0 {
-                    // Transition to ProbeBw when we have a bandwidth estimate
+                // Stay in SlowStart (reported as Probe phase to the DWRR)
+                // until we accumulate MIN_CALIBRATION_SAMPLES of delivery-
+                // rate data.  During SlowStart the DWRR applies a flat
+                // capacity floor so all links receive roughly equal traffic.
+                // This "calibration period" lets each link's btl_bw converge
+                // to its true bottleneck rate under uniform load before the
+                // DWRR switches to btl_bw-proportional credits.
+                //
+                // With ~3.3 samples/sec per link, 30 samples ≈ 9 seconds
+                // of calibration — long enough for the 10 s bw_window to
+                // fill and the 75th-percentile filter to stabilise.
+                const MIN_CALIBRATION_SAMPLES: usize = 30;
+                if self.btl_bw > 0.0 && self.bw_samples.len() >= MIN_CALIBRATION_SAMPLES {
                     self.bbr_phase = BbrPhase::ProbeBw;
+                    self.btl_bw
+                } else if self.btl_bw > 0.0 {
+                    // Have an estimate but still in calibration —
+                    // use btl_bw for pacing but stay in SlowStart so the
+                    // link reports Probe phase to the DWRR scheduler.
                     self.btl_bw
                 } else {
                     // No bandwidth data yet — keep current pacing_rate.
-                    // Don't ramp: we don't know the link speed yet, and
-                    // the initial 100 KB/s is a safe bootstrap rate that
-                    // lets enough data flow for ACK-based btl_bw measurement.
                     return;
                 }
             }
@@ -435,6 +534,21 @@ impl BiscayController {
             // Minimum cwnd: 2 packets
             self.cwnd = self.cwnd.max(2800.0);
         }
+
+        debug!(
+            target: "strata::cc",
+            pacing_rate_Bps = self.pacing_rate,
+            pacing_rate_kbps = self.pacing_rate * 8.0 / 1000.0,
+            btl_bw_Bps = self.btl_bw,
+            btl_bw_kbps = self.btl_bw * 8.0 / 1000.0,
+            drain_factor = self.drain_factor,
+            cwnd = self.cwnd,
+            phase = ?self.bbr_phase,
+            state = ?self.state,
+            sinr_ceiling_kbps = self.sinr_capacity_ceiling,
+            probe_allowed = self.probe_allowed,
+            "pacing rate updated"
+        );
     }
 
     /// Periodic tick — check for RTprop probe, state transitions.
@@ -455,6 +569,12 @@ impl BiscayController {
                 > self.rt_prop_expiry + Duration::from_millis(200)
         {
             self.bbr_phase = BbrPhase::ProbeBw;
+            // Reset RTprop to the latest RTT sample so bandwidth samples
+            // aren't rejected as app-limited (BDP = btl_bw × ∞ when
+            // rt_prop=MAX). The next real RTT sample will refine it.
+            if let Some(&latest) = self.rtt_samples.back() {
+                self.rt_prop_us = latest;
+            }
             self.rt_prop_stamp = now;
         }
     }
@@ -595,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn btlbw_is_max_of_samples() {
+    fn btlbw_is_max_of_recent_samples() {
         let mut cc = BiscayController::new();
 
         // Low sample
@@ -608,9 +728,17 @@ mod tests {
 
         assert!(bw2 > bw1, "BtlBw should take max");
 
-        // Low sample again — max shouldn't decrease
+        // Low sample again — max shouldn't decrease (within window)
         cc.on_bandwidth_sample(50_000, 1_000_000, false);
         assert_eq!(cc.btl_bw(), bw2);
+
+        // Simulate window expiry: shrink window to 0 and feed low sample
+        cc.bw_window = Duration::from_millis(0);
+        cc.on_bandwidth_sample(50_000, 1_000_000, false); // 50 KB/s
+        assert!(
+            cc.btl_bw() < bw2,
+            "BtlBw should decrease after old peaks expire"
+        );
     }
 
     #[test]
@@ -709,15 +837,26 @@ mod tests {
     // ─── Slow Start Transition ──────────────────────────────────────────
 
     #[test]
-    fn slow_start_to_probe_bw_on_first_sample() {
+    fn slow_start_stays_until_enough_samples() {
         let mut cc = BiscayController::new();
         assert_eq!(cc.bbr_phase, BbrPhase::SlowStart);
 
-        cc.on_bandwidth_sample(100_000, 1_000_000, false);
+        // Feed samples — need >= 30 (MIN_CALIBRATION_SAMPLES) for transition
+        for _ in 0..29 {
+            cc.on_bandwidth_sample(150_000, 1_000_000, false);
+            assert_eq!(
+                cc.bbr_phase,
+                BbrPhase::SlowStart,
+                "should stay in SlowStart with < 30 samples"
+            );
+        }
+
+        // 30th sample triggers transition
+        cc.on_bandwidth_sample(180_000, 1_000_000, false);
         assert_eq!(
             cc.bbr_phase,
             BbrPhase::ProbeBw,
-            "should transition after first BW sample"
+            "should transition to ProbeBw with ≥ 30 samples"
         );
     }
 

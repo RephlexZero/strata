@@ -98,10 +98,12 @@ services:
       RUST_LOG: "info,strata_agent=debug"
       GST_PLUGIN_PATH: "/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
       # Per-link tc netem impairment config (override to tune)
-      # Format: RATE_KBIT DELAY_MS JITTER_MS LOSS_PERCENT
-      LINK0_IMPAIRMENT: "8000 40 10 1.0"
-      LINK1_IMPAIRMENT: "5000 60 15 2.0"
-      LINK2_IMPAIRMENT: "6000 35 8 0.5"
+      # Format: RATE_KBIT DELAY_MS JITTER_MS LOSS_PERCENT LOSS_CORR_PERCENT
+      # Profiles: LTE urban / LTE poor / LTE good
+      # Half-RTT used (netem applies per-direction); full RTT = 2× delay.
+      LINK0_IMPAIRMENT: "8000 22 8 0.5 25"
+      LINK1_IMPAIRMENT: "5000 30 15 2.0 30"
+      LINK2_IMPAIRMENT: "6000 18 5 0.3 15"
     entrypoint: ["/usr/local/bin/entrypoint-sender.sh"]
     command:
       - "--control-url"

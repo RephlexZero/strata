@@ -116,6 +116,27 @@ impl Namespace {
                 String::from_utf8_lossy(&output.stderr)
             )));
         }
+        // Disable offloading to prevent GSO/GRO from bypassing tc netem rate limits
+        let out = self.exec(
+            "ethtool",
+            &[
+                "-K",
+                veth_name_local,
+                "tso",
+                "off",
+                "gso",
+                "off",
+                "gro",
+                "off",
+            ],
+        )?;
+        if !out.status.success() {
+            eprintln!(
+                "ethtool failed on {}: {}",
+                veth_name_local,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
 
         // 5. Configure other (peer side)
         let output = other.exec("ip", &["addr", "add", ip_peer, "dev", veth_name_peer])?;
@@ -131,6 +152,27 @@ impl Namespace {
                 "Failed to set peer link up: {}",
                 String::from_utf8_lossy(&output.stderr)
             )));
+        }
+        // Disable offloading to prevent GSO/GRO from bypassing tc netem rate limits
+        let out = other.exec(
+            "ethtool",
+            &[
+                "-K",
+                veth_name_peer,
+                "tso",
+                "off",
+                "gso",
+                "off",
+                "gro",
+                "off",
+            ],
+        )?;
+        if !out.status.success() {
+            eprintln!(
+                "ethtool failed on {}: {}",
+                veth_name_peer,
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
 
         Ok(())

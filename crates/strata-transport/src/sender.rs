@@ -55,7 +55,7 @@ impl Default for SenderConfig {
             pool_capacity: 4096,
             fec_k: 32,
             fec_r: 4,
-            packet_ttl: Duration::from_secs(5),
+            packet_ttl: Duration::from_secs(2),
             max_retries: 3,
         }
     }
@@ -198,6 +198,7 @@ impl Sender {
 
         // Cumulative ACK — all seqs <= cumulative_seq are acknowledged
         let cum_seq = ack.cumulative_seq.value();
+
         let to_remove: Vec<u64> = self
             .seq_to_handle
             .keys()
@@ -229,6 +230,12 @@ impl Sender {
 
         // Purge acknowledged packets from pool
         self.pool.purge_acked();
+
+        // Evict stale entries that have been in the pool for too long
+        // (e.g. never ACKed due to loss). Without this, the pool fills to
+        // capacity and new packets are never tracked, breaking delivery
+        // rate measurement entirely.
+        self.expire_old_packets();
 
         newly_acked
     }
@@ -531,6 +538,7 @@ mod tests {
         let ack = AckPacket {
             cumulative_seq: VarInt::from_u64(2),
             sack_bitmap: 0,
+            total_received: VarInt::from_u64(0),
         };
         let newly_acked = sender.process_ack(&ack);
         assert_eq!(newly_acked, 3); // seqs 0, 1, 2
@@ -549,6 +557,7 @@ mod tests {
         let ack = AckPacket {
             cumulative_seq: VarInt::from_u64(1),
             sack_bitmap: 0b110, // bits 1,2 → seqs 3,4
+            total_received: VarInt::from_u64(0),
         };
         let newly_acked = sender.process_ack(&ack);
         assert_eq!(newly_acked, 4); // seqs 0, 1, 3, 4
@@ -564,6 +573,7 @@ mod tests {
         let ack = AckPacket {
             cumulative_seq: VarInt::from_u64(0),
             sack_bitmap: 0,
+            total_received: VarInt::from_u64(0),
         };
         sender.process_ack(&ack);
         assert_eq!(sender.stats().packets_acked, 1);

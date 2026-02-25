@@ -31,7 +31,7 @@ use tracing::{error, warn};
 /// 2. DWRR selects the best link proportionally to capacity
 /// 3. IoDS tracks monotonic state (bookkeeping only)
 /// ```
-pub struct BondingScheduler<L: LinkSender + ?Sized> {
+pub struct BondingScheduler<L: LinkSender + ?Sized + 'static> {
     scheduler: Dwrr<L>,
     next_seq: u64,
 
@@ -67,7 +67,7 @@ pub struct BondingScheduler<L: LinkSender + ?Sized> {
     last_probe_rotation: Instant,
 }
 
-impl<L: LinkSender + ?Sized> BondingScheduler<L> {
+impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
     /// Creates a scheduler with default configuration.
     pub fn new() -> Self {
         Self::with_config(SchedulerConfig::default())
@@ -346,12 +346,28 @@ impl<L: LinkSender + ?Sized> BondingScheduler<L> {
         } else {
             Treatment::Normal
         };
-        if !self.degradation_stage.allows(treatment) {
+
+        // Periodic send path tracing (every 500 packets by drain count)
+        static SEND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = SEND_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count.is_multiple_of(500) {
+            let active_links = self.scheduler.get_active_links();
+            let alive_count = active_links.iter().filter(|(_, m)| m.alive).count();
             tracing::debug!(
-                stage = ?self.degradation_stage,
+                target: "strata::scheduler",
+                count,
+                degradation_stage = ?self.degradation_stage,
                 ?treatment,
-                "dropping packet per degradation policy"
+                allows = self.degradation_stage.allows(treatment),
+                active_links = active_links.len(),
+                alive_links = alive_count,
+                failover = self.in_failover_mode(),
+                consecutive_dead = self.consecutive_dead_count,
+                "send path trace"
             );
+        }
+
+        if !self.degradation_stage.allows(treatment) {
             return Ok(());
         }
 

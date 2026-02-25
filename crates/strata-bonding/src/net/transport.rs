@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
-use strata_transport::congestion::BiscayController;
+use strata_transport::congestion::{BbrPhase, BiscayController, BiscayState};
 
 /// Per-link token bucket for send-path pacing.
 ///
@@ -65,18 +65,24 @@ pub struct TransportLink {
     prev_rate_time_us: AtomicU64,
     /// EWMA-smoothed socket-level sending rate (bits/sec).
     rate_ewma_bps: Mutex<f64>,
+    /// EWMA-smoothed receiver goodput (bits/sec).
+    goodput_ewma_bps: Mutex<f64>,
     /// Cumulative bytes acknowledged (for delivery rate tracking).
     bytes_acked: AtomicU64,
     /// Microsecond timestamp of last delivery rate sample.
     prev_ack_time_us: AtomicU64,
     /// Snapshot of bytes_acked at last delivery rate sample.
     prev_ack_bytes: AtomicU64,
+    /// EWMA-smoothed ACK rate (bits/sec).
+    ack_rate_ewma_bps: Mutex<f64>,
     /// Latest receiver report from the remote receiver (if any).
     receiver_report: Mutex<Option<ReceiverReportPacket>>,
     /// Network interface name (e.g. "eth1").
     iface: Option<String>,
     /// Token bucket pacer — limits per-link send rate to pacing_rate.
     pacing: Mutex<PacingState>,
+    /// Paced send queue.
+    paced_queue: Mutex<std::collections::VecDeque<strata_transport::sender::OutputPacket>>,
 }
 
 impl TransportLink {
@@ -105,15 +111,18 @@ impl TransportLink {
             prev_rate_bytes: AtomicU64::new(0),
             prev_rate_time_us: AtomicU64::new(0),
             rate_ewma_bps: Mutex::new(0.0),
+            goodput_ewma_bps: Mutex::new(0.0),
             bytes_acked: AtomicU64::new(0),
             prev_ack_time_us: AtomicU64::new(0),
             prev_ack_bytes: AtomicU64::new(0),
+            ack_rate_ewma_bps: Mutex::new(0.0),
             receiver_report: Mutex::new(None),
             iface,
             pacing: Mutex::new(PacingState {
                 tokens: 10_000.0, // Bootstrap burst — enough for initial probes
                 last_refill: std::time::Instant::now(),
             }),
+            paced_queue: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -121,40 +130,59 @@ impl TransportLink {
     ///
     /// Uses GSO batching when outputs have uniform segment size.
     fn transport_send(&self, data: &[u8], priority: Priority) -> Result<usize> {
-        // ── Pacing bookkeeping ──────────────────────────────────────
-        // Track token budget for monitoring, but do NOT hard-block sends.
-        // BBR discovers btl_bw from ACK-based delivery rates, which requires
-        // actual data flow. Hard-blocking creates a starvation spiral:
-        // low pacing → no sends → no ACKs → btl_bw drops → pacing drops.
-        let pacing_rate = self.congestion.lock().unwrap().pacing_rate();
-        {
-            let mut p = self.pacing.lock().unwrap();
-            let now = std::time::Instant::now();
-            let elapsed = now.duration_since(p.last_refill).as_secs_f64();
-            p.tokens += pacing_rate * elapsed;
-            // Burst cap: 100 ms of data (or 10 KB minimum for startup)
-            p.tokens = p.tokens.min((pacing_rate * 0.1).max(10_000.0));
-            p.last_refill = now;
-        }
-
         let mut sender = self.sender.lock().unwrap();
-
         sender.send(Bytes::copy_from_slice(data), priority);
-
         let outputs: Vec<_> = sender.drain_output().collect();
-        let total_bytes = self.send_batch(&outputs);
 
-        // Deduct actual wire bytes (may go negative → next send blocked)
-        {
-            let mut p = self.pacing.lock().unwrap();
-            p.tokens -= total_bytes as f64;
+        let mut q = self.paced_queue.lock().unwrap();
+        q.extend(outputs);
+        drop(q);
+
+        self.flush_paced();
+
+        // Return data.len() to pretend we sent it all (or the actual bytes sent?)
+        // The trait expects the number of bytes accepted.
+        Ok(data.len())
+    }
+
+    /// Flush any pending packets in the paced send queue.
+    pub fn flush_paced(&self) {
+        let pacing_rate = self.congestion.lock().unwrap().pacing_rate();
+        let mut p = self.pacing.lock().unwrap();
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(p.last_refill).as_secs_f64();
+        p.tokens += pacing_rate * elapsed;
+        // Burst cap: 10 ms of data (or 10 KB minimum for startup)
+        p.tokens = p.tokens.min((pacing_rate * 0.01).max(10_000.0));
+        p.last_refill = now;
+
+        let mut q = self.paced_queue.lock().unwrap();
+        if q.is_empty() {
+            return;
         }
 
-        self.bytes_sent
-            .fetch_add(total_bytes as u64, Ordering::Relaxed);
-        self.packets_sent.fetch_add(1, Ordering::Relaxed);
+        let mut to_send = Vec::new();
+        while let Some(pkt) = q.front() {
+            let len = pkt.data.len() as f64;
+            // Allow sending if we have tokens, OR if we have a minimum burst debt
+            // (e.g. allow going negative up to 1 MTU)
+            if p.tokens >= 0.0 {
+                p.tokens -= len;
+                to_send.push(q.pop_front().unwrap());
+            } else {
+                break;
+            }
+        }
+        drop(q);
+        drop(p);
 
-        Ok(total_bytes)
+        if !to_send.is_empty() {
+            let total_bytes = self.send_batch(&to_send);
+            self.bytes_sent
+                .fetch_add(total_bytes as u64, Ordering::Relaxed);
+            self.packets_sent
+                .fetch_add(to_send.len() as u64, Ordering::Relaxed);
+        }
     }
 
     /// Batch-send outputs via quinn-udp with GSO when possible.
@@ -163,7 +191,16 @@ impl TransportLink {
             return 0;
         }
 
-        let max_gso = self.udp_state.max_gso_segments();
+        let mut max_gso = self.udp_state.max_gso_segments();
+
+        // Cap GSO batching in calibration mode to reduce burstiness
+        {
+            let cc = self.congestion.lock().unwrap();
+            if matches!(cc.bbr_phase, BbrPhase::SlowStart) {
+                max_gso = max_gso.min(4); // Small batches during probe
+            }
+        }
+
         let mut total_bytes = 0;
 
         if max_gso > 1 {
@@ -182,6 +219,14 @@ impl TransportLink {
                 }
 
                 if end - i > 1 {
+                    #[cfg(feature = "bursty_diag")]
+                    tracing::info!(
+                        target: "strata::bursty_diag",
+                        link_id = self.id,
+                        batch_size = end - i,
+                        "GSO batch"
+                    );
+
                     // GSO batch: concatenate into a single buffer
                     let mut buf = Vec::with_capacity(seg_len * (end - i));
                     for output in &outputs[i..end] {
@@ -264,40 +309,93 @@ impl TransportLink {
             let mut sender = self.sender.lock().unwrap();
             match &ctrl {
                 ControlBody::Ack(ack) => {
-                    let newly_acked = sender.process_ack(ack);
-                    // Feed BiscayController with delivery rate sample.
-                    // Approximate delivered bytes from newly ACKed packets × avg payload.
-                    if newly_acked > 0 {
-                        let avg_payload = 1200u64; // conservative MTU-sized estimate
-                        let delivered_bytes = newly_acked as u64 * avg_payload;
-                        self.bytes_acked
-                            .fetch_add(delivered_bytes, Ordering::Relaxed);
+                    let _newly_acked = sender.process_ack(ack);
 
-                        // Compute delivery rate over the inter-ACK interval
-                        let now_us = self.clock.lock().unwrap().now_us() as u64;
-                        let total_acked = self.bytes_acked.load(Ordering::Relaxed);
-                        let prev_bytes = self.prev_ack_bytes.load(Ordering::Relaxed);
-                        let prev_us = self.prev_ack_time_us.load(Ordering::Relaxed);
-                        let interval_us = now_us.saturating_sub(prev_us);
+                    // ── Delivery rate measurement ──────────────────────
+                    // Use the receiver's total_received counter — a smooth,
+                    // monotonically-increasing count of unique data packets.
+                    // This avoids dependency on the sender's packet pool
+                    // capacity (which can fill up, causing newly_acked to
+                    // drop to zero and halt BW measurement entirely).
+                    let total_recv = ack.total_received.value();
+                    let avg_payload = 1200u64;
 
-                        // Accumulate at least 10ms of ACKs to avoid ACK compression spikes
-                        if interval_us >= 10_000 && prev_us > 0 {
-                            self.prev_ack_bytes.store(total_acked, Ordering::Relaxed);
-                            self.prev_ack_time_us.store(now_us, Ordering::Relaxed);
-                            let delta_bytes = total_acked.saturating_sub(prev_bytes);
-                            let mut cc = self.congestion.lock().unwrap();
-
-                            // Determine if we are app-limited (in-flight bytes < BDP)
-                            let in_flight_bytes = sender.in_flight() as f64 * avg_payload as f64;
-                            let bdp = cc.btl_bw() * (cc.rt_prop_us() / 1_000_000.0);
-                            // Add a small margin (e.g., 1.2x) to avoid false positives
-                            let is_app_limited = in_flight_bytes < (bdp * 1.2).max(10_000.0);
-
-                            cc.on_bandwidth_sample(delta_bytes, interval_us, is_app_limited);
-                        } else if prev_us == 0 {
-                            self.prev_ack_bytes.store(total_acked, Ordering::Relaxed);
-                            self.prev_ack_time_us.store(now_us, Ordering::Relaxed);
+                    if total_recv > 0 {
+                        let total_recv_bytes = total_recv * avg_payload;
+                        let prev_bytes_val = self.bytes_acked.load(Ordering::Relaxed);
+                        if total_recv_bytes > prev_bytes_val {
+                            self.bytes_acked.store(total_recv_bytes, Ordering::Relaxed);
                         }
+                    }
+
+                    let now_us = {
+                        static EPOCH: std::sync::OnceLock<std::time::Instant> =
+                            std::sync::OnceLock::new();
+                        let epoch = EPOCH.get_or_init(std::time::Instant::now);
+                        epoch.elapsed().as_micros() as u64
+                    };
+                    let total_acked = self.bytes_acked.load(Ordering::Relaxed);
+                    let prev_bytes = self.prev_ack_bytes.load(Ordering::Relaxed);
+                    let prev_us = self.prev_ack_time_us.load(Ordering::Relaxed);
+                    let interval_us = now_us.saturating_sub(prev_us);
+
+                    let srtt_us = {
+                        let rtt = self.rtt.lock().unwrap();
+                        rtt.srtt_us()
+                    };
+                    let min_interval_us = (srtt_us as u64).clamp(250_000, 1_000_000);
+
+                    if interval_us >= min_interval_us && prev_us > 0 {
+                        let delta_bytes = total_acked.saturating_sub(prev_bytes);
+                        if delta_bytes > 0 {
+                            // Idle-gap detection: if the interval is much
+                            // larger than expected (> 4×SRTT), the link was
+                            // idle between DWRR bursts.  Reset the baseline
+                            // without computing a rate — the interval includes
+                            // idle time which would dilute the measurement and
+                            // underestimate the link's actual delivery rate.
+                            let max_interval_us = (srtt_us as u64 * 4).clamp(500_000, 2_000_000);
+                            if interval_us > max_interval_us {
+                                self.prev_ack_bytes.store(total_acked, Ordering::Relaxed);
+                                self.prev_ack_time_us.store(now_us, Ordering::Relaxed);
+                            } else {
+                                self.prev_ack_bytes.store(total_acked, Ordering::Relaxed);
+                                self.prev_ack_time_us.store(now_us, Ordering::Relaxed);
+
+                                let ack_rate_bps =
+                                    (delta_bytes as f64 * 8.0) / (interval_us as f64 / 1_000_000.0);
+                                let mut ewma = self.ack_rate_ewma_bps.lock().unwrap();
+                                if *ewma == 0.0 {
+                                    *ewma = ack_rate_bps;
+                                } else {
+                                    *ewma = 0.2 * ack_rate_bps + 0.8 * *ewma;
+                                }
+
+                                let mut cc = self.congestion.lock().unwrap();
+
+                                #[cfg(feature = "bursty_diag")]
+                                tracing::info!(
+                                    target: "strata::bursty_diag",
+                                    link_id = self.id,
+                                    interval_us = interval_us,
+                                    delta_bytes = delta_bytes,
+                                    "ACK sample"
+                                );
+
+                                // In multi-link bonding, never mark samples as
+                                // app-limited.  The DWRR scheduler controls how
+                                // much each link receives — low in-flight during
+                                // idle gaps between bursts is normal, not a sign
+                                // that the app can't keep up.  Marking those
+                                // samples app-limited causes the CC to reject all
+                                // low samples, ratcheting btl_bw upward via a
+                                // survivor-bias on high outliers only.
+                                cc.on_bandwidth_sample(delta_bytes, interval_us, false);
+                            }
+                        }
+                    } else if prev_us == 0 {
+                        self.prev_ack_bytes.store(total_acked, Ordering::Relaxed);
+                        self.prev_ack_time_us.store(now_us, Ordering::Relaxed);
                     }
                 }
                 ControlBody::Nack(nack) => {
@@ -315,6 +413,14 @@ impl TransportLink {
                 }
                 ControlBody::ReceiverReport(report) => {
                     *self.receiver_report.lock().unwrap() = Some(report.clone());
+                    let mut ewma = self.goodput_ewma_bps.lock().unwrap();
+                    let goodput = report.goodput_bps as f64;
+                    if *ewma == 0.0 {
+                        *ewma = goodput;
+                    } else {
+                        *ewma = 0.5 * goodput + 0.5 * *ewma;
+                    }
+                    tracing::debug!(target: "strata::transport", link_id = self.id, goodput = goodput, ewma = *ewma, "Received ReceiverReport");
                 }
                 _ => {}
             }
@@ -329,16 +435,14 @@ impl TransportLink {
         sender.flush_fec();
 
         let outputs: Vec<_> = sender.drain_output().collect();
-        let total_bytes = self.send_batch(&outputs);
 
-        // Charge FEC repair bytes against the pacing budget so they
-        // don't cause uncontrolled queue buildup.
-        if total_bytes > 0 {
-            let mut p = self.pacing.lock().unwrap();
-            p.tokens -= total_bytes as f64;
-        }
+        let mut q = self.paced_queue.lock().unwrap();
+        q.extend(outputs);
+        drop(q);
 
-        Ok(total_bytes)
+        self.flush_paced();
+
+        Ok(0)
     }
 
     /// Get the current RTT estimate in milliseconds.
@@ -369,7 +473,11 @@ impl LinkSender for TransportLink {
 
         // --- Socket-level rate (includes FEC/retransmit overhead) ---
         let total_bytes = self.bytes_sent.load(Ordering::Relaxed);
-        let now_us = self.clock.lock().unwrap().now_us() as u64;
+        let now_us = {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let epoch = EPOCH.get_or_init(std::time::Instant::now);
+            epoch.elapsed().as_micros() as u64
+        };
         let prev_bytes = self.prev_rate_bytes.swap(total_bytes, Ordering::Relaxed);
         let prev_us = self.prev_rate_time_us.swap(now_us, Ordering::Relaxed);
         let dt_s = now_us.saturating_sub(prev_us) as f64 / 1_000_000.0;
@@ -399,6 +507,17 @@ impl LinkSender for TransportLink {
         }
         let observed_bps = *ewma;
 
+        tracing::debug!(
+            target: "strata::transport",
+            link_id = self.id,
+            socket_rate_bps = socket_rate_bps,
+            ewma_bps = observed_bps,
+            dt_s = dt_s,
+            delta_bytes = total_bytes.saturating_sub(prev_bytes),
+            total_bytes_sent = total_bytes,
+            "get_metrics: observed rate"
+        );
+
         // --- Capacity estimate from BiscayController (BBR-based) ---
         // Use btl_bw (discovered bottleneck bandwidth) as the capacity
         // signal for DWRR credits.  btl_bw is derived from peak ACK-based
@@ -411,9 +530,36 @@ impl LinkSender for TransportLink {
         // stays low.  btl_bw breaks this loop by reflecting what the link
         // CAN do, not what the CC is currently allowing.
         let cc = self.congestion.lock().unwrap();
+        let phase = match cc.state {
+            BiscayState::PreHandover => LinkPhase::Degrade,
+            BiscayState::Cautious => LinkPhase::Degrade,
+            BiscayState::Normal => match cc.bbr_phase {
+                BbrPhase::SlowStart => LinkPhase::Probe,
+                BbrPhase::ProbeBw => LinkPhase::Live,
+                // ProbeRtt is a short control cycle for RTprop refresh, not
+                // a capacity-discovery startup phase. Mapping it to Probe
+                // would trigger scheduler capacity-floor overrides and flatten
+                // per-link estimates toward the floor.
+                BbrPhase::ProbeRtt => LinkPhase::Live,
+            },
+        };
         let btl_bw_bps = cc.btl_bw() * 8.0;
+
+        // --- Physics Guard ---
+        // Clamp btl_bw to ack_rate × 1.5 to prevent overestimation.
+        // Both btl_bw and ack_rate use the same total_received × 1200
+        // measurement, so any systematic bias cancels out in the ratio.
+        // The 1.5× headroom allows gradual capacity discovery for
+        // under-utilized links while preventing the 75th-percentile
+        // from drifting far above the link's actual delivery rate.
+        let ack_rate = *self.ack_rate_ewma_bps.lock().unwrap();
         let capacity_bps = if btl_bw_bps > 0.0 {
-            btl_bw_bps.clamp(100_000.0, 50_000_000.0)
+            let capped = if ack_rate > 100_000.0 {
+                btl_bw_bps.min(ack_rate * 1.5)
+            } else {
+                btl_bw_bps
+            };
+            capped.clamp(100_000.0, 50_000_000.0)
         } else {
             0.0 // No data yet — scheduler will use capacity floor
         };
@@ -422,6 +568,7 @@ impl LinkSender for TransportLink {
         } else {
             None
         };
+
         let rtprop_ms = if cc.rt_prop_us() < f64::MAX {
             Some(cc.rt_prop_us() / 1000.0)
         } else {
@@ -439,16 +586,33 @@ impl LinkSender for TransportLink {
             0.0
         };
 
+        tracing::debug!(
+            target: "strata::transport",
+            link_id = self.id,
+            capacity_bps = capacity_bps,
+            btl_bw_bps = btl_bw_bps,
+            observed_bps = observed_bps,
+            pacing_rate_bps = cc.pacing_rate() * 8.0,
+            phase = ?phase,
+            rtt_ms = rtt_ms,
+            rtprop_ms = rtprop_ms,
+            loss_rate = loss_rate,
+            drain_factor = cc.drain_factor(),
+            pkts_sent = stats.packets_sent,
+            pkts_acked = stats.packets_acked,
+            "get_metrics: full snapshot"
+        );
+
         LinkMetrics {
             rtt_ms,
             capacity_bps,
             loss_rate,
             observed_bps,
             observed_bytes: total_bytes,
-            queue_depth: sender.output_queue_len(),
+            queue_depth: sender.output_queue_len() + self.paced_queue.lock().unwrap().len(),
             max_queue: 0,
             alive: true,
-            phase: LinkPhase::Live,
+            phase,
             os_up: Some(true),
             mtu: None,
             iface: self.iface.clone(),
@@ -506,6 +670,16 @@ impl LinkSender for TransportLink {
             }
         }
 
+        #[cfg(feature = "bursty_diag")]
+        if processed > 0 {
+            tracing::info!(
+                target: "strata::bursty_diag",
+                link_id = self.id,
+                queue_depth = processed,
+                "Feedback drained"
+            );
+        }
+
         // Send periodic Pings for RTT measurement.
         let mut rtt = self.rtt.lock().unwrap();
         if rtt.needs_ping() {
@@ -524,6 +698,10 @@ impl LinkSender for TransportLink {
         }
 
         processed
+    }
+
+    fn flush_paced(&self) {
+        self.flush_paced();
     }
 }
 
@@ -578,6 +756,6 @@ mod tests {
         let link = make_loopback_link(3);
         let metrics = link.get_metrics();
         assert_eq!(metrics.observed_bytes, 0);
-        assert_eq!(metrics.phase, LinkPhase::Live);
+        assert_eq!(metrics.phase, LinkPhase::Probe);
     }
 }

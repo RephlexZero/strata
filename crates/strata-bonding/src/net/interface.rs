@@ -172,6 +172,9 @@ pub trait LinkSender: Send + Sync {
         0
     }
 
+    /// Flush any pending packets in the paced send queue.
+    fn flush_paced(&self) {}
+
     /// Forward RF metrics from the modem supervisor to this link's congestion
     /// controller. Called whenever the modem poller produces updated
     /// CQI/RSRP/SINR readings.

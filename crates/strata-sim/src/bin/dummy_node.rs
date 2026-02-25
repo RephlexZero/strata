@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use strata_bonding::config::LinkConfig;
+use strata_bonding::config::{LinkConfig, SchedulerConfig};
 use strata_bonding::receiver::transport::TransportBondingReceiver;
 use strata_bonding::runtime::BondingRuntime;
 use strata_bonding::scheduler::PacketProfile;
@@ -29,6 +29,8 @@ async fn main() -> Result<()> {
     let mut dest_addrs = Vec::new();
     let mut stats_dest = None;
     let mut bitrate_kbps = 2000;
+    let mut critical_broadcast = true;
+    let mut redundancy_enabled = true;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -56,6 +58,14 @@ async fn main() -> Result<()> {
             "--bitrate" => {
                 bitrate_kbps = args.next().expect("Missing --bitrate value").parse()?;
             }
+            "--critical-broadcast" => {
+                let v = args.next().expect("Missing --critical-broadcast value");
+                critical_broadcast = parse_bool_arg(&v, "--critical-broadcast")?;
+            }
+            "--redundancy" => {
+                let v = args.next().expect("Missing --redundancy value");
+                redundancy_enabled = parse_bool_arg(&v, "--redundancy")?;
+            }
             "--codec" | "--resolution" | "--framerate" => {
                 // Ignore these args from the old tests
                 args.next();
@@ -75,10 +85,18 @@ async fn main() -> Result<()> {
 
     if mode == "sender" {
         eprintln!(
-            "Starting sender with dests: {:?}, bitrate: {}",
-            dest_addrs, bitrate_kbps
+            "Starting sender with dests: {:?}, bitrate: {}, critical_broadcast: {}, redundancy: {}",
+            dest_addrs, bitrate_kbps, critical_broadcast, redundancy_enabled
         );
-        run_sender(dest_addrs, stats_dest, bitrate_kbps, running).await?;
+        run_sender(
+            dest_addrs,
+            stats_dest,
+            bitrate_kbps,
+            critical_broadcast,
+            redundancy_enabled,
+            running,
+        )
+        .await?;
     } else if mode == "receiver" {
         eprintln!("Starting receiver with binds: {:?}", bind_addrs);
         run_receiver(bind_addrs, stats_dest, running).await?;
@@ -178,9 +196,16 @@ async fn run_sender(
     dest_addrs: Vec<SocketAddr>,
     stats_dest: Option<SocketAddr>,
     bitrate_kbps: u32,
+    critical_broadcast: bool,
+    redundancy_enabled: bool,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut sender = BondingRuntime::new();
+    let scheduler_config = SchedulerConfig {
+        critical_broadcast,
+        redundancy_enabled,
+        ..SchedulerConfig::default()
+    };
+    let mut sender = BondingRuntime::with_config(scheduler_config);
 
     for (id, dest) in dest_addrs.into_iter().enumerate() {
         sender.add_link(LinkConfig {
@@ -283,6 +308,14 @@ async fn run_sender(
     }
 
     Ok(())
+}
+
+fn parse_bool_arg(value: &str, arg_name: &str) -> Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!("Invalid value for {arg_name}: {value} (expected true/false)"),
+    }
 }
 
 async fn run_receiver(

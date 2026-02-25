@@ -193,7 +193,8 @@ async fn link_reader_async(
     let mut buf = vec![0u8; 65536];
     let clock = TimestampClock::new();
     let mut last_ack = std::time::Instant::now();
-    let ack_interval = Duration::from_millis(50);
+    let ack_interval = Duration::from_millis(15); // 10-20ms max delay
+    let mut packets_since_ack = 0;
     let mut last_report = std::time::Instant::now();
     let report_interval = Duration::from_secs(1);
     // Track bytes delivered for goodput calculation.
@@ -216,6 +217,7 @@ async fn link_reader_async(
                 }
 
                 transport_rx.receive(raw);
+                packets_since_ack += 1;
                 buf = returned_buf;
 
                 for event in transport_rx.drain_events() {
@@ -251,8 +253,8 @@ async fn link_reader_async(
                     }
                 }
 
-                // Periodically generate and send ACKs.
-                if last_ack.elapsed() >= ack_interval {
+                // Hybrid ACK policy: send ACK if max delay elapsed OR packet threshold reached.
+                if packets_since_ack >= 12 || last_ack.elapsed() >= ack_interval {
                     let ack = transport_rx.generate_ack();
                     if let Some(addr) = sender_addr {
                         let pkt_bytes = encode_control_packet(&ack, &clock);
@@ -266,6 +268,7 @@ async fn link_reader_async(
                         let _ = socket.send_to(pkt_bytes, addr).await;
                     }
                     last_ack = std::time::Instant::now();
+                    packets_since_ack = 0;
                 }
 
                 // Periodically send ReceiverReport.
@@ -332,6 +335,7 @@ async fn link_reader_async(
                         let _ = socket.send_to(pkt_bytes, addr).await;
                     }
                     last_ack = std::time::Instant::now();
+                    packets_since_ack = 0;
                 }
             }
         }

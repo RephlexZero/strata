@@ -115,17 +115,8 @@ fn uploader_loop(config: &HlsUploaderConfig, stop: &AtomicBool) {
         let mut new_uploaded = false;
 
         // Scan for .ts segment files
-        if let Ok(entries) = std::fs::read_dir(&config.segment_dir) {
-            let mut new_segments = Vec::new();
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".ts") && !uploaded.contains(&name) {
-                    new_segments.push(name);
-                }
-            }
-
-            // Sort by name to upload in order (segment00000.ts, segment00001.ts, ...)
-            new_segments.sort();
+        {
+            let new_segments = find_new_segments(&config.segment_dir, &uploaded);
 
             for name in new_segments {
                 let path = config.segment_dir.join(&name);
@@ -156,19 +147,8 @@ fn uploader_loop(config: &HlsUploaderConfig, stop: &AtomicBool) {
     }
 
     // Final: upload any remaining segments, then playlist
-    if let Ok(entries) = std::fs::read_dir(&config.segment_dir) {
-        let mut remaining: Vec<String> = entries
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                if name.ends_with(".ts") && !uploaded.contains(&name) {
-                    Some(name)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        remaining.sort();
+    {
+        let remaining = find_new_segments(&config.segment_dir, &uploaded);
         for name in remaining {
             let path = config.segment_dir.join(&name);
             if upload_file_with_retry(&agent, &config.base_url, &name, &path) {
@@ -233,11 +213,7 @@ fn upload_file(agent: &ureq::Agent, base_url: &str, filename: &str, path: &Path)
     };
 
     let url = format!("{base_url}{filename}");
-    let content_type = if filename.ends_with(".m3u8") {
-        "application/vnd.apple.mpegurl"
-    } else {
-        "video/mp2t"
-    };
+    let content_type = content_type_for_hls(filename);
 
     match agent
         .put(&url)
@@ -260,12 +236,32 @@ fn upload_file(agent: &ureq::Agent, base_url: &str, filename: &str, path: &Path)
     }
 }
 
-/// Detect whether a relay URL is an HLS upload endpoint.
+/// Return the appropriate MIME type for an HLS file.
 ///
-/// Returns `true` if the URL looks like a YouTube HLS ingest URL
-/// (HTTPS with `http_upload_hls` in the path, ending with `file=`).
-pub fn is_hls_url(url: &str) -> bool {
-    url.starts_with("https://") && url.contains("http_upload_hls") && url.contains("file=")
+/// `.m3u8` playlists get `application/vnd.apple.mpegurl`; everything else
+/// (`.ts` segments) gets `video/mp2t`.
+pub(crate) fn content_type_for_hls(filename: &str) -> &'static str {
+    if filename.ends_with(".m3u8") {
+        "application/vnd.apple.mpegurl"
+    } else {
+        "video/mp2t"
+    }
+}
+
+/// Scan `dir` for `.ts` segment files not yet in `uploaded`, returning them
+/// sorted by name.
+pub(crate) fn find_new_segments(dir: &Path, uploaded: &HashSet<String>) -> Vec<String> {
+    let mut segments = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".ts") && !uploaded.contains(&name) {
+                segments.push(name);
+            }
+        }
+    }
+    segments.sort();
+    segments
 }
 
 /// Parse the HLS base URL from a relay URL.
@@ -284,25 +280,189 @@ pub fn hls_base_url(url: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    // ── hls_base_url ────────────────────────────────────────────────────
 
     #[test]
-    fn test_is_hls_url() {
-        assert!(is_hls_url(
-            "https://a.upload.youtube.com/http_upload_hls?cid=abc&copy=0&file="
-        ));
-        assert!(!is_hls_url("rtmp://a.rtmp.youtube.com/live2/key"));
-        assert!(!is_hls_url("https://example.com/upload"));
+    fn test_hls_base_url_trailing_file_eq() {
+        let url = "https://a.upload.youtube.com/http_upload_hls?cid=abc&copy=0&file=";
+        assert_eq!(hls_base_url(url), url);
     }
 
     #[test]
-    fn test_hls_base_url() {
-        let url = "https://a.upload.youtube.com/http_upload_hls?cid=abc&copy=0&file=";
-        assert_eq!(hls_base_url(url), url);
-
-        let url2 = "https://a.upload.youtube.com/http_upload_hls?cid=abc&copy=0&file=something";
+    fn test_hls_base_url_strips_after_file_eq() {
+        let url = "https://a.upload.youtube.com/http_upload_hls?cid=abc&copy=0&file=something";
         assert_eq!(
-            hls_base_url(url2),
+            hls_base_url(url),
             "https://a.upload.youtube.com/http_upload_hls?cid=abc&copy=0&file="
         );
+    }
+
+    #[test]
+    fn test_hls_base_url_no_file_param_returns_whole_url() {
+        let url = "https://example.com/upload";
+        assert_eq!(hls_base_url(url), url);
+    }
+
+    #[test]
+    fn test_hls_base_url_empty_string() {
+        assert_eq!(hls_base_url(""), "");
+    }
+
+    #[test]
+    fn test_hls_base_url_multiple_file_params_uses_last() {
+        let url = "https://example.com/?file=first&other=1&file=second";
+        // rfind should pick the *last* `file=`
+        assert_eq!(
+            hls_base_url(url),
+            "https://example.com/?file=first&other=1&file="
+        );
+    }
+
+    // ── tmpfs_segment_dir ───────────────────────────────────────────────
+
+    #[test]
+    fn test_tmpfs_segment_dir_contains_suffix() {
+        let dir = tmpfs_segment_dir("strata-test-123");
+        assert!(dir.to_string_lossy().contains("strata-test-123"));
+    }
+
+    #[test]
+    fn test_tmpfs_segment_dir_prefers_dev_shm_on_linux() {
+        let dir = tmpfs_segment_dir("test");
+        // On Linux CI/dev containers, /dev/shm should exist
+        if Path::new("/dev/shm").is_dir() {
+            assert!(dir.starts_with("/dev/shm"));
+        } else {
+            // Fallback path — just ensure it's reasonable
+            assert!(dir.to_string_lossy().contains("test"));
+        }
+    }
+
+    // ── content_type_for_hls ────────────────────────────────────────────
+
+    #[test]
+    fn test_content_type_playlist() {
+        assert_eq!(
+            content_type_for_hls("playlist.m3u8"),
+            "application/vnd.apple.mpegurl"
+        );
+    }
+
+    #[test]
+    fn test_content_type_segment() {
+        assert_eq!(content_type_for_hls("segment00001.ts"), "video/mp2t");
+    }
+
+    #[test]
+    fn test_content_type_unknown_extension() {
+        // Anything that isn't .m3u8 is treated as a transport stream
+        assert_eq!(content_type_for_hls("data.bin"), "video/mp2t");
+    }
+
+    // ── find_new_segments ───────────────────────────────────────────────
+
+    use std::sync::atomic::AtomicU32;
+
+    static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn make_temp_dir() -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("strata-test-{}-{}", std::process::id(), id));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_find_new_segments_empty_dir() {
+        let dir = make_temp_dir();
+        let uploaded = HashSet::new();
+        let result = find_new_segments(&dir, &uploaded);
+        assert!(result.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_find_new_segments_returns_only_ts_files() {
+        let dir = make_temp_dir();
+        fs::write(dir.join("segment00000.ts"), b"data").unwrap();
+        fs::write(dir.join("segment00001.ts"), b"data").unwrap();
+        fs::write(dir.join("playlist.m3u8"), b"#EXTM3U").unwrap();
+        fs::write(dir.join("notes.txt"), b"misc").unwrap();
+
+        let uploaded = HashSet::new();
+        let result = find_new_segments(&dir, &uploaded);
+        assert_eq!(result, vec!["segment00000.ts", "segment00001.ts"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_find_new_segments_excludes_already_uploaded() {
+        let dir = make_temp_dir();
+        fs::write(dir.join("segment00000.ts"), b"data").unwrap();
+        fs::write(dir.join("segment00001.ts"), b"data").unwrap();
+        fs::write(dir.join("segment00002.ts"), b"data").unwrap();
+
+        let mut uploaded = HashSet::new();
+        uploaded.insert("segment00000.ts".to_string());
+        uploaded.insert("segment00002.ts".to_string());
+
+        let result = find_new_segments(&dir, &uploaded);
+        assert_eq!(result, vec!["segment00001.ts"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_find_new_segments_returned_sorted() {
+        let dir = make_temp_dir();
+        // Create in reverse order — result should still be sorted
+        fs::write(dir.join("segment00005.ts"), b"d").unwrap();
+        fs::write(dir.join("segment00001.ts"), b"d").unwrap();
+        fs::write(dir.join("segment00003.ts"), b"d").unwrap();
+
+        let result = find_new_segments(&dir, &HashSet::new());
+        assert_eq!(
+            result,
+            vec!["segment00001.ts", "segment00003.ts", "segment00005.ts"]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_find_new_segments_nonexistent_dir() {
+        let dir = PathBuf::from("/tmp/strata-nonexistent-dir-12345");
+        let result = find_new_segments(&dir, &HashSet::new());
+        assert!(result.is_empty());
+    }
+
+    // ── HlsUploaderHandle lifecycle ─────────────────────────────────────
+
+    #[test]
+    fn test_uploader_start_and_immediate_stop() {
+        let dir = make_temp_dir();
+        let handle = start_hls_uploader(HlsUploaderConfig {
+            segment_dir: dir.clone(),
+            base_url: "https://localhost:0/file=".to_string(),
+            playlist_filename: "playlist.m3u8".to_string(),
+        });
+        // Signal stop — should not hang
+        handle.stop();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_uploader_stop_on_drop() {
+        let dir = make_temp_dir();
+        {
+            let _handle = start_hls_uploader(HlsUploaderConfig {
+                segment_dir: dir.clone(),
+                base_url: "https://localhost:0/file=".to_string(),
+                playlist_filename: "playlist.m3u8".to_string(),
+            });
+            // handle dropped here — should signal stop and join cleanly
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }

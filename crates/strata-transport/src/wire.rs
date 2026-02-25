@@ -384,6 +384,11 @@ pub struct AckPacket {
     /// Bitmap of received packets beyond cumulative_seq (up to 64 bits).
     /// Bit 0 = cumulative_seq + 1, Bit 1 = cumulative_seq + 2, etc.
     pub sack_bitmap: u64,
+    /// Total unique packets received on this link (monotonically increasing).
+    /// Used for delivery-rate measurement — increments by exactly 1 per
+    /// non-duplicate packet, avoiding the bursty jumps caused by cumulative
+    /// sequence advancing past irrecoverable gaps.
+    pub total_received: VarInt,
 }
 
 impl AckPacket {
@@ -391,6 +396,7 @@ impl AckPacket {
         buf.put_u8(ControlType::Ack as u8);
         self.cumulative_seq.encode(buf);
         buf.put_u64(self.sack_bitmap);
+        self.total_received.encode(buf);
     }
 
     pub fn decode(buf: &mut impl Buf) -> Option<Self> {
@@ -399,9 +405,16 @@ impl AckPacket {
             return None;
         }
         let sack_bitmap = buf.get_u64();
+        let total_received = if buf.has_remaining() {
+            VarInt::decode(buf)?
+        } else {
+            // Backward compatibility: old ACKs without total_received
+            VarInt::from_u64(0)
+        };
         Some(AckPacket {
             cumulative_seq,
             sack_bitmap,
+            total_received,
         })
     }
 
@@ -983,6 +996,7 @@ mod tests {
         let ack = AckPacket {
             cumulative_seq: VarInt::from_u64(10000),
             sack_bitmap: 0b1010_0101,
+            total_received: VarInt::from_u64(10004),
         };
         let mut buf = BytesMut::new();
         ack.encode(&mut buf);
@@ -990,6 +1004,7 @@ mod tests {
         let decoded = AckPacket::decode(&mut buf).unwrap();
         assert_eq!(decoded.cumulative_seq.value(), 10000);
         assert_eq!(decoded.sack_bitmap, 0b1010_0101);
+        assert_eq!(decoded.total_received.value(), 10004);
     }
 
     #[test]
@@ -1062,6 +1077,7 @@ mod tests {
         let ack = AckPacket {
             cumulative_seq: VarInt::from_u64(100),
             sack_bitmap: 0b0000_0101, // bits 0 and 2
+            total_received: VarInt::from_u64(0),
         };
         let sacked: Vec<u64> = ack.sacked_sequences().collect();
         assert_eq!(sacked, vec![101, 103]);

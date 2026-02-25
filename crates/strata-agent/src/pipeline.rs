@@ -354,13 +354,6 @@ fn spawn_strata_node(payload: &StreamStartPayload) -> anyhow::Result<Child> {
         cmd.arg("--dest").arg(&dest_str);
     }
 
-    // RTMP relay URL — sender tees encoded output to RTMP in parallel
-    if let Some(ref relay) = payload.relay_url
-        && !relay.is_empty()
-    {
-        cmd.arg("--relay-url").arg(relay);
-    }
-
     // Write bonding config to temp file if non-empty
     if !payload.bonding_config.is_null() {
         let config_path = format!("/tmp/strata-stream-{}.toml", payload.stream_id);

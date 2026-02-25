@@ -575,26 +575,8 @@ fn chaos_scenario() {
         duration: Duration::from_secs(25),
         step: Duration::from_secs(1),
         links: vec![
-            LinkScenarioConfig {
-                min_rate_kbit: 3000,
-                max_rate_kbit: 6000,
-                rate_step_kbit: 300,
-                base_delay_ms: 20,
-                delay_jitter_ms: 15,
-                delay_step_ms: 4,
-                max_loss_percent: 3.0,
-                loss_step_percent: 0.5,
-            },
-            LinkScenarioConfig {
-                min_rate_kbit: 500,
-                max_rate_kbit: 2000,
-                rate_step_kbit: 200,
-                base_delay_ms: 40,
-                delay_jitter_ms: 30,
-                delay_step_ms: 6,
-                max_loss_percent: 8.0,
-                loss_step_percent: 1.0,
-            },
+            LinkScenarioConfig::lte_urban(),
+            LinkScenarioConfig::lte_poor(),
         ],
     });
 

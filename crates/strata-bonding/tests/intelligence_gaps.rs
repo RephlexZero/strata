@@ -266,10 +266,13 @@ fn supervisor_adapter_to_wire_bitrate_cmd_pipeline() {
     // Feed degraded capacities to adapter → should produce a command
     let caps = supervisor.link_capacities();
     let cmd = adapter.update(&caps);
-    // The adapter may or may not issue a command depending on pressure;
-    // force-reduce to guarantee one.
-    let bitrate_command =
-        cmd.unwrap_or_else(|| adapter.force_reduce(AdaptationReason::LinkFailure));
+    // update() always returns Some for stage freshness; if the surviving
+    // link still covers the target, force a reduction explicitly to
+    // exercise the wire-format round-trip below.
+    let bitrate_command = match cmd {
+        Some(c) if c.target_kbps < 10_000 => c,
+        _ => adapter.force_reduce(AdaptationReason::LinkFailure),
+    };
 
     assert!(
         bitrate_command.target_kbps < 10_000,

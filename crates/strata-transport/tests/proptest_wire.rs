@@ -177,6 +177,7 @@ proptest! {
         let ack = AckPacket {
             cumulative_seq: VarInt::from_u64(cumulative),
             sack_bitmap: bitmap,
+            total_received: VarInt::from_u64(cumulative + bitmap.count_ones() as u64),
         };
 
         let mut buf = BytesMut::new();
@@ -186,6 +187,7 @@ proptest! {
 
         prop_assert_eq!(decoded.cumulative_seq.value(), cumulative);
         prop_assert_eq!(decoded.sack_bitmap, bitmap);
+        prop_assert_eq!(decoded.total_received.value(), cumulative + bitmap.count_ones() as u64);
     }
 
     #[test]
@@ -196,6 +198,7 @@ proptest! {
         let ack = AckPacket {
             cumulative_seq: VarInt::from_u64(base),
             sack_bitmap: bitmap,
+            total_received: VarInt::from_u64(0),
         };
 
         let sacked: Vec<u64> = ack.sacked_sequences().collect();

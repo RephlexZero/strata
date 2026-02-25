@@ -14,6 +14,7 @@
 use quanta::Instant;
 use std::collections::HashMap;
 use std::time::Duration;
+use tracing::debug;
 
 use crate::media::priority::DegradationStage;
 
@@ -289,6 +290,19 @@ impl BitrateAdapter {
         let capacity_ratio = if pressure > 0.0 { 1.0 / pressure } else { 1.0 };
         self.stage = DegradationStage::from_pressure(capacity_ratio);
 
+        debug!(
+            target: "strata::adapt",
+            aggregate_kbps = aggregate_kbps,
+            usable_kbps = usable_kbps,
+            pressure = pressure,
+            current_target_kbps = self.current_target_kbps,
+            alive_count = alive_count,
+            stage = ?self.stage,
+            mode = ?self.mode,
+            prev_capacity_kbps = self.prev_capacity_kbps,
+            "BitrateAdapter::update input"
+        );
+
         // Track capacity trend (stable-or-increasing vs decreasing)
         if aggregate_kbps >= self.prev_capacity_kbps * 0.95 {
             self.consecutive_increases += 1;
@@ -367,13 +381,29 @@ impl BitrateAdapter {
                 .last_command_time
                 .is_none_or(|t| t.elapsed() >= self.config.min_interval);
 
+        debug!(
+            target: "strata::adapt",
+            new_target_kbps = new_target,
+            old_target_kbps = self.current_target_kbps,
+            target_changed = target_changed,
+            interval_ok = interval_ok,
+            queue_alarm = ?queue_alarm,
+            reason = ?reason,
+            consecutive_inc = self.consecutive_increases,
+            consecutive_dec = self.consecutive_decreases,
+            "BitrateAdapter decision"
+        );
+
         if target_changed && interval_ok {
             self.current_target_kbps = new_target;
             self.last_command_time = Some(Instant::now());
-            Some(self.make_command(new_target, reason))
-        } else {
-            None
         }
+
+        // Always return a command so the degradation stage is forwarded to
+        // the scheduler on every tick.  Previously we returned `None` when
+        // the target hadn't changed, which caused the stage to "latch" —
+        // an aggressive stage set on the first tick was never corrected.
+        Some(self.make_command(self.current_target_kbps, reason))
     }
 
     /// Update with link capacity AND receiver feedback.
@@ -399,6 +429,19 @@ impl BitrateAdapter {
         let bufferbloat = feedback.jitter_buffer_ms > 500;
         let goodput_shortfall = feedback.goodput_bps > 0
             && (feedback.goodput_bps as f64) < self.current_target_kbps as f64 * 1000.0 * 0.7;
+
+        debug!(
+            target: "strata::adapt",
+            loss_after_fec = feedback.loss_after_fec,
+            jitter_buffer_ms = feedback.jitter_buffer_ms,
+            goodput_bps = feedback.goodput_bps,
+            fec_repair_rate = feedback.fec_repair_rate,
+            loss_pressure = loss_pressure,
+            bufferbloat = bufferbloat,
+            goodput_shortfall = goodput_shortfall,
+            current_target_kbps = self.current_target_kbps,
+            "receiver feedback signals"
+        );
 
         if loss_pressure || bufferbloat || goodput_shortfall {
             // Receiver signals congestion — force a reduction
@@ -578,7 +621,13 @@ mod tests {
         // 10 Mbps aggregate > 5 Mbps target
         let links = make_links(&[(5_000.0, true), (5_000.0, true)]);
         let cmd = adapter.update(&links);
-        assert!(cmd.is_none(), "should not change when capacity >> target");
+        // A command is always returned (for stage freshness) but the target
+        // should stay at max when capacity far exceeds it.
+        let cmd = cmd.expect("always returns a command");
+        assert_eq!(
+            cmd.target_kbps, 5_000,
+            "target should stay at max when capacity >> target"
+        );
     }
 
     // ─── Ramp Down ──────────────────────────────────────────────────────
@@ -748,12 +797,15 @@ mod tests {
 
         let links = make_links(&[(1_000.0, true)]);
         let first = adapter.update(&links);
-        assert!(first.is_some(), "first update should produce command");
+        let first = first.expect("first update should produce command");
+        let first_target = first.target_kbps;
+        assert!(first_target < 10_000, "first update should reduce target");
 
         let second = adapter.update(&links);
-        assert!(
-            second.is_none(),
-            "second update should be gated by interval"
+        let second = second.expect("always returns a command for stage freshness");
+        assert_eq!(
+            second.target_kbps, first_target,
+            "target should not change while gated by interval"
         );
     }
 

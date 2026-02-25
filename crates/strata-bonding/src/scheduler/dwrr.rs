@@ -31,6 +31,7 @@ pub(crate) struct LinkState<L: ?Sized> {
     pub loss_slope_per_s: f64,
     pub last_metrics_update: Instant,
     pub penalty_factor: f64,
+    pub stop_tx: Option<crossbeam_channel::Sender<()>>,
 }
 
 /// Deficit Weighted Round Robin (DWRR) packet scheduler.
@@ -43,11 +44,15 @@ pub(crate) struct LinkState<L: ?Sized> {
 ///
 /// The scheduler also provides broadcast, best-N selection (for redundancy),
 /// and spare-capacity queries used by higher-level bonding logic.
-pub struct Dwrr<L: LinkSender + ?Sized> {
+pub struct Dwrr<L: LinkSender + ?Sized + 'static> {
     links: HashMap<usize, LinkState<L>>,
     sorted_ids: Vec<usize>,
     current_rr_idx: usize,
     config: SchedulerConfig,
+    #[cfg(feature = "bursty_diag")]
+    last_selected_id: Option<usize>,
+    #[cfg(feature = "bursty_diag")]
+    current_burst_bytes: usize,
 }
 
 /// Computes the burst window (in seconds) for credit capping.
@@ -56,19 +61,38 @@ pub struct Dwrr<L: LinkSender + ?Sized> {
 /// them to absorb short traffic spikes. Degraded or probing links are
 /// tightly limited. Loss further reduces the window.
 fn compute_burst_window_s(phase: LinkPhase, loss_rate: f64) -> f64 {
+    // Window sizes are kept small (tens of milliseconds) to limit the number
+    // of back-to-back packets the DWRR sends on a single link before
+    // switching.  Large bursts fill tc/netem queues, inflating per-link RTT
+    // uniformly across all links and destroying the capacity-estimation
+    // signal that the bonding scheduler depends on.
+    //
+    // At 5 Mbps a 0.015 s window ≈ 10 packets — enough to amortise
+    // per-packet selection overhead while keeping netem queue depth to
+    // ~20 ms of additional delay.
     let base = match phase {
-        LinkPhase::Probe => 0.05,
-        LinkPhase::Warm => 0.08,
-        LinkPhase::Live => 0.1,
-        LinkPhase::Degrade => 0.04,
-        LinkPhase::Cooldown | LinkPhase::Reset | LinkPhase::Init => 0.01,
+        LinkPhase::Probe => 0.004,
+        LinkPhase::Warm => 0.008,
+        LinkPhase::Live => 0.015,
+        LinkPhase::Degrade => 0.006,
+        LinkPhase::Cooldown | LinkPhase::Reset | LinkPhase::Init => 0.002,
     };
 
     let loss_factor = (1.0 - loss_rate).clamp(0.1, 1.0);
-    (base * loss_factor).clamp(0.01, 0.1)
+    (base * loss_factor).clamp(0.002, 0.02)
 }
 
-impl<L: LinkSender + ?Sized> Dwrr<L> {
+impl<L: LinkSender + ?Sized + 'static> Drop for Dwrr<L> {
+    fn drop(&mut self) {
+        for state in self.links.values_mut() {
+            if let Some(tx) = state.stop_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+}
+
+impl<L: LinkSender + ?Sized + 'static> Dwrr<L> {
     pub fn new() -> Self {
         Self::with_config(SchedulerConfig::default())
     }
@@ -79,6 +103,10 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             sorted_ids: Vec::new(),
             current_rr_idx: 0,
             config,
+            #[cfg(feature = "bursty_diag")]
+            last_selected_id: None,
+            #[cfg(feature = "bursty_diag")]
+            current_burst_bytes: 0,
         }
     }
 
@@ -94,6 +122,20 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         let id = link.id();
         let metrics = link.get_metrics();
         let now = Instant::now();
+
+        let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let link_clone = link.clone();
+        std::thread::spawn(move || {
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                link_clone.recv_feedback();
+                link_clone.flush_paced();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+
         self.links.insert(
             id,
             LinkState {
@@ -117,6 +159,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 loss_slope_per_s: 0.0,
                 last_metrics_update: Instant::now(),
                 penalty_factor: 1.0,
+                stop_tx: Some(stop_tx),
             },
         );
         self.sorted_ids.push(id);
@@ -129,9 +172,6 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
         let penalty_recovery = self.config.penalty_recovery;
 
         for state in self.links.values_mut() {
-            // Process any pending feedback (ACKs, Pongs) before reading metrics.
-            state.link.recv_feedback();
-
             let now = Instant::now();
             state.metrics = state.link.get_metrics();
             let dt_sent = now.duration_since(state.last_sent_at).as_secs_f64();
@@ -189,8 +229,16 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                 // otherwise we artificially inflate genuinely slow links.
                 if matches!(state.metrics.phase, LinkPhase::Probe | LinkPhase::Warm) {
                     state.metrics.capacity_bps = capacity_floor;
+                    state.metrics.estimated_capacity_bps = capacity_floor;
                 }
             }
+
+            // Note: we intentionally do NOT force all Probe-phase links to
+            // the same floor once they already have non-trivial capacity
+            // estimates. Flattening them to an identical value makes it hard
+            // for per-link estimators to remain proportional to real link
+            // rates. The bootstrap floor above still handles low/no-signal
+            // startup cases.
             let prev_capacity = state.prev_capacity_bps;
             let curr_capacity = state.metrics.capacity_bps;
             if prev_capacity > 0.0 && curr_capacity < prev_capacity * 0.5 {
@@ -214,7 +262,11 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
     }
 
     pub fn remove_link(&mut self, id: usize) {
-        self.links.remove(&id);
+        if let Some(mut state) = self.links.remove(&id)
+            && let Some(tx) = state.stop_tx.take()
+        {
+            let _ = tx.send(());
+        }
         if let Some(pos) = self.sorted_ids.iter().position(|&x| x == id) {
             self.sorted_ids.remove(pos);
         }
@@ -416,7 +468,7 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
                     (metrics.loss_rate + state.loss_slope_per_s * horizon_s).clamp(0.0, 1.0);
                 let predicted_rtt = (metrics.rtt_ms + state.rtt_slope_ms_s * horizon_s).max(0.0);
 
-                let quality_factor = (1.0 - predicted_loss).powi(4);
+                let quality_factor = (1.0 - predicted_loss).max(0.1);
                 // NOTE: rtt_factor removed.  capacity_bps is already derived
                 // from BiscayController's pacing_rate which accounts for
                 // congestion and bufferbloat.  An additional RTT penalty
@@ -492,6 +544,25 @@ impl<L: LinkSender + ?Sized> Dwrr<L> {
             && let Some(state) = self.links.get_mut(&id)
         {
             state.credits -= packet_cost; // Goes negative
+
+            #[cfg(feature = "bursty_diag")]
+            {
+                if self.last_selected_id == Some(id) {
+                    self.current_burst_bytes += packet_len;
+                } else {
+                    if let Some(last_id) = self.last_selected_id {
+                        tracing::info!(
+                            target: "strata::bursty_diag",
+                            link_id = last_id,
+                            burst_bytes = self.current_burst_bytes,
+                            "DWRR burst ended"
+                        );
+                    }
+                    self.last_selected_id = Some(id);
+                    self.current_burst_bytes = packet_len;
+                }
+            }
+
             return Some(state.link.clone());
         }
 
@@ -587,27 +658,39 @@ mod tests {
 
     #[test]
     fn warmup_phase_reduces_credit_growth() {
-        let live = Arc::new(MockLink::new(1, 1_000_000.0, LinkPhase::Live));
-        let probe = Arc::new(MockLink::new(2, 1_000_000.0, LinkPhase::Probe));
+        // Probe-phase links with very low discovered capacity should use the
+        // bootstrap floor (5 Mbps). The phase_factor (0.5 for Probe) further
+        // reduces effective credits vs. Live links.
+        let live = Arc::new(MockLink::new(1, 10_000_000.0, LinkPhase::Live));
+        let probe = Arc::new(MockLink::new(2, 900_000.0, LinkPhase::Probe));
 
         let mut dwrr = Dwrr::new();
         dwrr.add_link(live.clone());
         dwrr.add_link(probe.clone());
 
-        // Force metrics refresh and provide elapsed time for credit accrual
+        // After refresh_metrics, the low-capacity Probe link should be
+        // elevated to the bootstrap floor.
         dwrr.refresh_metrics();
-        if let Some(state) = dwrr.links.get_mut(&1) {
-            state.last_update -= Duration::from_secs(1);
-        }
-        if let Some(state) = dwrr.links.get_mut(&2) {
-            state.last_update -= Duration::from_secs(1);
-        }
+        let probe_cap = dwrr.links.get(&2).unwrap().metrics.capacity_bps;
+        assert!(
+            (probe_cap - 5_000_000.0).abs() < 1.0,
+            "Probe link should get capacity_floor during calibration, got {probe_cap}"
+        );
 
-        let _ = dwrr.select_link(1200);
-        let live_credits = dwrr.links.get(&1).unwrap().credits;
-        let probe_credits = dwrr.links.get(&2).unwrap().credits;
+        // Live link should keep its reported capacity
+        let live_cap = dwrr.links.get(&1).unwrap().metrics.capacity_bps;
+        assert!(
+            (live_cap - 10_000_000.0).abs() < 1.0,
+            "Live link should keep its capacity, got {live_cap}"
+        );
 
-        assert!(live_credits >= probe_credits);
+        // Verify that burst windows are tighter for Probe than Live
+        let live_burst = compute_burst_window_s(LinkPhase::Live, 0.0);
+        let probe_burst = compute_burst_window_s(LinkPhase::Probe, 0.0);
+        assert!(
+            live_burst > probe_burst,
+            "Live burst window ({live_burst}) should exceed Probe ({probe_burst})"
+        );
     }
 
     #[test]

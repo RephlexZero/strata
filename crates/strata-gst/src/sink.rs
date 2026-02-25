@@ -609,10 +609,22 @@ mod imp {
                 size_bytes: data.len(),
             };
 
+            tracing::debug!(
+                target: "strata::sink",
+                size = data.len(),
+                is_critical,
+                can_drop,
+                "render: buffer received"
+            );
+
             if let Some(rt) = lock_or_recover(&self.runtime).as_mut() {
                 match rt.try_send_packet(data, profile) {
                     Ok(_) => (),
                     Err(PacketSendError::Full) => {
+                        tracing::warn!(
+                            target: "strata::sink",
+                            "ring buffer FULL — dropping packet"
+                        );
                         if can_drop {
                             gst::warning!(gst::CAT_DEFAULT, "Congestion dropping expendable frame");
                         } else {
@@ -621,9 +633,18 @@ mod imp {
                         return Ok(gst::FlowSuccess::Ok);
                     }
                     Err(PacketSendError::Disconnected) => {
+                        tracing::error!(
+                            target: "strata::sink",
+                            "runtime disconnected!"
+                        );
                         return Err(gst::FlowError::Error);
                     }
                 }
+            } else {
+                tracing::warn!(
+                    target: "strata::sink",
+                    "render: runtime is None — data lost"
+                );
             }
 
             Ok(gst::FlowSuccess::Ok)
