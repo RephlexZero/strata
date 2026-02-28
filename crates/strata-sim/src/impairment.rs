@@ -40,6 +40,31 @@ pub struct ImpairmentConfig {
     /// `rate_kbit` is set, [`apply_impairment`] auto-computes a limit
     /// targeting ~100ms of buffering at the configured rate.
     pub limit: Option<u32>,
+
+    /// LTE/5G TTI radio slot scheduling (`tc netem slot`).
+    ///
+    /// Models the radio scheduler's burst-then-silence rhythm: packets are
+    /// held in the netem queue and released only at TTI slot boundaries.
+    /// Both `slot_min_us` and `slot_max_us` must be `Some` for the `slot`
+    /// directive to be emitted.  `slot_max_packets` and `slot_max_bytes`
+    /// bound the per-slot release budget.
+    ///
+    /// LTE TTI = 1 ms → `slot_min_us: Some(1_000), slot_max_us: Some(2_000)`
+    /// 5G NR slot ≈ 0.5 ms → `slot_min_us: Some(500), slot_max_us: Some(1_000)`
+    pub slot_min_us: Option<u32>,
+    pub slot_max_us: Option<u32>,
+    pub slot_max_packets: Option<u32>,
+    pub slot_max_bytes: Option<u32>,
+
+    /// Modem firmware buffer size in kibibytes (`tc tbf burst`).
+    ///
+    /// When set together with `rate_kbit`, a `tbf` root qdisc is installed
+    /// first (`handle 1:`).  The `tbf` owns rate shaping and models the
+    /// fill-and-drain behaviour of a USB modem's internal Qualcomm buffer
+    /// (~64 KiB typical).  Netem becomes the tbf child at `parent 1:1
+    /// handle 10:` and handles delay, loss, and slot scheduling — but no
+    /// longer emits a `rate` argument (that belongs to tbf).
+    pub modem_buffer_kb: Option<u32>,
 }
 
 /// Assumed MTU for queue-depth calculations (bytes).
@@ -88,6 +113,12 @@ impl ImpairmentConfig {
             gemodel: None,
             // Generous limit — ACKs are small, just need room for delay
             limit: Some(1000),
+            // Slot scheduling and modem buffer are data-path-only phenomena
+            slot_min_us: None,
+            slot_max_us: None,
+            slot_max_packets: None,
+            slot_max_bytes: None,
+            modem_buffer_kb: None,
         }
     }
 
@@ -115,6 +146,11 @@ impl ImpairmentConfig {
             corrupt_percent: Some(0.05),
             reorder_percent: Some(0.1),
             reorder_correlation: Some(20.0),
+            slot_min_us: Some(1_000),
+            slot_max_us: Some(2_000),
+            slot_max_packets: Some(12),
+            slot_max_bytes: Some(14_400),
+            modem_buffer_kb: Some(64),
             ..Default::default()
         }
     }
@@ -137,6 +173,11 @@ impl ImpairmentConfig {
             corrupt_percent: Some(0.1),
             reorder_percent: Some(0.3),
             reorder_correlation: Some(25.0),
+            slot_min_us: Some(1_000),
+            slot_max_us: Some(5_000),
+            slot_max_packets: Some(8),
+            slot_max_bytes: Some(9_600),
+            modem_buffer_kb: Some(64),
             ..Default::default()
         }
     }
@@ -155,6 +196,11 @@ impl ImpairmentConfig {
             delay_distribution_normal: true,
             loss_percent: Some(0.3),
             loss_correlation: Some(15.0),
+            slot_min_us: Some(1_000),
+            slot_max_us: Some(2_000),
+            slot_max_packets: Some(14),
+            slot_max_bytes: Some(16_800),
+            modem_buffer_kb: Some(64),
             ..Default::default()
         }
     }
@@ -173,6 +219,11 @@ impl ImpairmentConfig {
             delay_distribution_normal: true,
             loss_percent: Some(0.1),
             loss_correlation: Some(10.0),
+            slot_min_us: Some(500),
+            slot_max_us: Some(1_000),
+            slot_max_packets: Some(40),
+            slot_max_bytes: Some(48_000),
+            modem_buffer_kb: Some(128),
             ..Default::default()
         }
     }
@@ -216,16 +267,67 @@ pub fn apply_impairment(
         return Ok(());
     }
 
-    // 2. Build netem command arguments
-    // command: tc qdisc add dev <interface> root netem ...
+    // 2. Optionally install a tbf root qdisc (modem firmware buffer model).
+    //
+    // When `modem_buffer_kb` and `rate_kbit` are both set, a tbf root qdisc
+    // is installed first.  It owns rate shaping and models the fill-and-drain
+    // behaviour of a USB modem's internal Qualcomm buffer (~64 KiB typical).
+    // Netem then becomes its child at `parent 1:1 handle 10:` and handles
+    // delay, loss, and slot scheduling — but does NOT emit a `rate` argument
+    // (tbf already owns that).
+    let use_tbf = config.modem_buffer_kb.is_some() && config.rate_kbit.is_some();
+
+    if use_tbf {
+        let rate = config.rate_kbit.unwrap();
+        let burst_bytes = config.modem_buffer_kb.unwrap() as u64 * 1024;
+        let tbf_args: Vec<String> = vec![
+            "qdisc".to_string(),
+            "add".to_string(),
+            "dev".to_string(),
+            interface.to_string(),
+            "root".to_string(),
+            "handle".to_string(),
+            "1:".to_string(),
+            "tbf".to_string(),
+            "rate".to_string(),
+            format!("{}kbit", rate),
+            "burst".to_string(),
+            format!("{}", burst_bytes),
+            "latency".to_string(),
+            "300ms".to_string(),
+        ];
+        let tbf_ref: Vec<&str> = tbf_args.iter().map(|s| s.as_str()).collect();
+        let out = ns.exec("tc", &tbf_ref)?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "Failed to apply tc tbf: {}\nCommand: tc {}",
+                String::from_utf8_lossy(&out.stderr),
+                tbf_args.join(" ")
+            )));
+        }
+    }
+
+    // 3. Build netem arguments.
+    //    When tbf is the root, netem is its child (parent 1:1 handle 10:).
+    //    When tbf is absent, netem is the root qdisc.
     let mut args_storage: Vec<String> = vec![
         "qdisc".to_string(),
         "add".to_string(),
         "dev".to_string(),
         interface.to_string(),
-        "root".to_string(),
-        "netem".to_string(),
     ];
+
+    if use_tbf {
+        args_storage.extend_from_slice(&[
+            "parent".to_string(),
+            "1:1".to_string(),
+            "handle".to_string(),
+            "10:".to_string(),
+        ]);
+    } else {
+        args_storage.push("root".to_string());
+    }
+    args_storage.push("netem".to_string());
 
     // Queue limit: use explicit value, or auto-compute from rate.
     let effective_limit = config.limit.or_else(|| config.auto_limit());
@@ -282,9 +384,28 @@ pub fn apply_impairment(
         args_storage.push(format!("{}%", corrupt));
     }
 
-    if let Some(rate) = config.rate_kbit {
+    // Rate: only when tbf is NOT handling it.
+    if !use_tbf
+        && let Some(rate) = config.rate_kbit
+    {
         args_storage.push("rate".to_string());
         args_storage.push(format!("{}kbit", rate));
+    }
+
+    // TTI slot scheduling: models LTE/5G radio scheduler burst-then-silence.
+    // Requires both slot_min_us and slot_max_us to be set.
+    if let (Some(slot_min), Some(slot_max)) = (config.slot_min_us, config.slot_max_us) {
+        args_storage.push("slot".to_string());
+        args_storage.push(format!("{}us", slot_min));
+        args_storage.push(format!("{}us", slot_max));
+        if let Some(pkts) = config.slot_max_packets {
+            args_storage.push("packets".to_string());
+            args_storage.push(pkts.to_string());
+        }
+        if let Some(bytes) = config.slot_max_bytes {
+            args_storage.push("bytes".to_string());
+            args_storage.push(bytes.to_string());
+        }
     }
 
     let args: Vec<&str> = args_storage.iter().map(|s| s.as_str()).collect();
