@@ -69,6 +69,10 @@ pub(crate) struct LinkState<L: ?Sized> {
 
 impl<L: ?Sized> LinkState<L> {
     /// Base RTT in seconds (uses rtprop if available, else rtt_ms/2 as proxy).
+    ///
+    /// Used for predicted-arrival calculation — deliberately includes any
+    /// queuing signal so we avoid routing more packets into an already-queued
+    /// link when it has lower clean-path RTT than others.
     fn base_rtt_secs(&self) -> f64 {
         if let Some(rtprop) = self.metrics.rtprop_ms
             && rtprop > 0.0
@@ -77,6 +81,25 @@ impl<L: ?Sized> LinkState<L> {
         }
         // Fall back to smoothed RTT (which includes queuing) — conservative.
         (self.metrics.rtt_ms / 1000.0).max(0.001)
+    }
+
+    /// Minimum RTT in seconds, strictly for BDP cap calculation.
+    ///
+    /// The BDP cap must use the *clean-path* RTT so that a queued link
+    /// doesn't self-justify a larger window and deepen its own queue.
+    /// - Prefers BBR rtprop (true minimum RTT, capped at 200 ms).
+    /// - Falls back to rtt_ms / 2 as a single-hop propagation proxy.
+    /// - Never exceeds 200 ms (prevents pathological BDP on broken paths).
+    fn min_rtt_for_bdp_secs(&self) -> f64 {
+        let ms = if let Some(rtprop) = self.metrics.rtprop_ms
+            && rtprop > 0.0
+        {
+            rtprop
+        } else {
+            // Half of smoothed RTT is a reasonable one-way propagation proxy.
+            self.metrics.rtt_ms / 2.0
+        };
+        (ms.min(200.0) / 1000.0).max(0.001)
     }
 
     /// Estimated capacity in bytes per second.
@@ -95,9 +118,12 @@ impl<L: ?Sized> LinkState<L> {
 
     /// Maximum in-flight bytes before this link is BDP-blocked.
     ///
-    /// `max = capacity_Bps * base_rtt * margin`
+    /// `max = capacity_Bps * min_rtt * margin`
+    ///
+    /// Uses the clean-path minimum RTT (not smoothed RTT) so that a queued
+    /// link cannot use its inflated RTT to justify a larger window.
     fn bdp_cap(&self, margin: f64) -> u64 {
-        let bdp = self.capacity_bytes_per_sec() * self.base_rtt_secs() * margin;
+        let bdp = self.capacity_bytes_per_sec() * self.min_rtt_for_bdp_secs() * margin;
         (bdp as u64).max(MIN_IN_FLIGHT_CAP)
     }
 
@@ -397,9 +423,7 @@ impl<L: LinkSender + ?Sized + 'static> Edpf<L> {
                 None => true,
                 Some(kind) => !used_kinds.contains(kind.as_str()),
             };
-            if is_diverse
-                && let Some(state) = self.links.get(id)
-            {
+            if is_diverse && let Some(state) = self.links.get(id) {
                 selected.push(state.link.clone());
                 if let Some(kind) = link_kind {
                     used_kinds.insert(kind.clone());

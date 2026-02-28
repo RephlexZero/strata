@@ -53,6 +53,10 @@ pub struct CapacityOracle {
     peak_estimate: f64,
     /// When tick() was last called, for delta-based confidence decay.
     last_tick: Instant,
+    /// Highest sustained `lower_bound` ever observed. Used to floor the
+    /// lower bound so ACK batching gaps (cellular scheduling holes, HARQ
+    /// gaps) cannot collapse the estimate below 40% of best known delivery.
+    lower_bound_peak: f64,
 }
 
 impl CapacityOracle {
@@ -71,6 +75,7 @@ impl CapacityOracle {
             probe_active: false,
             peak_estimate: 0.0,
             last_tick: now,
+            lower_bound_peak: 0.0,
         }
     }
 
@@ -143,6 +148,21 @@ impl CapacityOracle {
             self.lower_bound = (1.0 - alpha) * self.lower_bound + alpha * capped;
         }
 
+        // Track the historical peak of lower_bound.
+        if self.lower_bound > self.lower_bound_peak {
+            self.lower_bound_peak = self.lower_bound;
+        }
+
+        // Floor: never let lower_bound fall below 40% of its historical peak.
+        // Cellular links have scheduling gaps, HARQ retransmit pauses, and
+        // ACK batching that produce burst-then-silence patterns. Without this
+        // floor, a few near-zero observations collapse the estimate and cause
+        // EDPF to starve the link for several seconds.
+        let floor = self.lower_bound_peak * 0.4;
+        if self.lower_bound < floor {
+            self.lower_bound = floor;
+        }
+
         tracing::trace!(
             target: "strata::oracle",
             delivery_kbps = delivery_bps / 1000.0,
@@ -199,6 +219,9 @@ impl CapacityOracle {
         // Preserve 50% of the lower bound — the link likely still has
         // *some* capacity, just not what we previously measured.
         self.lower_bound *= 0.5;
+        // Also reset the peak so the 40% floor doesn't hold the link at the
+        // pre-downshift level after a genuine capacity reduction (handover).
+        self.lower_bound_peak = self.lower_bound;
         self.last_reset = Instant::now();
         // Keep upper_bound — it's still the best guess until the next probe.
         self.recompute();
