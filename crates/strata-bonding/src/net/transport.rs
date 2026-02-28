@@ -23,7 +23,7 @@ use strata_transport::congestion::{BbrPhase, BiscayController, BiscayState};
 /// Refills at the BiscayController's pacing_rate (bytes/sec) with a burst cap
 /// of 100 ms worth of data.  Tokens are deducted after each send based on
 /// actual wire bytes (including FEC/ARQ overhead).  When tokens are negative
-/// the next send is rejected, which the DWRR records as a failed send and
+/// the next send is rejected, which the scheduler records as a failed send and
 /// feeds into congestion detection.
 struct PacingState {
     tokens: f64,
@@ -369,7 +369,7 @@ impl TransportLink {
                         if delta_bytes > 0 {
                             // Idle-gap detection: if the interval is much
                             // larger than expected (> 4×SRTT), the link was
-                            // idle between DWRR bursts.  Reset the baseline
+                            // idle between scheduler bursts.  Reset the baseline
                             // without computing a rate — the interval includes
                             // idle time which would dilute the measurement and
                             // underestimate the link's actual delivery rate.
@@ -402,7 +402,7 @@ impl TransportLink {
                                 );
 
                                 // In multi-link bonding, never mark samples as
-                                // app-limited.  The DWRR scheduler controls how
+                                // app-limited.  The EDPF scheduler controls how
                                 // much each link receives — low in-flight during
                                 // idle gaps between bursts is normal, not a sign
                                 // that the app can't keep up.  Marking those
@@ -544,7 +544,7 @@ impl LinkSender for TransportLink {
             }
         } else if *ewma > 0.0 {
             // Gentle decay when no data flows — slow enough to survive
-            // normal DWRR idle gaps (multi-link round-robin) but will
+            // normal scheduler idle gaps (multi-link round-robin) but will
             // eventually reach 0 if a link is truly idle for seconds.
             *ewma *= 0.98;
             if *ewma < 1000.0 {
@@ -567,7 +567,7 @@ impl LinkSender for TransportLink {
         // --- Capacity estimate: Oracle (primary) + BBR btl_bw (fallback) ---
         //
         // The CapacityOracle provides a stable, feedback-loop-free capacity
-        // estimate for DWRR scheduling. btl_bw is only used as a fallback
+        // estimate for EDPF scheduling. btl_bw is only used as a fallback
         // before the first saturation probe completes.
         let cc = self.congestion.lock().unwrap();
         let phase = match cc.state {
@@ -774,7 +774,7 @@ impl LinkSender for TransportLink {
     fn complete_saturation_probe(&self, peak_bps: f64) {
         self.oracle.lock().unwrap().complete_probe(peak_bps);
         // Seed the congestion controller so btl_bw reflects the probe-measured
-        // physical capacity, not just the delivery rate under DWRR allocation.
+        // physical capacity, not just the delivery rate under scheduler allocation.
         self.congestion
             .lock()
             .unwrap()

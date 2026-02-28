@@ -1,15 +1,19 @@
 //! Packet scheduling engine for bonded transport links.
 //!
 //! The scheduler distributes outgoing packets across multiple network links
-//! using a Deficit Weighted Round Robin (DWRR) algorithm. It supports:
-//! - Capacity-proportional load balancing with quality-aware credit accrual
+//! using an Earliest Delivery Path First (EDPF) algorithm with BDP
+//! hard-capping. It supports:
+//! - Delay-based load balancing (route to the link that delivers soonest)
+//! - BDP hard-capping (prevents cellular bufferbloat at the source)
+//! - BLEST head-of-line blocking guard (core routing filter)
+//! - IoDS in-order delivery constraint (reduces receiver jitter)
 //! - Critical packet broadcast (e.g. keyframes sent to all links)
 //! - Adaptive redundancy (duplicate important packets when spare capacity exists)
 //! - Fast-failover (broadcast all traffic when link instability is detected)
 
 pub mod blest;
 pub mod bonding;
-pub mod dwrr;
+pub mod edpf;
 pub mod ewma;
 pub mod fec;
 pub mod iods;

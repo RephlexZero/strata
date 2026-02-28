@@ -1,6 +1,6 @@
 //! GStreamer plugin for Strata bonded transport.
 //!
-//! - `stratasink` — Sends packets via bonded Strata links with DWRR scheduling
+//! - `stratasink` — Sends packets via bonded Strata links with EDPF scheduling
 //! - `stratasrc`  — Receives packets from bonded Strata links with jitter-buffer reassembly
 
 use gst::glib;

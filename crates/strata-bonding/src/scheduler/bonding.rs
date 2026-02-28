@@ -2,7 +2,7 @@ use crate::config::SchedulerConfig;
 use crate::media::priority::{DegradationStage, Treatment};
 use crate::net::interface::LinkSender;
 use crate::scheduler::blest::BlestGuard;
-use crate::scheduler::dwrr::Dwrr;
+use crate::scheduler::edpf::Edpf;
 use crate::scheduler::iods::{IodsLinkState, IodsScheduler};
 use crate::scheduler::kalman::{KalmanConfig, KalmanFilter};
 use anyhow::Result;
@@ -16,10 +16,11 @@ use tracing::{error, warn};
 
 /// Top-level bonding packet scheduler.
 ///
-/// Wraps the [`Dwrr`] scheduler with intelligence overlays:
-/// - **IoDS** — in-order delivery constraint (reduces receiver-side jitter by 71%)
-/// - **BLEST** — head-of-line blocking guard for heterogeneous links
-/// - **Kalman filters** — per-link RTT smoothing for stable IoDS/BLEST inputs
+/// Uses an **Earliest Delivery Path First (EDPF)** scheduler with
+/// **BDP hard-capping** as the core routing engine, guarded by:
+/// - **BLEST** — head-of-line blocking filter (rejects links causing HoL blocking)
+/// - **IoDS** — in-order delivery constraint (prevents receiver reordering)
+/// - **Kalman filters** — per-link RTT smoothing for stable BLEST/IoDS inputs
 /// - Critical packet broadcast (keyframes sent to all alive links)
 /// - Fast-failover mode (broadcasts all traffic on link instability)
 /// - Adaptive redundancy (duplicates important packets when spare capacity allows)
@@ -28,11 +29,12 @@ use tracing::{error, warn};
 /// **Scheduling pipeline** (for standard, non-broadcast packets):
 /// ```text
 /// 1. BLEST guard filters out links that would cause HoL blocking
-/// 2. DWRR selects the best link proportionally to capacity
-/// 3. IoDS tracks monotonic state (bookkeeping only)
+/// 2. EDPF selects the link with lowest predicted arrival time
+/// 3. BDP cap blocks links with excessive in-flight bytes
+/// 4. IoDS tracks monotonic state for observability
 /// ```
 pub struct BondingScheduler<L: LinkSender + ?Sized + 'static> {
-    scheduler: Dwrr<L>,
+    scheduler: Edpf<L>,
     next_seq: u64,
 
     // ─── Intelligence overlays ──────────────────────────────────────
@@ -108,7 +110,7 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
     pub fn with_config(config: SchedulerConfig) -> Self {
         let now = Instant::now();
         Self {
-            scheduler: Dwrr::with_config(config),
+            scheduler: Edpf::with_config(config),
             next_seq: 0,
             iods: IodsScheduler::new(),
             blest: BlestGuard::default(),
@@ -429,7 +431,7 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
                             if let Some(link) = self.scheduler.get_link(candidate_id) {
                                 link.set_saturation_probe_active(true);
                             }
-                            // Boost DWRR credits to saturate the probe link
+                            // Route all traffic to probe link via EDPF
                             self.scheduler.set_probe_boost_link(Some(candidate_id));
                             tracing::info!(
                                 target: "strata::bonding",
@@ -531,13 +533,15 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
         }
     }
 
-    /// Intelligence pipeline: BLEST filter → DWRR primary.
+    /// Intelligence pipeline: BLEST filter → EDPF selection.
     ///
     /// BLEST pre-filters links that would cause HoL blocking.
-    /// DWRR selects the best link proportionally to capacity.
+    /// EDPF selects the link with the lowest predicted arrival time.
+    /// BDP hard-capping prevents any link from buffering excessively.
     /// IoDS tracks monotonic state for observability but does NOT filter,
-    /// because its strict arrival-time constraint monopolises traffic to
-    /// whichever slow link wins the first selection, defeating load balancing.
+    /// because its strict srtt-based constraint locks out fast links once
+    /// a slower link is committed — EDPF's in-flight-aware arrival
+    /// prediction already minimizes receiver reordering.
     fn intelligent_select(&mut self, packet_len: usize) -> Option<Arc<L>> {
         // During a saturation probe, route all traffic to the probed link
         // so the Oracle can observe its true capacity under full load.
@@ -569,13 +573,12 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
 
         let candidates = if blest_ok.is_empty() {
             // Fallback: if BLEST blocks everything, use all alive links
-            // and let Biscay's graceful degradation handle congestion.
             alive_ids.clone()
         } else {
             blest_ok
         };
 
-        // Step 3: DWRR primary selection (capacity-proportional) from filtered candidates
+        // Step 3: EDPF selection (lowest predicted arrival time, BDP-aware)
         if let Some(link) = self.scheduler.select_from_links(packet_len, &candidates) {
             let link_id = link.id();
             // IoDS bookkeeping — track for observability
@@ -611,7 +614,7 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
     /// Routing decision depends on the packet profile and current link state:
     /// 1. **Broadcast** — critical packets or failover mode → sent to all alive links
     /// 2. **Redundancy** — spare capacity available → duplicated to N best links
-    /// 3. **Standard** — DWRR selects the best single link
+    /// 3. **Standard** — EDPF selects the best single link (lowest predicted arrival)
     pub fn send(&mut self, payload: Bytes, profile: crate::scheduler::PacketProfile) -> Result<()> {
         let packet_len = payload.len();
         let config = self.scheduler.config();
@@ -738,7 +741,7 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
 
         // Standard Load Balancing — Intelligence Pipeline:
         // 1. BLEST guard filters out links that would cause HoL blocking
-        // 2. DWRR selects the best link proportionally to capacity
+        // 2. EDPF selects link with lowest predicted arrival time
         let selected_link = self.intelligent_select(packet_len);
 
         if let Some(link) = selected_link {
@@ -770,8 +773,8 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
                     {
                         // Send the duplicate packet
                         let _ = probe_link.send(&wrapped);
-                        // We don't record this send in DWRR to avoid double-counting
-                        // the primary payload's cost against the probe link's credits,
+                        // We don't record this in EDPF to avoid double-counting
+                        // the primary payload against the probe link's in-flight,
                         // but the transport layer will still observe the bytes for BBR.
                     }
 

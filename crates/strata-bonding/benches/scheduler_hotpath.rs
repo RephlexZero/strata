@@ -1,7 +1,7 @@
 //! Per-packet scheduling latency benchmarks for strata-bonding.
 //!
 //! Measures the overhead of the bonding scheduler intelligence pipeline:
-//! - BondingScheduler.send() with 2 links (DWRR + BLEST + IoDS + Thompson)
+//! - BondingScheduler.send() with 2 links (EDPF + BLEST + IoDS)
 //! - BondingScheduler.send() with 3 heterogeneous links
 //! - refresh_metrics() cost
 //! - Critical broadcast vs standard send

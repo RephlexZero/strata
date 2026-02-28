@@ -386,7 +386,7 @@ fn scheduler_distributes_across_heterogeneous_links() {
     scheduler.refresh_metrics();
 
     // Send packets in batches with brief pauses between batches so that
-    // DWRR credits accrue proportionally to each link's capacity.
+    // EDPF routing distributes proportionally via predicted arrival times.
     // Without this, a tight loop gives negligible time-delta, making
     // credit differentiation impossible.
     for _ in 0..20 {

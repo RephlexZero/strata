@@ -96,7 +96,7 @@ pub fn render_prometheus(links: &HashMap<usize, LinkMetrics>) -> String {
 
     writeln!(
         out,
-        "# HELP strata_link_queue_depth Current packets in DWRR queue."
+        "# HELP strata_link_queue_depth Current packets in send queue."
     )
     .unwrap();
     writeln!(out, "# TYPE strata_link_queue_depth gauge").unwrap();

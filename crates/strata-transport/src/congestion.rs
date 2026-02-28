@@ -501,13 +501,13 @@ impl BiscayController {
     fn update_pacing_rate(&mut self) {
         let mut rate = match self.bbr_phase {
             BbrPhase::SlowStart => {
-                // Stay in SlowStart (reported as Probe phase to the DWRR)
+                // Stay in SlowStart (reported as Probe phase to scheduler)
                 // until we accumulate MIN_CALIBRATION_SAMPLES of delivery-
-                // rate data.  During SlowStart the DWRR applies a flat
+                // rate data.  During SlowStart the scheduler applies a flat
                 // capacity floor so all links receive roughly equal traffic.
                 // This "calibration period" lets each link's btl_bw converge
                 // to its true bottleneck rate under uniform load before the
-                // DWRR switches to btl_bw-proportional credits.
+                // scheduler switches to EDPF arrival-time selection.
                 //
                 // With ~3.3 samples/sec per link, 30 samples ≈ 9 seconds
                 // of calibration — long enough for the 10 s bw_window to
@@ -519,7 +519,7 @@ impl BiscayController {
                 } else if self.btl_bw > 0.0 {
                     // Have an estimate but still in calibration —
                     // use btl_bw for pacing but stay in SlowStart so the
-                    // link reports Probe phase to the DWRR scheduler.
+                    // link reports Probe phase to the EDPF scheduler.
                     self.btl_bw
                 } else {
                     // No bandwidth data yet — keep current pacing_rate.

@@ -166,7 +166,7 @@ impl Default for LinkLifecycleConfig {
 
 /// Resolved scheduler tuning parameters.
 ///
-/// Controls DWRR credit computation, redundancy, failover, congestion
+/// Controls EDPF scheduling, redundancy, failover, congestion
 /// feedback, and EWMA smoothing across the bonding scheduler.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {

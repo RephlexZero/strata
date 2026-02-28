@@ -599,7 +599,7 @@ mod imp {
             // and worth broadcasting to all links.  The DELTA_UNIT flag is
             // unreliable for muxed streams — mpegtsmux never sets it, so
             // `!DELTA_UNIT` was true for every buffer, causing ALL data to
-            // be broadcast to every link (nullifying DWRR differentiation).
+            // be broadcast to every link (nullifying EDPF differentiation).
             let is_critical = flags.contains(gst::BufferFlags::HEADER);
             let can_drop = flags.contains(gst::BufferFlags::DROPPABLE);
 

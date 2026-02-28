@@ -3,14 +3,14 @@
 //! Per-link physical capacity estimator, decoupled from BBR congestion control.
 //!
 //! The Oracle solves the multi-path scheduling feedback loop where
-//! `btl_bw ≈ traffic_sent` under partial load, causing DWRR to see
+//! `btl_bw ≈ traffic_sent` under partial load, causing the scheduler to see
 //! identical capacities for links with very different physical rates.
 //!
 //! Two estimation signals feed the oracle:
 //! - **Delivery rate observations** — continuous, passive lower-bound updates
 //! - **Saturation probes** — periodic, active upper-bound measurements
 //!
-//! All scheduling consumers (`capacity_bps`, DWRR credits, IoDS, BLEST)
+//! All scheduling consumers (`capacity_bps`, EDPF, IoDS, BLEST)
 //! read `estimated_cap()` instead of raw `btl_bw`.
 
 use std::time::Instant;
@@ -23,7 +23,7 @@ const CONFIDENCE_HALF_LIFE_S: f64 = 30.0;
 ///
 /// Maintains a lower bound (max observed delivery rate) and an upper bound
 /// (peak from saturation probes) to produce a stable capacity estimate
-/// for the DWRR scheduler.
+/// for the EDPF scheduler.
 #[derive(Debug)]
 pub struct CapacityOracle {
     /// Best estimate of physical capacity (bps).
