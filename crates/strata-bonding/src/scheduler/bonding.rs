@@ -8,7 +8,7 @@ use crate::scheduler::kalman::{KalmanConfig, KalmanFilter};
 use anyhow::Result;
 use bytes::Bytes;
 use quanta::Instant;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -65,6 +65,37 @@ pub struct BondingScheduler<L: LinkSender + ?Sized + 'static> {
     probe_owner: Option<usize>,
     /// When the probe token was last rotated.
     last_probe_rotation: Instant,
+
+    // ─── Saturation probe state ───
+    /// Link currently undergoing a saturation probe (if any).
+    saturation_probe_link: Option<usize>,
+    /// When the current saturation probe started.
+    saturation_probe_start: Instant,
+    /// Round-robin index for cycling saturation probes.
+    saturation_probe_rr_idx: usize,
+    /// When the last saturation probe ended (any link).
+    last_saturation_probe_end: Instant,
+    /// Peak observed_bps seen during current probe window.
+    saturation_probe_peak_bps: f64,
+    /// Snapshot of ack_bytes at probe start (for byte-level rate measurement).
+    saturation_probe_start_ack_bytes: u64,
+    /// Snapshot of observed_bytes at probe start (fallback for byte-level measurement).
+    saturation_probe_start_obs_bytes: u64,
+
+    // ─── PPD (Packet-Pair Dispersion) probe state ───
+    /// When the last PPD probe pair was injected per link (link_id → Instant).
+    last_ppd_probe: HashMap<usize, Instant>,
+
+    // ─── Startup burst probe state ───
+    /// Whether the initial rapid probe cycle has completed.
+    /// During startup, probes are staggered at 1.0s instead of the normal
+    /// interval, so all links get measured quickly.
+    initial_probe_cycle_done: bool,
+    /// Set of link IDs that have completed at least one saturation probe.
+    probed_links: HashSet<usize>,
+    /// Whether the ACK-byte snapshot has been deferred by 1 SRTT.
+    /// When true, the snapshot has been taken and normal measurement proceeds.
+    saturation_probe_snapshot_taken: bool,
 }
 
 impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
@@ -75,6 +106,7 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
 
     /// Creates a scheduler with the given configuration.
     pub fn with_config(config: SchedulerConfig) -> Self {
+        let now = Instant::now();
         Self {
             scheduler: Dwrr::with_config(config),
             next_seq: 0,
@@ -88,7 +120,18 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             consecutive_dead_count: 0,
             total_dead_drops: Arc::new(AtomicU64::new(0)),
             probe_owner: None,
-            last_probe_rotation: Instant::now(),
+            last_probe_rotation: now,
+            saturation_probe_link: None,
+            saturation_probe_start: now,
+            saturation_probe_rr_idx: 0,
+            last_saturation_probe_end: now,
+            saturation_probe_peak_bps: 0.0,
+            saturation_probe_start_ack_bytes: 0,
+            saturation_probe_start_obs_bytes: 0,
+            last_ppd_probe: HashMap::new(),
+            initial_probe_cycle_done: false,
+            probed_links: HashSet::new(),
+            saturation_probe_snapshot_taken: false,
         }
     }
 
@@ -164,6 +207,12 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
         // applies the 1.25× ProbeBw UP-gain (phase-shifted probing).
         self.rotate_probe_token(&metrics);
 
+        // Drive saturation probes for capacity oracle
+        self.drive_saturation_probe(&metrics);
+
+        // Drive PPD continuous probes for between-saturation capacity updates
+        self.drive_ppd_probes(&metrics);
+
         self.check_failover_conditions();
     }
 
@@ -206,6 +255,226 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
 
         self.probe_owner = Some(next_owner);
         self.last_probe_rotation = Instant::now();
+    }
+
+    /// Returns the link currently undergoing a saturation probe (if any).
+    ///
+    /// Used by `intelligent_select` to route all traffic to the probe link.
+    pub fn saturation_probe_link(&self) -> Option<usize> {
+        self.saturation_probe_link
+    }
+
+    /// Drives the saturation probe state machine.
+    ///
+    /// Periodically routes 100% of traffic to one link at a time for a short
+    /// window so the Oracle can measure the link's true physical capacity.
+    fn drive_saturation_probe(&mut self, metrics: &[(usize, crate::net::interface::LinkMetrics)]) {
+        use crate::net::interface::LinkPhase;
+
+        let config = self.scheduler.config();
+        let probe_duration = Duration::from_secs_f64(config.saturation_probe_duration_s);
+        let num_links = metrics.iter().filter(|(_, m)| m.alive).count();
+
+        if num_links == 0 {
+            return;
+        }
+
+        // Per-link interval divided by link count → system-wide stagger
+        let stagger_interval =
+            Duration::from_secs_f64(config.saturation_probe_interval_s / num_links as f64);
+
+        if let Some(probe_id) = self.saturation_probe_link {
+            // Active probe — check for completion
+
+            // Delay the ACK-byte snapshot by 1 SRTT so bytes delivered
+            // before the probe window (still in the ACK pipeline) are
+            // excluded from the measurement.
+            if !self.saturation_probe_snapshot_taken {
+                let elapsed = self.saturation_probe_start.elapsed();
+                let srtt_ms = metrics
+                    .iter()
+                    .find(|(id, _)| *id == probe_id)
+                    .map(|(_, m)| m.rtt_ms)
+                    .unwrap_or(50.0);
+                let srtt_dur = Duration::from_secs_f64(srtt_ms / 1000.0);
+                if elapsed >= srtt_dur {
+                    if let Some((_, m)) = metrics.iter().find(|(id, _)| *id == probe_id) {
+                        self.saturation_probe_start_ack_bytes = m.ack_bytes;
+                        self.saturation_probe_start_obs_bytes = m.observed_bytes;
+                    }
+                    self.saturation_probe_snapshot_taken = true;
+                    // Reset the start time so the measurement window begins now
+                    self.saturation_probe_start = Instant::now();
+                }
+            }
+
+            // Re-read elapsed after potential snapshot reset
+            let elapsed = self.saturation_probe_start.elapsed();
+
+            if self.saturation_probe_snapshot_taken && elapsed >= probe_duration {
+                // Probe complete — compute average rate from byte deltas
+                let elapsed_s = elapsed.as_secs_f64();
+                let mut probe_rate_bps = 0.0;
+
+                if let Some((_, m)) = metrics.iter().find(|(id, _)| *id == probe_id) {
+                    // Use socket-level observed_bytes (pacing-limited send rate)
+                    // as primary measurement. The pacer rate-limits to the CC's
+                    // pacing_rate, so during a probe the send rate closely tracks
+                    // the bottleneck capacity. The pool-based ack_bytes counter
+                    // stalls when the sender pool fills up during traffic bursts.
+                    let obs_delta = m
+                        .observed_bytes
+                        .saturating_sub(self.saturation_probe_start_obs_bytes);
+                    if obs_delta > 0 {
+                        probe_rate_bps = (obs_delta as f64 * 8.0) / elapsed_s;
+                    }
+                }
+
+                if probe_rate_bps > 0.0 {
+                    if let Some(link) = self.scheduler.get_link(probe_id) {
+                        link.complete_saturation_probe(probe_rate_bps);
+                    }
+                    // Track startup cycle completion
+                    self.probed_links.insert(probe_id);
+                    if !self.initial_probe_cycle_done {
+                        let alive_count = metrics.iter().filter(|(_, m)| m.alive).count();
+                        if self.probed_links.len() >= alive_count {
+                            self.initial_probe_cycle_done = true;
+                            tracing::info!(
+                                target: "strata::bonding",
+                                probed = self.probed_links.len(),
+                                "initial probe cycle complete, switching to steady-state"
+                            );
+                        }
+                    }
+                    tracing::info!(
+                        target: "strata::bonding",
+                        link_id = probe_id,
+                        rate_kbps = probe_rate_bps / 1000.0,
+                        duration_ms = elapsed.as_millis(),
+                        "saturation probe completed"
+                    );
+                }
+                // Clear probe-active flag so oracle resumes delivery observations
+                if let Some(link) = self.scheduler.get_link(probe_id) {
+                    link.set_saturation_probe_active(false);
+                }
+                self.scheduler.set_probe_boost_link(None);
+                self.saturation_probe_link = None;
+                self.saturation_probe_peak_bps = 0.0;
+                self.last_saturation_probe_end = Instant::now();
+                self.saturation_probe_snapshot_taken = false;
+            } else if !metrics.iter().any(|(id, m)| *id == probe_id && m.alive) {
+                // Probe link died — cancel
+                if let Some(link) = self.scheduler.get_link(probe_id) {
+                    link.set_saturation_probe_active(false);
+                }
+                self.scheduler.set_probe_boost_link(None);
+                self.saturation_probe_link = None;
+                self.saturation_probe_peak_bps = 0.0;
+                self.last_saturation_probe_end = Instant::now();
+                self.saturation_probe_snapshot_taken = false;
+            }
+        } else {
+            // No active probe — check if we should start one
+            // Relaxed gate: only the candidate link needs to be in Live/Degrade.
+            // This allows probing to start as soon as individual links graduate
+            // from SlowStart, rather than waiting for ALL links.
+
+            // During startup, use a short stagger (1.0s) to rapidly probe
+            // each link once. After the first full cycle, switch to the
+            // normal steady-state stagger. Use the minimum of the startup
+            // stagger and the configured stagger so tests with tiny intervals work.
+            let effective_stagger = if !self.initial_probe_cycle_done {
+                Duration::from_secs_f64(1.0).min(stagger_interval)
+            } else {
+                stagger_interval
+            };
+
+            let since_last = self.last_saturation_probe_end.elapsed();
+
+            if since_last >= effective_stagger {
+                // Pick the next alive link in round-robin
+                let mut alive_ids: Vec<usize> = metrics
+                    .iter()
+                    .filter(|(_, m)| m.alive)
+                    .map(|(id, _)| *id)
+                    .collect();
+                alive_ids.sort_unstable();
+
+                if !alive_ids.is_empty() {
+                    let n = alive_ids.len();
+                    for _ in 0..n {
+                        let idx = self.saturation_probe_rr_idx % n;
+                        self.saturation_probe_rr_idx = (self.saturation_probe_rr_idx + 1) % n;
+                        let candidate_id = alive_ids[idx];
+                        // Only probe links that have reached Live/Degrade
+                        let candidate_ready = metrics.iter().any(|(id, m)| {
+                            *id == candidate_id
+                                && m.alive
+                                && matches!(m.phase, LinkPhase::Live | LinkPhase::Degrade)
+                        });
+                        if candidate_ready {
+                            self.saturation_probe_link = Some(candidate_id);
+                            self.saturation_probe_start = Instant::now();
+                            self.saturation_probe_peak_bps = 0.0;
+                            self.saturation_probe_snapshot_taken = false;
+                            // Initial snapshot — will be retaken after 1 SRTT
+                            if let Some((_, m)) = metrics.iter().find(|(id, _)| *id == candidate_id)
+                            {
+                                self.saturation_probe_start_ack_bytes = m.ack_bytes;
+                                self.saturation_probe_start_obs_bytes = m.observed_bytes;
+                            }
+                            // Suppress oracle delivery observations during probe
+                            if let Some(link) = self.scheduler.get_link(candidate_id) {
+                                link.set_saturation_probe_active(true);
+                            }
+                            // Boost DWRR credits to saturate the probe link
+                            self.scheduler.set_probe_boost_link(Some(candidate_id));
+                            tracing::info!(
+                                target: "strata::bonding",
+                                link_id = candidate_id,
+                                duration_ms = probe_duration.as_millis(),
+                                "saturation probe started"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Injects PPD (Packet-Pair Dispersion) probe pairs on alive links at a
+    /// configurable interval. These are lightweight (2 packets) and provide
+    /// continuous capacity samples between saturation probes.
+    fn drive_ppd_probes(&mut self, metrics: &[(usize, crate::net::interface::LinkMetrics)]) {
+        use crate::net::interface::LinkPhase;
+
+        let interval = Duration::from_secs_f64(self.scheduler.config().ppd_probe_interval_s);
+
+        for &(link_id, ref m) in metrics {
+            if !m.alive || !matches!(m.phase, LinkPhase::Live | LinkPhase::Degrade) {
+                continue;
+            }
+            // Don't inject PPD during a saturation probe — it would corrupt
+            // the dispersion measurement (traffic is pinned).
+            if self.saturation_probe_link == Some(link_id) {
+                continue;
+            }
+
+            let should_probe = self
+                .last_ppd_probe
+                .get(&link_id)
+                .is_none_or(|t| t.elapsed() >= interval);
+
+            if should_probe {
+                if let Some(link) = self.scheduler.get_link(link_id) {
+                    link.inject_ppd_pair();
+                }
+                self.last_ppd_probe.insert(link_id, Instant::now());
+            }
+        }
     }
 
     /// Detects link instability (phase degradation or RTT spikes) and triggers fast-failover mode.
@@ -270,6 +539,15 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
     /// because its strict arrival-time constraint monopolises traffic to
     /// whichever slow link wins the first selection, defeating load balancing.
     fn intelligent_select(&mut self, packet_len: usize) -> Option<Arc<L>> {
+        // During a saturation probe, route all traffic to the probed link
+        // so the Oracle can observe its true capacity under full load.
+        if let Some(probe_id) = self.saturation_probe_link
+            && let Some(link) = self.scheduler.select_from_links(packet_len, &[probe_id])
+        {
+            self.iods.commit_link(probe_id, packet_len);
+            return Some(link);
+        }
+
         // Step 1: Get available links
         let active = self.scheduler.get_active_links();
         let alive_ids: Vec<usize> = active
@@ -544,11 +822,13 @@ mod tests {
     use super::*;
     use crate::net::interface::{LinkMetrics, LinkPhase};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockLink {
         id: usize,
         metrics: Mutex<LinkMetrics>,
         sent_packets: Mutex<Vec<Vec<u8>>>,
+        ppd_probe_count: AtomicUsize,
     }
 
     impl MockLink {
@@ -572,11 +852,14 @@ mod tests {
                     transport: None,
                     btlbw_bps: None,
                     rtprop_ms: None,
+                    ack_delivery_bps: 0.0,
+                    ack_bytes: 0,
                     estimated_capacity_bps: 0.0,
                     owd_ms: 0.0,
                     receiver_report: None,
                 }),
                 sent_packets: Mutex::new(Vec::new()),
+                ppd_probe_count: AtomicUsize::new(0),
             }
         }
 
@@ -603,6 +886,9 @@ mod tests {
         }
         fn get_metrics(&self) -> LinkMetrics {
             self.metrics.lock().unwrap().clone()
+        }
+        fn inject_ppd_pair(&self) {
+            self.ppd_probe_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1046,10 +1332,14 @@ mod tests {
             m.os_up = Some(true);
             m.alive = true;
         }
+
+        // Let enough time pass for credits to accumulate, then refresh
+        // metrics so the scheduler sees the recovered link.
+        std::thread::sleep(std::time::Duration::from_millis(10));
         scheduler.refresh_metrics();
 
         // Send more packets — link1 should now participate
-        for _ in 0..20 {
+        for _ in 0..100 {
             scheduler.send(payload.clone(), profile).unwrap();
         }
 
@@ -1288,6 +1578,322 @@ mod tests {
             l1.sent_packets.lock().unwrap().len(),
             1,
             "droppable should pass after returning to Normal"
+        );
+    }
+
+    // ─── Saturation Probe Tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_saturation_probe_pins_traffic_to_probed_link() {
+        // During a saturation probe, all traffic should route to the probed link.
+        let config = crate::config::SchedulerConfig {
+            saturation_probe_interval_s: 0.001, // Trigger quickly
+            saturation_probe_duration_s: 0.5,   // Long enough to test
+            ..Default::default()
+        };
+
+        let mut scheduler = BondingScheduler::with_config(config);
+        let l1 = Arc::new(MockLink::new(1, 5_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
+
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+
+        // Let stagger interval expire
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        scheduler.refresh_metrics();
+
+        // A probe should now be active
+        let probe_link = scheduler.saturation_probe_link();
+        assert!(
+            probe_link.is_some(),
+            "saturation probe should be active after interval"
+        );
+
+        let probe_id = probe_link.unwrap();
+        l1.sent_packets.lock().unwrap().clear();
+        l2.sent_packets.lock().unwrap().clear();
+
+        // Send 50 droppable packets
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: false,
+            can_drop: true,
+            size_bytes: 1000,
+        };
+        for _ in 0..50 {
+            let payload = Bytes::from(vec![0u8; 1000]);
+            scheduler.send(payload, profile).unwrap();
+        }
+
+        let l1_count = l1.sent_packets.lock().unwrap().len();
+        let l2_count = l2.sent_packets.lock().unwrap().len();
+
+        // All traffic goes to the probed link (+ possible BBR probe duplicates)
+        if probe_id == 1 {
+            assert!(
+                l1_count >= 50,
+                "probed link 1 should get all traffic, got {}",
+                l1_count
+            );
+        } else {
+            assert!(
+                l2_count >= 50,
+                "probed link 2 should get all traffic, got {}",
+                l2_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_saturation_probe_completes_and_reports_peak() {
+        // After probe duration, the peak should be reported to the link.
+        let config = crate::config::SchedulerConfig {
+            saturation_probe_interval_s: 0.001,
+            saturation_probe_duration_s: 0.01, // 10ms — very short
+            ..Default::default()
+        };
+
+        let mut scheduler = BondingScheduler::with_config(config);
+        let l1 = Arc::new(MockLink::new(1, 5_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
+
+        // Give links some observed_bps so probe has a peak to measure
+        l1.set_observed_bps(4_000_000.0);
+        l2.set_observed_bps(8_000_000.0);
+
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+
+        // Let stagger interval expire and start probe
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        scheduler.refresh_metrics();
+        assert!(scheduler.saturation_probe_link().is_some());
+
+        // Wait for SRTT delay (10ms) + probe duration (10ms) + margin
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        scheduler.refresh_metrics(); // Takes snapshot after SRTT
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        scheduler.refresh_metrics(); // Completes probe after duration
+
+        // Probe should now be done
+        assert!(
+            scheduler.saturation_probe_link().is_none(),
+            "saturation probe should have completed"
+        );
+    }
+
+    #[test]
+    fn test_saturation_probe_round_robin() {
+        // Probes should cycle through links in round-robin.
+        let config = crate::config::SchedulerConfig {
+            saturation_probe_interval_s: 0.001,
+            saturation_probe_duration_s: 0.005,
+            ..Default::default()
+        };
+
+        let mut scheduler = BondingScheduler::with_config(config);
+        let l1 = Arc::new(MockLink::new(1, 5_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
+
+        l1.set_observed_bps(4_000_000.0);
+        l2.set_observed_bps(8_000_000.0);
+
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+
+        let mut probed_links = Vec::new();
+
+        for _ in 0..4 {
+            // Wait for stagger to expire and trigger probe
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            scheduler.refresh_metrics();
+
+            if let Some(probe_id) = scheduler.saturation_probe_link() {
+                probed_links.push(probe_id);
+            }
+
+            // Wait for SRTT delay + probe duration to complete
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            scheduler.refresh_metrics(); // snapshot
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            scheduler.refresh_metrics(); // complete
+        }
+
+        // Both links should have been probed
+        assert!(
+            probed_links.contains(&1) && probed_links.contains(&2),
+            "both links should be probed in round-robin: {:?}",
+            probed_links
+        );
+    }
+
+    #[test]
+    fn test_no_probe_during_startup() {
+        // Probes should not start while links are in Probe/Warm phase.
+        let config = crate::config::SchedulerConfig {
+            saturation_probe_interval_s: 0.001,
+            saturation_probe_duration_s: 0.01,
+            ..Default::default()
+        };
+
+        let mut scheduler = BondingScheduler::with_config(config);
+        let l1 = Arc::new(MockLink::new(1, 5_000_000.0, 10.0));
+
+        l1.set_phase(LinkPhase::Probe); // Still in startup
+
+        scheduler.add_link(l1.clone());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        scheduler.refresh_metrics();
+
+        assert!(
+            scheduler.saturation_probe_link().is_none(),
+            "no probe during Probe phase"
+        );
+    }
+
+    // ─── PPD Probe Tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_ppd_probes_fire_at_interval() {
+        let config = crate::config::SchedulerConfig {
+            ppd_probe_interval_s: 0.005, // 5ms
+            ..Default::default()
+        };
+
+        let mut scheduler = BondingScheduler::with_config(config);
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 5_000_000.0, 10.0));
+
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+
+        // First refresh should fire probes on both links
+        scheduler.refresh_metrics();
+        assert_eq!(l1.ppd_probe_count.load(Ordering::Relaxed), 1);
+        assert_eq!(l2.ppd_probe_count.load(Ordering::Relaxed), 1);
+
+        // Immediate second refresh — interval not elapsed, no new probes
+        scheduler.refresh_metrics();
+        assert_eq!(l1.ppd_probe_count.load(Ordering::Relaxed), 1);
+        assert_eq!(l2.ppd_probe_count.load(Ordering::Relaxed), 1);
+
+        // Wait for interval to elapse, then refresh
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        scheduler.refresh_metrics();
+        assert_eq!(l1.ppd_probe_count.load(Ordering::Relaxed), 2);
+        assert_eq!(l2.ppd_probe_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_ppd_probes_skip_during_saturation() {
+        let config = crate::config::SchedulerConfig {
+            ppd_probe_interval_s: 0.001,
+            saturation_probe_interval_s: 0.001,
+            saturation_probe_duration_s: 1.0, // Long probe (won’t complete in test)
+            ..Default::default()
+        };
+
+        let mut scheduler = BondingScheduler::with_config(config);
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
+
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+
+        // Trigger saturation probe
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        scheduler.refresh_metrics();
+
+        let probed_link = scheduler.saturation_probe_link();
+        assert!(probed_link.is_some(), "saturation probe should be active");
+
+        let probed_id = probed_link.unwrap();
+        let probed_link_obj = if probed_id == 1 { &l1 } else { &l2 };
+        let other_link_obj = if probed_id == 1 { &l2 } else { &l1 };
+
+        // Wait for interval and refresh again — saturated link should still
+        // be suppressed.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let before = probed_link_obj.ppd_probe_count.load(Ordering::Relaxed);
+        scheduler.refresh_metrics();
+        let after = probed_link_obj.ppd_probe_count.load(Ordering::Relaxed);
+
+        // The saturated link should NOT get additional PPD probes
+        assert_eq!(
+            before, after,
+            "PPD probes should be suppressed on saturated link"
+        );
+
+        // But the other link should have gotten a new PPD probe
+        let other_ppd = other_link_obj.ppd_probe_count.load(Ordering::Relaxed);
+        assert!(
+            other_ppd >= 2,
+            "non-saturated link should still get PPD probes, got {other_ppd}"
+        );
+    }
+
+    #[test]
+    fn test_ppd_probes_only_on_alive_live_links() {
+        let config = crate::config::SchedulerConfig {
+            ppd_probe_interval_s: 0.001,
+            ..Default::default()
+        };
+
+        let mut scheduler = BondingScheduler::with_config(config);
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
+        let l3 = Arc::new(MockLink::new(3, 10_000_000.0, 10.0));
+
+        // l2: dead link
+        {
+            let mut m = l2.metrics.lock().unwrap();
+            m.alive = false;
+        }
+        // l3: still in Probe phase (startup)
+        l3.set_phase(LinkPhase::Probe);
+
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+        scheduler.add_link(l3.clone());
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        scheduler.refresh_metrics();
+
+        assert!(
+            l1.ppd_probe_count.load(Ordering::Relaxed) > 0,
+            "alive + Live link should receive PPD probes"
+        );
+        assert_eq!(
+            l2.ppd_probe_count.load(Ordering::Relaxed),
+            0,
+            "dead link should NOT receive PPD probes"
+        );
+        assert_eq!(
+            l3.ppd_probe_count.load(Ordering::Relaxed),
+            0,
+            "Probe-phase link should NOT receive PPD probes"
+        );
+    }
+
+    #[test]
+    fn test_ppd_probes_fire_on_degrade_links() {
+        let config = crate::config::SchedulerConfig {
+            ppd_probe_interval_s: 0.001,
+            ..Default::default()
+        };
+
+        let mut scheduler = BondingScheduler::with_config(config);
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        l1.set_phase(LinkPhase::Degrade);
+
+        scheduler.add_link(l1.clone());
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        scheduler.refresh_metrics();
+
+        assert!(
+            l1.ppd_probe_count.load(Ordering::Relaxed) > 0,
+            "Degrade-phase link should still receive PPD probes"
         );
     }
 }

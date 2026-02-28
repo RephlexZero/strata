@@ -117,6 +117,10 @@ pub struct LinkMetrics {
     pub rtprop_ms: Option<f64>,
     /// AIMD delay-gradient capacity estimate (0.0 if estimator disabled).
     pub estimated_capacity_bps: f64,
+    /// ACK-confirmed delivery rate (bits/sec), measuring actual bottleneck throughput.
+    pub ack_delivery_bps: f64,
+    /// Cumulative bytes acknowledged by the receiver.
+    pub ack_bytes: u64,
     /// One-way delay estimate in milliseconds (0.0 if not available).
     pub owd_ms: f64,
     /// Latest receiver report from the remote receiver (if any).
@@ -194,4 +198,20 @@ pub trait LinkSender: Send + Sync {
     /// [`crate::net::transport::TransportLink`] instances forward this to their
     /// [`strata_transport::congestion::BiscayController`].
     fn set_probe_allowed(&self, _allowed: bool) {}
+
+    /// Report the result of a saturation probe to the link's capacity oracle.
+    ///
+    /// Called by the bonding scheduler when a saturation probe window completes.
+    /// `peak_bps` is the maximum observed delivery rate during the probe window.
+    fn complete_saturation_probe(&self, _peak_bps: f64) {}
+
+    /// Inject a PPD (Packet-Pair Dispersion) probe pair for continuous
+    /// capacity estimation. Two back-to-back packets are sent, bypassing
+    /// pacing, so the receiver can measure inter-arrival dispersion.
+    fn inject_ppd_pair(&self) {}
+
+    /// Notify the link that a saturation probe is starting/ending on it.
+    /// When active, the oracle suppresses delivery observations to prevent
+    /// inflated traffic rates from corrupting the lower bound estimate.
+    fn set_saturation_probe_active(&self, _active: bool) {}
 }

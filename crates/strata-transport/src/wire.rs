@@ -219,6 +219,7 @@ pub enum ControlType {
     Pong = 0x07,
     Session = 0x08,
     ReceiverReport = 0x09,
+    PpdReport = 0x0A,
 }
 
 impl ControlType {
@@ -233,6 +234,7 @@ impl ControlType {
             0x07 => Some(ControlType::Pong),
             0x08 => Some(ControlType::Session),
             0x09 => Some(ControlType::ReceiverReport),
+            0x0A => Some(ControlType::PpdReport),
             _ => None,
         }
     }
@@ -253,6 +255,8 @@ pub struct PacketHeader {
     pub is_keyframe: bool,
     /// Whether this packet contains codec config (SPS/PPS/VPS).
     pub is_config: bool,
+    /// Whether this is a PPD (Packet-Pair Dispersion) probe packet.
+    pub is_ppd_probe: bool,
     /// Payload length in bytes (after header).
     pub payload_len: u16,
     /// 62-bit sequence number.
@@ -269,7 +273,8 @@ impl PacketHeader {
             | ((self.packet_type as u8) << 5)
             | ((self.fragment as u8) << 3)
             | ((self.is_keyframe as u8) << 2)
-            | ((self.is_config as u8) << 1);
+            | ((self.is_config as u8) << 1)
+            | (self.is_ppd_probe as u8);
         buf.put_u8(flags);
 
         // Payload length (16-bit big endian)
@@ -302,6 +307,7 @@ impl PacketHeader {
         let fragment = Fragment::from_bits((flags >> 3) & 0x03);
         let is_keyframe = (flags >> 2) & 1 == 1;
         let is_config = (flags >> 1) & 1 == 1;
+        let is_ppd_probe = flags & 1 == 1;
 
         let payload_len = buf.get_u16();
         let sequence = VarInt::decode(buf)?;
@@ -316,6 +322,7 @@ impl PacketHeader {
             fragment,
             is_keyframe,
             is_config,
+            is_ppd_probe,
             payload_len,
             sequence,
             timestamp_us,
@@ -335,6 +342,7 @@ impl PacketHeader {
             fragment: Fragment::Complete,
             is_keyframe: false,
             is_config: false,
+            is_ppd_probe: false,
             payload_len,
             sequence: VarInt::from_u64(sequence),
             timestamp_us,
@@ -349,6 +357,7 @@ impl PacketHeader {
             fragment: Fragment::Complete,
             is_keyframe: false,
             is_config: false,
+            is_ppd_probe: false,
             payload_len,
             sequence: VarInt::from_u64(sequence),
             timestamp_us,
@@ -370,6 +379,12 @@ impl PacketHeader {
     /// Set fragmentation.
     pub fn with_fragment(mut self, frag: Fragment) -> Self {
         self.fragment = frag;
+        self
+    }
+
+    /// Mark as a PPD (Packet-Pair Dispersion) probe.
+    pub fn with_ppd_probe(mut self) -> Self {
+        self.is_ppd_probe = true;
         self
     }
 }
@@ -783,6 +798,45 @@ impl ReceiverReportPacket {
     }
 }
 
+// ─── PPD (Packet-Pair Dispersion) Report ────────────────────────────────────
+
+/// Report from the receiver when it detects a back-to-back PPD probe pair.
+///
+/// The receiver measures the inter-arrival time (dispersion) between two
+/// consecutively received packets marked with `is_ppd_probe = true` and
+/// computes the bottleneck capacity: `C = packet_size / dispersion`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PpdReportPacket {
+    /// Estimated bottleneck capacity in bits/sec.
+    pub capacity_bps: u64,
+    /// Inter-arrival dispersion in microseconds (for diagnostics).
+    pub dispersion_us: u32,
+    /// Packet size used in the measurement (bytes).
+    pub packet_size: u16,
+}
+
+impl PpdReportPacket {
+    pub const ENCODED_LEN: usize = 14; // 8 + 4 + 2
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(ControlType::PpdReport as u8);
+        buf.put_u64(self.capacity_bps);
+        buf.put_u32(self.dispersion_us);
+        buf.put_u16(self.packet_size);
+    }
+
+    pub fn decode(buf: &mut impl Buf) -> Option<Self> {
+        if buf.remaining() < Self::ENCODED_LEN {
+            return None;
+        }
+        Some(PpdReportPacket {
+            capacity_bps: buf.get_u64(),
+            dispersion_us: buf.get_u32(),
+            packet_size: buf.get_u16(),
+        })
+    }
+}
+
 // ─── Full Packet Serialization ──────────────────────────────────────────────
 
 /// A fully serialized Strata packet (header + payload).
@@ -835,6 +889,7 @@ pub enum ControlBody {
     Pong(PongPacket),
     Session(SessionPacket),
     ReceiverReport(ReceiverReportPacket),
+    PpdReport(PpdReportPacket),
 }
 
 impl ControlBody {
@@ -857,6 +912,7 @@ impl ControlBody {
             ControlType::ReceiverReport => {
                 ReceiverReportPacket::decode(buf).map(ControlBody::ReceiverReport)
             }
+            ControlType::PpdReport => PpdReportPacket::decode(buf).map(ControlBody::PpdReport),
         }
     }
 }
@@ -1112,5 +1168,76 @@ mod tests {
         };
         assert!((report.fec_repair_rate_f32() - 0.10).abs() < 1e-5);
         assert!((report.loss_after_fec_f32() - 1.0).abs() < 1e-5);
+    }
+
+    // ─── PPD Tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn ppd_probe_flag_roundtrip() {
+        let hdr = PacketHeader::data(77, 500_000, 1200).with_ppd_probe();
+        assert!(hdr.is_ppd_probe);
+
+        let mut buf = BytesMut::new();
+        hdr.encode(&mut buf);
+        let decoded = PacketHeader::decode(&mut buf).unwrap();
+        assert!(
+            decoded.is_ppd_probe,
+            "PPD probe flag should survive roundtrip"
+        );
+        assert_eq!(decoded.sequence.value(), 77);
+        assert_eq!(decoded.payload_len, 1200);
+        // Other flags remain false
+        assert!(!decoded.is_keyframe);
+        assert!(!decoded.is_config);
+    }
+
+    #[test]
+    fn ppd_probe_flag_default_false() {
+        let hdr = PacketHeader::data(0, 0, 100);
+        assert!(
+            !hdr.is_ppd_probe,
+            "PPD probe flag should be false by default"
+        );
+
+        let mut buf = BytesMut::new();
+        hdr.encode(&mut buf);
+        let decoded = PacketHeader::decode(&mut buf).unwrap();
+        assert!(!decoded.is_ppd_probe);
+    }
+
+    #[test]
+    fn ppd_report_roundtrip() {
+        let report = PpdReportPacket {
+            capacity_bps: 12_500_000,
+            dispersion_us: 768,
+            packet_size: 1200,
+        };
+        let mut buf = BytesMut::new();
+        report.encode(&mut buf);
+        assert_eq!(buf.len(), PpdReportPacket::ENCODED_LEN + 1); // +1 for type byte
+        let _ = buf.get_u8(); // skip type byte
+        let decoded = PpdReportPacket::decode(&mut buf).unwrap();
+        assert_eq!(decoded.capacity_bps, 12_500_000);
+        assert_eq!(decoded.dispersion_us, 768);
+        assert_eq!(decoded.packet_size, 1200);
+    }
+
+    #[test]
+    fn ppd_report_via_control_body() {
+        let report = PpdReportPacket {
+            capacity_bps: 8_000_000,
+            dispersion_us: 1200,
+            packet_size: 1200,
+        };
+        let mut buf = BytesMut::new();
+        report.encode(&mut buf);
+        let decoded = ControlBody::decode(&mut buf.freeze());
+        match decoded {
+            Some(ControlBody::PpdReport(ppd)) => {
+                assert_eq!(ppd.capacity_bps, 8_000_000);
+                assert_eq!(ppd.dispersion_us, 1200);
+            }
+            other => panic!("expected PpdReport, got {:?}", other),
+        }
     }
 }

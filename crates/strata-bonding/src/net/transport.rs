@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
+use crate::scheduler::oracle::CapacityOracle;
 use strata_transport::congestion::{BbrPhase, BiscayController, BiscayState};
 
 /// Per-link token bucket for send-path pacing.
@@ -73,8 +74,14 @@ pub struct TransportLink {
     prev_ack_time_us: AtomicU64,
     /// Snapshot of bytes_acked at last delivery rate sample.
     prev_ack_bytes: AtomicU64,
-    /// EWMA-smoothed ACK rate (bits/sec).
+    /// EWMA-smoothed ACK rate (bits/sec), from global total_received.
     ack_rate_ewma_bps: Mutex<f64>,
+    /// Per-link ACK rate (bits/sec), from per-link packets_acked.
+    per_link_ack_rate_bps: Mutex<f64>,
+    /// Previous per-link packets_acked snapshot.
+    prev_pkts_acked: AtomicU64,
+    /// Timestamp of previous per-link packets_acked snapshot.
+    prev_pkts_acked_us: AtomicU64,
     /// Latest receiver report from the remote receiver (if any).
     receiver_report: Mutex<Option<ReceiverReportPacket>>,
     /// Network interface name (e.g. "eth1").
@@ -83,6 +90,8 @@ pub struct TransportLink {
     pacing: Mutex<PacingState>,
     /// Paced send queue.
     paced_queue: Mutex<std::collections::VecDeque<strata_transport::sender::OutputPacket>>,
+    /// Capacity oracle — independent of BBR btl_bw.
+    oracle: Mutex<CapacityOracle>,
 }
 
 impl TransportLink {
@@ -116,6 +125,9 @@ impl TransportLink {
             prev_ack_time_us: AtomicU64::new(0),
             prev_ack_bytes: AtomicU64::new(0),
             ack_rate_ewma_bps: Mutex::new(0.0),
+            per_link_ack_rate_bps: Mutex::new(0.0),
+            prev_pkts_acked: AtomicU64::new(0),
+            prev_pkts_acked_us: AtomicU64::new(0),
             receiver_report: Mutex::new(None),
             iface,
             pacing: Mutex::new(PacingState {
@@ -123,6 +135,7 @@ impl TransportLink {
                 last_refill: std::time::Instant::now(),
             }),
             paced_queue: Mutex::new(std::collections::VecDeque::new()),
+            oracle: Mutex::new(CapacityOracle::new()),
         }
     }
 
@@ -147,7 +160,13 @@ impl TransportLink {
 
     /// Flush any pending packets in the paced send queue.
     pub fn flush_paced(&self) {
-        let pacing_rate = self.congestion.lock().unwrap().pacing_rate();
+        let cc_pacing_rate = self.congestion.lock().unwrap().pacing_rate();
+        // Floor: don't let the CC starve a link below 30% of the oracle's
+        // slow-decaying peak estimate. Using peak_cap() (not estimated_cap())
+        // prevents a death spiral where oracle collapse → pacing collapse →
+        // less delivery → further oracle collapse.
+        let peak_cap_bytes = self.oracle.lock().unwrap().peak_cap() / 8.0;
+        let pacing_rate = cc_pacing_rate.max(peak_cap_bytes * 0.5);
         let mut p = self.pacing.lock().unwrap();
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(p.last_refill).as_secs_f64();
@@ -422,6 +441,21 @@ impl TransportLink {
                     }
                     tracing::debug!(target: "strata::transport", link_id = self.id, goodput = goodput, ewma = *ewma, "Received ReceiverReport");
                 }
+                ControlBody::PpdReport(ppd) => {
+                    let capacity_bps = ppd.capacity_bps as f64;
+                    self.oracle
+                        .lock()
+                        .unwrap()
+                        .observe_packet_pair(capacity_bps);
+                    tracing::debug!(
+                        target: "strata::transport",
+                        link_id = self.id,
+                        capacity_bps = ppd.capacity_bps,
+                        dispersion_us = ppd.dispersion_us,
+                        packet_size = ppd.packet_size,
+                        "PPD report received"
+                    );
+                }
                 _ => {}
             }
         }
@@ -467,9 +501,21 @@ impl LinkSender for TransportLink {
     }
 
     fn get_metrics(&self) -> LinkMetrics {
-        let sender = self.sender.lock().unwrap();
-        let rtt = self.rtt.lock().unwrap();
-        let rtt_ms = rtt.srtt_us() / 1000.0;
+        // ── Snapshot sender state and release lock immediately ──────────
+        // Holding the sender lock during oracle/CC computations blocks
+        // process_ack() in the feedback recv loop, causing ACK batching
+        // that inflates delivery rate measurements.
+        let (stats, sender_queue_depth) = {
+            let sender = self.sender.lock().unwrap();
+            let s = sender.stats().clone();
+            let q = sender.output_queue_len();
+            (s, q)
+        };
+
+        let rtt_ms = {
+            let rtt = self.rtt.lock().unwrap();
+            rtt.srtt_us() / 1000.0
+        };
 
         // --- Socket-level rate (includes FEC/retransmit overhead) ---
         let total_bytes = self.bytes_sent.load(Ordering::Relaxed);
@@ -518,17 +564,11 @@ impl LinkSender for TransportLink {
             "get_metrics: observed rate"
         );
 
-        // --- Capacity estimate from BiscayController (BBR-based) ---
-        // Use btl_bw (discovered bottleneck bandwidth) as the capacity
-        // signal for DWRR credits.  btl_bw is derived from peak ACK-based
-        // delivery rates, so it discovers the actual link speed even when
-        // the scheduler only sends a fraction of the link's capacity
-        // (burst delivery rates at the bottleneck reflect the true rate).
+        // --- Capacity estimate: Oracle (primary) + BBR btl_bw (fallback) ---
         //
-        // Using pacing_rate would create a feedback loop: low pacing →
-        // low DWRR credits → less traffic → btl_bw stays low → pacing
-        // stays low.  btl_bw breaks this loop by reflecting what the link
-        // CAN do, not what the CC is currently allowing.
+        // The CapacityOracle provides a stable, feedback-loop-free capacity
+        // estimate for DWRR scheduling. btl_bw is only used as a fallback
+        // before the first saturation probe completes.
         let cc = self.congestion.lock().unwrap();
         let phase = match cc.state {
             BiscayState::PreHandover => LinkPhase::Degrade,
@@ -545,24 +585,110 @@ impl LinkSender for TransportLink {
         };
         let btl_bw_bps = cc.btl_bw() * 8.0;
 
-        // --- Physics Guard ---
-        // Clamp btl_bw to ack_rate × 1.5 to prevent overestimation.
-        // Both btl_bw and ack_rate use the same total_received × 1200
-        // measurement, so any systematic bias cancels out in the ratio.
-        // The 1.5× headroom allows gradual capacity discovery for
-        // under-utilized links while preventing the 75th-percentile
-        // from drifting far above the link's actual delivery rate.
-        let ack_rate = *self.ack_rate_ewma_bps.lock().unwrap();
-        let capacity_bps = if btl_bw_bps > 0.0 {
-            let capped = if ack_rate > 100_000.0 {
-                btl_bw_bps.min(ack_rate * 1.5)
+        // Feed ACK-confirmed delivery rate to the Oracle (passive lower-bound).
+        // Use per-link bytes_acked (actual payload sizes summed during ACK
+        // processing) — NOT packets_acked * estimated_size, which is inaccurate
+        // due to FEC packets and varying payload sizes.
+        let per_link_ack_bytes = stats.bytes_acked;
+        let now_ack_us = {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let epoch = EPOCH.get_or_init(std::time::Instant::now);
+            epoch.elapsed().as_micros() as u64
+        };
+        // Read without swapping — only commit the snapshot when the interval
+        // condition is met. This lets the interval accumulate across multiple
+        // get_metrics() calls until ≥ 500ms has passed.
+        let prev_bytes = self.prev_pkts_acked.load(Ordering::Relaxed);
+        let prev_us = self.prev_pkts_acked_us.load(Ordering::Relaxed);
+        let interval_us = now_ack_us.saturating_sub(prev_us);
+
+        // Require ≥ 500ms between rate samples to avoid spikes from batch
+        // ACKs. This gives a smoother, more accurate delivery rate.
+        let per_link_ack_rate = if interval_us >= 500_000 && prev_us > 0 {
+            // Commit the snapshot for next interval
+            self.prev_pkts_acked
+                .store(per_link_ack_bytes, Ordering::Relaxed);
+            self.prev_pkts_acked_us.store(now_ack_us, Ordering::Relaxed);
+
+            let delta = per_link_ack_bytes.saturating_sub(prev_bytes);
+            let mut ewma = self.per_link_ack_rate_bps.lock().unwrap();
+            if delta > 0 {
+                let rate = (delta as f64 * 8.0) / (interval_us as f64 / 1_000_000.0);
+                if *ewma == 0.0 {
+                    *ewma = rate;
+                } else {
+                    *ewma = 0.2 * rate + 0.8 * *ewma;
+                }
+            } else {
+                // No new ACKs in this 500ms window — decay the EWMA.
+                // Without this, the rate stays frozen at a peak value
+                // indefinitely, inflating the oracle's capacity estimate.
+                *ewma *= 0.5;
+                if *ewma < 1000.0 {
+                    *ewma = 0.0;
+                }
+            }
+            *ewma
+        } else if prev_us == 0 {
+            // First call — seed the baseline
+            self.prev_pkts_acked
+                .store(per_link_ack_bytes, Ordering::Relaxed);
+            self.prev_pkts_acked_us.store(now_ack_us, Ordering::Relaxed);
+            0.0
+        } else {
+            *self.per_link_ack_rate_bps.lock().unwrap()
+        };
+
+        let mut oracle = self.oracle.lock().unwrap();
+
+        // Use the best available delivery rate signal for the oracle.
+        // per_link_ack_rate underreports when the sender pool overflows
+        // (entries expire before ACKs arrive). The receiver-reported goodput
+        // is more accurate since it measures actual delivered data.
+        let goodput = *self.goodput_ewma_bps.lock().unwrap();
+        let delivery_signal = if goodput > 100_000.0 {
+            goodput
+        } else {
+            per_link_ack_rate
+        };
+
+        if delivery_signal > 0.0 {
+            oracle.observe_delivery(delivery_signal);
+        }
+        // Update baseline RTT for downshift detection
+        oracle.update_baseline_rtt(rtt_ms);
+        // Apply time-based confidence decay
+        oracle.tick();
+
+        // Check for downshift conditions (handover/severe degradation)
+        let loss_rate = if stats.packets_acked > 0 && stats.packets_sent > 0 {
+            stats.retransmit_ratio()
+        } else {
+            0.0
+        };
+        if oracle.should_reset(rtt_ms, loss_rate) {
+            oracle.reset_on_downshift();
+        }
+
+        // Capacity: prefer Oracle, fall back to btl_bw before first probe
+        let oracle_cap = oracle.estimated_cap();
+        let btl_bw_capped = if btl_bw_bps > 0.0 {
+            let capped = if per_link_ack_rate > 100_000.0 {
+                btl_bw_bps.min(per_link_ack_rate * 1.5)
             } else {
                 btl_bw_bps
             };
             capped.clamp(100_000.0, 50_000_000.0)
         } else {
-            0.0 // No data yet — scheduler will use capacity floor
+            0.0
         };
+        let capacity_bps = if oracle_cap > 0.0 {
+            oracle_cap
+        } else {
+            btl_bw_capped
+        };
+        drop(oracle);
+
         let btlbw_bps = if btl_bw_bps > 0.0 {
             Some(btl_bw_bps)
         } else {
@@ -573,17 +699,6 @@ impl LinkSender for TransportLink {
             Some(cc.rt_prop_us() / 1000.0)
         } else {
             None
-        };
-
-        // Only report transport-level loss when we have receiver feedback
-        // (packets_acked > 0). Use retransmission ratio instead of the
-        // unacked ratio — unacked counts in-flight packets as "lost" which
-        // is misleading on high-BDP links.
-        let stats = sender.stats();
-        let loss_rate = if stats.packets_acked > 0 && stats.packets_sent > 0 {
-            stats.retransmit_ratio()
-        } else {
-            0.0
         };
 
         tracing::debug!(
@@ -609,7 +724,7 @@ impl LinkSender for TransportLink {
             loss_rate,
             observed_bps,
             observed_bytes: total_bytes,
-            queue_depth: sender.output_queue_len() + self.paced_queue.lock().unwrap().len(),
+            queue_depth: sender_queue_depth + self.paced_queue.lock().unwrap().len(),
             max_queue: 0,
             alive: true,
             phase,
@@ -626,6 +741,8 @@ impl LinkSender for TransportLink {
                 fec_repairs_sent: stats.fec_repairs_sent,
                 packets_expired: stats.packets_expired,
             }),
+            ack_delivery_bps: per_link_ack_rate,
+            ack_bytes: per_link_ack_bytes,
             estimated_capacity_bps: capacity_bps,
             owd_ms: rtt_ms / 2.0,
             receiver_report: self.latest_receiver_report().map(|r| {
@@ -652,6 +769,35 @@ impl LinkSender for TransportLink {
 
     fn set_probe_allowed(&self, allowed: bool) {
         self.congestion.lock().unwrap().set_probe_allowed(allowed);
+    }
+
+    fn complete_saturation_probe(&self, peak_bps: f64) {
+        self.oracle.lock().unwrap().complete_probe(peak_bps);
+        // Seed the congestion controller so btl_bw reflects the probe-measured
+        // physical capacity, not just the delivery rate under DWRR allocation.
+        self.congestion
+            .lock()
+            .unwrap()
+            .seed_bandwidth(peak_bps / 8.0);
+    }
+
+    fn inject_ppd_pair(&self) {
+        let pair = {
+            let mut sender = self.sender.lock().unwrap();
+            sender.inject_ppd_pair(1200) // use default MTU size
+        };
+        // Send directly, bypassing pacing, to keep packets back-to-back
+        if !pair.is_empty() {
+            let total_bytes = self.send_batch(&pair);
+            self.bytes_sent
+                .fetch_add(total_bytes as u64, Ordering::Relaxed);
+            self.packets_sent
+                .fetch_add(pair.len() as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn set_saturation_probe_active(&self, active: bool) {
+        self.oracle.lock().unwrap().set_probe_active(active);
     }
 
     fn recv_feedback(&self) -> usize {

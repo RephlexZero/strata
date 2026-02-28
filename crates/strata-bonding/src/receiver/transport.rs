@@ -250,6 +250,12 @@ async fn link_reader_async(
                                 let _ = socket.send_to(pkt_bytes, addr).await;
                             }
                         }
+                        ReceiverEvent::SendPpdReport(ppd) => {
+                            if let Some(addr) = sender_addr {
+                                let pkt_bytes = encode_ppd_report(&ppd, &clock);
+                                let _ = socket.send_to(pkt_bytes, addr).await;
+                            }
+                        }
                     }
                 }
 
@@ -407,6 +413,22 @@ fn encode_receiver_report(
 ) -> Vec<u8> {
     let mut body = BytesMut::with_capacity(24);
     report.encode(&mut body);
+    let body_bytes = body.freeze();
+    let header = PacketHeader::control(0, clock.now_us(), body_bytes.len() as u16);
+    let pkt = WirePacket {
+        header,
+        payload: body_bytes,
+    };
+    pkt.encode().to_vec()
+}
+
+/// Encode a PpdReport as a wire-format control packet.
+fn encode_ppd_report(
+    ppd: &strata_transport::wire::PpdReportPacket,
+    clock: &TimestampClock,
+) -> Vec<u8> {
+    let mut body = BytesMut::with_capacity(20);
+    ppd.encode(&mut body);
     let body_bytes = body.freeze();
     let header = PacketHeader::control(0, clock.now_us(), body_bytes.len() as u16);
     let pkt = WirePacket {

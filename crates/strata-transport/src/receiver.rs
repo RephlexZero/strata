@@ -23,7 +23,8 @@ use crate::codec::FecDecoder;
 use crate::pool::SequenceGenerator;
 use crate::stats::ReceiverStats;
 use crate::wire::{
-    AckPacket, ControlBody, Fragment, NackPacket, Packet, PacketHeader, PacketType, VarInt,
+    AckPacket, ControlBody, Fragment, NackPacket, Packet, PacketHeader, PacketType,
+    PpdReportPacket, VarInt,
 };
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -82,6 +83,8 @@ pub enum ReceiverEvent {
     SendAck(AckPacket),
     /// Application data is ready for delivery.
     Deliver(DeliveredPacket),
+    /// A PPD probe pair was detected — send capacity report back to sender.
+    SendPpdReport(PpdReportPacket),
 }
 
 // ─── Reorder Buffer Entry ───────────────────────────────────────────────────
@@ -220,6 +223,9 @@ pub struct Receiver {
     ack_seq_gen: SequenceGenerator,
     events: Vec<ReceiverEvent>,
     initialized: bool,
+    /// PPD state: arrival time and wire size of the last PPD-flagged packet.
+    last_ppd_arrival: Option<std::time::Instant>,
+    last_ppd_wire_size: usize,
 }
 
 impl Receiver {
@@ -244,6 +250,8 @@ impl Receiver {
             ack_seq_gen: SequenceGenerator::new(),
             events: Vec::new(),
             initialized: false,
+            last_ppd_arrival: None,
+            last_ppd_wire_size: 0,
         }
     }
 
@@ -288,6 +296,38 @@ impl Receiver {
 
         // Feed loss detector
         self.loss_detector.record_received(seq);
+
+        // PPD probe pair detection: when two consecutive PPD-flagged packets
+        // arrive within a short window, compute bottleneck capacity from
+        // the inter-arrival dispersion.
+        if pkt.header.is_ppd_probe {
+            let now = std::time::Instant::now();
+            // Wire size = header + payload (what the bottleneck had to transmit)
+            let wire_size = pkt.header.encoded_len() + pkt.payload.len();
+
+            if let Some(prev_arrival) = self.last_ppd_arrival {
+                let dispersion = now.duration_since(prev_arrival);
+                let dispersion_us = dispersion.as_micros() as u64;
+                // Guard: ignore unreasonable dispersions (< 200µs or > 100ms).
+                // Kernel batching (recvmmsg) can deliver both probe packets
+                // in the same syscall, producing sub-100µs dispersions that
+                // translate to multi-Gbps capacity estimates.  200µs minimum
+                // caps the maximum measurable rate at ~48 Mbps for 1200B packets.
+                if (200..=100_000).contains(&dispersion_us) {
+                    let avg_size = (self.last_ppd_wire_size + wire_size) / 2;
+                    let capacity_bps =
+                        (avg_size as f64 * 8.0) / (dispersion_us as f64 / 1_000_000.0);
+                    self.events
+                        .push(ReceiverEvent::SendPpdReport(PpdReportPacket {
+                            capacity_bps: capacity_bps as u64,
+                            dispersion_us: dispersion_us as u32,
+                            packet_size: avg_size as u16,
+                        }));
+                }
+            }
+            self.last_ppd_arrival = Some(now);
+            self.last_ppd_wire_size = wire_size;
+        }
 
         // Buffer for reordering
         self.reorder_buf.insert(
@@ -724,5 +764,139 @@ mod tests {
         let mut rx = default_receiver();
         rx.receive(Bytes::from_static(b"\x00\x00\x00")); // too short / invalid
         assert_eq!(rx.stats().packets_received, 0);
+    }
+
+    // ─── PPD Probe Pair Detection ───────────────────────────────────────
+
+    /// Helper: build a PPD-flagged wire packet.
+    fn make_ppd_probe_packet(seq: u64, payload: &[u8]) -> Bytes {
+        let header =
+            PacketHeader::data(seq, seq as u32 * 1000, payload.len() as u16).with_ppd_probe();
+        let pkt = Packet {
+            header,
+            payload: Bytes::copy_from_slice(payload),
+        };
+        pkt.encode().freeze()
+    }
+
+    #[test]
+    fn ppd_single_probe_no_report() {
+        let mut rx = default_receiver();
+        rx.receive(make_ppd_probe_packet(0, &[0u8; 1200]));
+
+        let ppd_events: Vec<_> = rx
+            .drain_events()
+            .filter(|e| matches!(e, ReceiverEvent::SendPpdReport(_)))
+            .collect();
+        assert!(
+            ppd_events.is_empty(),
+            "single PPD probe should not generate a report"
+        );
+    }
+
+    #[test]
+    fn ppd_pair_generates_report() {
+        let mut rx = default_receiver();
+        let payload = vec![0u8; 1200];
+
+        rx.receive(make_ppd_probe_packet(0, &payload));
+        rx.drain_events().for_each(drop);
+
+        // Sleep > 200μs to exceed the minimum dispersion guard
+        std::thread::sleep(std::time::Duration::from_micros(300));
+
+        rx.receive(make_ppd_probe_packet(1, &payload));
+        let ppd_events: Vec<_> = rx
+            .drain_events()
+            .filter_map(|e| match e {
+                ReceiverEvent::SendPpdReport(ppd) => Some(ppd),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ppd_events.len(),
+            1,
+            "back-to-back PPD pair should generate 1 report"
+        );
+        assert!(
+            ppd_events[0].capacity_bps > 0,
+            "capacity should be positive"
+        );
+        assert!(
+            ppd_events[0].dispersion_us >= 200,
+            "dispersion should be >= 200μs guard"
+        );
+        assert!(
+            ppd_events[0].packet_size > 0,
+            "packet_size should be positive"
+        );
+    }
+
+    #[test]
+    fn ppd_pair_with_normal_packet_between_still_works() {
+        let mut rx = default_receiver();
+        let payload = vec![0u8; 1200];
+
+        // First PPD probe
+        rx.receive(make_ppd_probe_packet(0, &payload));
+        rx.drain_events().for_each(drop);
+
+        // Normal (non-PPD) packet in between
+        rx.receive(make_wire_packet(1, &payload));
+        rx.drain_events().for_each(drop);
+
+        // Sleep > 200μs to exceed the minimum dispersion guard
+        std::thread::sleep(std::time::Duration::from_micros(300));
+
+        // Second PPD probe — should still pair with the first
+        rx.receive(make_ppd_probe_packet(2, &payload));
+        let ppd_events: Vec<_> = rx
+            .drain_events()
+            .filter_map(|e| match e {
+                ReceiverEvent::SendPpdReport(ppd) => Some(ppd),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ppd_events.len(),
+            1,
+            "PPD pair should work even with normal packets between"
+        );
+    }
+
+    #[test]
+    fn ppd_non_probe_packets_dont_trigger_report() {
+        let mut rx = default_receiver();
+        for i in 0..10 {
+            rx.receive(make_wire_packet(i, &[0u8; 1200]));
+        }
+        let ppd_events: Vec<_> = rx
+            .drain_events()
+            .filter(|e| matches!(e, ReceiverEvent::SendPpdReport(_)))
+            .collect();
+        assert!(
+            ppd_events.is_empty(),
+            "non-PPD packets should never generate PPD reports"
+        );
+    }
+
+    #[test]
+    fn ppd_probe_packets_still_delivered() {
+        let mut rx = default_receiver();
+        rx.receive(make_ppd_probe_packet(0, b"ppd data"));
+
+        let delivers: Vec<_> = rx
+            .drain_events()
+            .filter_map(|e| match e {
+                ReceiverEvent::Deliver(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delivers.len(),
+            1,
+            "PPD probes should still be delivered as data"
+        );
+        assert_eq!(delivers[0].payload, &b"ppd data"[..]);
     }
 }

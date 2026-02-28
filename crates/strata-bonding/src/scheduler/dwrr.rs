@@ -32,6 +32,8 @@ pub(crate) struct LinkState<L: ?Sized> {
     pub last_metrics_update: Instant,
     pub penalty_factor: f64,
     pub stop_tx: Option<crossbeam_channel::Sender<()>>,
+    /// Previous link phase (for detecting transitions).
+    pub prev_phase: LinkPhase,
 }
 
 /// Deficit Weighted Round Robin (DWRR) packet scheduler.
@@ -49,6 +51,9 @@ pub struct Dwrr<L: LinkSender + ?Sized + 'static> {
     sorted_ids: Vec<usize>,
     current_rr_idx: usize,
     config: SchedulerConfig,
+    /// When set, the DWRR applies a credit boost to this link so the
+    /// saturation probe can measure true link capacity under load.
+    probe_boost_link: Option<usize>,
     #[cfg(feature = "bursty_diag")]
     last_selected_id: Option<usize>,
     #[cfg(feature = "bursty_diag")]
@@ -103,6 +108,7 @@ impl<L: LinkSender + ?Sized + 'static> Dwrr<L> {
             sorted_ids: Vec::new(),
             current_rr_idx: 0,
             config,
+            probe_boost_link: None,
             #[cfg(feature = "bursty_diag")]
             last_selected_id: None,
             #[cfg(feature = "bursty_diag")]
@@ -112,6 +118,11 @@ impl<L: LinkSender + ?Sized + 'static> Dwrr<L> {
 
     pub fn config(&self) -> &SchedulerConfig {
         &self.config
+    }
+
+    /// Set the link to receive a credit boost for saturation probing.
+    pub fn set_probe_boost_link(&mut self, id: Option<usize>) {
+        self.probe_boost_link = id;
     }
 
     pub fn update_config(&mut self, config: SchedulerConfig) {
@@ -160,6 +171,7 @@ impl<L: LinkSender + ?Sized + 'static> Dwrr<L> {
                 last_metrics_update: Instant::now(),
                 penalty_factor: 1.0,
                 stop_tx: Some(stop_tx),
+                prev_phase: LinkPhase::Init,
             },
         );
         self.sorted_ids.push(id);
@@ -220,11 +232,6 @@ impl<L: LinkSender + ?Sized + 'static> Dwrr<L> {
 
             if state.metrics.capacity_bps < 1_000_000.0 {
                 // Bandwidth hasn't converged yet — use the capacity floor.
-                // Avoid using `measured_bps * 2.0` because the scheduler distributes
-                // traffic proportionally to capacity. If all links bootstrap to
-                // the same 2×throughput, a feedback loop forms and all link stats
-                // converge to identical values with no way to differentiate them.
-                // The flat floor lets RTT/loss quality factors drive divergence.
                 // Only apply the floor if the link is in a probing or warm phase,
                 // otherwise we artificially inflate genuinely slow links.
                 if matches!(state.metrics.phase, LinkPhase::Probe | LinkPhase::Warm) {
@@ -233,12 +240,8 @@ impl<L: LinkSender + ?Sized + 'static> Dwrr<L> {
                 }
             }
 
-            // Note: we intentionally do NOT force all Probe-phase links to
-            // the same floor once they already have non-trivial capacity
-            // estimates. Flattening them to an identical value makes it hard
-            // for per-link estimators to remain proportional to real link
-            // rates. The bootstrap floor above still handles low/no-signal
-            // startup cases.
+            state.prev_phase = state.metrics.phase;
+
             let prev_capacity = state.prev_capacity_bps;
             let curr_capacity = state.metrics.capacity_bps;
             if prev_capacity > 0.0 && curr_capacity < prev_capacity * 0.5 {
@@ -456,26 +459,17 @@ impl<L: LinkSender + ?Sized + 'static> Dwrr<L> {
 
         // 1. Update Credits
         let any_alive = self.links.values().any(|state| state.metrics.alive);
-        for state in self.links.values_mut() {
+        for (&link_id, state) in self.links.iter_mut() {
             let metrics = state.metrics.clone();
             if metrics.alive || !any_alive {
                 let elapsed = now.duration_since(state.last_update).as_secs_f64();
 
                 // Calculate Effective Capacity (Quality Aware)
-                let predicted_bw =
-                    (metrics.capacity_bps + state.bw_slope_bps_s * horizon_s).max(0.0);
-                let predicted_loss =
-                    (metrics.loss_rate + state.loss_slope_per_s * horizon_s).clamp(0.0, 1.0);
-                let predicted_rtt = (metrics.rtt_ms + state.rtt_slope_ms_s * horizon_s).max(0.0);
-
-                let quality_factor = (1.0 - predicted_loss).max(0.1);
-                // NOTE: rtt_factor removed.  capacity_bps is already derived
-                // from BiscayController's pacing_rate which accounts for
-                // congestion and bufferbloat.  An additional RTT penalty
-                // destroyed credit differentiation when queues were deep
-                // (7-12s RTTs → factor ≈ 0.02 → all links get equal near-zero
-                // credits → DWRR falls through to the unconstrained fallback).
-                let _predicted_rtt = predicted_rtt;
+                //
+                // With the CapacityOracle providing stable capacity_bps,
+                // the standard DWRR formula works correctly without
+                // calibrated/probed branching. Oracle-backed capacity is
+                // immune to the scheduler-controller feedback loop.
 
                 let phase_factor = match metrics.phase {
                     LinkPhase::Probe => 0.5,
@@ -485,28 +479,37 @@ impl<L: LinkSender + ?Sized + 'static> Dwrr<L> {
                     LinkPhase::Cooldown | LinkPhase::Reset | LinkPhase::Init => 0.1,
                 };
 
-                // When the OS reports the interface as down, zero out
-                // credits entirely.  The link should already be marked
-                // not-alive in Link::get_metrics, but this is belt-and-
-                // suspenders to prevent any stale traffic.
                 let os_up_factor = if matches!(metrics.os_up, Some(false)) {
                     0.0
                 } else {
                     1.0
                 };
 
+                let base_bw = metrics.capacity_bps;
+                let predicted_bw = (base_bw + state.bw_slope_bps_s * horizon_s).max(0.0);
+                let predicted_loss =
+                    (metrics.loss_rate + state.loss_slope_per_s * horizon_s).clamp(0.0, 1.0);
+                let quality_factor = (1.0 - predicted_loss).max(0.1);
                 let effective_bps = predicted_bw
                     * quality_factor
                     * state.penalty_factor
                     * phase_factor
                     * os_up_factor;
                 // Capacity is in bps (bits per sec). Convert to bytes per sec.
-                let bytes_per_sec = effective_bps / 8.0;
+                let mut bytes_per_sec = effective_bps / 8.0;
+
+                // During saturation probes, boost the probed link's credit
+                // accrual so the DWRR routes enough traffic to saturate it.
+                if self.probe_boost_link == Some(link_id) {
+                    bytes_per_sec *= 5.0;
+                }
 
                 // Add credits
                 state.credits += bytes_per_sec * elapsed;
 
                 // Cap credits (adaptive burst window based on phase/loss)
+                let predicted_loss =
+                    (metrics.loss_rate + state.loss_slope_per_s * horizon_s).clamp(0.0, 1.0);
                 let burst_window_s = compute_burst_window_s(metrics.phase, predicted_loss);
                 let max_credits = bytes_per_sec * burst_window_s;
                 if state.credits > max_credits {
@@ -611,6 +614,8 @@ mod tests {
                     transport: None,
                     btlbw_bps: None,
                     rtprop_ms: None,
+                    ack_delivery_bps: 0.0,
+                    ack_bytes: 0,
                     estimated_capacity_bps: 0.0,
                     owd_ms: 0.0,
                     receiver_report: None,

@@ -206,8 +206,12 @@ impl Sender {
             .copied()
             .collect();
 
+        let mut newly_acked_bytes = 0u64;
         for seq in to_remove {
             if let Some(handle) = self.seq_to_handle.remove(&seq) {
+                if let Some(entry) = self.pool.get(handle) {
+                    newly_acked_bytes += entry.payload.len() as u64;
+                }
                 self.pool.mark_acked(handle);
                 newly_acked += 1;
             }
@@ -217,6 +221,9 @@ impl Sender {
         // SACK bitmap — individual acks beyond cumulative
         for sack_seq in ack.sacked_sequences() {
             if let Some(handle) = self.seq_to_handle.remove(&sack_seq) {
+                if let Some(entry) = self.pool.get(handle) {
+                    newly_acked_bytes += entry.payload.len() as u64;
+                }
                 self.pool.mark_acked(handle);
                 newly_acked += 1;
             }
@@ -224,6 +231,7 @@ impl Sender {
         }
 
         self.stats.packets_acked += newly_acked as u64;
+        self.stats.bytes_acked += newly_acked_bytes;
 
         // Cleanup retransmit tracker below cumulative
         self.retransmit.cleanup_below(cum_seq);
@@ -300,6 +308,50 @@ impl Sender {
     /// Peek at the number of queued output packets.
     pub fn output_queue_len(&self) -> usize {
         self.output_queue.len()
+    }
+
+    /// Inject a back-to-back PPD (Packet-Pair Dispersion) probe pair.
+    ///
+    /// Creates two identically-sized data packets with the PPD flag set.
+    /// The receiver will measure the inter-arrival dispersion between them
+    /// to estimate bottleneck capacity. Returns the two output packets for
+    /// immediate dispatch (caller should bypass pacing to keep them
+    /// back-to-back).
+    pub fn inject_ppd_pair(&mut self, payload_size: usize) -> Vec<OutputPacket> {
+        let size = payload_size.min(self.config.max_payload_size);
+        let probe_payload = Bytes::from(vec![0u8; size]);
+        let mut pair = Vec::with_capacity(2);
+
+        for _ in 0..2 {
+            let seq = self.seq_gen.next();
+            let ts = self.clock.now_us();
+
+            let header = PacketHeader::data(seq, ts, size as u16).with_ppd_probe();
+            let pkt = Packet {
+                header,
+                payload: probe_payload.clone(),
+            };
+            let wire_bytes = pkt.encode().freeze();
+
+            // Track in the pool so ACK processing works normally
+            let ctx = PacketContext::new(seq, ts).with_priority(Priority::Standard);
+            if let Some(handle) = self.pool.insert(ctx, probe_payload.clone()) {
+                self.seq_to_handle.insert(seq, handle);
+            }
+
+            self.stats.packets_sent += 1;
+            self.stats.bytes_sent += size as u64;
+
+            pair.push(OutputPacket {
+                data: wire_bytes,
+                priority: Priority::Standard,
+                sequence: seq,
+                is_retransmit: false,
+                is_fec_repair: false,
+            });
+        }
+
+        pair
     }
 
     /// Expire old unacked packets from the pool.
@@ -743,5 +795,84 @@ mod tests {
         assert_eq!(sender.next_sequence(), 1);
         sender.send(Bytes::from(vec![0; 10]), Priority::Standard);
         assert_eq!(sender.next_sequence(), 2);
+    }
+
+    // ─── PPD Probe Pair Injection ───────────────────────────────────────
+
+    #[test]
+    fn inject_ppd_pair_produces_two_packets() {
+        let mut sender = Sender::new(test_config());
+        let pair = sender.inject_ppd_pair(1200);
+        assert_eq!(pair.len(), 2, "PPD pair should produce exactly 2 packets");
+    }
+
+    #[test]
+    fn inject_ppd_pair_packets_have_ppd_flag() {
+        let mut sender = Sender::new(test_config());
+        let pair = sender.inject_ppd_pair(1200);
+        for (i, out) in pair.iter().enumerate() {
+            let decoded = Packet::decode(&mut out.data.clone()).unwrap();
+            assert!(
+                decoded.header.is_ppd_probe,
+                "PPD pair packet {i} should have is_ppd_probe flag set"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_ppd_pair_packets_same_size() {
+        let mut sender = Sender::new(test_config());
+        let pair = sender.inject_ppd_pair(1200);
+        assert_eq!(
+            pair[0].data.len(),
+            pair[1].data.len(),
+            "PPD pair packets must be the same wire size"
+        );
+    }
+
+    #[test]
+    fn inject_ppd_pair_has_consecutive_sequences() {
+        let mut sender = Sender::new(test_config());
+        let pair = sender.inject_ppd_pair(1200);
+        assert_eq!(pair[1].sequence, pair[0].sequence + 1);
+    }
+
+    #[test]
+    fn inject_ppd_pair_tracked_in_pool() {
+        let mut sender = Sender::new(test_config());
+        assert_eq!(sender.in_flight(), 0);
+        let _pair = sender.inject_ppd_pair(1200);
+        assert_eq!(
+            sender.in_flight(),
+            2,
+            "PPD packets should be tracked in send pool"
+        );
+    }
+
+    #[test]
+    fn inject_ppd_pair_clamps_to_mtu() {
+        let config = SenderConfig {
+            max_payload_size: 500,
+            ..test_config()
+        };
+        let mut sender = Sender::new(config);
+        let pair = sender.inject_ppd_pair(2000);
+        let decoded = Packet::decode(&mut pair[0].data.clone()).unwrap();
+        assert_eq!(
+            decoded.payload.len(),
+            500,
+            "PPD payload should be clamped to max_payload_size"
+        );
+    }
+
+    #[test]
+    fn inject_ppd_pair_does_not_use_output_queue() {
+        let mut sender = Sender::new(test_config());
+        let _pair = sender.inject_ppd_pair(1200);
+        assert_eq!(
+            sender.output_queue_len(),
+            0,
+            "PPD pair should be returned directly, not queued"
+        );
     }
 }

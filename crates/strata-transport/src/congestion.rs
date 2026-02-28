@@ -188,6 +188,36 @@ impl BiscayController {
         self.probe_allowed = allowed;
     }
 
+    /// Seed the congestion controller with a probe-measured bandwidth.
+    ///
+    /// Called when a saturation probe completes. Clears stale BW samples,
+    /// pushes the probe result as the sole sample, and recalculates pacing.
+    /// This breaks the feedback loop where btl_bw only tracks delivery rate
+    /// (which is limited by the scheduler's own allocation).
+    pub fn seed_bandwidth(&mut self, bw_bytes_sec: f64) {
+        if bw_bytes_sec <= 0.0 {
+            return;
+        }
+        // Clear old feedback-dependent samples and seed with probe result
+        self.bw_samples.clear();
+        self.bw_samples.push_back((Instant::now(), bw_bytes_sec));
+        self.btl_bw = bw_bytes_sec;
+
+        // If still in SlowStart, transition to ProbeBw since we now have
+        // a reliable capacity measurement.
+        if self.bbr_phase == BbrPhase::SlowStart {
+            self.bbr_phase = BbrPhase::ProbeBw;
+        }
+
+        tracing::info!(
+            target: "strata::cc",
+            seeded_kbps = bw_bytes_sec * 8.0 / 1000.0,
+            "CC seeded from saturation probe"
+        );
+
+        self.update_pacing_rate();
+    }
+
     // ─── Getters ────────────────────────────────────────────────────────
 
     /// Get the current pacing rate in bytes/sec.
@@ -335,9 +365,10 @@ impl BiscayController {
         // drain_factor is applied inside update_pacing_rate() so the
         // reduction persists across recalculations.
         //
-        // Thresholds are generous (4× / 2× RTprop) because bonded cellular
-        // links typically have 50-200ms base RTT and moderate queuing is
-        // normal. Aggressive drain at 1.5× would starve BBR of samples.
+        // Thresholds are set for bonded cellular with deep modem TX buffers
+        // (500ms–2s).  Real eNodeB queues routinely inflate RTT to 5-10×
+        // rt_prop without indicating actual congestion.  Tight thresholds
+        // (e.g. 2×/4×) cause persistent drain that starves throughput.
         //
         // Guard: require rt_prop_us ≥ 1 ms to avoid drain_factor collapse
         // from artificially low initial RTTs (e.g. first ping on docker
@@ -347,12 +378,12 @@ impl BiscayController {
             // Only update drain_factor periodically to avoid per-ACK overreaction
             let now = Instant::now();
             if now.duration_since(self.last_tick) > Duration::from_millis(100) {
-                if rtt_us > self.rt_prop_us * 4.0 {
+                if rtt_us > self.rt_prop_us * 5.0 {
                     // Severe bloat — aggressive drain
-                    self.drain_factor = (self.drain_factor * 0.85).max(0.05);
-                } else if rtt_us > self.rt_prop_us * 2.0 {
+                    self.drain_factor = (self.drain_factor * 0.85).max(0.5);
+                } else if rtt_us > self.rt_prop_us * 3.0 {
                     // Moderate bloat — gentle drain
-                    self.drain_factor = (self.drain_factor * 0.95).max(0.05);
+                    self.drain_factor = (self.drain_factor * 0.95).max(0.5);
                 } else if rtt_us < self.rt_prop_us * 1.5 {
                     // RTT is near baseline — recover
                     self.drain_factor = (self.drain_factor + 0.05).min(1.0);
@@ -877,5 +908,59 @@ mod tests {
             cc.pacing_rate() <= rate_before,
             "bufferbloat should reduce pacing rate"
         );
+    }
+
+    // ─── Seed Bandwidth Tests ───────────────────────────────────────────
+
+    #[test]
+    fn seed_bandwidth_updates_btlbw_and_pacing() {
+        let mut cc = BiscayController::new();
+        assert_eq!(cc.btl_bw(), 0.0);
+        assert_eq!(cc.bbr_phase, BbrPhase::SlowStart);
+
+        // Seed with 1 MB/s (bytes/sec)
+        cc.seed_bandwidth(1_000_000.0);
+
+        assert!(
+            (cc.btl_bw() - 1_000_000.0).abs() < 1.0,
+            "btl_bw should be seeded value"
+        );
+        assert_eq!(
+            cc.bbr_phase,
+            BbrPhase::ProbeBw,
+            "should transition out of SlowStart after seeding"
+        );
+        assert!(
+            cc.pacing_rate() > 100_000.0,
+            "pacing rate should increase from probe seed"
+        );
+    }
+
+    #[test]
+    fn seed_bandwidth_clears_old_samples() {
+        let mut cc = BiscayController::new();
+
+        // Accumulate low-rate samples
+        for _ in 0..10 {
+            cc.on_bandwidth_sample(50_000, 1_000_000, false);
+        }
+        let low_bw = cc.btl_bw();
+
+        // Seed with high probe result
+        cc.seed_bandwidth(500_000.0);
+
+        assert!(
+            cc.btl_bw() > low_bw * 5.0,
+            "seed should override low feedback samples"
+        );
+    }
+
+    #[test]
+    fn seed_bandwidth_ignores_zero() {
+        let mut cc = BiscayController::new();
+        cc.on_bandwidth_sample(100_000, 1_000_000, false);
+        let before = cc.btl_bw();
+        cc.seed_bandwidth(0.0);
+        assert_eq!(cc.btl_bw(), before);
     }
 }

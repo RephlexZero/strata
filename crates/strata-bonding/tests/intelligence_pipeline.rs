@@ -44,6 +44,8 @@ impl MockLink {
                 transport: None,
                 btlbw_bps: None,
                 rtprop_ms: None,
+                ack_delivery_bps: 0.0,
+                ack_bytes: 0,
                 estimated_capacity_bps: 0.0,
                 owd_ms: 0.0,
                 receiver_report: None,

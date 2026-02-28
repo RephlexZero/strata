@@ -226,6 +226,8 @@ async fn run_sender(
 
     let mut stats_interval = time::interval(Duration::from_millis(200));
     let mut current_bitrate_bps = bitrate_kbps as f64 * 1000.0;
+    let warmup_start = tokio::time::Instant::now();
+    let warmup_duration = Duration::from_secs(5);
     let mut packet_interval = time::interval(Duration::from_micros(
         ((1_000_000.0 * 8.0 * 1200.0) / current_bitrate_bps) as u64,
     ));
@@ -266,6 +268,13 @@ async fn run_sender(
                     .max(500_000.0);
                 // Smooth the transition
                 current_bitrate_bps = 0.8 * current_bitrate_bps + 0.2 * target_bps;
+
+                // During warmup, keep encoder at ≥80% of CLI bitrate so
+                // saturation probes have enough traffic to fill each link.
+                if warmup_start.elapsed() < warmup_duration {
+                    let warmup_floor = bitrate_kbps as f64 * 1000.0 * 0.8;
+                    current_bitrate_bps = current_bitrate_bps.max(warmup_floor);
+                }
                 let new_interval = Duration::from_micros(
                     ((1_000_000.0 * 8.0 * 1200.0) / current_bitrate_bps) as u64,
                 );
@@ -275,7 +284,10 @@ async fn run_sender(
 
                 if let Some(sock) = &stats_socket {
                     let mut links = Vec::new();
-                    for metrics in stats.values() {
+                    // Sort by link ID for stable JSON ordering across snapshots
+                    let mut sorted_stats: Vec<_> = stats.iter().collect();
+                    sorted_stats.sort_by_key(|(id, _)| *id);
+                    for (link_id, metrics) in sorted_stats {
                         // Use receiver-reported goodput when available;
                         // falls back to sender observed_bps during warmup.
                         let reported_bps = if let Some(ref rr) = metrics.receiver_report {
@@ -284,6 +296,7 @@ async fn run_sender(
                             metrics.observed_bps
                         };
                         links.push(serde_json::json!({
+                            "link_id": link_id,
                             "observed_bps": reported_bps,
                             "rtt_ms": metrics.rtt_ms,
                             "loss_ratio": metrics.loss_rate,
@@ -291,6 +304,10 @@ async fn run_sender(
                             "estimated_capacity_bps": metrics.estimated_capacity_bps,
                             // Cumulative bytes sent on this link since process start
                             "sent_bytes": metrics.observed_bytes,
+                            // ACK-confirmed delivery rate
+                            "ack_delivery_bps": metrics.ack_delivery_bps,
+                            // Cumulative ACK-confirmed bytes
+                            "ack_bytes": metrics.ack_bytes,
                         }));
                     }
                     let json = serde_json::json!({

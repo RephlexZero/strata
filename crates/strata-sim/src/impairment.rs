@@ -46,7 +46,12 @@ pub struct ImpairmentConfig {
 const ASSUMED_MTU: u64 = 1200;
 
 /// Target queue depth in seconds for auto-computed `limit`.
-const QUEUE_TARGET_SECS: f64 = 0.100;
+///
+/// Real cellular eNodeB / modem TX buffers hold 500ms–2s of data.
+/// Using 100ms caused artificially shallow queues that triggered CC
+/// drain reactions (RTT inflation from tiny buffer overflow) that
+/// would never occur with real modem hardware.
+const QUEUE_TARGET_SECS: f64 = 0.500;
 
 impl ImpairmentConfig {
     /// Compute a reasonable netem `limit` (in packets) for the configured rate,
@@ -60,11 +65,37 @@ impl ImpairmentConfig {
         })
     }
 
+    /// Derive a return-path (ACK direction) config from this forward-path config.
+    ///
+    /// The return path gets the same delay/jitter/loss characteristics but
+    /// **no rate limit** — ACKs are small and the bottleneck capacity only
+    /// constrains the data direction.  This produces realistic symmetric
+    /// RTT measurements and ACK-path loss.
+    pub fn return_path_config(&self) -> Self {
+        Self {
+            delay_ms: self.delay_ms,
+            jitter_ms: self.jitter_ms,
+            delay_distribution_normal: self.delay_distribution_normal,
+            loss_percent: self.loss_percent,
+            loss_correlation: self.loss_correlation,
+            // No rate limit on the return path
+            rate_kbit: None,
+            // No corruption/reorder/dup — these are data-path phenomena
+            corrupt_percent: None,
+            duplicate_percent: None,
+            reorder_percent: None,
+            reorder_correlation: None,
+            gemodel: None,
+            // Generous limit — ACKs are small, just need room for delay
+            limit: Some(1000),
+        }
+    }
+
     // ── Realistic cellular presets ───────────────────────────────────
     //
-    // These model **uplink** conditions (what tc shapes on the sender's
-    // egress).  Half-RTT is used for the one-way delay since netem adds
-    // delay on egress only; the full RTT is 2× the configured value.
+    // Delay values represent one-way (per-hop) delay.  When used with
+    // [`apply_bidirectional_impairment`], both egress directions are
+    // shaped, producing a full RTT of 2× the configured delay value.
 
     /// Average urban LTE uplink.
     ///
@@ -268,6 +299,29 @@ pub fn apply_impairment(
         )));
     }
 
+    Ok(())
+}
+
+/// Applies network impairment bidirectionally on a veth link.
+///
+/// Shapes the forward path (data: `fwd_ns`/`fwd_iface`) with the full config,
+/// and the return path (ACKs: `ret_ns`/`ret_iface`) with delay + loss only
+/// (no rate limit).  This produces realistic symmetric RTT measurements
+/// and ACK-path loss that match real cellular behavior.
+///
+/// Without return-path shaping, ACKs travel at infinite speed with zero
+/// loss, producing artificially low RTT measurements and an unrealistically
+/// reliable feedback channel.
+pub fn apply_bidirectional_impairment(
+    fwd_ns: &Namespace,
+    fwd_iface: &str,
+    ret_ns: &Namespace,
+    ret_iface: &str,
+    config: ImpairmentConfig,
+) -> io::Result<()> {
+    let ret_config = config.return_path_config();
+    apply_impairment(fwd_ns, fwd_iface, config)?;
+    apply_impairment(ret_ns, ret_iface, ret_config)?;
     Ok(())
 }
 
