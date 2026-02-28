@@ -269,15 +269,20 @@ pub fn apply_impairment(
 
     // 2. Optionally install a tbf root qdisc (modem firmware buffer model).
     //
-    // When `modem_buffer_kb` and `rate_kbit` are both set, a tbf root qdisc
-    // is installed first.  It owns rate shaping and models the fill-and-drain
+    // When `modem_buffer_kb` and `rate_kbit` are both set, we attempt a tbf
+    // root qdisc first.  It owns rate shaping and models the fill-and-drain
     // behaviour of a USB modem's internal Qualcomm buffer (~64 KiB typical).
     // Netem then becomes its child at `parent 1:1 handle 10:` and handles
     // delay, loss, and slot scheduling — but does NOT emit a `rate` argument
     // (tbf already owns that).
-    let use_tbf = config.modem_buffer_kb.is_some() && config.rate_kbit.is_some();
-
-    if use_tbf {
+    //
+    // If the kernel's `sch_tbf` module is unavailable (e.g. dev containers
+    // where /lib/modules is not mounted), the tbf add will fail.  We detect
+    // that and fall back silently: netem becomes the root qdisc and owns rate
+    // limiting itself, losing the modem-buffer fill-and-drain model but still
+    // applying slot scheduling.
+    let want_tbf = config.modem_buffer_kb.is_some() && config.rate_kbit.is_some();
+    let use_tbf = if want_tbf {
         let rate = config.rate_kbit.unwrap();
         let burst_bytes = config.modem_buffer_kb.unwrap() as u64 * 1024;
         let tbf_args: Vec<String> = vec![
@@ -298,14 +303,28 @@ pub fn apply_impairment(
         ];
         let tbf_ref: Vec<&str> = tbf_args.iter().map(|s| s.as_str()).collect();
         let out = ns.exec("tc", &tbf_ref)?;
-        if !out.status.success() {
-            return Err(io::Error::other(format!(
-                "Failed to apply tc tbf: {}\nCommand: tc {}",
-                String::from_utf8_lossy(&out.stderr),
-                tbf_args.join(" ")
-            )));
+        if out.status.success() {
+            true
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if stderr.contains("unknown") || stderr.contains("not supported") {
+                // sch_tbf module not available — fall back to netem rate
+                eprintln!(
+                    "[impairment] tbf unavailable on {interface} (kernel module missing?), \
+                     falling back to netem rate shaping"
+                );
+                false
+            } else {
+                return Err(io::Error::other(format!(
+                    "Failed to apply tc tbf: {}\nCommand: tc {}",
+                    stderr,
+                    tbf_args.join(" ")
+                )));
+            }
         }
-    }
+    } else {
+        false
+    };
 
     // 3. Build netem arguments.
     //    When tbf is the root, netem is its child (parent 1:1 handle 10:).
@@ -385,9 +404,7 @@ pub fn apply_impairment(
     }
 
     // Rate: only when tbf is NOT handling it.
-    if !use_tbf
-        && let Some(rate) = config.rate_kbit
-    {
+    if !use_tbf && let Some(rate) = config.rate_kbit {
         args_storage.push("rate".to_string());
         args_storage.push(format!("{}kbit", rate));
     }
