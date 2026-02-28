@@ -304,6 +304,11 @@ fn three_link_convergence_3_5_8_mbps() {
                 loss_percent: Some(0.5),
                 loss_correlation: Some(25.0),
                 corrupt_percent: Some(0.05),
+                slot_min_us: Some(1_000),
+                slot_max_us: Some(2_000),
+                slot_max_packets: Some(12),
+                slot_max_bytes: Some(14_400),
+                modem_buffer_kb: Some(64),
                 ..Default::default()
             },
         )
