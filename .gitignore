@@ -51,6 +51,9 @@ test_output/
 crates/strata-dashboard/dist/
 crates/strata-portal/dist/
 
+# Local release staging directory
+dist/
+
 # Node.js (Tailwind CSS build tooling)
 node_modules/
 package-lock.json
