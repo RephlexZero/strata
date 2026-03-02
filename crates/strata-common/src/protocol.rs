@@ -576,6 +576,81 @@ pub struct JitterBufferResponsePayload {
     pub error: Option<String>,
 }
 
+// ── Receiver → Control Plane ────────────────────────────────────────
+
+/// Auth payload sent by a receiver daemon when connecting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiverAuthLoginPayload {
+    pub enrollment_token: Option<String>,
+    pub receiver_version: String,
+    pub hostname: String,
+    pub region: Option<String>,
+    /// Public IP or hostname the receiver is reachable at.
+    pub bind_host: String,
+    /// UDP ports available for incoming bonded streams.
+    pub link_ports: Vec<u16>,
+    /// Maximum concurrent streams this receiver can handle.
+    pub max_streams: u32,
+}
+
+/// Auth response sent to a receiver daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiverAuthLoginResponsePayload {
+    pub success: bool,
+    pub receiver_id: Option<String>,
+    pub session_token: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Control plane tells the receiver to start receiving a stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiverStreamStartPayload {
+    pub stream_id: String,
+    /// UDP ports to bind for this stream's links.
+    pub bind_ports: Vec<u16>,
+    /// Optional RTMP/HLS relay URL.
+    pub relay_url: Option<String>,
+    /// Optional bonding config (scheduler params, etc).
+    #[serde(default)]
+    pub bonding_config: serde_json::Value,
+}
+
+/// Control plane tells the receiver to stop a stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiverStreamStopPayload {
+    pub stream_id: String,
+    pub reason: String,
+}
+
+/// Receiver reports a stream has ended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiverStreamEndedPayload {
+    pub stream_id: String,
+    pub reason: StreamEndReason,
+    pub duration_s: u64,
+    pub total_bytes: u64,
+}
+
+/// Receiver reports per-second stats for a stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiverStreamStatsPayload {
+    pub stream_id: String,
+    pub receiver_id: String,
+    pub uptime_s: u64,
+    pub timestamp_ms: u64,
+    pub links: Vec<crate::models::LinkStats>,
+}
+
+/// Receiver heartbeat with capacity info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiverStatusPayload {
+    pub active_streams: u32,
+    pub max_streams: u32,
+    pub cpu_percent: f32,
+    pub mem_used_mb: u64,
+    pub uptime_s: u64,
+}
+
 // ── Dashboard WebSocket Events ──────────────────────────────────────
 
 /// Events pushed to dashboard WebSocket subscribers.

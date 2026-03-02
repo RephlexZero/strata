@@ -7,7 +7,7 @@ use strata_bonding::metrics::MetricsServer;
 use gststrata::hls_upload;
 
 const SENDER_HELP: &str = r#"
-USAGE: strata-node sender [OPTIONS] --dest <ADDR[,ADDR...]>
+USAGE: strata-pipeline sender [OPTIONS] --dest <ADDR[,ADDR...]>
 
 OPTIONS:
   --dest <addrs>      Comma-separated destination addresses (required)
@@ -24,11 +24,9 @@ OPTIONS:
   --min-bitrate <kbps> Minimum bitrate for adaptation (default: from profile)
   --max-bitrate <kbps> Maximum bitrate for adaptation (default: from profile)
   --framerate <fps>   Video framerate (default: 30)
-  --audio             Add silent AAC audio track (required for RTMP targets)
+  --audio             Add silent AAC audio track (required for relay targets)
   --config <path>     Path to TOML config file (see Configuration Reference)
   --stats-dest <addr> UDP address to relay stats JSON (e.g. 127.0.0.1:9100)
-  --relay-url <url>   RTMP/RTMPS URL to relay encoded stream to in parallel
-                      (tees output: one copy goes via Strata, another via RTMP)
   --metrics-port <port> Start Prometheus metrics endpoint on this port
                         (serves /metrics on 0.0.0.0:<port>)
   --control <path>    Unix socket path for hot-swap commands
@@ -50,33 +48,33 @@ SOURCE HOT-SWAP:
 
 EXAMPLES:
   # Test pattern over two cellular links
-  strata-node sender --dest server:5000,server:5002 \
+  strata-pipeline sender --dest server:5000,server:5002 \
     --config sender.toml
 
   # 1080p30 with audio for YouTube relay via receiver
-  strata-node sender --source test --framerate 30 --audio --bitrate 2000 \
+  strata-pipeline sender --source test --framerate 30 --audio --bitrate 2000 \
     --dest receiver:5000,receiver:5002,receiver:5004
 
-  # Direct RTMP relay to YouTube (sender tees output to Strata + RTMP)
-  strata-node sender --source test --bitrate 2000 \
-    --dest receiver:5000,receiver:5002 \
-    --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
-
   # HDMI capture card to cloud receiver
-  strata-node sender --source v4l2 --device /dev/video0 \
+  strata-pipeline sender --source v4l2 --device /dev/video0 \
     --dest cloud.example.com:5000,cloud.example.com:5002 \
     --bitrate 2000 --config sender.toml
 "#;
 
 const RECEIVER_HELP: &str = r#"
-USAGE: strata-node receiver [OPTIONS] --bind <ADDR>
+USAGE: strata-pipeline receiver [OPTIONS] --bind <ADDR>
 
 OPTIONS:
   --bind <addr>       Bind address (required), e.g. 0.0.0.0:5000
                       Multiple bind addresses: 0.0.0.0:5000,0.0.0.0:5002
   --output <path>     Record to file (.ts = raw MPEG-TS, .mp4 = remuxed)
-  --relay-url <url>   RTMP/RTMPS URL to relay the received stream to
+  --relay-url <url>   URL to relay the received stream to
                       e.g. rtmp://a.rtmp.youtube.com/live2/STREAM_KEY
+                           https://a.upload.youtube.com/http_upload_hls?cid=KEY&copy=0&file=
+  --relay-type <type> Relay protocol: rtmp or hls
+                      Inferred from URL scheme when omitted:
+                        rtmp:// or rtmps:// → rtmp
+                        https://            → hls
   --codec <codec>     Codec of incoming stream: h265 (default) or h264
   --config <path>     Path to TOML config file (see Configuration Reference)
   --metrics-port <port> Start Prometheus metrics endpoint on this port
@@ -85,21 +83,21 @@ OPTIONS:
 
 EXAMPLES:
   # Receive and monitor (no file output)
-  strata-node receiver --bind 0.0.0.0:5000
+  strata-pipeline receiver --bind 0.0.0.0:5000
 
   # Receive bonded stream and relay to YouTube
-  strata-node receiver --bind 0.0.0.0:5000,0.0.0.0:5002,0.0.0.0:5004 \
+  strata-pipeline receiver --bind 0.0.0.0:5000,0.0.0.0:5002,0.0.0.0:5004 \
     --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
 
   # Receive H.265 stream and relay
-  strata-node receiver --bind 0.0.0.0:5000 --codec h265 \
+  strata-pipeline receiver --bind 0.0.0.0:5000 --codec h265 \
     --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
 
   # Receive and record to MPEG-TS file
-  strata-node receiver --bind 0.0.0.0:5000 --output capture.ts
+  strata-pipeline receiver --bind 0.0.0.0:5000 --output capture.ts
 
   # Receive with config
-  strata-node receiver --bind 0.0.0.0:5000 --config receiver.toml
+  strata-pipeline receiver --bind 0.0.0.0:5000 --config receiver.toml
 "#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -122,13 +120,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "sender" => run_sender(&args[2..]),
         "receiver" => run_receiver(&args[2..]),
         "--help" | "-h" | "help" => {
-            eprintln!("Usage: {} <sender|receiver> [args]\n", args[0]);
+            eprintln!("Usage: strata-pipeline <sender|receiver> [args]\n");
             eprintln!("Modes:");
             eprintln!("  sender    Encode and transmit video over bonded Strata links");
             eprintln!("  receiver  Receive and reassemble bonded Strata stream\n");
             eprintln!(
-                "Run `{} sender --help` or `{} receiver --help` for mode-specific options.",
-                args[0], args[0]
+                "Run `strata-pipeline sender --help` or `strata-pipeline receiver --help` for mode-specific options."
             );
             Ok(())
         }
@@ -170,7 +167,6 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut source_uri = "";
     let mut control_sock_path = "/tmp/strata-pipeline.sock";
     let mut resolution = "1280x720";
-    let mut relay_url = "";
     let mut passthrough = false;
     let mut metrics_port: Option<u16> = None;
     let mut codec_str = "h265";
@@ -239,10 +235,6 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 resolution = &args[i + 1];
                 i += 1;
             }
-            "--relay-url" if i + 1 < args.len() => {
-                relay_url = &args[i + 1];
-                i += 1;
-            }
             "--passthrough" => {
                 passthrough = true;
             }
@@ -288,7 +280,6 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return run_sender_passthrough(
             source_uri,
             dest_str,
-            relay_url,
             config_path,
             stats_dest,
             control_sock_path,
@@ -347,119 +338,16 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // Build the pipeline with input-selector.
     // The test source is always available as the fallback.
     //
-    // When --relay-url is set, the encoded video and audio are teed:
-    //   encoder → tee → queue → mpegtsmux → stratasink   (Strata)
-    //                 └→ queue → parser → [e]flvmux → rtmpsink (RTMP)
-    //   voaacenc → tee → aacparse → queue → mpegtsmux         (Strata)
-    //                 └→ queue → aacparse → [e]flvmux          (RTMP)
-    //
-    // For HLS relay (YouTube HLS ingest):
-    //   encoder → tee → queue → mpegtsmux → stratasink         (Strata)
-    //                 └→ queue → parser → hlssink2.video        (HLS)
-    //   voaacenc → tee → aacparse → queue → mpegtsmux          (Strata)
-    //                 └→ queue → aacparse → hlssink2.audio      (HLS)
-    let mut use_relay = !relay_url.is_empty();
-    let use_hls_relay = use_relay && hls_upload::is_hls_url(relay_url);
-
-    // Validate that the relay muxer element is actually available before trying.
-    // eflvmux (for H.265) requires GStreamer 1.24+. If it's missing, disable the
-    // relay and log a warning rather than failing the whole pipeline.
-    if use_relay && !use_hls_relay {
-        let muxer_factory = codec_ctrl.relay_muxer_factory_name();
-        if gst::ElementFactory::find(muxer_factory).is_none() {
-            eprintln!(
-                "Warning: relay muxer '{}' not available (requires GStreamer >= 1.24) — \
-                 RTMP relay disabled; stream will still start without relay",
-                muxer_factory
-            );
-            use_relay = false;
-        }
-    }
-    if use_hls_relay && gst::ElementFactory::find("hlssink2").is_none() {
-        eprintln!(
-            "Warning: hlssink2 not available — HLS relay disabled; \
-             stream will still start without relay"
-        );
-        use_relay = false;
-    }
-
-    // When relay is enabled, force audio on (RTMP requires it, HLS expects it)
-    if use_relay {
-        add_audio = true;
-    }
-
-    // For HLS, create a temp directory for segment files.
-    // Prefer /dev/shm (RAM-backed tmpfs) to avoid flash/eMMC wear on SBCs.
-    let hls_tmp_dir = if use_hls_relay {
-        let dir = hls_upload::tmpfs_segment_dir(&format!("strata-hls-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("failed to create HLS temp dir");
-        eprintln!(
-            "HLS temp dir: {} (tmpfs={})",
-            dir.display(),
-            dir.starts_with("/dev/shm")
-        );
-        Some(dir)
+    // Pipeline:
+    //   source → input-selector → encoder → queue → mpegtsmux → stratasink
+    //   [optional] audiotestsrc → voaacenc → aacparse → queue → mpegtsmux
+    let audio_fragment = if add_audio {
+        " audiotestsrc is-live=true wave=silence ! audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! queue ! mux.".to_string()
     } else {
-        None
+        String::new()
     };
 
-    let (audio_fragment, relay_fragment) = if use_hls_relay {
-        let hls_dir = hls_tmp_dir.as_ref().unwrap();
-        let seg_location = hls_dir.join("segment%05d.ts");
-        let pl_location = hls_dir.join("playlist.m3u8");
-        // Audio with tee — one path to Strata mux, another to hlssink2
-        let audio = " audiotestsrc is-live=true wave=silence \
-            ! audioconvert ! audioresample ! voaacenc bitrate=128000 \
-            ! tee name=atee \
-            atee. ! queue ! aacparse ! mux. \
-            atee. ! queue ! aacparse ! hls.audio";
-        let hls = format!(
-            " hlssink2 name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
-             target-duration=2 max-files=10 send-keyframe-requests=true",
-            seg = seg_location.display(),
-            pl = pl_location.display(),
-        );
-        (audio.to_string(), hls)
-    } else if use_relay {
-        // Audio with tee — one path to Strata mux, another to FLV mux
-        let audio = " audiotestsrc is-live=true wave=silence \
-            ! audioconvert ! audioresample ! voaacenc bitrate=128000 \
-            ! tee name=atee \
-            atee. ! queue ! aacparse ! mux. \
-            atee. ! queue ! aacparse ! fmux.";
-        // RTMP mux + sink — use codec-appropriate muxer (eflvmux for H.265, flvmux for H.264)
-        let rtmp = format!(
-            " {mux} ! rtmpsink location=\"{url}\" sync=false",
-            mux = codec_ctrl.relay_muxer_fragment(),
-            url = relay_url
-        );
-        (audio.to_string(), rtmp)
-    } else if add_audio {
-        (
-            " audiotestsrc is-live=true wave=silence ! audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! queue ! mux.".to_string(),
-            String::new(),
-        )
-    } else {
-        (String::new(), String::new())
-    };
-
-    // Video path: with relay, tee after encoder; without, straight to mux
-    let parser = codec_type.parser_factory();
-    let video_to_mux = if use_hls_relay {
-        format!(
-            "! tee name=vtee \
-             vtee. ! queue ! mux. \
-             vtee. ! queue ! {parser} ! hls.video"
-        )
-    } else if use_relay {
-        format!(
-            "! tee name=vtee \
-             vtee. ! queue ! mux. \
-             vtee. ! queue ! {parser} ! fmux."
-        )
-    } else {
-        "! queue ! mux.".to_string()
-    };
+    let video_to_mux = "! queue ! mux.".to_string();
 
     let enc_fragment =
         codec_ctrl.pipeline_fragment("enc", bitrate_kbps, key_int, max_bitrate_kbps_val);
@@ -472,14 +360,13 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
          ! {enc_fragment} \
          {video_to_mux}{audio} \
          mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 \
-         ! stratasink name=rsink{relay}",
+         ! stratasink name=rsink",
         w = res_w,
         h = res_h,
         fps = framerate,
         enc_fragment = enc_fragment,
         video_to_mux = video_to_mux,
         audio = audio_fragment,
-        relay = relay_fragment,
     );
 
     eprintln!("Sender Pipeline: {}", pipeline_str);
@@ -489,21 +376,6 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "Failed to cast to pipeline")?;
 
     configure_mpegtsmux(&pipeline);
-
-    // Start HLS segment uploader if in HLS relay mode
-    let _hls_uploader = if use_hls_relay {
-        let hls_dir = hls_tmp_dir.as_ref().unwrap().clone();
-        let base_url = hls_upload::hls_base_url(relay_url).to_string();
-        Some(hls_upload::start_hls_uploader(
-            hls_upload::HlsUploaderConfig {
-                segment_dir: hls_dir,
-                base_url,
-                playlist_filename: "playlist.m3u8".into(),
-            },
-        ))
-    } else {
-        None
-    };
 
     // Keep a handle to the input-selector and its test-source pad
     let selector = pipeline
@@ -734,11 +606,6 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     pipeline.set_state(gst::State::Null)?;
     let _ = std::fs::remove_file(control_sock_path);
 
-    // Clean up HLS temp directory
-    if let Some(ref dir) = hls_tmp_dir {
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     Ok(())
 }
 
@@ -754,7 +621,6 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 fn run_sender_passthrough(
     source_uri: &str,
     dest_str: &str,
-    _relay_url: &str,
     config_path: &str,
     stats_dest: &str,
     control_sock_path: &str,
@@ -1057,19 +923,28 @@ fn serialize_bonding_stats(s: &gst::StructureRef) -> String {
             let os_up = s.get::<i32>(&format!("link_{}_os_up", id)).unwrap_or(-1);
             let kind = s.get::<&str>(&format!("link_{}_kind", id)).unwrap_or("");
 
-            links.push(serde_json::json!({
-                "id": id,
-                "rtt_us": (rtt_ms * 1000.0) as u64,
-                "loss_rate": loss,
-                "capacity_bps": capacity.round() as u64,
-                "sent_bytes": observed_bytes,
-                "observed_bps": observed_bps.round() as u64,
-                "interface": iface,
-                "alive": alive,
-                "phase": phase,
-                "os_up": os_up,
-                "link_kind": kind,
-            }));
+            links.push({
+                let mut obj = serde_json::json!({
+                    "id": id,
+                    "rtt_us": (rtt_ms * 1000.0) as u64,
+                    "loss_rate": loss,
+                    "capacity_bps": capacity.round() as u64,
+                    "sent_bytes": observed_bytes,
+                    "observed_bps": observed_bps.round() as u64,
+                    "interface": iface,
+                    "alive": alive,
+                    "phase": phase,
+                    "os_up": os_up,
+                    "link_kind": kind,
+                });
+                if let Ok(bw) = s.get::<f64>(&format!("link_{}_btlbw_bps", id)) {
+                    obj["btlbw_bps"] = serde_json::json!(bw.round() as u64);
+                }
+                if let Ok(rtp) = s.get::<f64>(&format!("link_{}_rtprop_ms", id)) {
+                    obj["rtprop_ms"] = serde_json::json!(rtp);
+                }
+                obj
+            });
         }
     }
 
@@ -1394,11 +1269,33 @@ fn run_control_socket(path: &str, pipeline_weak: gst::glib::WeakRef<gst::Pipelin
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayType {
+    Rtmp,
+    Hls,
+}
+
+impl RelayType {
+    /// Infer relay type from URL scheme.
+    /// Returns `None` if the scheme is unrecognised and the caller must require
+    /// an explicit `--relay-type` flag.
+    fn from_url(url: &str) -> Option<Self> {
+        if url.starts_with("rtmp://") || url.starts_with("rtmps://") {
+            Some(RelayType::Rtmp)
+        } else if url.starts_with("https://") {
+            Some(RelayType::Hls)
+        } else {
+            None
+        }
+    }
+}
+
 fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut bind_str = "";
     let mut output_file = "";
     let mut config_path = "";
     let mut relay_url = "";
+    let mut relay_type_override: Option<RelayType> = None;
     let mut codec_str = "h265";
     let mut metrics_port: Option<u16> = None;
     let mut i = 0;
@@ -1422,6 +1319,17 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--relay-url" if i + 1 < args.len() => {
                 relay_url = &args[i + 1];
+                i += 1;
+            }
+            "--relay-type" if i + 1 < args.len() => {
+                relay_type_override = match args[i + 1].to_ascii_lowercase().as_str() {
+                    "rtmp" => Some(RelayType::Rtmp),
+                    "hls" => Some(RelayType::Hls),
+                    other => {
+                        eprintln!("Unknown --relay-type '{}': expected 'rtmp' or 'hls'", other);
+                        std::process::exit(1);
+                    }
+                };
                 i += 1;
             }
             "--codec" if i + 1 < args.len() => {
@@ -1455,6 +1363,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let codec_type = gststrata::codec::CodecType::from_str_loose(codec_str)
         .unwrap_or(gststrata::codec::CodecType::H264);
     let video_parser = codec_type.parser_factory();
+    let relay_parser = codec_type.relay_parser_fragment();
 
     // Pipeline construction:
     //
@@ -1469,7 +1378,22 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     //   stratasrc ! appsink
 
     let use_relay = !relay_url.is_empty();
-    let use_hls_relay = use_relay && hls_upload::is_hls_url(relay_url);
+    let relay_type = if use_relay {
+        let resolved = relay_type_override
+            .or_else(|| RelayType::from_url(relay_url))
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "Cannot infer relay type from URL '{}'. \
+                     Use --relay-type rtmp|hls to specify it explicitly.",
+                    relay_url
+                );
+                std::process::exit(1);
+            });
+        Some(resolved)
+    } else {
+        None
+    };
+    let use_hls_relay = relay_type == Some(RelayType::Hls);
 
     // For HLS receiver relay, create a temp directory for segment files.
     // Prefer /dev/shm (RAM-backed tmpfs) to avoid flash/eMMC wear on SBCs.
@@ -1499,7 +1423,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
              hlssink2 name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
              target-duration=2 max-files=10 send-keyframe-requests=true",
             bind = bind_str,
-            parser = video_parser,
+            parser = relay_parser,
             seg = seg_location.display(),
             pl = pl_location.display(),
         )
@@ -1513,7 +1437,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
              rtmpsink location=\"{url}\" sync=false \
              d. ! queue ! aacparse ! fmux.",
             bind = bind_str,
-            parser = video_parser,
+            parser = relay_parser,
             relay = relay_frag,
             url = relay_url
         )

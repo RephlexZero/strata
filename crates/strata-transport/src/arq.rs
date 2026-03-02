@@ -39,6 +39,11 @@ pub struct LossDetector {
     initialized: bool,
     /// Maximum NACK retries per sequence.
     max_nacks_per_seq: u8,
+    /// Total unique (non-duplicate) packets received. Incremented exactly
+    /// once per packet in `record_received()`, providing a smooth counter
+    /// for delivery-rate measurement that avoids the bursty jumps caused
+    /// by cumulative-sequence advancement past irrecoverable gaps.
+    total_received: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +65,7 @@ impl LossDetector {
             playout_deadline: Duration::from_secs(2),
             initialized: false,
             max_nacks_per_seq: 3,
+            total_received: 0,
         }
     }
 
@@ -83,6 +89,7 @@ impl LossDetector {
         if !self.initialized {
             self.highest_contiguous = seq;
             self.initialized = true;
+            self.total_received += 1;
             return;
         }
 
@@ -91,9 +98,11 @@ impl LossDetector {
             return;
         }
 
+        // Not a duplicate — count it
         if seq == self.highest_contiguous + 1 {
             // Next expected — advance contiguous pointer
             self.highest_contiguous = seq;
+            self.total_received += 1;
             // Advance past any buffered out-of-order packets
             while self.received_above.contains(&(self.highest_contiguous + 1)) {
                 self.received_above.remove(&(self.highest_contiguous + 1));
@@ -103,7 +112,9 @@ impl LossDetector {
             self.nacked.retain(|&s, _| s > self.highest_contiguous);
         } else {
             // Out of order — gap detected
-            self.received_above.insert(seq);
+            if self.received_above.insert(seq) {
+                self.total_received += 1;
+            }
             // Remove from NACK tracking if we already NACKed it and it arrived
             self.nacked.remove(&seq);
         }
@@ -172,6 +183,45 @@ impl LossDetector {
     /// Get the highest contiguous sequence number received.
     pub fn highest_contiguous(&self) -> u64 {
         self.highest_contiguous
+    }
+
+    /// Total unique (non-duplicate) packets received on this link.
+    pub fn total_received(&self) -> u64 {
+        self.total_received
+    }
+
+    /// Advance past irrecoverably lost packets.
+    ///
+    /// When a sequence has exhausted its NACK budget and will never be
+    /// recovered, keeping `highest_contiguous` stuck behind it prevents
+    /// the cumulative ACK from ever advancing.  This poisons delivery-rate
+    /// measurement on the sender side because the 64-bit SACK bitmap
+    /// can only report a tiny window beyond the stalled cumulative.
+    ///
+    /// Call this periodically (e.g. after `generate_nacks`).  It skips
+    /// past sequences whose NACK budget is exhausted and that are present
+    /// in `received_above`, catching up the contiguous frontier.
+    pub fn advance_past_irrecoverable(&mut self) {
+        loop {
+            let next = self.highest_contiguous + 1;
+            if self.received_above.contains(&next) {
+                // Already received — advance normally
+                self.received_above.remove(&next);
+                self.highest_contiguous = next;
+            } else if let Some(state) = self.nacked.get(&next) {
+                if state.nack_count >= state.max_nacks {
+                    // Exhausted NACK budget — skip this packet
+                    self.nacked.remove(&next);
+                    self.highest_contiguous = next;
+                } else {
+                    break; // Still waiting for recovery
+                }
+            } else {
+                break; // Haven't observed a gap here yet
+            }
+        }
+        // Clean up stale NACK state below the new contiguous point
+        self.nacked.retain(|&s, _| s > self.highest_contiguous);
     }
 
     /// Number of out-of-order packets buffered above the contiguous point.

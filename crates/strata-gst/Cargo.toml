@@ -1,6 +1,6 @@
 [package]
 name = "strata-gst"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2024"
 description = "GStreamer plugin for Strata bonded transport"
 repository = "https://github.com/RephlexZero/strata"
@@ -28,5 +28,5 @@ crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [[bin]]
-name = "strata-node"
-path = "src/bin/strata_node.rs"
+name = "strata-pipeline"
+path = "src/bin/strata_pipeline.rs"

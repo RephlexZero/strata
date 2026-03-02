@@ -23,16 +23,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use strata_sim::impairment::{ImpairmentConfig, apply_impairment};
+use strata_sim::impairment::{ImpairmentConfig, apply_bidirectional_impairment, apply_impairment};
 use strata_sim::scenario::{LinkScenarioConfig, Scenario, ScenarioConfig};
 use strata_sim::test_util::check_privileges;
 use strata_sim::topology::Namespace;
 
 // ─── Shared test harness ────────────────────────────────────────────
 
-/// Ensure the strata-node binary is built and return its path.
+/// Ensure the strata-pipeline binary is built and return its path.
 fn strata_node_binary() -> PathBuf {
-    if let Ok(p) = std::env::var("STRATA_NODE_BIN") {
+    if let Ok(p) = std::env::var("STRATA_PIPELINE_BIN") {
         let path = PathBuf::from(p);
         if path.exists() {
             return path;
@@ -270,8 +270,8 @@ fn capacity_step_change() {
         loss_percent: Some(0.1),
         ..Default::default()
     };
-    apply_impairment(&ns_snd, "st_s1_a", cfg.clone()).unwrap();
-    apply_impairment(&ns_snd, "st_s2_a", cfg).unwrap();
+    apply_bidirectional_impairment(&ns_snd, "st_s1_a", &ns_rcv, "st_s1_b", cfg.clone()).unwrap();
+    apply_bidirectional_impairment(&ns_snd, "st_s2_a", &ns_rcv, "st_s2_b", cfg).unwrap();
 
     let mut recv = spawn_in_ns(
         &ns_rcv.name,
@@ -431,8 +431,8 @@ fn link_failure_recovery() {
         delay_ms: Some(30),
         ..Default::default()
     };
-    apply_impairment(&ns_snd, "st_f1_a", cfg.clone()).unwrap();
-    apply_impairment(&ns_snd, "st_f2_a", cfg).unwrap();
+    apply_bidirectional_impairment(&ns_snd, "st_f1_a", &ns_rcv, "st_f1_b", cfg.clone()).unwrap();
+    apply_bidirectional_impairment(&ns_snd, "st_f2_a", &ns_rcv, "st_f2_b", cfg).unwrap();
 
     let mut recv = spawn_in_ns(
         &ns_rcv.name,
@@ -575,28 +575,17 @@ fn chaos_scenario() {
         duration: Duration::from_secs(25),
         step: Duration::from_secs(1),
         links: vec![
-            LinkScenarioConfig {
-                min_rate_kbit: 3000,
-                max_rate_kbit: 6000,
-                rate_step_kbit: 300,
-                base_delay_ms: 20,
-                delay_jitter_ms: 15,
-                delay_step_ms: 4,
-                max_loss_percent: 3.0,
-                loss_step_percent: 0.5,
-            },
-            LinkScenarioConfig {
-                min_rate_kbit: 500,
-                max_rate_kbit: 2000,
-                rate_step_kbit: 200,
-                base_delay_ms: 40,
-                delay_jitter_ms: 30,
-                delay_step_ms: 6,
-                max_loss_percent: 8.0,
-                loss_step_percent: 1.0,
-            },
+            LinkScenarioConfig::lte_urban(),
+            LinkScenarioConfig::lte_poor(),
         ],
     });
+
+    // Apply baseline return-path shaping before scenario loop.
+    // The scenario dynamically changes the forward path every step;
+    // the return path stays at this baseline throughout.
+    let baseline_return = ImpairmentConfig::lte_urban().return_path_config();
+    apply_impairment(&ns_rcv, "st_c1_b", baseline_return.clone()).unwrap();
+    apply_impairment(&ns_rcv, "st_c2_b", baseline_return).unwrap();
 
     for frame in scenario.frames() {
         let elapsed = scenario_start.elapsed();
@@ -670,9 +659,11 @@ fn throughput_stability() {
         "192.168.203.2/24",
     );
 
-    apply_impairment(
+    apply_bidirectional_impairment(
         &ns_snd,
         "st_st_a",
+        &ns_rcv,
+        "st_st_b",
         ImpairmentConfig {
             rate_kbit: Some(5_000),
             delay_ms: Some(30),
@@ -797,9 +788,11 @@ fn asymmetric_rtt_bonding() {
     );
 
     // Link A: 4 Mbps, 20ms (WiFi-like)
-    apply_impairment(
+    apply_bidirectional_impairment(
         &ns_snd,
         "st_a1_a",
+        &ns_rcv,
+        "st_a1_b",
         ImpairmentConfig {
             rate_kbit: Some(4_000),
             delay_ms: Some(20),
@@ -809,9 +802,11 @@ fn asymmetric_rtt_bonding() {
     )
     .unwrap();
     // Link B: 4 Mbps, 150ms (LTE-like)
-    apply_impairment(
+    apply_bidirectional_impairment(
         &ns_snd,
         "st_a2_a",
+        &ns_rcv,
+        "st_a2_b",
         ImpairmentConfig {
             rate_kbit: Some(4_000),
             delay_ms: Some(150),
@@ -956,9 +951,11 @@ fn the_cliff() {
     );
 
     // Initial: A=8 Mbps, B=5 Mbps, C=6 Mbps, all 30ms
-    apply_impairment(
+    apply_bidirectional_impairment(
         &ns_snd,
         "st_cl1_a",
+        &ns_rcv,
+        "st_cl1_b",
         ImpairmentConfig {
             rate_kbit: Some(8_000),
             delay_ms: Some(30),
@@ -967,9 +964,11 @@ fn the_cliff() {
         },
     )
     .unwrap();
-    apply_impairment(
+    apply_bidirectional_impairment(
         &ns_snd,
         "st_cl2_a",
+        &ns_rcv,
+        "st_cl2_b",
         ImpairmentConfig {
             rate_kbit: Some(5_000),
             delay_ms: Some(30),
@@ -978,9 +977,11 @@ fn the_cliff() {
         },
     )
     .unwrap();
-    apply_impairment(
+    apply_bidirectional_impairment(
         &ns_snd,
         "st_cl3_a",
+        &ns_rcv,
+        "st_cl3_b",
         ImpairmentConfig {
             rate_kbit: Some(6_000),
             delay_ms: Some(30),
@@ -1117,8 +1118,9 @@ fn flapping_link() {
         loss_percent: Some(0.1),
         ..Default::default()
     };
-    apply_impairment(&ns_snd, "st_fl1_a", stable_cfg.clone()).unwrap();
-    apply_impairment(&ns_snd, "st_fl2_a", stable_cfg).unwrap();
+    apply_bidirectional_impairment(&ns_snd, "st_fl1_a", &ns_rcv, "st_fl1_b", stable_cfg.clone())
+        .unwrap();
+    apply_bidirectional_impairment(&ns_snd, "st_fl2_a", &ns_rcv, "st_fl2_b", stable_cfg).unwrap();
 
     let mut recv = spawn_in_ns(
         &ns_rcv.name,
@@ -1261,8 +1263,9 @@ fn jitter_bomb() {
         jitter_ms: Some(5),
         ..Default::default()
     };
-    apply_impairment(&ns_snd, "st_j1_a", base_cfg.clone()).unwrap();
-    apply_impairment(&ns_snd, "st_j2_a", base_cfg).unwrap();
+    apply_bidirectional_impairment(&ns_snd, "st_j1_a", &ns_rcv, "st_j1_b", base_cfg.clone())
+        .unwrap();
+    apply_bidirectional_impairment(&ns_snd, "st_j2_a", &ns_rcv, "st_j2_b", base_cfg).unwrap();
 
     let mut recv = spawn_in_ns(
         &ns_rcv.name,
@@ -1394,8 +1397,9 @@ fn burst_loss() {
         loss_percent: Some(0.1),
         ..Default::default()
     };
-    apply_impairment(&ns_snd, "st_b1_a", normal_cfg.clone()).unwrap();
-    apply_impairment(&ns_snd, "st_b2_a", normal_cfg).unwrap();
+    apply_bidirectional_impairment(&ns_snd, "st_b1_a", &ns_rcv, "st_b1_b", normal_cfg.clone())
+        .unwrap();
+    apply_bidirectional_impairment(&ns_snd, "st_b2_a", &ns_rcv, "st_b2_b", normal_cfg).unwrap();
 
     let mut recv = spawn_in_ns(
         &ns_rcv.name,
@@ -1519,9 +1523,11 @@ fn bandwidth_ramp() {
     );
 
     // Start at 1 Mbps
-    apply_impairment(
+    apply_bidirectional_impairment(
         &ns_snd,
         "st_r1_a",
+        &ns_rcv,
+        "st_r1_b",
         ImpairmentConfig {
             rate_kbit: Some(1_000),
             delay_ms: Some(30),
@@ -1693,9 +1699,11 @@ fn capacity_estimation_converges() {
     );
 
     // Link capped at exactly 5 Mbps — this is what estimated_capacity_bps must converge to.
-    apply_impairment(
+    apply_bidirectional_impairment(
         &ns_snd,
         "st_ce_a",
+        &ns_rcv,
+        "st_ce_b",
         ImpairmentConfig {
             rate_kbit: Some(5_000),
             delay_ms: Some(30),

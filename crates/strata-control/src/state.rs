@@ -7,7 +7,9 @@ use sqlx::PgPool;
 use tokio::sync::{broadcast, oneshot};
 
 use strata_common::auth::JwtContext;
-use strata_common::protocol::{DashboardEvent, DeviceStatusPayload, StreamStatsPayload};
+use strata_common::protocol::{
+    DashboardEvent, DeviceStatusPayload, ReceiverStatusPayload, StreamStatsPayload,
+};
 
 /// State shared across all request handlers.
 #[derive(Clone)]
@@ -34,6 +36,10 @@ struct Inner {
     pub stream_stats: DashMap<String, StreamStatsPayload>,
     /// In-memory alerting rules per sender.
     pub alert_rules: DashMap<String, Vec<serde_json::Value>>,
+    /// Connected receiver daemons, keyed by receiver_id.
+    pub receivers: DashMap<String, ReceiverHandle>,
+    /// Cached latest receiver status per receiver, updated on each heartbeat.
+    pub receiver_status: DashMap<String, ReceiverStatusPayload>,
 }
 
 /// Handle to a connected sender agent.
@@ -41,6 +47,15 @@ pub struct AgentHandle {
     /// Channel to send control messages to this agent's WebSocket task.
     pub tx: tokio::sync::mpsc::Sender<String>,
     /// The sender's hostname (for display in future API responses).
+    #[allow(dead_code)]
+    pub hostname: Option<String>,
+}
+
+/// Handle to a connected receiver daemon.
+pub struct ReceiverHandle {
+    /// Channel to send control messages to this receiver's WebSocket task.
+    pub tx: tokio::sync::mpsc::Sender<String>,
+    /// The receiver's hostname.
     #[allow(dead_code)]
     pub hostname: Option<String>,
 }
@@ -59,6 +74,8 @@ impl AppState {
                 live_streams: DashSet::new(),
                 stream_stats: DashMap::new(),
                 alert_rules: DashMap::new(),
+                receivers: DashMap::new(),
+                receiver_status: DashMap::new(),
             }),
         }
     }
@@ -98,6 +115,16 @@ impl AppState {
     /// In-memory alert rules per sender.
     pub fn alert_rules(&self) -> &DashMap<String, Vec<serde_json::Value>> {
         &self.inner.alert_rules
+    }
+
+    /// Connected receiver daemons.
+    pub fn receivers(&self) -> &DashMap<String, ReceiverHandle> {
+        &self.inner.receivers
+    }
+
+    /// Cached latest receiver status per receiver.
+    pub fn receiver_status(&self) -> &DashMap<String, ReceiverStatusPayload> {
+        &self.inner.receiver_status
     }
 
     /// Broadcast a dashboard event to all subscribed browsers.

@@ -10,7 +10,7 @@
 
 ---
 
-Strata bonds 2–6 unreliable network interfaces — USB cellular modems, WiFi, Ethernet, satellite — into a single resilient live video stream. It ships as a **GStreamer plugin** (`stratasink` / `stratasrc`), a standalone CLI (`strata-node`), and a complete **management platform** with a web dashboard, control plane API, and field-device agent.
+Strata bonds 2–6 unreliable network interfaces — USB cellular modems, WiFi, Ethernet, satellite — into a single resilient live video stream. It ships as a **GStreamer plugin** (`stratasink` / `stratasrc`), a standalone CLI (`strata-pipeline`), and a complete **management platform** with a web dashboard, control plane API, and field-device sender daemon.
 
 Built for field deployment on commodity ARM64 hardware (Orange Pi 5 Plus, Raspberry Pi 5) with off-the-shelf USB modems. Pure Rust from the wire protocol up — no C transport dependencies, no vendor lock-in.
 
@@ -52,14 +52,14 @@ Only GStreamer 1.x is needed at runtime — the transport is pure Rust with no C
 **Sender** — bonded stream over two links:
 
 ```bash
-strata-node sender --source test --bitrate 3000 \
+strata-pipeline sender --source test --bitrate 3000 \
   --dest 192.168.1.100:5000,10.0.0.100:5000
 ```
 
 **Receiver** — reassemble and relay to YouTube:
 
 ```bash
-strata-node receiver --bind 0.0.0.0:5000,0.0.0.0:5002 \
+strata-pipeline receiver --bind 0.0.0.0:5000,0.0.0.0:5002 \
   --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
 ```
 
@@ -142,9 +142,9 @@ Multi-link scheduling and orchestration:
 
 ### Management Platform
 
-- **Control plane** (`strata-control`) — Axum REST API, WebSocket hubs for agents and dashboards, PostgreSQL, JWT auth
+- **Control plane** (`strata-control`) — Axum REST API, WebSocket hubs for senders and dashboards, PostgreSQL, JWT auth
 - **Operator dashboard** (`strata-dashboard`) — Leptos WASM SPA with live sender status, stream management, destination CRUD
-- **Sender agent** (`strata-agent`) — field device daemon with hardware scanning, interface management, GStreamer pipeline lifecycle
+- **Sender daemon** (`strata-sender`) — field device daemon with hardware scanning, interface management, GStreamer pipeline lifecycle
 - **Sender portal** (`strata-portal`) — local WASM UI for on-site enrollment, configuration, and diagnostics
 
 ---
@@ -155,11 +155,11 @@ Multi-link scheduling and orchestration:
 crates/
   strata-transport/      Custom wire protocol — FEC, ARQ, Biscay CC, session mgmt
   strata-bonding/        Bonding engine — DWRR/IoDS/BLEST scheduler, modem, media
-  strata-gst/            GStreamer plugin (stratasink/stratasrc) + strata-node CLI
+  strata-gst/            GStreamer plugin (stratasink/stratasrc) + strata-pipeline CLI
   strata-sim/            Network simulation — Linux netns + tc-netem
   strata-common/         Shared types, protocol messages, auth (JWT + ed25519)
   strata-control/        Control plane — Axum API, WebSocket, PostgreSQL
-  strata-agent/          Sender agent daemon (field devices)
+  strata-sender/         Sender daemon (field devices)
   strata-dashboard/      Operator dashboard — Leptos CSR WASM + Tailwind/DaisyUI
   strata-portal/         Field device portal — Leptos CSR WASM + Tailwind/DaisyUI
 docker/

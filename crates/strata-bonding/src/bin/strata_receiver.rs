@@ -1,9 +1,12 @@
-//! # Strata Cloud Receiver
+//! # Strata Probe
 //!
-//! Standalone cloud gateway binary that receives bonded transport streams
-//! without requiring GStreamer. Accepts UDP traffic on multiple links,
-//! performs multi-link reassembly (FEC + ARQ + jitter buffer), and outputs
-//! the recovered MPEG-TS stream to file, stdout, or an RTMP relay.
+//! Transport-layer diagnostic binary. Accepts UDP traffic on multiple links,
+//! performs multi-link reassembly (FEC + ARQ + jitter buffer), and either
+//! discards output (monitor mode) or writes recovered MPEG-TS to a file.
+//!
+//! This is a **testing and diagnostic tool** — it operates at the raw transport
+//! layer without a GStreamer pipeline.  For production relay (RTMP, HLS, etc.)
+//! use `strata-node receiver --relay-url <url>` instead.
 //!
 //! ## Usage
 //!
@@ -11,12 +14,8 @@
 //! # Monitor mode (log stats, discard output)
 //! strata-receiver --bind 0.0.0.0:5000,0.0.0.0:5002,0.0.0.0:5004
 //!
-//! # Write to file
+//! # Write MPEG-TS to file (pipe it yourself from there)
 //! strata-receiver --bind 0.0.0.0:5000,0.0.0.0:5002 --output stream.ts
-//!
-//! # Relay to RTMP (pipes to ffmpeg)
-//! strata-receiver --bind 0.0.0.0:5000,0.0.0.0:5002 \
-//!   --relay-url rtmp://a.rtmp.youtube.com/live2/KEY
 //!
 //! # Prometheus metrics
 //! strata-receiver --bind 0.0.0.0:5000 --metrics-port 9090
@@ -24,7 +23,6 @@
 
 use std::io::Write;
 use std::net::SocketAddr;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -49,7 +47,6 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(
         bind = ?args.bind_addrs,
         latency_ms = args.latency_ms,
-        relay = ?args.relay_url,
         output = ?args.output,
         metrics_port = ?args.metrics_port,
         "strata-receiver starting"
@@ -87,10 +84,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ── Output sink ─────────────────────────────────────────────
-    let mut sink: Box<dyn OutputSink> = match (&args.relay_url, &args.output) {
-        (Some(url), _) => Box::new(FfmpegRelay::start(url)?),
-        (None, Some(path)) => Box::new(FileSink::open(path)?),
-        (None, None) => Box::new(NullSink::new()),
+    let mut sink: Box<dyn OutputSink> = match &args.output {
+        Some(path) => Box::new(FileSink::open(path)?),
+        None => Box::new(NullSink::new()),
     };
 
     // ── Main receive loop ───────────────────────────────────────
@@ -141,7 +137,6 @@ fn main() -> anyhow::Result<()> {
 struct Args {
     bind_addrs: Vec<SocketAddr>,
     latency_ms: u64,
-    relay_url: Option<String>,
     output: Option<String>,
     metrics_port: Option<u16>,
 }
@@ -150,7 +145,6 @@ fn parse_args() -> anyhow::Result<Args> {
     let args: Vec<String> = std::env::args().collect();
     let mut bind_addrs = Vec::new();
     let mut latency_ms = 200u64;
-    let mut relay_url = None;
     let mut output = None;
     let mut metrics_port = None;
 
@@ -177,14 +171,6 @@ fn parse_args() -> anyhow::Result<Args> {
                 latency_ms = val
                     .parse()
                     .map_err(|e| anyhow::anyhow!("invalid latency '{}': {}", val, e))?;
-            }
-            "--relay-url" | "-r" => {
-                i += 1;
-                relay_url = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--relay-url requires a value"))?
-                        .clone(),
-                );
             }
             "--output" | "-o" => {
                 i += 1;
@@ -226,9 +212,6 @@ fn parse_args() -> anyhow::Result<Args> {
     if let Ok(val) = std::env::var("LATENCY_MS") {
         latency_ms = val.parse().unwrap_or(latency_ms);
     }
-    if relay_url.is_none() {
-        relay_url = std::env::var("RELAY_URL").ok().filter(|s| !s.is_empty());
-    }
     if metrics_port.is_none()
         && let Ok(val) = std::env::var("METRICS_PORT")
     {
@@ -244,7 +227,6 @@ fn parse_args() -> anyhow::Result<Args> {
     Ok(Args {
         bind_addrs,
         latency_ms,
-        relay_url,
         output,
         metrics_port,
     })
@@ -252,24 +234,25 @@ fn parse_args() -> anyhow::Result<Args> {
 
 fn print_help() {
     eprintln!(
-        r#"strata-receiver — Standalone bonded transport cloud receiver
+        r#"strata-receiver — Bonded transport diagnostic tool
+
+Receives and reassembles a bonded Strata stream at the transport layer.
+For production relay to RTMP/HLS use: strata-node receiver --relay-url <url>
 
 USAGE:
   strata-receiver --bind <ADDR[,ADDR...]> [OPTIONS]
 
 OPTIONS:
-  --bind, -b <addrs>      Comma-separated UDP bind addresses (required)
-                           e.g. 0.0.0.0:5000,0.0.0.0:5002,0.0.0.0:5004
-  --latency, -l <ms>      Jitter buffer latency in ms (default: 200)
-  --relay-url, -r <url>   RTMP/RTMPS URL to relay stream via ffmpeg
-  --output, -o <path>     Write recovered MPEG-TS to file
+  --bind, -b <addrs>        Comma-separated UDP bind addresses (required)
+                             e.g. 0.0.0.0:5000,0.0.0.0:5002,0.0.0.0:5004
+  --latency, -l <ms>        Jitter buffer latency in ms (default: 200)
+  --output, -o <path>       Write recovered MPEG-TS to file
   --metrics-port, -m <port> Prometheus metrics on 0.0.0.0:<port>/metrics
-  --help, -h              Show this help
+  --help, -h                Show this help
 
 ENVIRONMENT VARIABLES:
   BIND_ADDRS     Comma-separated bind addresses (fallback for --bind)
   LATENCY_MS     Jitter buffer latency (fallback for --latency)
-  RELAY_URL      RTMP relay URL (fallback for --relay-url)
   METRICS_PORT   Prometheus port (fallback for --metrics-port)
   RUST_LOG       Log level filter (e.g. info, debug, strata_bonding=trace)
 
@@ -277,11 +260,7 @@ EXAMPLES:
   # Monitor mode (logs stats, discards output)
   strata-receiver --bind 0.0.0.0:5000,0.0.0.0:5002,0.0.0.0:5004
 
-  # Relay to YouTube
-  strata-receiver --bind 0.0.0.0:5000,0.0.0.0:5002,0.0.0.0:5004 \
-    --relay-url "rtmp://a.rtmp.youtube.com/live2/STREAM_KEY"
-
-  # Record to file
+  # Capture to file
   strata-receiver --bind 0.0.0.0:5000 --output capture.ts
 
   # With Prometheus metrics
@@ -329,70 +308,6 @@ impl OutputSink for FileSink {
     fn write(&mut self, data: &[u8]) -> anyhow::Result<()> {
         self.file.write_all(data)?;
         Ok(())
-    }
-}
-
-/// Pipes MPEG-TS to ffmpeg for RTMP relay.
-struct FfmpegRelay {
-    child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
-}
-
-impl FfmpegRelay {
-    fn start(relay_url: &str) -> anyhow::Result<Self> {
-        tracing::info!(url = relay_url, "output: starting ffmpeg RTMP relay");
-
-        let mut child = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "warning",
-                // Input: raw MPEG-TS from stdin
-                "-f",
-                "mpegts",
-                "-i",
-                "pipe:0",
-                // Copy — no re-encoding
-                "-c",
-                "copy",
-                // Output: FLV over RTMP
-                "-f",
-                "flv",
-                relay_url,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("failed to start ffmpeg: {e} (is ffmpeg installed?)"))?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to open ffmpeg stdin"))?;
-
-        Ok(FfmpegRelay {
-            child,
-            stdin: Some(stdin),
-        })
-    }
-}
-
-impl OutputSink for FfmpegRelay {
-    fn write(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        if let Some(ref mut stdin) = self.stdin {
-            stdin.write_all(data)?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for FfmpegRelay {
-    fn drop(&mut self) {
-        // Close stdin first to signal EOF, then wait for ffmpeg to exit
-        drop(self.stdin.take());
-        let _ = self.child.wait();
-        tracing::info!("ffmpeg relay stopped");
     }
 }
 

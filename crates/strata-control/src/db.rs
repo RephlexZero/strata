@@ -64,6 +64,25 @@ pub async fn seed_dev_data(pool: &PgPool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // Dev receiver: enrollment token RCV1-TEST
+    let rcv_token_normalized = strata_common::ids::normalize_enrollment_token("RCV1-TEST");
+    let rcv_token_hash = strata_common::auth::hash_password(&rcv_token_normalized)?;
+
+    sqlx::query(
+        "INSERT INTO receivers (id, owner_id, name, bind_host, link_ports, max_streams, enrollment_token, enrolled) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING"
+    )
+    .bind("rcv_00000000-0000-0000-0000-000000000001")
+    .bind("usr_00000000-0000-0000-0000-000000000001")
+    .bind("Dev Receiver")
+    .bind("strata-receiver")
+    .bind(vec![5000i32, 5002, 5004])
+    .bind(6i32)
+    .bind(&rcv_token_hash)
+    .bind(false)
+    .execute(pool)
+    .await?;
+
     tracing::info!("dev seed data inserted (dev@strata.local / development)");
     Ok(())
 }

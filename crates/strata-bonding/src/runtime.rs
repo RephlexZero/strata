@@ -248,13 +248,30 @@ async fn runtime_worker_async(
     let mut last_fast_stats = Instant::now();
     let fast_stats_interval = Duration::from_millis(100);
 
+    let mut total_pkts_drained: u64 = 0;
+    let mut last_drain_log = Instant::now();
+
     loop {
         let mut did_work = false;
 
         // Drain all available packets from the lock-free ring buffer.
         while let Ok((data, profile)) = packet_rx.pop() {
-            let _ = scheduler.send(data, profile);
+            let result = scheduler.send(data, profile);
+            if let Err(ref e) = result {
+                tracing::warn!(target: "strata::runtime", error = %e, "scheduler.send() failed");
+            }
             did_work = true;
+            total_pkts_drained += 1;
+        }
+
+        // Periodic drain summary (every 2s)
+        if last_drain_log.elapsed() >= Duration::from_secs(2) {
+            tracing::debug!(
+                target: "strata::runtime",
+                total_pkts_drained,
+                "runtime: drain summary"
+            );
+            last_drain_log = Instant::now();
         }
 
         // Process control messages (non-blocking).

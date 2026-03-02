@@ -18,6 +18,8 @@ pub struct SenderStats {
     pub bytes_sent: u64,
     /// Packets acknowledged by receiver.
     pub packets_acked: u64,
+    /// Total payload bytes acknowledged by receiver (actual sizes, not estimates).
+    pub bytes_acked: u64,
     /// Retransmissions triggered by NACKs.
     pub retransmissions: u64,
     /// Packets that expired from the send buffer without ACK.

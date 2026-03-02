@@ -524,6 +524,14 @@ mod imp {
                                         .field(format!("link_{}_mtu", id), mtu)
                                         .field(format!("link_{}_iface", id), iface)
                                         .field(format!("link_{}_kind", id), link_kind);
+                                    if let Some(bw) = m.btlbw_bps {
+                                        msg_struct =
+                                            msg_struct.field(format!("link_{}_btlbw_bps", id), bw);
+                                    }
+                                    if let Some(rtp) = m.rtprop_ms {
+                                        msg_struct =
+                                            msg_struct.field(format!("link_{}_rtprop_ms", id), rtp);
+                                    }
                                 }
                                 let _ = element
                                     .post_message(gst::message::Element::new(msg_struct.build()));
@@ -587,8 +595,12 @@ mod imp {
             let data = bytes::Bytes::copy_from_slice(&map);
 
             let flags = buffer.flags();
-            let is_critical = !flags.contains(gst::BufferFlags::DELTA_UNIT)
-                || flags.contains(gst::BufferFlags::HEADER);
+            // Only stream headers (SPS/PPS/VPS, PAT/PMT) are truly critical
+            // and worth broadcasting to all links.  The DELTA_UNIT flag is
+            // unreliable for muxed streams — mpegtsmux never sets it, so
+            // `!DELTA_UNIT` was true for every buffer, causing ALL data to
+            // be broadcast to every link (nullifying EDPF differentiation).
+            let is_critical = flags.contains(gst::BufferFlags::HEADER);
             let can_drop = flags.contains(gst::BufferFlags::DROPPABLE);
 
             let profile = PacketProfile {
@@ -597,10 +609,22 @@ mod imp {
                 size_bytes: data.len(),
             };
 
+            tracing::debug!(
+                target: "strata::sink",
+                size = data.len(),
+                is_critical,
+                can_drop,
+                "render: buffer received"
+            );
+
             if let Some(rt) = lock_or_recover(&self.runtime).as_mut() {
                 match rt.try_send_packet(data, profile) {
                     Ok(_) => (),
                     Err(PacketSendError::Full) => {
+                        tracing::warn!(
+                            target: "strata::sink",
+                            "ring buffer FULL — dropping packet"
+                        );
                         if can_drop {
                             gst::warning!(gst::CAT_DEFAULT, "Congestion dropping expendable frame");
                         } else {
@@ -609,9 +633,18 @@ mod imp {
                         return Ok(gst::FlowSuccess::Ok);
                     }
                     Err(PacketSendError::Disconnected) => {
+                        tracing::error!(
+                            target: "strata::sink",
+                            "runtime disconnected!"
+                        );
                         return Err(gst::FlowError::Error);
                     }
                 }
+            } else {
+                tracing::warn!(
+                    target: "strata::sink",
+                    "render: runtime is None — data lost"
+                );
             }
 
             Ok(gst::FlowSuccess::Ok)

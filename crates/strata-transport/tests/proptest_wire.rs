@@ -121,6 +121,7 @@ proptest! {
         fragment in fragment_strategy(),
         is_keyframe in any::<bool>(),
         is_config in any::<bool>(),
+        is_ppd_probe in any::<bool>(),
     ) {
         let header = PacketHeader {
             version: PROTOCOL_VERSION,
@@ -128,6 +129,7 @@ proptest! {
             fragment,
             is_keyframe,
             is_config,
+            is_ppd_probe,
             payload_len,
             sequence: VarInt::from_u64(seq),
             timestamp_us: timestamp,
@@ -142,6 +144,7 @@ proptest! {
         prop_assert_eq!(decoded.fragment, fragment);
         prop_assert_eq!(decoded.is_keyframe, is_keyframe);
         prop_assert_eq!(decoded.is_config, is_config);
+        prop_assert_eq!(decoded.is_ppd_probe, is_ppd_probe);
         prop_assert_eq!(decoded.payload_len, payload_len);
         prop_assert_eq!(decoded.sequence.value(), seq);
         prop_assert_eq!(decoded.timestamp_us, timestamp);
@@ -177,6 +180,7 @@ proptest! {
         let ack = AckPacket {
             cumulative_seq: VarInt::from_u64(cumulative),
             sack_bitmap: bitmap,
+            total_received: VarInt::from_u64(cumulative + bitmap.count_ones() as u64),
         };
 
         let mut buf = BytesMut::new();
@@ -186,6 +190,7 @@ proptest! {
 
         prop_assert_eq!(decoded.cumulative_seq.value(), cumulative);
         prop_assert_eq!(decoded.sack_bitmap, bitmap);
+        prop_assert_eq!(decoded.total_received.value(), cumulative + bitmap.count_ones() as u64);
     }
 
     #[test]
@@ -196,6 +201,7 @@ proptest! {
         let ack = AckPacket {
             cumulative_seq: VarInt::from_u64(base),
             sack_bitmap: bitmap,
+            total_received: VarInt::from_u64(0),
         };
 
         let sacked: Vec<u64> = ack.sacked_sequences().collect();

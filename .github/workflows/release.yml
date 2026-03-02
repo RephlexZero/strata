@@ -62,7 +62,8 @@ jobs:
           cargo build --release \
             -p strata-gst \
             -p strata-control \
-            -p strata-agent
+            -p strata-sender \
+            -p strata-receiver
 
       - name: Package
         run: |
@@ -70,12 +71,14 @@ jobs:
           VERSION="${{ github.ref_name }}"
           cp target/release/libgststrata.so \
             "staging/strata-${VERSION}-x86_64-linux-gnu.so"
-          cp target/release/strata-node \
-            "staging/strata-node-${VERSION}-x86_64-linux-gnu" 2>/dev/null || true
+          cp target/release/strata-pipeline \
+            "staging/strata-pipeline-${VERSION}-x86_64-linux-gnu" 2>/dev/null || true
           cp target/release/strata-control \
             "staging/strata-control-${VERSION}-x86_64-linux-gnu" 2>/dev/null || true
-          cp target/release/strata-agent \
-            "staging/strata-agent-${VERSION}-x86_64-linux-gnu" 2>/dev/null || true
+          cp target/release/strata-sender \
+            "staging/strata-sender-${VERSION}-x86_64-linux-gnu" 2>/dev/null || true
+          cp target/release/strata-receiver \
+            "staging/strata-receiver-${VERSION}-x86_64-linux-gnu" 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:
@@ -118,10 +121,12 @@ jobs:
           VERSION="${{ github.ref_name }}"
           cp cross-output/libgststrata.so \
             "staging/strata-${VERSION}-aarch64-linux-gnu.so" 2>/dev/null || true
-          cp cross-output/strata-node \
-            "staging/strata-node-${VERSION}-aarch64-linux-gnu" 2>/dev/null || true
-          cp cross-output/strata-agent \
-            "staging/strata-agent-${VERSION}-aarch64-linux-gnu" 2>/dev/null || true
+          cp cross-output/strata-pipeline \
+            "staging/strata-pipeline-${VERSION}-aarch64-linux-gnu" 2>/dev/null || true
+          cp cross-output/strata-sender \
+            "staging/strata-sender-${VERSION}-aarch64-linux-gnu" 2>/dev/null || true
+          cp cross-output/strata-receiver \
+            "staging/strata-receiver-${VERSION}-aarch64-linux-gnu" 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:

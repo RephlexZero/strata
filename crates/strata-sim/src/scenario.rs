@@ -24,6 +24,79 @@ pub struct LinkScenarioConfig {
     pub delay_step_ms: u32,
     pub max_loss_percent: f32,
     pub loss_step_percent: f32,
+    /// Burst loss correlation (%).  Applied to every generated frame.
+    /// Set to 0.0 for independent (Bernoulli) loss.
+    pub loss_correlation: f32,
+}
+
+impl LinkScenarioConfig {
+    /// Typical urban LTE uplink scenario bounds.
+    ///
+    /// Rate 3–10 Mbps, 18–40ms one-way delay, up to 3% loss.
+    pub fn lte_urban() -> Self {
+        Self {
+            min_rate_kbit: 3_000,
+            max_rate_kbit: 10_000,
+            rate_step_kbit: 500,
+            base_delay_ms: 22,
+            delay_jitter_ms: 12,
+            delay_step_ms: 4,
+            max_loss_percent: 3.0,
+            loss_step_percent: 0.5,
+            loss_correlation: 25.0,
+        }
+    }
+
+    /// Poor / congested LTE uplink scenario bounds.
+    ///
+    /// Rate 500–4000 kbit, 25–70ms delay, up to 8% loss.
+    pub fn lte_poor() -> Self {
+        Self {
+            min_rate_kbit: 500,
+            max_rate_kbit: 4_000,
+            rate_step_kbit: 300,
+            base_delay_ms: 30,
+            delay_jitter_ms: 25,
+            delay_step_ms: 6,
+            max_loss_percent: 8.0,
+            loss_step_percent: 1.0,
+            loss_correlation: 30.0,
+        }
+    }
+
+    /// Good-signal LTE uplink scenario bounds.
+    ///
+    /// Rate 4–8 Mbps, 15–30ms delay, up to 1.5% loss.
+    pub fn lte_good() -> Self {
+        Self {
+            min_rate_kbit: 4_000,
+            max_rate_kbit: 8_000,
+            rate_step_kbit: 400,
+            base_delay_ms: 18,
+            delay_jitter_ms: 8,
+            delay_step_ms: 3,
+            max_loss_percent: 1.5,
+            loss_step_percent: 0.3,
+            loss_correlation: 15.0,
+        }
+    }
+
+    /// 5G NSA uplink scenario bounds.
+    ///
+    /// Rate 15–50 Mbps, 8–20ms delay, up to 1% loss.
+    pub fn fiveg_good() -> Self {
+        Self {
+            min_rate_kbit: 15_000,
+            max_rate_kbit: 50_000,
+            rate_step_kbit: 2_000,
+            base_delay_ms: 12,
+            delay_jitter_ms: 6,
+            delay_step_ms: 2,
+            max_loss_percent: 1.0,
+            loss_step_percent: 0.2,
+            loss_correlation: 10.0,
+        }
+    }
 }
 
 /// A single time-step of impairment values across all links.
@@ -110,7 +183,13 @@ impl Scenario {
                     rate_kbit: Some(state.rate_kbit.max(1.0) as u64),
                     delay_ms: Some(state.delay_ms.max(1.0) as u32),
                     jitter_ms,
+                    delay_distribution_normal: jitter_ms.is_some(),
                     loss_percent: Some(state.loss_percent as f32),
+                    loss_correlation: if link_cfg.loss_correlation > 0.0 {
+                        Some(link_cfg.loss_correlation)
+                    } else {
+                        None
+                    },
                     ..Default::default()
                 });
             }
@@ -150,6 +229,7 @@ mod tests {
                     delay_step_ms: 5,
                     max_loss_percent: 10.0,
                     loss_step_percent: 2.0,
+                    loss_correlation: 25.0,
                 },
                 LinkScenarioConfig {
                     min_rate_kbit: 800,
@@ -160,6 +240,7 @@ mod tests {
                     delay_step_ms: 4,
                     max_loss_percent: 5.0,
                     loss_step_percent: 1.0,
+                    loss_correlation: 15.0,
                 },
             ],
         };

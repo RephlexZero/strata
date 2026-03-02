@@ -1,8 +1,8 @@
 //! Pipeline manager — spawns and manages GStreamer sender pipelines.
 //!
-//! The agent spawns `strata-node` as a child process for clean isolation.
+//! The daemon spawns `strata-pipeline` as a child process for clean isolation.
 //!
-//! Stats are relayed from strata-node via UDP to 127.0.0.1:9100,
+//! Stats are relayed from strata-pipeline via UDP to 127.0.0.1:9100,
 //! where the telemetry module reads and forwards them to the control plane.
 //!
 //! Hot-swap source switching is supported via a Unix domain socket at
@@ -115,8 +115,8 @@ impl PipelineManager {
             "starting pipeline"
         );
 
-        // Spawn strata-node
-        let child = spawn_strata_node(&payload)?;
+        // Spawn strata-pipeline
+        let child = spawn_pipeline(&payload)?;
         self.child = Some(child);
         self.stream_id = Some(payload.stream_id);
         self.started_at = Some(Instant::now());
@@ -282,10 +282,11 @@ impl PipelineManager {
     }
 }
 
-/// Spawn the `strata-node` binary as a child process.
-fn spawn_strata_node(payload: &StreamStartPayload) -> anyhow::Result<Child> {
-    let node_bin = std::env::var("STRATA_NODE_BIN").unwrap_or_else(|_| "strata-node".to_string());
-    let mut cmd = std::process::Command::new(&node_bin);
+/// Spawn the `strata-pipeline` binary as a child process.
+fn spawn_pipeline(payload: &StreamStartPayload) -> anyhow::Result<Child> {
+    let bin =
+        std::env::var("STRATA_PIPELINE_BIN").unwrap_or_else(|_| "strata-pipeline".to_string());
+    let mut cmd = std::process::Command::new(&bin);
     cmd.arg("sender");
 
     // Source flags
@@ -352,13 +353,6 @@ fn spawn_strata_node(payload: &StreamStartPayload) -> anyhow::Result<Child> {
     if !payload.destinations.is_empty() {
         let dest_str = payload.destinations.join(",");
         cmd.arg("--dest").arg(&dest_str);
-    }
-
-    // RTMP relay URL — sender tees encoded output to RTMP in parallel
-    if let Some(ref relay) = payload.relay_url
-        && !relay.is_empty()
-    {
-        cmd.arg("--relay-url").arg(relay);
     }
 
     // Write bonding config to temp file if non-empty

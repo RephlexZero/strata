@@ -7,7 +7,8 @@ members = [
     "crates/strata-sim",
     "crates/strata-common",
     "crates/strata-control",
-    "crates/strata-agent",
+    "crates/strata-sender",
+    "crates/strata-receiver",
     "crates/strata-dashboard",
     "crates/strata-portal",
 ]

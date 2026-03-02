@@ -10,4 +10,5 @@ if command -v modprobe >/dev/null 2>&1; then
     sudo modprobe br_netfilter 2>/dev/null || true
     sudo modprobe overlay      2>/dev/null || true
     sudo modprobe sch_netem    2>/dev/null || true
+    sudo modprobe sch_tbf      2>/dev/null || true
 fi

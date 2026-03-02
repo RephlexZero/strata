@@ -166,7 +166,7 @@ impl Default for LinkLifecycleConfig {
 
 /// Resolved scheduler tuning parameters.
 ///
-/// Controls DWRR credit computation, redundancy, failover, congestion
+/// Controls EDPF scheduling, redundancy, failover, congestion
 /// feedback, and EWMA smoothing across the bonding scheduler.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
@@ -189,6 +189,14 @@ pub struct SchedulerConfig {
     pub max_latency_ms: u64,
     pub stats_interval_ms: u64,
     pub channel_capacity: usize,
+    /// Interval between saturation probes for each link (seconds).
+    /// With 3 links and 20s interval, one probe fires every ~7s system-wide.
+    pub saturation_probe_interval_s: f64,
+    /// Duration of each saturation probe in seconds.
+    pub saturation_probe_duration_s: f64,
+    /// Interval between PPD (Packet-Pair Dispersion) probe pairs per link (seconds).
+    /// PPD provides continuous capacity samples between saturation probes.
+    pub ppd_probe_interval_s: f64,
 }
 
 impl Default for SchedulerConfig {
@@ -213,6 +221,9 @@ impl Default for SchedulerConfig {
             max_latency_ms: 500,
             stats_interval_ms: 1000,
             channel_capacity: 1000,
+            saturation_probe_interval_s: 10.0,
+            saturation_probe_duration_s: 0.4,
+            ppd_probe_interval_s: 2.0,
         }
     }
 }
@@ -336,6 +347,9 @@ impl SchedulerConfigInput {
                 .channel_capacity
                 .unwrap_or(defaults.channel_capacity)
                 .max(16),
+            saturation_probe_interval_s: defaults.saturation_probe_interval_s,
+            saturation_probe_duration_s: defaults.saturation_probe_duration_s,
+            ppd_probe_interval_s: defaults.ppd_probe_interval_s,
         }
     }
 }

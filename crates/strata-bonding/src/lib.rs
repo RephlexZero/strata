@@ -5,7 +5,7 @@
 //! GStreamer plugin (`strata-gst`) and the integration node binary.
 //!
 //! Key components:
-//! - [`scheduler`] — Deficit Weighted Round Robin (DWRR) packet scheduler
+//! - [`scheduler`] — EDPF (Earliest Delivery Path First) packet scheduler
 //!   with adaptive redundancy and fast-failover
 //! - [`net`] — Network link abstraction and lifecycle state machine
 //! - [`receiver`] — Bonding receiver with jitter-buffer reassembly

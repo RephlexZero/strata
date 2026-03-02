@@ -96,7 +96,7 @@ pub fn render_prometheus(links: &HashMap<usize, LinkMetrics>) -> String {
 
     writeln!(
         out,
-        "# HELP strata_link_queue_depth Current packets in DWRR queue."
+        "# HELP strata_link_queue_depth Current packets in send queue."
     )
     .unwrap();
     writeln!(out, "# TYPE strata_link_queue_depth gauge").unwrap();
@@ -444,22 +444,31 @@ pub fn to_telemetry_json(links: &HashMap<usize, LinkMetrics>) -> String {
                 Some(false) => 0,
                 None => -1,
             };
-            serde_json::json!({
-                "id": id,
-                "rtt_us": (m.rtt_ms * 1000.0) as u64,
-                "loss_rate": m.loss_rate,
-                "capacity_bps": m.capacity_bps.round() as u64,
-                "sent_bytes": m.observed_bytes,
-                "observed_bps": m.observed_bps.round() as u64,
-                "interface": m.iface.as_deref().unwrap_or("unknown"),
-                "alive": m.alive,
-                "phase": m.phase.as_str(),
-                "os_up": os_up,
-                "link_kind": m.link_kind.as_deref().unwrap_or(""),
-                "packets_acked": m.transport.as_ref().map(|t| t.packets_acked).unwrap_or(0),
-                "retransmissions": m.transport.as_ref().map(|t| t.retransmissions).unwrap_or(0),
-                "fec_repairs_sent": m.transport.as_ref().map(|t| t.fec_repairs_sent).unwrap_or(0),
-            })
+            {
+                let mut obj = serde_json::json!({
+                    "id": id,
+                    "rtt_us": (m.rtt_ms * 1000.0) as u64,
+                    "loss_rate": m.loss_rate,
+                    "capacity_bps": m.capacity_bps.round() as u64,
+                    "sent_bytes": m.observed_bytes,
+                    "observed_bps": m.observed_bps.round() as u64,
+                    "interface": m.iface.as_deref().unwrap_or("unknown"),
+                    "alive": m.alive,
+                    "phase": m.phase.as_str(),
+                    "os_up": os_up,
+                    "link_kind": m.link_kind.as_deref().unwrap_or(""),
+                    "packets_acked": m.transport.as_ref().map(|t| t.packets_acked).unwrap_or(0),
+                    "retransmissions": m.transport.as_ref().map(|t| t.retransmissions).unwrap_or(0),
+                    "fec_repairs_sent": m.transport.as_ref().map(|t| t.fec_repairs_sent).unwrap_or(0),
+                });
+                if let Some(bw) = m.btlbw_bps {
+                    obj["btlbw_bps"] = serde_json::json!(bw.round() as u64);
+                }
+                if let Some(rtp) = m.rtprop_ms {
+                    obj["rtprop_ms"] = serde_json::json!(rtp);
+                }
+                obj
+            }
         })
         .collect();
     arr.sort_by_key(|v| v.get("id").and_then(|v| v.as_u64()).unwrap_or(0));
@@ -742,8 +751,12 @@ mod tests {
                     fec_repairs_sent: 200,
                     packets_expired: 3,
                 }),
+                ack_delivery_bps: 0.0,
+                ack_bytes: 0,
                 estimated_capacity_bps: 0.0,
                 owd_ms: 0.0,
+                btlbw_bps: None,
+                rtprop_ms: None,
                 receiver_report: None,
             },
         );
@@ -770,8 +783,12 @@ mod tests {
                     fec_repairs_sent: 120,
                     packets_expired: 5,
                 }),
+                ack_delivery_bps: 0.0,
+                ack_bytes: 0,
                 estimated_capacity_bps: 0.0,
                 owd_ms: 0.0,
+                btlbw_bps: None,
+                rtprop_ms: None,
                 receiver_report: None,
             },
         );

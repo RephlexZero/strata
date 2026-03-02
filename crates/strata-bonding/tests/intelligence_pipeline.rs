@@ -42,6 +42,10 @@ impl MockLink {
                 iface: None,
                 link_kind: None,
                 transport: None,
+                btlbw_bps: None,
+                rtprop_ms: None,
+                ack_delivery_bps: 0.0,
+                ack_bytes: 0,
                 estimated_capacity_bps: 0.0,
                 owd_ms: 0.0,
                 receiver_report: None,
@@ -381,10 +385,17 @@ fn scheduler_distributes_across_heterogeneous_links() {
     scheduler.add_link(l3.clone());
     scheduler.refresh_metrics();
 
-    // Send 200 droppable packets
-    for _ in 0..200 {
-        let payload = Bytes::from(vec![0u8; 1000]);
-        scheduler.send(payload, default_profile(1000)).unwrap();
+    // Send packets in batches with brief pauses between batches so that
+    // EDPF routing distributes proportionally via predicted arrival times.
+    // Without this, a tight loop gives negligible time-delta, making
+    // credit differentiation impossible.
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(1));
+        scheduler.refresh_metrics();
+        for _ in 0..10 {
+            let payload = Bytes::from(vec![0u8; 1000]);
+            scheduler.send(payload, default_profile(1000)).unwrap();
+        }
     }
 
     let c1 = l1.packet_count();
@@ -394,13 +405,11 @@ fn scheduler_distributes_across_heterogeneous_links() {
     // All links should receive some traffic
     assert!(c1 > 0, "fastest link should get traffic");
     assert!(c3 > 0, "medium link should get traffic");
-    // Link 2 has much higher RTT — intelligence may reduce its share
-    // but it should still participate
     assert!(
         c1 + c2 + c3 == 200,
         "all packets should be delivered: {c1} + {c2} + {c3}"
     );
-    // Fastest link should get the most traffic
+    // Fastest link (20 Mbps) should get more traffic than slowest (5 Mbps)
     assert!(
         c1 >= c2,
         "fastest link should get >= slow link: l1={c1}, l2={c2}"

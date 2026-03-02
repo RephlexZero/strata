@@ -150,7 +150,7 @@ fn three_links_heterogeneous_rtt_prefers_low_latency() {
 // ─── Test 2: Capacity-weighted distribution ──────────────────────────────
 
 /// With three links of different capacities (10Mbps, 5Mbps, 1Mbps),
-/// the DWRR scheduler should distribute traffic roughly proportional
+/// the EDPF scheduler should distribute traffic roughly proportional
 /// to capacity (the high-cap link should get significantly more).
 #[test]
 fn three_links_capacity_weighted_distribution() {

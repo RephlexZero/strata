@@ -1,11 +1,15 @@
 [package]
 name = "strata-bonding"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 
 [[bin]]
-name = "strata-receiver"
-path = "src/bin/strata_receiver.rs"
+name = "strata-probe"
+path = "src/bin/strata_probe.rs"
+
+[features]
+default = []
+bursty_diag = []
 
 [dependencies]
 tracing = { workspace = true }

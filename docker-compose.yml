@@ -7,12 +7,12 @@
 #   # Terminal 1 — control plane:
 #   cargo watch -x 'run -p strata-control'
 #
-#   # Terminal 2 — sender agent:
-#   cargo watch -x 'run -p strata-agent -- --control-url ws://localhost:3000/agent/ws --enrollment-token DEV1-TEST --hostname sim-sender-01'
+#   # Terminal 2 — sender daemon:
+#   cargo watch -x 'run -p strata-sender -- --control-url ws://localhost:3000/agent/ws --enrollment-token DEV1-TEST --hostname sim-sender-01'
 #
-# ── Full Docker stack (no cargo needed) ────────────────────────────
+# ── Full Docker stack (no cargo needed) ────────────────────────────────────────
 #
-#   cargo build -p strata-gst -p strata-agent -p strata-control
+#   cargo build -p strata-gst -p strata-sender -p strata-control
 #   docker compose up -d
 #
 # Dashboard:  http://localhost:3000
@@ -71,14 +71,14 @@ services:
 
   # ── Sender Agent (real GStreamer pipeline) ───────────────────
   #
-  # Runs the strata-agent daemon.  The sender is attached to three
+  # Runs the strata-sender daemon.  The sender is attached to three
   # isolated Docker networks (link0, link1, link2) which give it
   # three genuine eth interfaces.  The entrypoint script applies
   # tc netem impairments modelled after realistic LTE/5G cellular
-  # links before handing off to the agent binary.
+  # links before handing off to the sender daemon.
   #
-  # When a stream is started from the dashboard, the agent spawns
-  # integration_node which builds a real GStreamer pipeline:
+  # When a stream is started from the dashboard, the daemon spawns
+  # strata-pipeline sender which builds a real GStreamer pipeline:
   # videotestsrc → x264enc → mpegtsmux → stratasink
   # sending over bonded transport links to the receiver.
   strata-sender-sim:
@@ -95,13 +95,15 @@ services:
     devices:
       - /dev/dri:/dev/dri
     environment:
-      RUST_LOG: "info,strata_agent=debug"
+      RUST_LOG: "info,strata_sender=debug"
       GST_PLUGIN_PATH: "/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
       # Per-link tc netem impairment config (override to tune)
-      # Format: RATE_KBIT DELAY_MS JITTER_MS LOSS_PERCENT
-      LINK0_IMPAIRMENT: "8000 40 10 1.0"
-      LINK1_IMPAIRMENT: "5000 60 15 2.0"
-      LINK2_IMPAIRMENT: "6000 35 8 0.5"
+      # Format: RATE_KBIT DELAY_MS JITTER_MS LOSS_PERCENT LOSS_CORR_PERCENT
+      # Profiles: LTE urban / LTE poor / LTE good
+      # Half-RTT used (netem applies per-direction); full RTT = 2× delay.
+      LINK0_IMPAIRMENT: "8000 22 8 0.5 25"
+      LINK1_IMPAIRMENT: "5000 30 15 2.0 30"
+      LINK2_IMPAIRMENT: "6000 18 5 0.3 15"
     entrypoint: ["/usr/local/bin/entrypoint-sender.sh"]
     command:
       - "--control-url"
@@ -124,47 +126,41 @@ services:
       default: {}   # management — control plane access (no impairment)
     restart: unless-stopped
 
-  # ── Receiver (bonded transport → RTMP relay) ─────────────────────
+  # ── Receiver Daemon (managed receiver → spawns pipelines) ──────────
   #
-  # Receives the bonded transport stream on UDP ports via stratasrc,
-  # reassembles it, and relays to an RTMP destination.
-  # Attached to same link networks as the sender so traffic flows
-  # across the impaired paths.
+  # Runs the strata-receiver daemon which connects to the control plane,
+  # registers capacity, and spawns strata-pipeline receiver processes
+  # on command. Attached to same link networks as the sender so traffic
+  # flows across the impaired paths.
   #
-  # Set RELAY_URL to enable the relay:
+  # Set RELAY_URL to have the control plane pass it to receiver pipelines:
   #   RELAY_URL="rtmp://a.rtmp.youtube.com/live2/YOUR_KEY" docker compose up -d
   #
-  # Without RELAY_URL the receiver runs in monitor mode (logs packets).
+  # Without RELAY_URL the receiver pipelines run in monitor mode.
   strata-receiver:
     build:
       context: .
       dockerfile: dev/Dockerfile.agent
+    depends_on:
+      - strata-control
     environment:
-      RUST_LOG: "info"
+      RUST_LOG: "info,strata_receiver=debug"
       GST_PLUGIN_PATH: "/usr/lib/x86_64-linux-gnu/gstreamer-1.0"
-      RELAY_URL: "${RELAY_URL:-}"
-      STRATA_CODEC: "${STRATA_CODEC:-h265}"
-      STRATA_LINK_COUNT: "3"
-    entrypoint: ["/bin/sh", "-c"]
+      BIND_HOST: "strata-receiver"
+    entrypoint: ["strata-receiver"]
     command:
-      - |
-        # Build bind URL from STRATA_LINK_COUNT (default 3)
-        COUNT=$${STRATA_LINK_COUNT:-3}
-        BIND=""
-        for i in $$(seq 0 $$((COUNT - 1))); do
-          PORT=$$((5000 + i * 2))
-          if [ -n "$$BIND" ]; then BIND="$$BIND,"; fi
-          BIND="$${BIND}0.0.0.0:$$PORT"
-        done
-        echo "=== Receiver: binding $$BIND (codec=$$STRATA_CODEC) ==="
-        ARGS="--bind $$BIND --codec $${STRATA_CODEC:-h265}"
-        if [ -n "$$RELAY_URL" ]; then
-          echo "=== Receiver: relay → $$RELAY_URL ==="
-          ARGS="$$ARGS --relay-url $$RELAY_URL"
-        else
-          echo "=== Receiver: monitor mode (set RELAY_URL to relay) ==="
-        fi
-        exec strata-node receiver $$ARGS
+      - "--control-url"
+      - "ws://strata-control:3000/receiver/ws"
+      - "--enrollment-token"
+      - "RCV1-TEST"
+      - "--bind-host"
+      - "strata-receiver"
+      - "--link-ports"
+      - "5000,5002,5004"
+      - "--max-streams"
+      - "6"
+      - "--heartbeat-interval"
+      - "5"
     ports:
       - "5000:5000/udp"
       - "5002:5002/udp"

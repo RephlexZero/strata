@@ -1,12 +1,12 @@
 [package]
-name = "strata-agent"
-version = "0.1.1"
+name = "strata-sender"
+version = "0.2.0"
 edition = "2024"
-description = "Strata sender agent — field device daemon with WSS control, hardware scanning, pipeline management"
+description = "Strata sender daemon — field device daemon with WSS control, hardware scanning, pipeline management"
 publish = false
 
 [[bin]]
-name = "strata-agent"
+name = "strata-sender"
 path = "src/main.rs"
 
 [dependencies]
