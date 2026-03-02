@@ -182,7 +182,8 @@ jobs:
           cargo build --release \
             -p strata-gst \
             -p strata-control \
-            -p strata-agent
+            -p strata-sender \
+            -p strata-receiver
 
       - name: Set up Docker Buildx
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -207,17 +208,20 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/libgststrata.so dist/ 2>/dev/null || true
-          cp target/release/strata-node dist/ 2>/dev/null || true
+          cp target/release/strata-pipeline dist/ 2>/dev/null || true
           cp target/release/strata-control dist/ 2>/dev/null || true
-          cp target/release/strata-agent dist/ 2>/dev/null || true
+          cp target/release/strata-sender dist/ 2>/dev/null || true
+          cp target/release/strata-receiver dist/ 2>/dev/null || true
 
       - name: Prepare artifacts (cross)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           mkdir -p dist
           cp cross-output/libgststrata.so dist/ 2>/dev/null || true
-          cp cross-output/strata-node dist/ 2>/dev/null || true
-          cp cross-output/strata-agent dist/ 2>/dev/null || true
+          cp cross-output/strata-pipeline dist/ 2>/dev/null || true
+          cp cross-output/strata-control dist/ 2>/dev/null || true
+          cp cross-output/strata-sender dist/ 2>/dev/null || true
+          cp cross-output/strata-receiver dist/ 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:
