@@ -32,6 +32,11 @@ pub fn destination_id() -> String {
     prefixed_id("dst")
 }
 
+/// Generate a receiver ID: `rcv_<uuid7>`
+pub fn receiver_id() -> String {
+    prefixed_id("rcv")
+}
+
 /// Generate a short, human-readable enrollment token: `XXXX-XXXX`.
 ///
 /// Uses an unambiguous character set (no 0/O, 1/I/l confusion).

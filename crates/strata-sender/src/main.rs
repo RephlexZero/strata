@@ -1,4 +1,4 @@
-//! Strata Sender Agent
+//! Strata Sender Daemon
 //!
 //! Lightweight daemon running on each field sender device.
 //!
@@ -24,9 +24,9 @@ use clap::Parser;
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 
-/// Strata sender agent daemon.
+/// Strata sender daemon.
 #[derive(Parser, Debug)]
-#[command(name = "strata-agent", about = "Strata field sender agent")]
+#[command(name = "strata-sender", about = "Strata field sender daemon")]
 struct Cli {
     /// Control plane WebSocket URL.
     #[arg(long, default_value = "ws://localhost:3000/agent/ws")]
@@ -90,12 +90,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let hostname = cli
         .hostname
-        .unwrap_or_else(|| gethostname().unwrap_or_else(|| "strata-agent".into()));
+        .unwrap_or_else(|| gethostname().unwrap_or_else(|| "strata-sender".into()));
 
     tracing::info!(
         hostname = %hostname,
         control_url = %cli.control_url,
-        "strata-agent starting"
+        "strata-sender starting"
     );
 
     // Shutdown signal
@@ -189,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    tracing::info!("strata-agent stopped");
+    tracing::info!("strata-sender stopped");
     Ok(())
 }
 

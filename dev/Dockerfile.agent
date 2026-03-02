@@ -112,7 +112,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     cargo build --release -p strata-gst
 
-# ── Stage 3: Build strata-agent ──────────────────────────────
+# ── Stage 3: Build strata-sender + strata-receiver ───────────
 FROM rust:bookworm AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -127,12 +127,13 @@ WORKDIR /src
 # Write a minimal workspace manifest (avoids needing GStreamer deps)
 COPY Cargo.lock ./
 COPY crates/strata-common/Cargo.toml crates/strata-common/Cargo.toml
-COPY crates/strata-agent/Cargo.toml crates/strata-agent/Cargo.toml
+COPY crates/strata-sender/Cargo.toml crates/strata-sender/Cargo.toml
+COPY crates/strata-receiver/Cargo.toml crates/strata-receiver/Cargo.toml
 
 RUN cat > Cargo.toml <<'TOML'
 [workspace]
 resolver = "2"
-members = ["crates/strata-common", "crates/strata-agent"]
+members = ["crates/strata-common", "crates/strata-sender", "crates/strata-receiver"]
 
 [workspace.dependencies]
 tracing = "0.1.44"
@@ -145,22 +146,24 @@ TOML
 
 # Stub out sources for dep caching
 RUN mkdir -p crates/strata-common/src && echo "" > crates/strata-common/src/lib.rs && \
-    mkdir -p crates/strata-agent/src && echo "fn main() {}" > crates/strata-agent/src/main.rs
+    mkdir -p crates/strata-sender/src && echo "fn main() {}" > crates/strata-sender/src/main.rs && \
+    mkdir -p crates/strata-receiver/src && echo "fn main() {}" > crates/strata-receiver/src/main.rs
 
 # Pre-build deps
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git/db \
-    cargo build --release -p strata-agent 2>/dev/null || true
+    cargo build --release -p strata-sender -p strata-receiver 2>/dev/null || true
 
 # Copy real source
 COPY crates/strata-common/src crates/strata-common/src
-COPY crates/strata-agent/src crates/strata-agent/src
+COPY crates/strata-sender/src crates/strata-sender/src
+COPY crates/strata-receiver/src crates/strata-receiver/src
 
 # Build for real
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git/db \
-    touch crates/strata-common/src/lib.rs crates/strata-agent/src/main.rs && \
-    cargo build --release -p strata-agent
+    touch crates/strata-common/src/lib.rs crates/strata-sender/src/main.rs crates/strata-receiver/src/main.rs && \
+    cargo build --release -p strata-sender -p strata-receiver
 
 # ── Stage 4: Runtime ────────────────────────────────────────
 # Debian sid ships GStreamer 1.28 — includes eflvmux (Enhanced FLV) for H.265 RTMP.
@@ -200,11 +203,14 @@ RUN mkdir -p /opt/strata/test-media && \
     "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/1080/Big_Buck_Bunny_1080_10s_30MB.mp4" || \
     echo "Warning: failed to download sample video, dev file source will not work"
 
-# Agent binary
-COPY --from=builder /src/target/release/strata-agent /usr/local/bin/strata-agent
+# Sender daemon binary
+COPY --from=builder /src/target/release/strata-sender /usr/local/bin/strata-sender
+
+# Receiver daemon binary
+COPY --from=builder /src/target/release/strata-receiver /usr/local/bin/strata-receiver
 
 # Pipeline binary + GStreamer bonding plugin
-COPY --from=pipeline /src/target/release/strata-node /usr/local/bin/strata-node
+COPY --from=pipeline /src/target/release/strata-pipeline /usr/local/bin/strata-pipeline
 COPY --from=pipeline /src/target/release/libgststrata.so /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgststrata.so
 
 # Entrypoint script (applies tc netem impairments before starting agent)
@@ -218,4 +224,4 @@ ENV GST_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/gstreamer-1.0
 
 EXPOSE 3001
 
-ENTRYPOINT ["strata-agent"]
+ENTRYPOINT ["strata-sender"]

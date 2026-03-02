@@ -7,7 +7,7 @@ use strata_bonding::metrics::MetricsServer;
 use gststrata::hls_upload;
 
 const SENDER_HELP: &str = r#"
-USAGE: strata-node sender [OPTIONS] --dest <ADDR[,ADDR...]>
+USAGE: strata-pipeline sender [OPTIONS] --dest <ADDR[,ADDR...]>
 
 OPTIONS:
   --dest <addrs>      Comma-separated destination addresses (required)
@@ -48,21 +48,21 @@ SOURCE HOT-SWAP:
 
 EXAMPLES:
   # Test pattern over two cellular links
-  strata-node sender --dest server:5000,server:5002 \
+  strata-pipeline sender --dest server:5000,server:5002 \
     --config sender.toml
 
   # 1080p30 with audio for YouTube relay via receiver
-  strata-node sender --source test --framerate 30 --audio --bitrate 2000 \
+  strata-pipeline sender --source test --framerate 30 --audio --bitrate 2000 \
     --dest receiver:5000,receiver:5002,receiver:5004
 
   # HDMI capture card to cloud receiver
-  strata-node sender --source v4l2 --device /dev/video0 \
+  strata-pipeline sender --source v4l2 --device /dev/video0 \
     --dest cloud.example.com:5000,cloud.example.com:5002 \
     --bitrate 2000 --config sender.toml
 "#;
 
 const RECEIVER_HELP: &str = r#"
-USAGE: strata-node receiver [OPTIONS] --bind <ADDR>
+USAGE: strata-pipeline receiver [OPTIONS] --bind <ADDR>
 
 OPTIONS:
   --bind <addr>       Bind address (required), e.g. 0.0.0.0:5000
@@ -83,21 +83,21 @@ OPTIONS:
 
 EXAMPLES:
   # Receive and monitor (no file output)
-  strata-node receiver --bind 0.0.0.0:5000
+  strata-pipeline receiver --bind 0.0.0.0:5000
 
   # Receive bonded stream and relay to YouTube
-  strata-node receiver --bind 0.0.0.0:5000,0.0.0.0:5002,0.0.0.0:5004 \
+  strata-pipeline receiver --bind 0.0.0.0:5000,0.0.0.0:5002,0.0.0.0:5004 \
     --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
 
   # Receive H.265 stream and relay
-  strata-node receiver --bind 0.0.0.0:5000 --codec h265 \
+  strata-pipeline receiver --bind 0.0.0.0:5000 --codec h265 \
     --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
 
   # Receive and record to MPEG-TS file
-  strata-node receiver --bind 0.0.0.0:5000 --output capture.ts
+  strata-pipeline receiver --bind 0.0.0.0:5000 --output capture.ts
 
   # Receive with config
-  strata-node receiver --bind 0.0.0.0:5000 --config receiver.toml
+  strata-pipeline receiver --bind 0.0.0.0:5000 --config receiver.toml
 "#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -120,13 +120,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "sender" => run_sender(&args[2..]),
         "receiver" => run_receiver(&args[2..]),
         "--help" | "-h" | "help" => {
-            eprintln!("Usage: {} <sender|receiver> [args]\n", args[0]);
+            eprintln!("Usage: strata-pipeline <sender|receiver> [args]\n");
             eprintln!("Modes:");
             eprintln!("  sender    Encode and transmit video over bonded Strata links");
             eprintln!("  receiver  Receive and reassemble bonded Strata stream\n");
             eprintln!(
-                "Run `{} sender --help` or `{} receiver --help` for mode-specific options.",
-                args[0], args[0]
+                "Run `strata-pipeline sender --help` or `strata-pipeline receiver --help` for mode-specific options."
             );
             Ok(())
         }
@@ -1364,6 +1363,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let codec_type = gststrata::codec::CodecType::from_str_loose(codec_str)
         .unwrap_or(gststrata::codec::CodecType::H264);
     let video_parser = codec_type.parser_factory();
+    let relay_parser = codec_type.relay_parser_fragment();
 
     // Pipeline construction:
     //
@@ -1423,7 +1423,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
              hlssink2 name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
              target-duration=2 max-files=10 send-keyframe-requests=true",
             bind = bind_str,
-            parser = video_parser,
+            parser = relay_parser,
             seg = seg_location.display(),
             pl = pl_location.display(),
         )
@@ -1437,7 +1437,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
              rtmpsink location=\"{url}\" sync=false \
              d. ! queue ! aacparse ! fmux.",
             bind = bind_str,
-            parser = video_parser,
+            parser = relay_parser,
             relay = relay_frag,
             url = relay_url
         )

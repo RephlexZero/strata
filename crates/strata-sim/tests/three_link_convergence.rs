@@ -29,7 +29,7 @@ use strata_sim::topology::Namespace;
 
 /// Locate (or build) the dummy_node binary.
 fn dummy_node_binary() -> PathBuf {
-    if let Ok(p) = std::env::var("STRATA_NODE_BIN") {
+    if let Ok(p) = std::env::var("STRATA_PIPELINE_BIN") {
         let path = PathBuf::from(p);
         if path.exists() {
             return path;

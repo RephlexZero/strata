@@ -9,7 +9,7 @@ COMPOSE = docker compose -f ../docker-compose.yml
 
 # Build all Rust binaries + plugin locally
 build:
-	cargo build -p strata-gst -p strata-agent -p strata-control
+	cargo build -p strata-gst -p strata-sender -p strata-control
 
 # Start Postgres + receiver (containers that don't change often)
 infra:

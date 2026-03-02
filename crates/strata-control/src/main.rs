@@ -14,7 +14,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
-use strata_control::{api, db, state, ws_agent, ws_dashboard};
+use strata_control::{api, db, state, ws_agent, ws_dashboard, ws_receiver};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -64,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         .nest("/api", api::router())
         .route("/metrics", axum::routing::get(api::metrics::handler))
         .route("/agent/ws", axum::routing::get(ws_agent::handler))
+        .route("/receiver/ws", axum::routing::get(ws_receiver::handler))
         .route("/ws", axum::routing::get(ws_dashboard::handler))
         .fallback_service(dashboard_service)
         .layer(TraceLayer::new_for_http())

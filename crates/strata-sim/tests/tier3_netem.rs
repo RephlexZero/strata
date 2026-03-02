@@ -30,9 +30,9 @@ use strata_sim::topology::Namespace;
 
 // ─── Shared test harness ────────────────────────────────────────────
 
-/// Ensure the strata-node binary is built and return its path.
+/// Ensure the strata-pipeline binary is built and return its path.
 fn strata_node_binary() -> PathBuf {
-    if let Ok(p) = std::env::var("STRATA_NODE_BIN") {
+    if let Ok(p) = std::env::var("STRATA_PIPELINE_BIN") {
         let path = PathBuf::from(p);
         if path.exists() {
             return path;

@@ -131,15 +131,10 @@ async fn start_stream(
 
     // Build stream.start command and send to agent.
     //
-    // Strata destinations are built dynamically based on the sender's
-    // currently enabled network interfaces.  Each link targets the
-    // receiver's IP on the matching subnet so traffic flows over
-    // physically separate paths.
-    //
-    // RECEIVER_LINKS env var provides the list of receiver endpoints
-    // (one per network link), e.g. "172.30.0.20:5000,172.30.1.20:5002,..."
-    // Falls back to RECEIVER_HOST with 3 hardcoded ports for single-network setups.
-    let receiver_links = build_receiver_links();
+    // Try to pick a receiver from the DB (capacity-aware assignment).
+    // Falls back to RECEIVER_LINKS / RECEIVER_HOST env vars for
+    // backwards compatibility with manual deployments.
+    let (receiver_id_opt, receiver_links) = pick_receiver_links(&state, &user.user_id).await;
     let enabled_count = state
         .device_status()
         .get(&sender_id)
@@ -257,19 +252,45 @@ async fn start_stream(
     });
     let config_json_final = serde_json::to_string(&full_config).ok();
 
-    // Insert stream row into DB
+    // Insert stream row into DB (with receiver_id if assigned)
     sqlx::query(
-        "INSERT INTO streams (id, sender_id, destination_id, state, started_at, config_json) \
-         VALUES ($1, $2, $3, 'starting', $4, $5)",
+        "INSERT INTO streams (id, sender_id, destination_id, receiver_id, state, started_at, config_json) \
+         VALUES ($1, $2, $3, $4, 'starting', $5, $6)",
     )
     .bind(&stream_id)
     .bind(&sender_id)
     .bind(body.destination_id.as_deref().filter(|s| !s.is_empty()))
+    .bind(&receiver_id_opt)
     .bind(Utc::now())
     .bind(&config_json_final)
     .execute(state.pool())
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // If we picked a managed receiver, send it a receiver.stream.start command
+    if let Some(ref rcv_id) = receiver_id_opt {
+        if let Some(rcv_handle) = state.receivers().get(rcv_id) {
+            let rcv_payload = strata_common::protocol::ReceiverStreamStartPayload {
+                stream_id: stream_id.clone(),
+                bind_ports: receiver_links
+                    .iter()
+                    .filter_map(|addr| addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()))
+                    .collect(),
+                relay_url: start_payload.relay_url.clone(),
+                bonding_config: start_payload.bonding_config.clone(),
+            };
+            let rcv_envelope = Envelope::new("receiver.stream.start", &rcv_payload);
+            let rcv_json = serde_json::to_string(&rcv_envelope).unwrap();
+            let _ = rcv_handle.tx.send(rcv_json).await;
+        }
+
+        // Increment active_streams counter
+        let _ =
+            sqlx::query("UPDATE receivers SET active_streams = active_streams + 1 WHERE id = $1")
+                .bind(rcv_id)
+                .execute(state.pool())
+                .await;
+    }
 
     let envelope = Envelope::new("stream.start", &start_payload);
     let json = serde_json::to_string(&envelope).unwrap();
@@ -492,6 +513,42 @@ async fn get_stream(
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/// Pick a receiver and build the list of link addresses.
+///
+/// 1. Try to find an online receiver in the DB with spare capacity.
+/// 2. Fall back to `RECEIVER_LINKS` / `RECEIVER_HOST` env vars.
+///
+/// Returns `(Some(receiver_id), links)` when a managed receiver is chosen,
+/// or `(None, links)` when falling back to env var config.
+async fn pick_receiver_links(state: &AppState, owner_id: &str) -> (Option<String>, Vec<String>) {
+    // Try DB: pick the least-loaded online receiver for this owner
+    let row = sqlx::query_as::<_, (String, String, Vec<i32>)>(
+        "SELECT id, bind_host, link_ports FROM receivers \
+         WHERE owner_id = $1 AND online = TRUE AND active_streams < max_streams \
+         ORDER BY active_streams ASC, last_seen_at DESC \
+         LIMIT 1",
+    )
+    .bind(owner_id)
+    .fetch_optional(state.pool())
+    .await
+    .ok()
+    .flatten();
+
+    if let Some((receiver_id, bind_host, link_ports)) = row {
+        // Verify this receiver is actually connected right now
+        if state.receivers().contains_key(&receiver_id) {
+            let links: Vec<String> = link_ports
+                .iter()
+                .map(|&p| format!("{bind_host}:{p}"))
+                .collect();
+            return (Some(receiver_id), links);
+        }
+    }
+
+    // Fall back to env var config
+    (None, build_receiver_links())
+}
 
 /// Build the list of receiver link addresses from environment config.
 ///

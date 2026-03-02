@@ -4,6 +4,7 @@ pub mod auth;
 pub mod auth_extractor;
 pub mod destinations;
 pub mod metrics;
+pub mod receivers;
 pub mod senders;
 pub mod streams;
 
@@ -18,4 +19,5 @@ pub fn router() -> Router<AppState> {
         .nest("/senders", senders::router())
         .nest("/streams", streams::router())
         .nest("/destinations", destinations::router())
+        .nest("/receivers", receivers::router())
 }

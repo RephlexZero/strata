@@ -1,0 +1,39 @@
+[package]
+name = "strata-sender"
+version = "0.1.1"
+edition = "2024"
+description = "Strata sender daemon — field device daemon with WSS control, hardware scanning, pipeline management"
+publish = false
+
+[[bin]]
+name = "strata-sender"
+path = "src/main.rs"
+
+[dependencies]
+strata-common = { path = "../strata-common" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+futures = "0.3"
+
+# Web (onboarding portal)
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# System info
+sysinfo = "0.35"
+libc = "0.2"

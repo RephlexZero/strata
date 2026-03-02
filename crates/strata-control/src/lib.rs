@@ -9,3 +9,4 @@ pub mod db;
 pub mod state;
 pub mod ws_agent;
 pub mod ws_dashboard;
+pub mod ws_receiver;

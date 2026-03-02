@@ -44,6 +44,21 @@ impl CodecType {
         }
     }
 
+    /// GStreamer parser pipeline fragment for relay (RTMP/HLS) pipelines.
+    ///
+    /// `config-interval=-1` re-injects SPS/PPS/VPS headers before every
+    /// keyframe so decoders and muxers that join mid-stream can initialise.
+    /// `disable-passthrough=true` forces the parser to actively process every
+    /// buffer even when upstream (e.g. tsdemux) marks data as passthrough,
+    /// which would otherwise bypass the header injection.
+    pub fn relay_parser_fragment(&self) -> &'static str {
+        match self {
+            CodecType::H264 => "h264parse config-interval=-1 disable-passthrough=true",
+            CodecType::H265 => "h265parse config-interval=-1 disable-passthrough=true",
+            CodecType::Fake => "identity",
+        }
+    }
+
     /// Media type caps string for the encoded output.
     pub fn caps_media_type(&self) -> &'static str {
         match self {
@@ -304,6 +319,19 @@ mod tests {
     fn parser_factory_names() {
         assert_eq!(CodecType::H264.parser_factory(), "h264parse");
         assert_eq!(CodecType::H265.parser_factory(), "h265parse");
+    }
+
+    #[test]
+    fn relay_parser_fragments_inject_headers() {
+        let h264 = CodecType::H264.relay_parser_fragment();
+        assert!(h264.starts_with("h264parse"));
+        assert!(h264.contains("config-interval=-1"));
+        assert!(h264.contains("disable-passthrough=true"));
+
+        let h265 = CodecType::H265.relay_parser_fragment();
+        assert!(h265.starts_with("h265parse"));
+        assert!(h265.contains("config-interval=-1"));
+        assert!(h265.contains("disable-passthrough=true"));
     }
 
     #[test]

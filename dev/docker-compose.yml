@@ -45,7 +45,7 @@ services:
     depends_on:
       - strata-control
     environment:
-      RUST_LOG: "info,strata_agent=debug"
+      RUST_LOG: "info,strata_sender=debug"
     command:
       - "--control-url"
       - "ws://strata-control:3000/agent/ws"

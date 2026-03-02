@@ -28,5 +28,5 @@ crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [[bin]]
-name = "strata-node"
-path = "src/bin/strata_node.rs"
+name = "strata-pipeline"
+path = "src/bin/strata_pipeline.rs"

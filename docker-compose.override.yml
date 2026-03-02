@@ -16,12 +16,12 @@ services:
 
   strata-sender-sim:
     environment:
-      RUST_LOG: "info,strata_agent=debug,strata::cc=debug,strata::transport=debug,strata::adapt=debug,strata::sink=debug,strata::runtime=debug,strata::scheduler=debug"
+      RUST_LOG: "info,strata_sender=debug,strata::cc=debug,strata::transport=debug,strata::adapt=debug,strata::sink=debug,strata::runtime=debug,strata::scheduler=debug"
     volumes:
-      # Agent binary
-      - ./target/debug/strata-agent:/usr/local/bin/strata-agent:ro
-      # Pipeline binary (strata-node sender)
-      - ./target/debug/strata-node:/usr/local/bin/strata-node:ro
+      # Sender daemon binary
+      - ./target/debug/strata-sender:/usr/local/bin/strata-sender:ro
+      # Pipeline binary (strata-pipeline sender)
+      - ./target/debug/strata-pipeline:/usr/local/bin/strata-pipeline:ro
       # GStreamer bonding plugin
       - ./target/debug/libgststrata.so:/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgststrata.so:ro
       # Portal WASM app (locally built)
@@ -29,7 +29,9 @@ services:
 
   strata-receiver:
     volumes:
+      # Receiver daemon binary
+      - ./target/debug/strata-receiver:/usr/local/bin/strata-receiver:ro
+      # Pipeline binary (strata-pipeline receiver, spawned by daemon)
+      - ./target/debug/strata-pipeline:/usr/local/bin/strata-pipeline:ro
       # GStreamer bonding plugin (stratasrc element)
       - ./target/debug/libgststrata.so:/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgststrata.so:ro
-      # If using strata-node as receiver:
-      - ./target/debug/strata-node:/usr/local/bin/strata-node:ro

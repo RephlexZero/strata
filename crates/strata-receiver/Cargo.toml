@@ -1,12 +1,12 @@
 [package]
-name = "strata-agent"
+name = "strata-receiver"
 version = "0.1.1"
 edition = "2024"
-description = "Strata sender agent — field device daemon with WSS control, hardware scanning, pipeline management"
+description = "Strata receiver daemon — cloud server daemon with WSS control, capacity registration, pipeline management"
 publish = false
 
 [[bin]]
-name = "strata-agent"
+name = "strata-receiver"
 path = "src/main.rs"
 
 [dependencies]
@@ -17,14 +17,13 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 
-# Web (onboarding portal)
-axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.6", features = ["cors", "fs"] }
-
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+
+# Web (metrics server)
+axum = "0.8"
 
 # Observability
 tracing = { workspace = true }
@@ -32,8 +31,10 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # System info
 sysinfo = "0.35"
+
+# Unix signal
 libc = "0.2"

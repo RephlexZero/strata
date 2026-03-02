@@ -1,12 +1,16 @@
-//! # Strata Probe
+//! # strata-probe
 //!
 //! Transport-layer diagnostic binary. Accepts UDP traffic on multiple links,
 //! performs multi-link reassembly (FEC + ARQ + jitter buffer), and either
 //! discards output (monitor mode) or writes recovered MPEG-TS to a file.
 //!
 //! This is a **testing and diagnostic tool** — it operates at the raw transport
-//! layer without a GStreamer pipeline.  For production relay (RTMP, HLS, etc.)
-//! use `strata-node receiver --relay-url <url>` instead.
+//! layer without a GStreamer pipeline and has no relay capability.
+//! For production relay to RTMP, HLS, or file use:
+//!
+//! ```bash
+//! strata-node receiver --bind 0.0.0.0:5000 --relay-url rtmp://...
+//! ```
 //!
 //! ## Usage
 //!
@@ -49,7 +53,7 @@ fn main() -> anyhow::Result<()> {
         latency_ms = args.latency_ms,
         output = ?args.output,
         metrics_port = ?args.metrics_port,
-        "strata-receiver starting"
+        "strata-probe starting"
     );
 
     // ── Receiver ────────────────────────────────────────────────
@@ -127,7 +131,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Cleanup ─────────────────────────────────────────────────
     drop(sink);
-    tracing::info!(total_packets, total_bytes, "strata-receiver stopped");
+    tracing::info!(total_packets, total_bytes, "strata-probe stopped");
 
     Ok(())
 }
@@ -234,13 +238,13 @@ fn parse_args() -> anyhow::Result<Args> {
 
 fn print_help() {
     eprintln!(
-        r#"strata-receiver — Bonded transport diagnostic tool
+        r#"strata-probe — Bonded transport diagnostic tool
 
 Receives and reassembles a bonded Strata stream at the transport layer.
 For production relay to RTMP/HLS use: strata-node receiver --relay-url <url>
 
 USAGE:
-  strata-receiver --bind <ADDR[,ADDR...]> [OPTIONS]
+  strata-probe --bind <ADDR[,ADDR...]> [OPTIONS]
 
 OPTIONS:
   --bind, -b <addrs>        Comma-separated UDP bind addresses (required)
