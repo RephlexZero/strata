@@ -1,6 +1,6 @@
 [package]
 name = "strata-receiver"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Strata receiver daemon — cloud server daemon with WSS control, capacity registration, pipeline management"
 publish = false
