@@ -47,12 +47,19 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc"
 ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc"
 ENV CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++"
 
-# Build the plugin + binary
+# Build the plugin + all binaries
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git/db \
-    cargo build --release --target aarch64-unknown-linux-gnu -p strata-gst
+    cargo build --release --target aarch64-unknown-linux-gnu \
+      -p strata-gst \
+      -p strata-control \
+      -p strata-sender \
+      -p strata-receiver
 
 # ── Stage 2: Extract artifacts ───────────────────────────────
 FROM scratch AS export
 COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/libgststrata.so /libgststrata.so
-COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/strata-node /strata-node
+COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/strata-pipeline /strata-pipeline
+COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/strata-control /strata-control
+COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/strata-sender /strata-sender
+COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/strata-receiver /strata-receiver
