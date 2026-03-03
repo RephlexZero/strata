@@ -116,7 +116,7 @@ fn uploader_loop(config: &HlsUploaderConfig, stop: &AtomicBool) {
 
         // Scan for .ts segment files
         {
-            let new_segments = find_new_segments(&config.segment_dir, &uploaded);
+            let new_segments = find_new_segments(&config.segment_dir, &uploaded, false);
 
             for name in new_segments {
                 let path = config.segment_dir.join(&name);
@@ -148,7 +148,7 @@ fn uploader_loop(config: &HlsUploaderConfig, stop: &AtomicBool) {
 
     // Final: upload any remaining segments, then playlist
     {
-        let remaining = find_new_segments(&config.segment_dir, &uploaded);
+        let remaining = find_new_segments(&config.segment_dir, &uploaded, true);
         for name in remaining {
             let path = config.segment_dir.join(&name);
             if upload_file_with_retry(&agent, &config.base_url, &name, &path) {
@@ -250,17 +250,40 @@ pub(crate) fn content_type_for_hls(filename: &str) -> &'static str {
 
 /// Scan `dir` for `.ts` segment files not yet in `uploaded`, returning them
 /// sorted by name.
-pub(crate) fn find_new_segments(dir: &Path, uploaded: &HashSet<String>) -> Vec<String> {
+///
+/// Only non-empty files are considered — `hlssink2` creates the segment file
+/// before writing any data, so a zero-byte file is still open for writing.
+///
+/// When `include_latest` is `false` (live polling mode), the segment with the
+/// highest name is also excluded because it may still be open for writing.
+/// `hlssink2` always finalises segment N before creating segment N+1, so a
+/// segment is guaranteed complete as soon as a successor exists.
+///
+/// Set `include_latest = true` only during final shutdown cleanup, when the
+/// pipeline is already stopped and no further segments will be created.
+pub(crate) fn find_new_segments(
+    dir: &Path,
+    uploaded: &HashSet<String>,
+    include_latest: bool,
+) -> Vec<String> {
     let mut segments = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".ts") && !uploaded.contains(&name) {
+            if name.ends_with(".ts")
+                && !uploaded.contains(&name)
+                && entry.metadata().map(|m| m.len() > 0).unwrap_or(false)
+            {
                 segments.push(name);
             }
         }
     }
     segments.sort();
+    if !include_latest {
+        // Without a successor we can't confirm the latest segment is fully
+        // written, so hold it back until the next poll cycle.
+        segments.pop();
+    }
     segments
 }
 
@@ -379,7 +402,7 @@ mod tests {
     fn test_find_new_segments_empty_dir() {
         let dir = make_temp_dir();
         let uploaded = HashSet::new();
-        let result = find_new_segments(&dir, &uploaded);
+        let result = find_new_segments(&dir, &uploaded, true);
         assert!(result.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -393,7 +416,7 @@ mod tests {
         fs::write(dir.join("notes.txt"), b"misc").unwrap();
 
         let uploaded = HashSet::new();
-        let result = find_new_segments(&dir, &uploaded);
+        let result = find_new_segments(&dir, &uploaded, true);
         assert_eq!(result, vec!["segment00000.ts", "segment00001.ts"]);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -409,7 +432,7 @@ mod tests {
         uploaded.insert("segment00000.ts".to_string());
         uploaded.insert("segment00002.ts".to_string());
 
-        let result = find_new_segments(&dir, &uploaded);
+        let result = find_new_segments(&dir, &uploaded, true);
         assert_eq!(result, vec!["segment00001.ts"]);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -422,7 +445,7 @@ mod tests {
         fs::write(dir.join("segment00001.ts"), b"d").unwrap();
         fs::write(dir.join("segment00003.ts"), b"d").unwrap();
 
-        let result = find_new_segments(&dir, &HashSet::new());
+        let result = find_new_segments(&dir, &HashSet::new(), true);
         assert_eq!(
             result,
             vec!["segment00001.ts", "segment00003.ts", "segment00005.ts"]
@@ -433,8 +456,45 @@ mod tests {
     #[test]
     fn test_find_new_segments_nonexistent_dir() {
         let dir = PathBuf::from("/tmp/strata-nonexistent-dir-12345");
-        let result = find_new_segments(&dir, &HashSet::new());
+        let result = find_new_segments(&dir, &HashSet::new(), true);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_find_new_segments_skips_zero_byte() {
+        let dir = make_temp_dir();
+        fs::write(dir.join("segment00000.ts"), b"").unwrap(); // 0-byte: still open
+        fs::write(dir.join("segment00001.ts"), b"data").unwrap();
+        // Zero-byte file skipped in both modes
+        let result_live = find_new_segments(&dir, &HashSet::new(), false);
+        let result_final = find_new_segments(&dir, &HashSet::new(), true);
+        // Live: 00000 is 0-byte (skip), 00001 is latest with no successor (skip)
+        assert!(result_live.is_empty());
+        // Final: 00000 is 0-byte (skip), 00001 has data (include)
+        assert_eq!(result_final, vec!["segment00001.ts"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_find_new_segments_live_mode_skips_latest() {
+        let dir = make_temp_dir();
+        fs::write(dir.join("segment00000.ts"), b"data").unwrap();
+        fs::write(dir.join("segment00001.ts"), b"data").unwrap();
+        fs::write(dir.join("segment00002.ts"), b"data").unwrap();
+        // Live mode: all but the latest (00002 has no confirmed successor)
+        let result = find_new_segments(&dir, &HashSet::new(), false);
+        assert_eq!(result, vec!["segment00000.ts", "segment00001.ts"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_find_new_segments_live_mode_single_segment_returns_empty() {
+        let dir = make_temp_dir();
+        fs::write(dir.join("segment00000.ts"), b"data").unwrap();
+        // Only one non-empty segment with no successor — can't confirm it's finalised
+        let result = find_new_segments(&dir, &HashSet::new(), false);
+        assert!(result.is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ── HlsUploaderHandle lifecycle ─────────────────────────────────────

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use strata_bonding::receiver::ReceiverBackend;
+use strata_bonding::receiver::aggregator::ReassemblyConfig;
 
 mod imp {
     use super::*;
@@ -14,6 +15,7 @@ mod imp {
     struct Settings {
         links: String,
         latency: u32,
+        max_latency_ms: u64,
         config_toml: String,
     }
 
@@ -22,6 +24,7 @@ mod imp {
             Self {
                 links: String::new(),
                 latency: 100,
+                max_latency_ms: 500,
                 config_toml: String::new(),
             }
         }
@@ -45,6 +48,7 @@ mod imp {
                     let mut settings = lock_or_recover(&self.settings);
                     settings.config_toml = toml_str.to_string();
                     settings.latency = cfg.receiver.start_latency.as_millis() as u32;
+                    settings.max_latency_ms = cfg.scheduler.max_latency_ms;
                     if !cfg.links.is_empty() {
                         settings.links = cfg
                             .links
@@ -215,7 +219,12 @@ mod imp {
             }
 
             let latency_duration = Duration::from_millis(settings.latency as u64);
-            let receiver = ReceiverBackend::new(latency_duration);
+            let max_latency_ms = settings.max_latency_ms;
+            let receiver = ReceiverBackend::new_with_config(ReassemblyConfig {
+                start_latency: latency_duration,
+                max_latency_ms,
+                ..ReassemblyConfig::default()
+            });
 
             for link in settings.links.split(',') {
                 let link = link.trim();

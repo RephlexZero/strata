@@ -401,28 +401,31 @@ fn create_transport_link(link: &LinkConfig) -> anyhow::Result<TransportLink> {
     let socket = if let Some(ref iface) = link.interface {
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
         let sock = UdpSocket::bind(bind_addr)?;
-        // Bind to specific interface via SO_BINDTODEVICE
+        // Bind to specific interface via SO_BINDTODEVICE (requires CAP_NET_RAW or root).
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
             let fd = sock.as_raw_fd();
             let iface_bytes = iface.as_bytes();
-            unsafe {
-                let ret = libc::setsockopt(
+            let ret = unsafe {
+                libc::setsockopt(
                     fd,
                     libc::SOL_SOCKET,
                     libc::SO_BINDTODEVICE,
                     iface_bytes.as_ptr() as *const libc::c_void,
                     iface_bytes.len() as libc::socklen_t,
-                );
-                if ret != 0 {
-                    warn!(
-                        "SO_BINDTODEVICE failed for link {} iface {}: {}",
-                        link.id,
-                        iface,
-                        std::io::Error::last_os_error()
-                    );
-                }
+                )
+            };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(anyhow::anyhow!(
+                    "SO_BINDTODEVICE failed for link {} on interface {:?}: {} \
+                     (hint: run `sudo setcap cap_net_raw+ep <binary>` or use \
+                     policy routing — see scripts/setup-routing.sh)",
+                    link.id,
+                    iface,
+                    err
+                ));
             }
         }
         sock
@@ -712,5 +715,52 @@ mod tests {
         let result = rcv_socket.recv(&mut buf);
         assert!(result.is_ok(), "Should have received UDP data");
         assert!(result.unwrap() > 0, "Should have received non-empty data");
+    }
+
+    // ── Regression: snag #6 — SO_BINDTODEVICE must hard-error on EPERM ──
+
+    /// Binding to a non-existent interface should return Err, not Ok.
+    /// Before the fix, the code logged a warning and continued, silently
+    /// routing all links through the default interface.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_bind_to_device_rejects_bad_interface() {
+        let link = LinkConfig {
+            id: 99,
+            uri: "127.0.0.1:9999".to_string(),
+            interface: Some("nonexistent_if_xyz".to_string()),
+        };
+        let result = create_transport_link(&link);
+        assert!(
+            result.is_err(),
+            "Binding to a non-existent interface must return Err, not silently succeed"
+        );
+        let err_msg = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("Expected Err but got Ok"),
+        };
+        assert!(
+            err_msg.contains("SO_BINDTODEVICE"),
+            "Error message should mention SO_BINDTODEVICE: {}",
+            err_msg
+        );
+    }
+
+    // ── Regression: snag #15 — config parsing detects duplicate interfaces ──
+
+    #[test]
+    fn config_from_toml_allows_distinct_interfaces() {
+        let toml = r#"
+            [[links]]
+            id = 0
+            uri = "10.0.0.1:5000"
+            interface = "eth0"
+            [[links]]
+            id = 1
+            uri = "10.0.0.1:5002"
+            interface = "eth1"
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.links.len(), 2);
     }
 }

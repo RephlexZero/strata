@@ -60,3 +60,33 @@ release-check: ## Full release verification
 
 clean: ## Clean build artifacts
 	@cargo clean
+
+cross-aarch64: ## Cross-compile for aarch64 (outputs to target/aarch64-unknown-linux-gnu/)
+	@echo "Building aarch64 binaries via Docker..."
+	@mkdir -p target/aarch64-unknown-linux-gnu/release
+	@DOCKER_BUILDKIT=1 docker build \
+		-f docker/Dockerfile.cross-aarch64 \
+		--output type=local,dest=target/aarch64-unknown-linux-gnu/release \
+		.
+	@echo "✓ Artifacts in target/aarch64-unknown-linux-gnu/release/"
+
+deploy-aarch64: cross-aarch64 ## Cross-compile and deploy to STRATA_DEPLOY_HOST via scp
+	@test -n "$${STRATA_DEPLOY_HOST}" || { echo "Set STRATA_DEPLOY_HOST (SSH alias or user@host)"; exit 1; }
+	@echo "Deploying to $${STRATA_DEPLOY_HOST}..."
+	@scp target/aarch64-unknown-linux-gnu/release/strata-pipeline "$${STRATA_DEPLOY_HOST}:/usr/local/bin/strata-pipeline"
+	@scp target/aarch64-unknown-linux-gnu/release/libgststrata.so "$${STRATA_DEPLOY_HOST}:~/.local/share/gstreamer-1.0/plugins/libgststrata.so"
+	@ssh "$${STRATA_DEPLOY_HOST}" 'setcap cap_net_raw+ep /usr/local/bin/strata-pipeline 2>/dev/null || true'
+	@echo "✓ Deployed strata-pipeline + libgststrata.so to $${STRATA_DEPLOY_HOST}"
+
+build: ## Build strata-pipeline (release)
+	@cargo build --release -p strata-gst
+
+install: build ## Build and install strata-pipeline with cap_net_raw for interface binding
+	@echo "Installing strata-pipeline..."
+	@sudo install -m 755 target/release/strata-pipeline /usr/local/bin/strata-pipeline
+	@sudo setcap cap_net_raw+ep /usr/local/bin/strata-pipeline
+	@echo "Installing libgststrata.so..."
+	@mkdir -p ~/.local/share/gstreamer-1.0/plugins
+	@cp target/release/libgststrata.so ~/.local/share/gstreamer-1.0/plugins/
+	@echo "✓ strata-pipeline installed with cap_net_raw (SO_BINDTODEVICE enabled)"
+	@echo "✓ libgststrata.so installed to ~/.local/share/gstreamer-1.0/plugins/"

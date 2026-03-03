@@ -335,14 +335,24 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let min_bitrate_kbps_val = min_bitrate_kbps.unwrap_or(profile.min_kbps);
     let max_bitrate_kbps_val = max_bitrate_kbps.unwrap_or(profile.max_kbps);
 
+    // Probe for available AAC encoder (preference: fdkaacenc > faac > avenc_aac)
+    let aac_enc_element = ["fdkaacenc", "faac", "avenc_aac"]
+        .iter()
+        .find(|&&name| gst::ElementFactory::find(name).is_some())
+        .copied()
+        .unwrap_or("fdkaacenc");
+    eprintln!("AAC encoder: {}", aac_enc_element);
+
     // Build the pipeline with input-selector.
     // The test source is always available as the fallback.
     //
     // Pipeline:
     //   source → input-selector → encoder → queue → mpegtsmux → stratasink
-    //   [optional] audiotestsrc → voaacenc → aacparse → queue → mpegtsmux
+    //   [optional] audiotestsrc → <aac_enc> → aacparse → queue → mpegtsmux
     let audio_fragment = if add_audio {
-        " audiotestsrc is-live=true wave=silence ! audioconvert ! audioresample ! voaacenc bitrate=128000 ! aacparse ! queue ! mux.".to_string()
+        format!(
+            " audiotestsrc is-live=true wave=silence ! audioconvert ! audioresample ! {aac_enc_element} bitrate=128000 ! aacparse ! queue ! mux."
+        )
     } else {
         String::new()
     };
@@ -417,11 +427,32 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Configure destinations ──
     if let Some(sink) = pipeline.by_name("rsink") {
+        // Build a URI→interface map from the TOML config so per-link
+        // interface bindings in the config take priority over the
+        // routing-table fallback below.
+        let mut toml_iface_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
         if !config_path.is_empty() {
             let config_toml = std::fs::read_to_string(config_path)
                 .map_err(|e| format!("Failed to read config file '{}': {}", config_path, e))?;
             sink.set_property("config", &config_toml);
             eprintln!("Applied config from {}", config_path);
+
+            // Parse [[links]] to extract uri→interface mappings.
+            if let Ok(toml::Value::Table(ref tbl)) = toml::from_str::<toml::Value>(&config_toml)
+                && let Some(toml::Value::Array(links)) = tbl.get("links")
+            {
+                for link in links {
+                    if let (Some(uri_v), Some(iface_v)) =
+                        (link.get("uri"), link.get("interface"))
+                        && let (Some(uri_s), Some(iface_s)) =
+                            (uri_v.as_str(), iface_v.as_str())
+                    {
+                        toml_iface_map.insert(uri_s.to_string(), iface_s.to_string());
+                    }
+                }
+            }
         }
 
         for (idx, uri) in dest_str.split(',').enumerate() {
@@ -434,8 +465,13 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("Failed to request link pad")?;
             pad.set_property("uri", uri);
 
-            // Resolve which OS interface routes to this destination
-            if let Some(iface) = resolve_interface_for_uri(uri) {
+            // Use TOML-specified interface if present, otherwise fall back
+            // to routing-table lookup (best-effort).
+            let iface = toml_iface_map
+                .get(uri)
+                .cloned()
+                .or_else(|| resolve_interface_for_uri(uri));
+            if let Some(iface) = iface {
                 pad.set_property("interface", &iface);
                 eprintln!("Configured link {} -> {} (via {})", idx, uri, iface);
             } else {
@@ -1421,7 +1457,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
              d. ! queue ! {parser} ! hls.video \
              d. ! queue ! aacparse ! hls.audio \
              hlssink2 name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
-             target-duration=2 max-files=10 send-keyframe-requests=true",
+             target-duration=2 max-files=10 send-keyframe-requests=false",
             bind = bind_str,
             parser = relay_parser,
             seg = seg_location.display(),

@@ -1,24 +1,21 @@
 # ── Stage 1: Build GStreamer 1.28 from source ────────────────────────
-# Debian 12 ships GStreamer 1.22 and Meson 1.3; we need Meson ≥ 1.4 for
-# GStreamer 1.28, so we install a newer version via pip.
-# A separate builder stage keeps build-only tools out of the final image.
-FROM debian:12-slim AS gst-builder
+# Debian 12 ships GStreamer 1.22; we build 1.28 from the upstream mono-repo.
+# A separate builder stage keeps meson/ninja/nasm/flex/bison out of the
+# final image, saving ~400 MB.
+FROM ubuntu:25.10 AS gst-builder
 
 ARG GST_VERSION=1.28.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
     build-essential pkg-config \
-    python3 python3-pip ninja-build nasm flex bison \
+    meson ninja-build python3 nasm flex bison \
     libglib2.0-dev libfreetype-dev \
     libx264-dev libx265-dev \
     libvorbis-dev libopus-dev libogg-dev \
     libpng-dev libjpeg-dev \
     libavcodec-dev libavformat-dev libavutil-dev \
     libswresample-dev libswscale-dev \
-    # VA-API (hardware encoding support for AMD / Intel GPUs)
-    libva-dev libdrm-dev \
-    && pip3 install --break-system-packages meson>=1.4 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL \
@@ -52,9 +49,6 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     libpng-dev libjpeg-dev \
     libavcodec-dev libavformat-dev libavutil-dev \
     libswresample-dev libswscale-dev \
-    # VA-API hardware encoding drivers (AMD / Intel)
-    mesa-va-drivers intel-media-va-driver \
-    libva2 libva-drm2 vainfo \
     # Network / system tools
     iproute2 iputils-ping net-tools tcpdump kmod \
     && rm -rf /var/lib/apt/lists/*
@@ -64,5 +58,4 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
 COPY --from=gst-builder /gst-install/usr/ /usr/
 RUN ldconfig
 
-ENV PKG_CONFIG_PATH="/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" \
-    GST_PLUGIN_PATH="/workspaces/strata/target/debug"
+ENV PKG_CONFIG_PATH="/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig"

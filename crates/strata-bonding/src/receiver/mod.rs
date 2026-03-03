@@ -29,6 +29,13 @@ impl ReceiverBackend {
         }
     }
 
+    /// Create a new receiver with a full reassembly configuration.
+    pub fn new_with_config(config: aggregator::ReassemblyConfig) -> Self {
+        ReceiverBackend {
+            inner: TransportBondingReceiver::new_with_config(config),
+        }
+    }
+
     /// Add a link by address string.
     ///
     /// Accepts plain socket addresses (e.g. `0.0.0.0:5000`), `strata://`
