@@ -206,7 +206,7 @@ impl Default for SchedulerConfig {
             redundancy_spare_ratio: 0.5,
             redundancy_max_packet_bytes: 10_000,
             redundancy_target_links: 2,
-            critical_broadcast: true,
+            critical_broadcast: false,
             failover_enabled: true,
             failover_duration_ms: 3000,
             failover_rtt_spike_factor: 3.0,
@@ -384,12 +384,24 @@ impl BondingConfigInput {
 
         let mut out = Vec::new();
         let mut seen_ids = HashSet::new();
+        let mut seen_ifaces: HashSet<String> = HashSet::new();
         for (idx, link) in self.links.into_iter().enumerate() {
             let id = link.id.unwrap_or(idx);
             if !seen_ids.insert(id) {
                 continue;
             }
             let iface = link.interface.filter(|s| !s.is_empty());
+            // Each physical interface may only appear once. Duplicate entries
+            // silently cause self-congestion: two links share one pipe so
+            // bursts are doubled on that interface while the other sits idle.
+            if let Some(ref name) = iface
+                && !seen_ifaces.insert(name.clone())
+            {
+                return Err(format!(
+                    "interface '{}' is assigned to more than one link - each link must use a distinct interface",
+                    name
+                ));
+            }
             out.push(LinkConfig {
                 id,
                 uri: link.uri,

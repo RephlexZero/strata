@@ -444,10 +444,8 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 && let Some(toml::Value::Array(links)) = tbl.get("links")
             {
                 for link in links {
-                    if let (Some(uri_v), Some(iface_v)) =
-                        (link.get("uri"), link.get("interface"))
-                        && let (Some(uri_s), Some(iface_s)) =
-                            (uri_v.as_str(), iface_v.as_str())
+                    if let (Some(uri_v), Some(iface_v)) = (link.get("uri"), link.get("interface"))
+                        && let (Some(uri_s), Some(iface_s)) = (uri_v.as_str(), iface_v.as_str())
                     {
                         toml_iface_map.insert(uri_s.to_string(), iface_s.to_string());
                     }
@@ -1016,7 +1014,15 @@ fn add_source_branch(
         "v4l2" => {
             let src = gst::ElementFactory::make("v4l2src")
                 .property("device", device)
+                // is-live=true is required for hot-swap: without it v4l2src
+                // timestamps from zero, causing a discontinuity in mpegtsmux
+                // and a "Timestamping error" crash in the receiver's hlssink2.
+                .property("is-live", true)
                 .build()?;
+            // clocksync re-stamps buffers against the pipeline clock so that
+            // switching from testsrc (already clock-stamped) to v4l2 does not
+            // produce a backwards or large-forward jump at input-selector.
+            let csync = gst::ElementFactory::make("clocksync").build()?;
             let conv = gst::ElementFactory::make("videoconvert").build()?;
             let scale = gst::ElementFactory::make("videoscale").build()?;
             let filter = gst::ElementFactory::make("capsfilter")
@@ -1026,7 +1032,7 @@ fn add_source_branch(
                 .property("max-size-buffers", 3u32)
                 .build()?;
             let name = src.name().to_string();
-            (vec![src, conv, scale, filter, queue], name)
+            (vec![src, csync, conv, scale, filter, queue], name)
         }
         "uri" => {
             if uri.is_empty() {

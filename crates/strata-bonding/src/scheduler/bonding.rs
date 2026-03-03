@@ -957,7 +957,11 @@ mod tests {
 
     #[test]
     fn test_broadcast_critical() {
-        let mut scheduler = BondingScheduler::new();
+        // Explicitly enable critical_broadcast — it is off by default (snag #16).
+        let mut scheduler = BondingScheduler::with_config(SchedulerConfig {
+            critical_broadcast: true,
+            ..SchedulerConfig::default()
+        });
         let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
         let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
         scheduler.add_link(l1.clone());
