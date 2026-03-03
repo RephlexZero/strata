@@ -485,7 +485,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let strata_sink = sink
             .downcast::<gststrata::sink::StrataSink>()
             .expect("rsink is not a StrataSink");
-        strata_sink.set_adaptation_envelope(min_bitrate_kbps_val, max_bitrate_kbps_val);
+        strata_sink.set_adaptation_envelope(min_bitrate_kbps_val, max_bitrate_kbps_val, bitrate_kbps);
         eprintln!(
             "Adaptation envelope: {}–{} kbps",
             min_bitrate_kbps_val, max_bitrate_kbps_val

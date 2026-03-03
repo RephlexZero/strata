@@ -45,6 +45,11 @@ pub struct AdaptationConfig {
     /// Minimum spare bandwidth (kbps) to trigger MaxReliability mode.
     /// Default: 3000 (3 Mbps spare).
     pub reliability_spare_threshold_kbps: u32,
+    /// Starting bitrate for the adapter (kbps).
+    /// Should match the encoder's initial `--bitrate` to keep the adapter
+    /// and encoder in sync from the first tick.  A value of 0 means "use
+    /// max_bitrate_kbps" (legacy behaviour, kept for tests).
+    pub initial_bitrate_kbps: u32,
 }
 
 impl Default for AdaptationConfig {
@@ -53,12 +58,13 @@ impl Default for AdaptationConfig {
             min_bitrate_kbps: 500,
             max_bitrate_kbps: 20_000,
             headroom: 0.15,
-            ramp_up_kbps_per_step: 200,
+            ramp_up_kbps_per_step: 500,
             ramp_down_factor: 0.7,
             min_interval: Duration::from_millis(200),
             pressure_threshold: 0.9,
             quality_cap_kbps: 6_000,
             reliability_spare_threshold_kbps: 3_000,
+            initial_bitrate_kbps: 0,
         }
     }
 }
@@ -196,7 +202,13 @@ pub struct BitrateAdapter {
 
 impl BitrateAdapter {
     pub fn new(config: AdaptationConfig) -> Self {
-        let initial = config.max_bitrate_kbps;
+        // If an explicit starting point is provided use it; otherwise fall back to
+        // max (legacy behaviour kept for unit tests that rely on starting at max).
+        let initial = if config.initial_bitrate_kbps > 0 {
+            config.initial_bitrate_kbps
+        } else {
+            config.max_bitrate_kbps
+        };
         BitrateAdapter {
             config,
             current_target_kbps: initial,
@@ -480,6 +492,13 @@ impl BitrateAdapter {
         // Emergency: no links
         if alive_count == 0 {
             return (self.config.min_bitrate_kbps, AdaptationReason::LinkFailure);
+        }
+
+        // Links are alive but capacity estimates haven't arrived yet (BBR/oracle
+        // cold-start). Hold current bitrate rather than treating zero capacity as
+        // "over-pressure" and tanking to min on the first tick.
+        if usable_kbps == 0.0 {
+            return (self.current_target_kbps, AdaptationReason::Capacity);
         }
 
         // Over-pressure: need to reduce

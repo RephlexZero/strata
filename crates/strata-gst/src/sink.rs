@@ -65,6 +65,8 @@ mod imp {
         /// Bitrate envelope for adaptation (set via properties).
         pub(crate) adaptation_min_kbps: AtomicU32,
         pub(crate) adaptation_max_kbps: AtomicU32,
+        /// Starting bitrate for BitrateAdapter — should match encoder --bitrate.
+        pub(crate) adaptation_initial_kbps: AtomicU32,
     }
 
     impl Default for StrataSink {
@@ -81,6 +83,7 @@ mod imp {
                 scheduler_config: Mutex::new(SchedulerConfig::default()),
                 adaptation_min_kbps: AtomicU32::new(500),
                 adaptation_max_kbps: AtomicU32::new(25_000),
+                adaptation_initial_kbps: AtomicU32::new(0),
             }
         }
     }
@@ -452,6 +455,7 @@ mod imp {
 
             let adapt_min = self.adaptation_min_kbps.load(Ordering::Relaxed);
             let adapt_max = self.adaptation_max_kbps.load(Ordering::Relaxed);
+            let adapt_initial = self.adaptation_initial_kbps.load(Ordering::Relaxed);
 
             let handle = std::thread::Builder::new()
                 .name("strata-stats".into())
@@ -464,6 +468,7 @@ mod imp {
                     let mut adapter = BitrateAdapter::new(AdaptationConfig {
                         max_bitrate_kbps: adapt_max,
                         min_bitrate_kbps: adapt_min,
+                        initial_bitrate_kbps: adapt_initial,
                         ..AdaptationConfig::default()
                     });
 
@@ -765,13 +770,18 @@ impl StrataSink {
     }
 
     /// Set the bitrate adaptation envelope (must be called before PLAYING).
-    pub fn set_adaptation_envelope(&self, min_kbps: u32, max_kbps: u32) {
+    /// `initial_kbps` should match the encoder's starting `--bitrate` so the
+    /// adapter and encoder start in sync and avoid a cold-start ramp-down.
+    pub fn set_adaptation_envelope(&self, min_kbps: u32, max_kbps: u32, initial_kbps: u32) {
         self.imp()
             .adaptation_min_kbps
             .store(min_kbps, Ordering::Relaxed);
         self.imp()
             .adaptation_max_kbps
             .store(max_kbps, Ordering::Relaxed);
+        self.imp()
+            .adaptation_initial_kbps
+            .store(initial_kbps, Ordering::Relaxed);
     }
 }
 
