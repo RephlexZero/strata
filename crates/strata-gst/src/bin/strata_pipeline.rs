@@ -379,9 +379,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let hw_fmt_conv = match codec_ctrl.backend() {
         gststrata::codec::EncoderBackend::Vaapi
         | gststrata::codec::EncoderBackend::Vulkan
-        | gststrata::codec::EncoderBackend::Nvenc => {
-            "! videoconvert ! video/x-raw,format=NV12 "
-        }
+        | gststrata::codec::EncoderBackend::Nvenc => "! videoconvert ! video/x-raw,format=NV12 ",
         _ => "",
     };
 
@@ -1492,7 +1490,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
              d. ! queue ! {parser} ! hls.video \
              d. ! queue ! aacparse ! hls.audio \
              hlssink2 name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
-             target-duration=2 max-files=10 send-keyframe-requests=false",
+             target-duration=2 max-files=10 send-keyframe-requests=true",
             bind = bind_str,
             parser = relay_parser,
             seg = seg_location.display(),

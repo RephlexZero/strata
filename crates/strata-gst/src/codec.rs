@@ -54,7 +54,13 @@ impl CodecType {
     pub fn relay_parser_fragment(&self) -> &'static str {
         match self {
             CodecType::H264 => "h264parse config-interval=-1 disable-passthrough=true",
-            CodecType::H265 => "h265parse config-interval=-1 disable-passthrough=true",
+            // NOTE: disable-passthrough=true causes h265parse in GStreamer ≤1.24 to fail
+            // keyframe detection for IDR frames after the first GOP boundary, stalling
+            // splitmuxsink at segment 1.  Without it, h265parse honours the keyframe flags
+            // set by tsdemux (from the TS random-access-indicator bit) and segments cut
+            // normally.  config-interval=-1 is kept so each HLS segment starts with
+            // VPS/SPS/PPS (required for independent seek/playback of each segment).
+            CodecType::H265 => "h265parse config-interval=-1",
             CodecType::Fake => "identity",
         }
     }
@@ -108,20 +114,20 @@ impl std::fmt::Display for EncoderBackend {
 fn resolve_encoder(codec: CodecType) -> (&'static str, EncoderBackend) {
     let candidates: &[(&str, EncoderBackend)] = match codec {
         CodecType::H264 => &[
-            ("nvh264enc",     EncoderBackend::Nvenc),
-            ("vah264enc",     EncoderBackend::Vaapi),    // new va plugin (gst-plugins-bad 1.20+)
-            ("vaapih264enc",  EncoderBackend::Vaapi),    // old gstreamer-vaapi plugin
-            ("qsvh264enc",    EncoderBackend::Qsv),
-            ("vulkanh264enc", EncoderBackend::Vulkan),   // AMD RADV / any Vulkan 1.3 GPU
-            ("x264enc",       EncoderBackend::Software),
+            ("nvh264enc", EncoderBackend::Nvenc),
+            ("vah264enc", EncoderBackend::Vaapi), // new va plugin (gst-plugins-bad 1.20+)
+            ("vaapih264enc", EncoderBackend::Vaapi), // old gstreamer-vaapi plugin
+            ("qsvh264enc", EncoderBackend::Qsv),
+            ("vulkanh264enc", EncoderBackend::Vulkan), // AMD RADV / any Vulkan 1.3 GPU
+            ("x264enc", EncoderBackend::Software),
         ],
         CodecType::H265 => &[
-            ("nvh265enc",     EncoderBackend::Nvenc),
-            ("vah265enc",     EncoderBackend::Vaapi),    // new va plugin
-            ("vaapih265enc",  EncoderBackend::Vaapi),    // old gstreamer-vaapi plugin
-            ("qsvh265enc",    EncoderBackend::Qsv),
-            ("svthevcenc",    EncoderBackend::SvtHevc),  // fast multi-threaded SW (much faster than x265)
-            ("x265enc",       EncoderBackend::Software),
+            ("nvh265enc", EncoderBackend::Nvenc),
+            ("vah265enc", EncoderBackend::Vaapi), // new va plugin
+            ("vaapih265enc", EncoderBackend::Vaapi), // old gstreamer-vaapi plugin
+            ("qsvh265enc", EncoderBackend::Qsv),
+            ("svthevcenc", EncoderBackend::SvtHevc), // fast multi-threaded SW (much faster than x265)
+            ("x265enc", EncoderBackend::Software),
         ],
         CodecType::Fake => return ("identity", EncoderBackend::Software),
     };
@@ -367,7 +373,9 @@ mod tests {
         let h265 = CodecType::H265.relay_parser_fragment();
         assert!(h265.starts_with("h265parse"));
         assert!(h265.contains("config-interval=-1"));
-        assert!(h265.contains("disable-passthrough=true"));
+        // NOTE: disable-passthrough=true is intentionally absent for H.265 — see
+        // relay_parser_fragment() comment for why it breaks GStreamer ≤1.24 receivers.
+        assert!(!h265.contains("disable-passthrough=true"));
     }
 
     #[test]
