@@ -371,12 +371,26 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ct => format!("{} config-interval=-1", ct.parser_factory()),
     };
 
+    // VA-API and Vulkan encoders negotiate 10-bit (P010_10LE) input by default when
+    // upstream offers it.  mpegtsmux does not handle 10-bit H.265 properly — it
+    // produces corrupt PES packets that tsdemux on the receiver cannot parse.
+    // Force NV12 (8-bit YUV 4:2:0) so the encoder produces HEVC Main (8-bit) output.
+    // videoconvert is cheap when the source already outputs NV12 (most webcams do).
+    let hw_fmt_conv = match codec_ctrl.backend() {
+        gststrata::codec::EncoderBackend::Vaapi
+        | gststrata::codec::EncoderBackend::Vulkan
+        | gststrata::codec::EncoderBackend::Nvenc => {
+            "! videoconvert ! video/x-raw,format=NV12 "
+        }
+        _ => "",
+    };
+
     let pipeline_str = format!(
         "videotestsrc name=testsrc is-live=true pattern=ball \
          ! video/x-raw,width={w},height={h},framerate={fps}/1 \
          ! queue name=testq max-size-buffers=3 ! sel. \
          input-selector name=sel \
-         ! {enc_fragment} \
+         {hw_fmt_conv}! {enc_fragment} \
          ! {parser_fragment} \
          {video_to_mux}{audio} \
          mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 \
@@ -384,6 +398,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         w = res_w,
         h = res_h,
         fps = framerate,
+        hw_fmt_conv = hw_fmt_conv,
         enc_fragment = enc_fragment,
         parser_fragment = parser_fragment,
         video_to_mux = video_to_mux,
