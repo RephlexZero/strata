@@ -362,12 +362,22 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let enc_fragment =
         codec_ctrl.pipeline_fragment("enc", bitrate_kbps, key_int, max_bitrate_kbps_val);
 
+    // Add a parser after the encoder to normalise stream-format to byte-stream.
+    // Hardware encoders (VA-API, NVENC, Vulkan) can emit hvc1/avc1 (length-prefixed)
+    // which mpegtsmux cannot accept — h265parse/h264parse converts to byte-stream.
+    // For software encoders this is a cheap passthrough.
+    let parser_fragment = match codec_ctrl.codec() {
+        gststrata::codec::CodecType::Fake => "identity".to_string(),
+        ct => format!("{} config-interval=-1", ct.parser_factory()),
+    };
+
     let pipeline_str = format!(
         "videotestsrc name=testsrc is-live=true pattern=ball \
          ! video/x-raw,width={w},height={h},framerate={fps}/1 \
          ! queue name=testq max-size-buffers=3 ! sel. \
          input-selector name=sel \
          ! {enc_fragment} \
+         ! {parser_fragment} \
          {video_to_mux}{audio} \
          mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 \
          ! stratasink name=rsink",
@@ -375,6 +385,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         h = res_h,
         fps = framerate,
         enc_fragment = enc_fragment,
+        parser_fragment = parser_fragment,
         video_to_mux = video_to_mux,
         audio = audio_fragment,
     );
@@ -485,7 +496,11 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let strata_sink = sink
             .downcast::<gststrata::sink::StrataSink>()
             .expect("rsink is not a StrataSink");
-        strata_sink.set_adaptation_envelope(min_bitrate_kbps_val, max_bitrate_kbps_val, bitrate_kbps);
+        strata_sink.set_adaptation_envelope(
+            min_bitrate_kbps_val,
+            max_bitrate_kbps_val,
+            bitrate_kbps,
+        );
         eprintln!(
             "Adaptation envelope: {}–{} kbps",
             min_bitrate_kbps_val, max_bitrate_kbps_val
@@ -1014,10 +1029,9 @@ fn add_source_branch(
         "v4l2" => {
             let src = gst::ElementFactory::make("v4l2src")
                 .property("device", device)
-                // is-live=true is required for hot-swap: without it v4l2src
-                // timestamps from zero, causing a discontinuity in mpegtsmux
-                // and a "Timestamping error" crash in the receiver's hlssink2.
-                .property("is-live", true)
+                // v4l2src is always a live source internally; it does not
+                // expose is-live as a settable GObject property.  The
+                // clocksync element downstream handles hot-swap timestamps.
                 .build()?;
             // clocksync re-stamps buffers against the pipeline clock so that
             // switching from testsrc (already clock-stamped) to v4l2 does not
