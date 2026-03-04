@@ -14,7 +14,7 @@
 use quanta::Instant;
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::media::priority::DegradationStage;
 
@@ -135,7 +135,8 @@ pub struct LinkCapacity {
 /// Per-link state for the queue-depth alarm.
 #[derive(Default)]
 struct QueueState {
-    /// Rolling EWMA of ARQ queue depth (α=0.01, slow-moving baseline).
+    /// Rolling EWMA of ARQ queue depth (α=0.3 fast-warm, decays to 0.01
+    /// after convergence).
     ///
     /// As traffic builds up and the queue settles at a normal operating
     /// level, the thresholds grow proportionally — preventing spurious
@@ -143,6 +144,9 @@ struct QueueState {
     /// minimums (50 / 200 packets) ensure the alarm fires immediately
     /// in Docker/CI environments where the baseline is zero.
     ewma: f64,
+    /// Number of samples observed for this link. Used to warm up the
+    /// EWMA before trusting the alarm thresholds.
+    samples: u32,
 }
 
 /// Result of the queue-depth alarm check.
@@ -198,6 +202,10 @@ pub struct BitrateAdapter {
     consecutive_decreases: u32,
     /// Per-link queue EWMA state for the belacoder-inspired alarm.
     queue_state: HashMap<usize, QueueState>,
+    /// When the last rate *increase* was committed — used to suppress
+    /// feedback-driven reductions for a grace period so stale receiver
+    /// metrics don't immediately revert the increase.
+    last_increase_time: Option<Instant>,
 }
 
 impl BitrateAdapter {
@@ -220,6 +228,7 @@ impl BitrateAdapter {
             consecutive_increases: 0,
             consecutive_decreases: 0,
             queue_state: HashMap::new(),
+            last_increase_time: None,
         }
     }
 
@@ -285,6 +294,20 @@ impl BitrateAdapter {
             .sum();
 
         let alive_count = links.iter().filter(|l| l.alive).count();
+
+        // Log per-link detail
+        for l in links {
+            info!(
+                target: "strata::adapt",
+                link = l.link_id,
+                cap_kbps = format_args!("{:.0}", l.capacity_kbps),
+                alive = l.alive,
+                loss = format_args!("{:.3}", l.loss_rate),
+                rtt = format_args!("{:.0}", l.rtt_ms),
+                queue = ?l.queue_depth,
+                "link"
+            );
+        }
 
         // Compute usable capacity (with headroom)
         let usable_kbps = aggregate_kbps * (1.0 - self.config.headroom);
@@ -385,9 +408,12 @@ impl BitrateAdapter {
 
         // Only issue command if target changed meaningfully and enough time passed.
         // Extreme queue alarms bypass the rate limiter — they need to act immediately.
+        // Use a relative threshold (>10% change) with a small absolute floor (50 kbps)
+        // so that small-but-significant changes at low bitrates aren't suppressed.
         let alarm_urgent = matches!(queue_alarm, QueueAlarm::Extreme);
-        let target_changed = (new_target as i64 - self.current_target_kbps as i64).unsigned_abs()
-            > self.config.ramp_up_kbps_per_step as u64 / 2;
+        let abs_change = (new_target as i64 - self.current_target_kbps as i64).unsigned_abs();
+        let pct_change = abs_change as f64 / self.current_target_kbps.max(1) as f64;
+        let target_changed = abs_change > 50 && pct_change > 0.10;
         let interval_ok = alarm_urgent
             || self
                 .last_command_time
@@ -406,10 +432,30 @@ impl BitrateAdapter {
             "BitrateAdapter decision"
         );
 
+        // Compact info-level summary for field-test debugging
+        info!(
+            target: "strata::adapt",
+            "[adapt] agg={:.0} usable={:.0} pres={:.2} cur={} → {} ({:?}) ci={} cd={} q={:?} changed={} int_ok={}",
+            aggregate_kbps, usable_kbps, pressure,
+            self.current_target_kbps, new_target, reason,
+            self.consecutive_increases, self.consecutive_decreases, queue_alarm,
+            target_changed, interval_ok
+        );
+
         if target_changed && interval_ok {
+            if new_target > self.current_target_kbps {
+                self.last_increase_time = Some(Instant::now());
+            }
             self.current_target_kbps = new_target;
             self.last_command_time = Some(Instant::now());
         }
+
+        let cmd_target = self.current_target_kbps;
+        info!(
+            target: "strata::adapt",
+            "[adapt] CMD target_kbps={}",
+            cmd_target
+        );
 
         // Always return a command so the degradation stage is forwarded to
         // the scheduler on every tick.  Previously we returned `None` when
@@ -422,40 +468,63 @@ impl BitrateAdapter {
     ///
     /// The receiver feedback provides ground-truth signals that can override
     /// or supplement the sender's local capacity estimates:
-    /// - `loss_after_fec > 1%` → apply congestion pressure
-    /// - `jitter_buffer_ms > 500` → bufferbloat, cap bitrate
+    /// - `loss_after_fec > 5%` → apply congestion pressure
+    /// - `jitter_buffer_ms > 1000` → bufferbloat, reduce bitrate
     /// - `goodput_bps` significantly below encoder output → congestion
     pub fn update_with_feedback(
         &mut self,
         links: &[LinkCapacity],
         feedback: &ReceiverFeedback,
     ) -> Option<BitrateCommand> {
+        // Snapshot the target BEFORE update() — goodput reflects the previous
+        // rate, so we must compare against the pre-update target to avoid
+        // immediately reverting a rate increase due to stale goodput.
+        let target_before_update = self.current_target_kbps;
+
         // Start with normal capacity-based update.
         // NOTE: `update()` may already reduce via capacity pressure.
         // The feedback reduction below can stack, which is intentional —
         // receiver-side signals confirm congestion the sender sees locally.
         let mut result = self.update(links);
 
-        // Apply receiver-side pressure signals
-        let loss_pressure = feedback.loss_after_fec > 0.01;
-        let bufferbloat = feedback.jitter_buffer_ms > 500;
+        // Apply receiver-side pressure signals.
+        // Thresholds are set for bonded cellular where baseline jitter is
+        // 500-600ms and post-FEC loss of ~5% is normal.
+        let loss_pressure = feedback.loss_after_fec > 0.05;
+        let bufferbloat = feedback.jitter_buffer_ms > 1000;
+        // Compare goodput against the PRE-update target since goodput lags
+        // the encoder rate by at least one RTT.
         let goodput_shortfall = feedback.goodput_bps > 0
-            && (feedback.goodput_bps as f64) < self.current_target_kbps as f64 * 1000.0 * 0.7;
+            && (feedback.goodput_bps as f64) < target_before_update as f64 * 1000.0 * 0.7;
 
-        debug!(
+        // After a rate increase, receiver metrics are stale for a few seconds
+        // (they still reflect the old encoder rate).  Suppress loss/goodput
+        // reductions during this grace period so we don't immediately revert
+        // every increase.  Bufferbloat (jitter > 1000ms) is kept because it's
+        // an absolute signal that doesn't depend on rate matching.
+        let feedback_grace = self
+            .last_increase_time
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3));
+        let feedback_reduction = if feedback_grace {
+            bufferbloat
+        } else {
+            loss_pressure || bufferbloat || goodput_shortfall
+        };
+
+        info!(
             target: "strata::adapt",
-            loss_after_fec = feedback.loss_after_fec,
-            jitter_buffer_ms = feedback.jitter_buffer_ms,
-            goodput_bps = feedback.goodput_bps,
-            fec_repair_rate = feedback.fec_repair_rate,
-            loss_pressure = loss_pressure,
-            bufferbloat = bufferbloat,
-            goodput_shortfall = goodput_shortfall,
-            current_target_kbps = self.current_target_kbps,
-            "receiver feedback signals"
+            "[adapt] fb: loss_fec={:.3} jitter={}ms gp={}kbps | loss_p={} bb={} gp_short={} grace={} → reduce={}",
+            feedback.loss_after_fec,
+            feedback.jitter_buffer_ms,
+            feedback.goodput_bps / 1000,
+            loss_pressure,
+            bufferbloat,
+            goodput_shortfall,
+            feedback_grace,
+            feedback_reduction
         );
 
-        if loss_pressure || bufferbloat || goodput_shortfall {
+        if feedback_reduction {
             // Receiver signals congestion — force a reduction
             let new_target =
                 (self.current_target_kbps as f64 * self.config.ramp_down_factor) as u32;
@@ -491,6 +560,7 @@ impl BitrateAdapter {
 
         // Emergency: no links
         if alive_count == 0 {
+            debug!(target: "strata::adapt", "decision: no alive links → min");
             return (self.config.min_bitrate_kbps, AdaptationReason::LinkFailure);
         }
 
@@ -498,6 +568,7 @@ impl BitrateAdapter {
         // cold-start). Hold current bitrate rather than treating zero capacity as
         // "over-pressure" and tanking to min on the first tick.
         if usable_kbps == 0.0 {
+            debug!(target: "strata::adapt", "decision: zero usable (cold-start) → hold");
             return (self.current_target_kbps, AdaptationReason::Capacity);
         }
 
@@ -514,6 +585,11 @@ impl BitrateAdapter {
                 AdaptationReason::Capacity
             };
 
+            debug!(
+                target: "strata::adapt",
+                "decision: OVER-PRESSURE {:.2} > {:.2} → reduce {} → {} ({:?})",
+                pressure, self.config.pressure_threshold, current, target, reason
+            );
             return (target, reason);
         }
 
@@ -521,11 +597,32 @@ impl BitrateAdapter {
         if pressure < 0.7 && self.consecutive_increases >= 3 {
             let target = current + self.config.ramp_up_kbps_per_step;
             let target = target.min(self.config.max_bitrate_kbps);
-            let target = target.min(usable_kbps as u32);
+            // Cap below the pressure threshold to avoid overshooting into
+            // over-pressure on the very next tick.
+            let safe_ceiling = (usable_kbps * (self.config.pressure_threshold - 0.05)) as u32;
+            let target = target.min(safe_ceiling);
+            debug!(
+                target: "strata::adapt",
+                "decision: RAMP-UP pressure={:.2} ci={} → {} → {}",
+                pressure, self.consecutive_increases, current, target
+            );
             return (target, AdaptationReason::Recovery);
         }
 
         // Stable: no change
+        if pressure < 0.7 {
+            debug!(
+                target: "strata::adapt",
+                "decision: low-pressure {:.2} but ci={} < 3 → hold at {}",
+                pressure, self.consecutive_increases, current
+            );
+        } else {
+            debug!(
+                target: "strata::adapt",
+                "decision: stable pressure={:.2} → hold at {}",
+                pressure, current
+            );
+        }
         (current, AdaptationReason::Capacity)
     }
 
@@ -562,12 +659,13 @@ impl BitrateAdapter {
     /// | Extreme | `depth > max(200, avg*4)` | jump to min bitrate |
     /// | Heavy   | `depth > max(50, avg*2)`  | fast decrement      |
     ///
-    /// EWMA (alpha=0.01) ensures thresholds scale with sustained load while
-    /// absolute minimums prevent false positives in Docker/CI environments
-    /// where ARQ queues remain near zero.
+    /// EWMA is seeded with the first observation and requires a warm-up
+    /// period (5 samples) before firing alarms. This prevents the cold-start
+    /// queue burst from permanently locking bitrate at minimum.
     fn update_and_check_queues(&mut self, links: &[LinkCapacity]) -> QueueAlarm {
         const MIN_HEAVY: f64 = 50.0;
         const MIN_EXTREME: f64 = 200.0;
+        const WARMUP_SAMPLES: u32 = 5;
 
         let mut alarm = QueueAlarm::None;
 
@@ -575,19 +673,36 @@ impl BitrateAdapter {
             let Some(depth) = l.queue_depth else {
                 continue;
             };
+            // Skip links with catastrophic loss — their unbounded queue
+            // growth is a link-level failure, not system-wide congestion.
+            if l.loss_rate > 0.5 {
+                continue;
+            }
             let depth = depth as f64;
 
             let state = self.queue_state.entry(l.link_id).or_default();
-            state.ewma = state.ewma * 0.99 + depth * 0.01;
-            let avg = state.ewma;
+            state.samples += 1;
 
-            let th_extreme = (avg * 4.0).max(MIN_EXTREME);
-            let th_heavy = (avg * 2.0).max(MIN_HEAVY);
+            // Check alarm BEFORE updating EWMA so thresholds reflect the
+            // previous baseline, not the current spike.
+            if state.samples > WARMUP_SAMPLES {
+                let avg = state.ewma;
+                let th_extreme = (avg * 4.0).max(MIN_EXTREME);
+                let th_heavy = (avg * 2.0).max(MIN_HEAVY);
 
-            if depth > th_extreme {
-                alarm = QueueAlarm::Extreme;
-            } else if matches!(alarm, QueueAlarm::None) && depth > th_heavy {
-                alarm = QueueAlarm::Heavy;
+                if depth > th_extreme {
+                    alarm = QueueAlarm::Extreme;
+                } else if matches!(alarm, QueueAlarm::None) && depth > th_heavy {
+                    alarm = QueueAlarm::Heavy;
+                }
+            }
+
+            // Update EWMA after alarm check
+            if state.samples == 1 {
+                state.ewma = depth;
+            } else {
+                let alpha = if state.samples < 10 { 0.3 } else { 0.01 };
+                state.ewma = state.ewma * (1.0 - alpha) + depth * alpha;
             }
         }
 
@@ -866,7 +981,7 @@ mod tests {
             goodput_bps: 5_000_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
-            loss_after_fec: 0.05, // 5% — well above 1% threshold
+            loss_after_fec: 0.10, // 10% — well above 5% threshold
         };
 
         let before = adapter.current_target_kbps();
@@ -896,7 +1011,7 @@ mod tests {
             goodput_bps: 8_000_000,
             fec_repair_rate: 0.01,
             jitter_buffer_ms: 50,
-            loss_after_fec: 0.005, // below 1% threshold
+            loss_after_fec: 0.03, // below 5% threshold
         };
 
         adapter.update_with_feedback(&links, &feedback);
@@ -923,7 +1038,7 @@ mod tests {
         let feedback = ReceiverFeedback {
             goodput_bps: 8_000_000,
             fec_repair_rate: 0.0,
-            jitter_buffer_ms: 800, // well above 500ms threshold
+            jitter_buffer_ms: 1200, // well above 1000ms threshold
             loss_after_fec: 0.0,
         };
 
@@ -1222,9 +1337,14 @@ mod tests {
             ..Default::default()
         });
 
-        // Issue a command to set last_command_time
-        let links = make_links_with_queue(&[(1_000.0, true, None)]);
+        // Issue a command to set last_command_time and warm up queue EWMA
+        let links = make_links_with_queue(&[(1_000.0, true, Some(0))]);
         adapter.update(&links); // triggers capacity reduction, sets timer
+        // Provide warm-up samples for the queue alarm
+        let warmup = make_links_with_queue(&[(30_000.0, true, Some(0))]);
+        for _ in 0..6 {
+            adapter.update(&warmup);
+        }
 
         // Now inject extreme queue depth — must bypass the 100s interval gate
         let extreme = make_links_with_queue(&[(30_000.0, true, Some(300))]);

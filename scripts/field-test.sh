@@ -276,6 +276,9 @@ if [[ "$VIDEO_SOURCE" == "v4l2" ]]; then
     SENDER_ARGS+=(--device "$VIDEO_DEVICE")
 fi
 
+# Enable adaptation debug logging unless user already set RUST_LOG
+export RUST_LOG="${RUST_LOG:-warn,strata::adapt=info}"
+
 strata-pipeline "${SENDER_ARGS[@]}" > /tmp/strata-sender.log 2>&1 &
 SENDER_PID=$!
 info "Sender started (PID $SENDER_PID)"
@@ -325,8 +328,12 @@ while [[ $ELAPSED -lt $DURATION ]]; do
 
     # Sender adaptation
     SENDER_STATE=$(grep 'Bitrate:' /tmp/strata-sender.log 2>/dev/null | tail -1 || echo "(no adaptation yet)")
+    ADAPT_STATE=$(grep '\[adapt\]' /tmp/strata-sender.log 2>/dev/null | tail -1 | sed 's/.*\[adapt\]/[adapt]/' || echo "")
+    LINK_STATE=$(grep 'strata::adapt.*link' /tmp/strata-sender.log 2>/dev/null | tail -2 | sed 's/.*link=/  link=/' | tr '\n' ' ' || echo "")
 
     echo "[${ELAPSED}s] segments=$SEGMENT_COUNT | $STATS | $SENDER_STATE"
+    [[ -n "$ADAPT_STATE" ]] && echo "        $ADAPT_STATE"
+    [[ -n "$LINK_STATE" ]] && echo "        $LINK_STATE"
 done
 
 echo ""

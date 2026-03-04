@@ -624,9 +624,15 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             && let Some(enc) = pipeline.by_name("enc")
                         {
                             let current = codec_ctrl.get_bitrate_kbps(&enc);
-                            // Limit step to +50% to avoid VBV shock
-                            let max_step = current + current / 2;
-                            let clamped = target_kbps.min(max_step).max(500);
+                            // Limit step to +50% to avoid VBV shock, but allow
+                            // larger jumps when recovering from minimum so the
+                            // encoder doesn't get stuck at 500-750 kbps.
+                            let max_step = if current <= min_bitrate_kbps_val + 200 {
+                                current * 3 // 3× from minimum (e.g. 500 → 1500)
+                            } else {
+                                current + current / 2 // +50% otherwise
+                            };
+                            let clamped = target_kbps.min(max_step).max(min_bitrate_kbps_val);
                             if (clamped as i32 - current as i32).unsigned_abs() > 50 {
                                 let reason = s.get::<String>("reason").unwrap_or_default();
                                 let stage = s.get::<String>("stage").unwrap_or_default();
