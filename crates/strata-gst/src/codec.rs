@@ -76,10 +76,14 @@ pub enum EncoderBackend {
     Software,
     /// NVIDIA NVENC hardware encoder.
     Nvenc,
-    /// VA-API hardware encoder (Intel/AMD, new `va` plugin).
+    /// VA-API hardware encoder (Intel/AMD — both old `gstreamer-vaapi` and new `va` plugin).
     Vaapi,
     /// Intel Quick Sync Video.
     Qsv,
+    /// Vulkan Video hardware encoder (AMD RADV / any Vulkan 1.3 GPU).
+    Vulkan,
+    /// SVT-HEVC: fast software H.265 encoder (multi-threaded, much faster than x265enc).
+    SvtHevc,
 }
 
 impl std::fmt::Display for EncoderBackend {
@@ -89,27 +93,35 @@ impl std::fmt::Display for EncoderBackend {
             EncoderBackend::Nvenc => write!(f, "NVENC"),
             EncoderBackend::Vaapi => write!(f, "VA-API"),
             EncoderBackend::Qsv => write!(f, "QSV"),
+            EncoderBackend::Vulkan => write!(f, "Vulkan"),
+            EncoderBackend::SvtHevc => write!(f, "SVT-HEVC"),
         }
     }
 }
 
 /// Probe GStreamer for the best available encoder for the given codec.
 ///
-/// Priority: NVENC → VA-API → QSV → software.
+/// Priority: NVENC → VA-API (new `va` plugin) → VA-API (old `gstreamer-vaapi` plugin)
+///           → QSV → Vulkan (H.264 only) → SVT-HEVC (H.265 fast-software)
+///           → x264enc / x265enc.
 /// Returns `(factory_name, backend)`.
 fn resolve_encoder(codec: CodecType) -> (&'static str, EncoderBackend) {
     let candidates: &[(&str, EncoderBackend)] = match codec {
         CodecType::H264 => &[
-            ("nvh264enc", EncoderBackend::Nvenc),
-            ("vah264enc", EncoderBackend::Vaapi),
-            ("qsvh264enc", EncoderBackend::Qsv),
-            ("x264enc", EncoderBackend::Software),
+            ("nvh264enc",     EncoderBackend::Nvenc),
+            ("vah264enc",     EncoderBackend::Vaapi),    // new va plugin (gst-plugins-bad 1.20+)
+            ("vaapih264enc",  EncoderBackend::Vaapi),    // old gstreamer-vaapi plugin
+            ("qsvh264enc",    EncoderBackend::Qsv),
+            ("vulkanh264enc", EncoderBackend::Vulkan),   // AMD RADV / any Vulkan 1.3 GPU
+            ("x264enc",       EncoderBackend::Software),
         ],
         CodecType::H265 => &[
-            ("nvh265enc", EncoderBackend::Nvenc),
-            ("vah265enc", EncoderBackend::Vaapi),
-            ("qsvh265enc", EncoderBackend::Qsv),
-            ("x265enc", EncoderBackend::Software),
+            ("nvh265enc",     EncoderBackend::Nvenc),
+            ("vah265enc",     EncoderBackend::Vaapi),    // new va plugin
+            ("vaapih265enc",  EncoderBackend::Vaapi),    // old gstreamer-vaapi plugin
+            ("qsvh265enc",    EncoderBackend::Qsv),
+            ("svthevcenc",    EncoderBackend::SvtHevc),  // fast multi-threaded SW (much faster than x265)
+            ("x265enc",       EncoderBackend::Software),
         ],
         CodecType::Fake => return ("identity", EncoderBackend::Software),
     };
@@ -223,8 +235,12 @@ impl CodecController {
             }
             // ── VA-API (Intel/AMD) ──────────────────────────────────────
             (EncoderBackend::Vaapi, _) => {
+                // target-usage=7: fastest encode speed (good for live streaming).
+                // cpb-size=0: let the driver auto-size the coded picture buffer.
+                // rate-control=cbr: constant bitrate for predictable transport load.
                 format!(
-                    "{factory} name={name} bitrate={bps} key-int-max={ki} rate-control=cbr",
+                    "{factory} name={name} bitrate={bps} key-int-max={ki} \
+                     rate-control=cbr target-usage=7",
                     factory = factory,
                     name = name,
                     bps = bitrate_kbps,
@@ -270,6 +286,26 @@ impl CodecController {
             // ── Fake / identity ─────────────────────────────────────────
             (_, CodecType::Fake) => {
                 format!("identity name={name} drop-probability=0.0")
+            }
+            // ── Vulkan H.264 (AMD RADV / any Vulkan 1.3 GPU) ─────────────
+            (EncoderBackend::Vulkan, _) => {
+                format!(
+                    "{factory} name={name} bitrate={bps} rate-control=cbr",
+                    factory = factory,
+                    name = name,
+                    bps = bitrate_kbps,
+                )
+            }
+            // ── SVT-HEVC (fast multi-threaded software H.265) ─────────────
+            (EncoderBackend::SvtHevc, _) => {
+                // speed=9: fastest preset. enable-open-gop=false: IDR keyframes for HLS.
+                format!(
+                    "svthevcenc name={name} bitrate={bps} key-int-max={ki} speed=9 \
+                     enable-open-gop=false",
+                    name = name,
+                    bps = bitrate_kbps,
+                    ki = key_int_max,
+                )
             }
         }
     }
