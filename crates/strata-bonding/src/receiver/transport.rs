@@ -69,9 +69,16 @@ impl TransportBondingReceiver {
                 let tick_interval = Duration::from_millis(10);
 
                 while running_clone.load(Ordering::Relaxed) {
+                    // Drain all available input packets (non-blocking after
+                    // the first recv_timeout), so the link readers never stall
+                    // waiting on a full input channel.
                     match input_rx.recv_timeout(tick_interval) {
                         Ok(packet) => {
                             buffer.push(packet.seq_id, packet.payload, packet.arrival_time);
+                            // Drain any additional queued packets without blocking.
+                            while let Ok(p) = input_rx.try_recv() {
+                                buffer.push(p.seq_id, p.payload, p.arrival_time);
+                            }
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -85,8 +92,12 @@ impl TransportBondingReceiver {
                     }
 
                     for p in ready {
-                        if output_tx_clone.send(p).is_err() {
-                            return;
+                        // Use try_send to avoid blocking the jitter thread
+                        // when the downstream consumer (GStreamer) stalls.
+                        // Dropping late frames is better than deadlocking
+                        // the entire receive pipeline.
+                        if output_tx_clone.try_send(p).is_err() {
+                            break;
                         }
                     }
                 }
@@ -200,6 +211,9 @@ async fn link_reader_async(
     // Track bytes delivered for goodput calculation.
     let mut prev_bytes_delivered: u64 = 0;
     let mut prev_report_time = std::time::Instant::now();
+    // Track packet counters for per-interval loss (not cumulative lifetime).
+    let mut prev_packets_received: u64 = 0;
+    let mut prev_packets_delivered: u64 = 0;
     // Most recently seen sender address on this socket.
     let mut sender_addr: Option<std::net::SocketAddr> = None;
 
@@ -231,9 +245,9 @@ async fn link_reader_async(
                                     payload: original_payload,
                                     arrival_time: quanta::Instant::now(),
                                 };
-                                if input_tx.send(packet).is_err() {
-                                    return;
-                                }
+                                // Non-blocking: drop packet rather than stall
+                                // the async reader (and ACK/NACK generation).
+                                let _ = input_tx.try_send(packet);
                             } else {
                                 debug!("Dropped packet with invalid bonding header");
                             }
@@ -273,6 +287,21 @@ async fn link_reader_async(
                         let pkt_bytes = encode_nack_packet(&nack, &clock);
                         let _ = socket.send_to(pkt_bytes, addr).await;
                     }
+                    // Drain deliveries produced by gap-skipping during
+                    // ACK/NACK generation (irrecoverable loss handling).
+                    for event in transport_rx.drain_events() {
+                        if let ReceiverEvent::Deliver(delivered) = event
+                            && let Some((header, original_payload)) =
+                                BondingHeader::unwrap(delivered.payload)
+                        {
+                            let packet = Packet {
+                                seq_id: header.seq_id,
+                                payload: original_payload,
+                                arrival_time: quanta::Instant::now(),
+                            };
+                            let _ = input_tx.try_send(packet);
+                        }
+                    }
                     last_ack = std::time::Instant::now();
                     packets_since_ack = 0;
                 }
@@ -284,8 +313,12 @@ async fn link_reader_async(
                         let now = std::time::Instant::now();
                         let dt = now.duration_since(prev_report_time).as_secs_f64();
 
-                        // Compute goodput from bytes delivered since last report
-                        let cur_bytes = rx_stats.bytes_received;
+                        // Compute goodput from bytes actually delivered (not
+                        // just received). During a reorder stall, bytes_received
+                        // keeps growing while packets_delivered is flat — using
+                        // bytes_received would report positive goodput during a
+                        // stall, defeating the adaptation layer's EWMA gate.
+                        let cur_bytes = rx_stats.bytes_delivered;
                         let delta_bytes = cur_bytes.saturating_sub(prev_bytes_delivered);
                         let goodput_bps = if dt > 0.01 {
                             ((delta_bytes as f64 * 8.0) / dt) as u64
@@ -306,10 +339,20 @@ async fn link_reader_async(
                             .map(|s| s.current_latency_ms as u32)
                             .unwrap_or(0);
 
-                        // Residual loss: (lost - fec_recovered) / total, after FEC
-                        let delivered = rx_stats.packets_delivered;
-                        let residual = total.saturating_sub(delivered);
-                        let loss_after_fec = (residual as f64 / total as f64).clamp(0.0, 1.0);
+                        // Residual loss over this interval (delta, not cumulative).
+                        // Using lifetime totals causes startup queue-flood losses to
+                        // permanently inflate the ratio even after recovery.
+                        let delta_recv = rx_stats
+                            .packets_received
+                            .saturating_sub(prev_packets_received)
+                            .max(1);
+                        let delta_delivered = rx_stats
+                            .packets_delivered
+                            .saturating_sub(prev_packets_delivered);
+                        prev_packets_received = rx_stats.packets_received;
+                        prev_packets_delivered = rx_stats.packets_delivered;
+                        let residual = delta_recv.saturating_sub(delta_delivered);
+                        let loss_after_fec = (residual as f64 / delta_recv as f64).clamp(0.0, 1.0);
 
                         let report = strata_transport::wire::ReceiverReportPacket {
                             goodput_bps,
@@ -339,6 +382,21 @@ async fn link_reader_async(
                         let ack = transport_rx.generate_ack();
                         let pkt_bytes = encode_control_packet(&ack, &clock);
                         let _ = socket.send_to(pkt_bytes, addr).await;
+
+                        // Drain gap-skip deliveries.
+                        for event in transport_rx.drain_events() {
+                            if let ReceiverEvent::Deliver(delivered) = event
+                                && let Some((header, original_payload)) =
+                                    BondingHeader::unwrap(delivered.payload)
+                            {
+                                let packet = Packet {
+                                    seq_id: header.seq_id,
+                                    payload: original_payload,
+                                    arrival_time: quanta::Instant::now(),
+                                };
+                                let _ = input_tx.try_send(packet);
+                            }
+                        }
                     }
                     last_ack = std::time::Instant::now();
                     packets_since_ack = 0;

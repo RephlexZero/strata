@@ -15,7 +15,8 @@
                 "tamasfe.even-better-toml",
                 "vadimcn.vscode-lldb",
                 "fill-labs.dependi",
-                "github.vscode-github-actions"
+                "github.vscode-github-actions",
+                "GitHub.copilot-chat"
             ]
         }
     },
@@ -29,12 +30,32 @@
         "seccomp=unconfined"
     ],
     "mounts": [
-        "source=/lib/modules,target=/lib/modules,type=bind,readonly"
+        "source=/lib/modules,target=/lib/modules,type=bind,readonly",
+        // Expose all host device nodes (video*, bus/usb for LTE dongles, dri for VA-API).
+        // Safe because the container is already privileged; avoids enumerating
+        // individual /dev/videoN or /dev/bus/usb/... paths that change per-host.
+        "source=/dev,target=/dev,type=bind",
+        // Forward the host SSH agent socket so field-test.sh can reach the
+        // receiver server using whatever identities are loaded on the host
+        // (including hardware keys / YubiKeys) without copying key files.
+        "source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent.sock,type=bind"
     ],
+    // Tell the container where the forwarded agent socket lives.
+    "containerEnv": {
+        "SSH_AUTH_SOCK": "/ssh-agent.sock"
+    },
     // GPU passthrough for hardware video encoding (VA-API: AMD / Intel).
-    // Harmless on hosts without /dev/dri — privileged mode still starts.
+    // /dev/dri is already covered by the /dev bind mount above; kept as an
+    // explicit hint so the container engine knows to allow the cgroup entry
+    // even on hosts that start the container before the bind mount applies.
+    //
+    // --network=host: share the host's network namespace so that LTE modem
+    // interfaces (enp2s0f0u3, enp2s0f0u4, etc.) are visible inside the
+    // container for the field test. Without this they live only in the host
+    // netns and are invisible to ip(8) inside the container.
     "runArgs": [
-        "--device=/dev/dri"
+        "--device=/dev/dri",
+        "--network=host"
     ],
     "features": {
         "ghcr.io/devcontainers/features/rust:1": {},
