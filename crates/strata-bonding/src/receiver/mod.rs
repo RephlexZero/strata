@@ -4,14 +4,13 @@ pub mod aggregator;
 pub mod transport;
 
 use anyhow::Result;
-use bytes::Bytes;
 use crossbeam_channel::Receiver;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use self::aggregator::ReassemblyStats;
-use self::transport::TransportBondingReceiver;
+use self::transport::{DeliveredPayload, TransportBondingReceiver};
 
 /// Bonding receiver backed by the pure-Rust strata-transport layer.
 ///
@@ -46,7 +45,10 @@ impl ReceiverBackend {
     }
 
     /// The output channel for received reassembled payloads.
-    pub fn output_rx(&self) -> &Receiver<Bytes> {
+    ///
+    /// Each item is `(payload_bytes, discont)` where `discont = true`
+    /// indicates a gap was skipped before this payload.
+    pub fn output_rx(&self) -> &Receiver<DeliveredPayload> {
         &self.inner.output_rx
     }
 

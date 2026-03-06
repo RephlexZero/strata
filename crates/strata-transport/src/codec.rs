@@ -245,27 +245,39 @@ unsafe fn gf_mul_acc_ssse3(dst: &mut [u8], coeff: u8, src: &[u8]) {
 /// Uses `vqtbl1q_u8` (TBL) for parallel 16-byte GF(2^8) table lookup.
 /// Same split-nibble algorithm as the SSSE3 path. NEON has native 8-bit
 /// shift (`vshrq_n_u8`) so no masking trick is needed for the high nibble.
+///
+/// `#[target_feature(enable = "neon")]` is redundant on aarch64 (NEON is
+/// mandatory) but required so that the intrinsics are callable without an
+/// additional `unsafe` block under the `unsafe_op_in_unsafe_fn` lint that
+/// Rust 2024 enables by default.
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 unsafe fn gf_mul_acc_neon(dst: &mut [u8], coeff: u8, src: &[u8]) {
     use std::arch::aarch64::*;
 
     let (lo_lut, hi_lut) = build_mul_luts(coeff);
-    let lo_tbl = vld1q_u8(lo_lut.as_ptr());
-    let hi_tbl = vld1q_u8(hi_lut.as_ptr());
-    let mask_0f = vdupq_n_u8(0x0F);
+    // SAFETY: lo_lut / hi_lut are 16-byte stack arrays — always valid.
+    let lo_tbl = unsafe { vld1q_u8(lo_lut.as_ptr()) };
+    let hi_tbl = unsafe { vld1q_u8(hi_lut.as_ptr()) };
+    // SAFETY: vdupq_n_u8 takes an integer immediate — no pointer, always safe.
+    let mask_0f = unsafe { vdupq_n_u8(0x0F) };
 
     let len = dst.len().min(src.len());
     let mut i = 0;
 
     while i + 16 <= len {
-        let s = vld1q_u8(src.as_ptr().add(i));
-        let d = vld1q_u8(dst.as_ptr().add(i));
+        // SAFETY: i + 16 <= len ensures both loads are in-bounds.
+        let s = unsafe { vld1q_u8(src.as_ptr().add(i)) };
+        let d = unsafe { vld1q_u8(dst.as_ptr().add(i)) };
 
-        let lo_nibble = vandq_u8(s, mask_0f);
-        let hi_nibble = vshrq_n_u8::<4>(s);
+        // Split-nibble table lookup (no unsafe — all lane operations).
+        let lo_nibble = unsafe { vandq_u8(s, mask_0f) };
+        let hi_nibble = unsafe { vshrq_n_u8::<4>(s) };
 
-        let product = veorq_u8(vqtbl1q_u8(lo_tbl, lo_nibble), vqtbl1q_u8(hi_tbl, hi_nibble));
-        vst1q_u8(dst.as_mut_ptr().add(i), veorq_u8(d, product));
+        let product =
+            unsafe { veorq_u8(vqtbl1q_u8(lo_tbl, lo_nibble), vqtbl1q_u8(hi_tbl, hi_nibble)) };
+        // SAFETY: i + 16 <= len ensures the store is in-bounds.
+        unsafe { vst1q_u8(dst.as_mut_ptr().add(i), veorq_u8(d, product)) };
         i += 16;
     }
 

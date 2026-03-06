@@ -155,6 +155,11 @@ impl LinkLifecycle {
                     LinkPhase::Reset
                 } else if self.consecutive_good >= self.config.probe_to_warm_good {
                     LinkPhase::Warm
+                } else if self.consecutive_bad >= self.config.warm_to_degrade_bad {
+                    // Link stuck in Probe with sustained bad stats — advance to
+                    // Degrade so it can eventually reach Cooldown and be excluded
+                    // from routing until conditions improve.
+                    LinkPhase::Degrade
                 } else {
                     LinkPhase::Probe
                 }

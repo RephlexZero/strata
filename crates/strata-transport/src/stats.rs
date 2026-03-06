@@ -66,6 +66,8 @@ pub struct ReceiverStats {
     pub bytes_received: u64,
     /// Packets delivered to the application (unique + in-order).
     pub packets_delivered: u64,
+    /// Total payload bytes delivered to the application (unique + in-order).
+    pub bytes_delivered: u64,
     /// Duplicate packets received (same seq_no).
     pub duplicates: u64,
     /// Packets received after playout deadline.

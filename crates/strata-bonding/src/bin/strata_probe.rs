@@ -101,7 +101,7 @@ fn main() -> anyhow::Result<()> {
 
     while running.load(Ordering::Relaxed) {
         match rcv.output_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(payload) => {
+            Ok((payload, _discont)) => {
                 total_bytes += payload.len() as u64;
                 total_packets += 1;
                 if let Err(e) = sink.write(&payload) {

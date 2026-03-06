@@ -378,6 +378,7 @@ impl Receiver {
 
             self.next_deliver_seq += 1;
             self.stats.packets_delivered += 1;
+            self.stats.bytes_delivered += pkt.payload.len() as u64;
 
             // Reassemble fragments
             if let Some(delivered) = self.assembler.process(&pkt) {
@@ -387,6 +388,35 @@ impl Receiver {
 
         // Cleanup old fragment chains
         self.assembler.cleanup_stale(self.next_deliver_seq, 1000);
+    }
+
+    /// Advance `next_deliver_seq` past irrecoverable gaps so that the
+    /// reorder buffer doesn't block forever on permanently lost packets.
+    ///
+    /// When the loss detector declares a sequence irrecoverable (NACK
+    /// budget exhausted), `highest_contiguous` advances past it.  We
+    /// must mirror that in `next_deliver_seq`, delivering any buffered
+    /// packets along the way.
+    fn skip_irrecoverable_gaps(&mut self) {
+        let frontier = self.loss_detector.highest_contiguous();
+        if frontier < self.next_deliver_seq {
+            return;
+        }
+        // Walk from next_deliver_seq to frontier, delivering buffered
+        // packets and skipping gaps.
+        while self.next_deliver_seq <= frontier {
+            let seq = self.next_deliver_seq;
+            if let Some(pkt) = self.reorder_buf.remove(&seq) {
+                self.stats.packets_delivered += 1;
+                self.stats.bytes_delivered += pkt.payload.len() as u64;
+                if let Some(delivered) = self.assembler.process(&pkt) {
+                    self.events.push(ReceiverEvent::Deliver(delivered));
+                }
+            }
+            self.next_deliver_seq += 1;
+        }
+        // Continue delivering any consecutive packets after the gap.
+        self.deliver_in_order();
     }
 
     /// Generate NACKs for detected losses.
@@ -399,6 +429,7 @@ impl Receiver {
         // 64-bit SACK window and breaking sender-side delivery-rate
         // measurement.
         self.loss_detector.advance_past_irrecoverable();
+        self.skip_irrecoverable_gaps();
         if let Some(nack) = nack {
             self.stats.nacks_sent += 1;
             self.events.push(ReceiverEvent::SendNack(nack.clone()));
@@ -413,6 +444,7 @@ impl Receiver {
         // Advance past irrecoverable gaps before reading the cumulative
         // so that ACKs always reflect the latest recoverable frontier.
         self.loss_detector.advance_past_irrecoverable();
+        self.skip_irrecoverable_gaps();
 
         let cum_seq = self.loss_detector.highest_contiguous();
 
@@ -898,5 +930,268 @@ mod tests {
             "PPD probes should still be delivered as data"
         );
         assert_eq!(delivers[0].payload, &b"ppd data"[..]);
+    }
+
+    #[test]
+    fn irrecoverable_gap_unblocks_delivery() {
+        // Receive packets 0, 2, 3 — packet 1 is lost.
+        let mut rx = Receiver::new(ReceiverConfig {
+            max_nack_retries: 1,
+            nack_rearm_ms: 0,
+            ..ReceiverConfig::default()
+        });
+
+        rx.receive(make_wire_packet(0, b"p0"));
+        rx.receive(make_wire_packet(2, b"p2"));
+        rx.receive(make_wire_packet(3, b"p3"));
+
+        // Drain initial events (delivery of p0 + possible NACKs).
+        let initial: Vec<_> = rx
+            .drain_events()
+            .filter_map(|e| match e {
+                ReceiverEvent::Deliver(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(initial.len(), 1, "only p0 should deliver initially");
+        assert_eq!(initial[0].payload, &b"p0"[..]);
+        assert_eq!(rx.next_expected_seq(), 1, "blocked on missing seq 1");
+
+        // First generate_nacks: nack_count goes 0→1, which equals
+        // max_nack_retries=1, so the gap is immediately irrecoverable.
+        // skip_irrecoverable_gaps then delivers p2 and p3.
+        rx.generate_nacks();
+
+        let delivered: Vec<_> = rx
+            .drain_events()
+            .filter_map(|e| match e {
+                ReceiverEvent::Deliver(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delivered.len(), 2, "p2 and p3 should now be delivered");
+        assert_eq!(delivered[0].payload, &b"p2"[..]);
+        assert_eq!(delivered[1].payload, &b"p3"[..]);
+        assert_eq!(rx.next_expected_seq(), 4);
+    }
+
+    // ─── P0 Gap-Skip Tests ─────────────────────────────────────────────
+
+    #[test]
+    fn irrecoverable_gap_multiple_bursts() {
+        // Skip gap, deliver, encounter another gap, skip again.
+        let mut rx = Receiver::new(ReceiverConfig {
+            max_nack_retries: 1,
+            nack_rearm_ms: 0,
+            ..ReceiverConfig::default()
+        });
+
+        // First burst: 0 arrives, 1 lost, 2-3 arrive
+        rx.receive(make_wire_packet(0, b"p0"));
+        rx.receive(make_wire_packet(2, b"p2"));
+        rx.receive(make_wire_packet(3, b"p3"));
+        rx.drain_events().for_each(drop);
+
+        // Skip first gap
+        rx.generate_nacks();
+        let d1: Vec<_> = rx
+            .drain_events()
+            .filter_map(|e| match e {
+                ReceiverEvent::Deliver(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(d1.len(), 2, "should deliver p2 and p3 after first gap skip");
+        assert_eq!(rx.next_expected_seq(), 4);
+
+        // Second burst: 4 arrives, 5 lost, 6-7 arrive
+        rx.receive(make_wire_packet(4, b"p4"));
+        rx.receive(make_wire_packet(6, b"p6"));
+        rx.receive(make_wire_packet(7, b"p7"));
+        rx.drain_events().for_each(drop);
+        assert_eq!(rx.next_expected_seq(), 5, "blocked on missing seq 5");
+
+        // Skip second gap
+        rx.generate_nacks();
+        let d2: Vec<_> = rx
+            .drain_events()
+            .filter_map(|e| match e {
+                ReceiverEvent::Deliver(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            d2.len(),
+            2,
+            "should deliver p6 and p7 after second gap skip"
+        );
+        assert_eq!(rx.next_expected_seq(), 8);
+    }
+
+    #[test]
+    fn irrecoverable_gap_with_fragments() {
+        // Lost middle fragment: Start arrives, Middle lost, End arrives.
+        // Gap-skip should advance past the orphaned fragment chain.
+        let mut rx = Receiver::new(ReceiverConfig {
+            max_nack_retries: 1,
+            nack_rearm_ms: 0,
+            ..ReceiverConfig::default()
+        });
+
+        // seq 0: Start fragment, seq 1: Middle (lost), seq 2: End fragment
+        rx.receive(make_fragment_packet(0, Fragment::Start, b"AAA", true));
+        // Skip seq 1
+        rx.receive(make_fragment_packet(2, Fragment::End, b"CCC", false));
+
+        rx.drain_events().for_each(drop);
+        assert_eq!(rx.next_expected_seq(), 1, "blocked on missing seq 1");
+
+        // Skip the gap — should advance past all 3 fragment seqs
+        rx.generate_nacks();
+
+        // seq 3 should be the next expected (0 delivered as partial Start,
+        // 1 was skipped, 2 delivered as End — but the fragment chain is
+        // incomplete so no DeliveredPacket event for the fragment group)
+        assert_eq!(
+            rx.next_expected_seq(),
+            3,
+            "should advance past orphaned fragment chain"
+        );
+
+        // Now send a complete packet at seq 3 — should deliver fine
+        rx.receive(make_wire_packet(3, b"p3"));
+        let d: Vec<_> = rx
+            .drain_events()
+            .filter_map(|e| match e {
+                ReceiverEvent::Deliver(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(d.len(), 1, "packet after gap should deliver normally");
+        assert_eq!(d[0].payload, &b"p3"[..]);
+    }
+
+    #[test]
+    fn generate_ack_also_skips_gaps() {
+        // Verify that generate_ack() (not just generate_nacks()) triggers
+        // gap-skip deliveries.
+        let mut rx = Receiver::new(ReceiverConfig {
+            max_nack_retries: 1,
+            nack_rearm_ms: 0,
+            ..ReceiverConfig::default()
+        });
+
+        rx.receive(make_wire_packet(0, b"p0"));
+        rx.receive(make_wire_packet(2, b"p2"));
+        rx.receive(make_wire_packet(3, b"p3"));
+        rx.drain_events().for_each(drop);
+
+        // Exhaust NACK budget so the gap becomes irrecoverable
+        rx.generate_nacks();
+        rx.drain_events().for_each(drop);
+
+        // Now receive more data: 4 arrives, 5 lost, 6 arrives
+        rx.receive(make_wire_packet(4, b"p4"));
+        rx.receive(make_wire_packet(6, b"p6"));
+        rx.drain_events().for_each(drop);
+
+        // Exhaust NACK budget for seq 5
+        rx.generate_nacks();
+        rx.drain_events().for_each(drop);
+
+        // Now use generate_ack (not nacks) to trigger gap skip
+        let ack = rx.generate_ack();
+
+        let _d: Vec<_> = rx
+            .drain_events()
+            .filter_map(|e| match e {
+                ReceiverEvent::Deliver(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        // p6 should have been delivered via the ack-triggered gap skip
+        // (p4 was already delivered when received since next_deliver_seq was at 4)
+        assert!(
+            ack.cumulative_seq.value() >= 6,
+            "ACK cumulative should advance past gap: got {}",
+            ack.cumulative_seq.value()
+        );
+    }
+
+    #[test]
+    fn delivery_after_gap_updates_stats() {
+        let mut rx = Receiver::new(ReceiverConfig {
+            max_nack_retries: 1,
+            nack_rearm_ms: 0,
+            ..ReceiverConfig::default()
+        });
+
+        // Send 10 packets, lose 2 (seq 3 and 7)
+        for i in 0..10u64 {
+            if i != 3 && i != 7 {
+                rx.receive(make_wire_packet(i, &[i as u8; 100]));
+            }
+        }
+        rx.drain_events().for_each(drop);
+
+        // Initially: delivered 0,1,2 (blocked at 3)
+        assert_eq!(rx.stats().packets_delivered, 3);
+        assert_eq!(rx.stats().bytes_delivered, 300);
+
+        // Skip gaps
+        rx.generate_nacks();
+        rx.drain_events().for_each(drop);
+
+        // After gap skip: delivered 0-9 minus 3 and 7 = 8 packets
+        assert_eq!(rx.stats().packets_delivered, 8);
+        assert_eq!(rx.stats().bytes_delivered, 800);
+        assert_eq!(rx.next_expected_seq(), 10);
+    }
+
+    #[test]
+    fn high_loss_burst_then_recovery() {
+        // 50% of a 100-packet burst is lost, rest arrives.
+        let mut rx = Receiver::new(ReceiverConfig {
+            max_nack_retries: 1,
+            nack_rearm_ms: 0,
+            ..ReceiverConfig::default()
+        });
+
+        // Send even-numbered packets only (odd are "lost")
+        for i in 0..100u64 {
+            if i % 2 == 0 {
+                rx.receive(make_wire_packet(i, &[i as u8; 50]));
+            }
+        }
+        rx.drain_events().for_each(drop);
+
+        // Only seq 0 delivered initially (blocked at 1)
+        assert_eq!(rx.stats().packets_delivered, 1);
+
+        // Skip all gaps
+        rx.generate_nacks();
+        rx.drain_events().for_each(drop);
+
+        // All 50 received packets should now be delivered.
+        // next_deliver_seq advances to the highest contiguous after gap-skip.
+        // The ceiling for NACKs is the highest out-of-order seq (98), so
+        // seq 99 is never NACKed (nothing above it to detect it as a gap).
+        assert_eq!(rx.stats().packets_delivered, 50);
+        assert_eq!(rx.next_expected_seq(), 99);
+
+        // Now send recovery packets 100-109 (all arrive).
+        // Seq 99 (lost, odd) is now detectable as a gap.
+        for i in 100..110u64 {
+            rx.receive(make_wire_packet(i, &[i as u8; 50]));
+        }
+        rx.drain_events().for_each(drop);
+
+        // Seq 99 gap blocks delivery — trigger gap-skip
+        rx.generate_nacks();
+        rx.drain_events().for_each(drop);
+
+        // All recovery packets plus the skip past 99 should deliver
+        assert_eq!(rx.stats().packets_delivered, 60);
+        assert_eq!(rx.next_expected_seq(), 110);
     }
 }

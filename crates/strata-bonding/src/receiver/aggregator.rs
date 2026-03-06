@@ -48,6 +48,14 @@ pub struct ReassemblyBuffer {
     // Adaptive latency — loss-aware sizing
     loss_rate_smoothed: f64,
     loss_penalty_ms: f64,
+
+    // Desync recovery: track consecutive late packets to detect when
+    // next_seq has jumped ahead of the sender's actual sequence space.
+    consecutive_late: u64,
+    /// Highest seq_id seen among consecutive late packets — used as the
+    /// resync target so we resume from the most recent sender position,
+    /// not from an arbitrary old packet that happened to arrive last.
+    max_late_seq: u64,
 }
 
 /// Configuration for the reassembly jitter buffer.
@@ -78,13 +86,13 @@ impl Default for ReassemblyConfig {
             start_latency: Duration::from_millis(50),
             buffer_capacity: 2048,
             skip_after: None,
-            jitter_latency_multiplier: 4.0,
+            jitter_latency_multiplier: 2.0,
             max_latency_ms: 500,
             min_latency_ms: 10,
             ramp_up_alpha: 0.3,
-            ramp_down_alpha: 0.02,
+            ramp_down_alpha: 0.05,
             stability_threshold_ms: 2000,
-            loss_penalty_ms: 500.0,
+            loss_penalty_ms: 200.0,
         }
     }
 }
@@ -157,6 +165,8 @@ impl ReassemblyBuffer {
             stability_threshold: Duration::from_millis(config.stability_threshold_ms),
             loss_rate_smoothed: 0.0,
             loss_penalty_ms: config.loss_penalty_ms,
+            consecutive_late: 0,
+            max_late_seq: 0,
         }
     }
 
@@ -225,26 +235,87 @@ impl ReassemblyBuffer {
                 self.latency = Duration::from_secs_f64(new_ms / 1000.0);
                 self.stable_since = None;
             } else if target_ms < current_ms - 0.5 {
-                // Slow ramp-down, only after stability period
-                match self.stable_since {
-                    Some(since) if now.duration_since(since) >= self.stability_threshold => {
-                        let new_ms = current_ms + self.ramp_down_alpha * (target_ms - current_ms);
-                        self.latency =
-                            Duration::from_secs_f64(new_ms / 1000.0).max(self.min_latency);
+                // Fast ramp-down when target is dramatically lower (stall
+                // recovery: loss_rate dropped → loss_penalty shrank).  Use
+                // the same ramp-up alpha to avoid being stuck at a bloated
+                // latency for seconds after the underlying issue resolved.
+                if current_ms > target_ms * 2.0 {
+                    let new_ms = current_ms + self.ramp_up_alpha * (target_ms - current_ms);
+                    self.latency = Duration::from_secs_f64(new_ms / 1000.0).max(self.min_latency);
+                    self.stable_since = None;
+                } else {
+                    // Normal slow ramp-down, only after stability period
+                    match self.stable_since {
+                        Some(since) if now.duration_since(since) >= self.stability_threshold => {
+                            let new_ms =
+                                current_ms + self.ramp_down_alpha * (target_ms - current_ms);
+                            self.latency =
+                                Duration::from_secs_f64(new_ms / 1000.0).max(self.min_latency);
+                        }
+                        None => {
+                            self.stable_since = Some(now);
+                        }
+                        _ => {} // Waiting for stability threshold
                     }
-                    None => {
-                        self.stable_since = Some(now);
-                    }
-                    _ => {} // Waiting for stability threshold
                 }
             }
         }
         self.last_arrival = Some(now);
 
         if seq_id < self.next_seq {
-            // Late packet, drop
-            self.late_packets += 1;
-            return;
+            self.consecutive_late += 1;
+            // Track the highest seq_id seen among consecutive late packets.
+            // This is the resync target: the most recent position the sender
+            // was at, not an arbitrary old packet that happened to arrive last.
+            if seq_id > self.max_late_seq {
+                self.max_late_seq = seq_id;
+            }
+
+            // If we see many consecutive late packets, the buffer's next_seq
+            // has desynchronised from the sender (e.g. after a burst loss
+            // caused a large gap-skip).  Reset to re-sync with the sender.
+            const RESYNC_THRESHOLD: u64 = 100;
+            if self.consecutive_late >= RESYNC_THRESHOLD {
+                // Use the highest seq_id seen in this window as the resync
+                // target — it's the best approximation of the sender's current
+                // position.  Using `seq_id` (the last, possibly very old
+                // retransmission) would reset next_seq to 0 or some stale
+                // value and permanently stall the receiver.
+                let resync_target = self.max_late_seq + 1;
+                tracing::warn!(
+                    old_next_seq = self.next_seq,
+                    new_next_seq = resync_target,
+                    consecutive_late = self.consecutive_late,
+                    "reassembly buffer desync detected — resetting next_seq to re-sync with sender"
+                );
+                // Clear stale buffer contents below the resync target
+                for slot in self.buffer.iter_mut() {
+                    if let Some(p) = slot
+                        && p.seq_id < resync_target
+                    {
+                        *slot = None;
+                        self.buffered = self.buffered.saturating_sub(1);
+                    }
+                }
+                self.next_seq = resync_target;
+                self.consecutive_late = 0;
+                self.max_late_seq = 0;
+                // Reset adaptive latency — the stall inflated it via
+                // loss_penalty and we need a fresh start to avoid the
+                // new packets immediately being classified as late too.
+                self.loss_rate_smoothed = 0.0;
+                self.latency = self.start_latency;
+                self.target_latency = self.start_latency;
+                self.stable_since = None;
+                // Fall through to insert this packet normally
+            } else {
+                // Late packet, drop
+                self.late_packets += 1;
+                return;
+            }
+        } else {
+            self.consecutive_late = 0;
+            self.max_late_seq = 0;
         }
 
         let capacity = self.capacity as u64;
@@ -278,7 +349,10 @@ impl ReassemblyBuffer {
         });
     }
 
-    pub fn tick(&mut self, now: Instant) -> Vec<Bytes> {
+    /// Release ready packets. Returns `(payload, discont)` pairs where
+    /// `discont = true` means a gap was skipped immediately before this
+    /// packet (the MPEG-TS byte-alignment may have shifted).
+    pub fn tick(&mut self, now: Instant) -> Vec<(Bytes, bool)> {
         let loss_before = self.lost_packets;
         let mut released = Vec::new();
         let skip_after = self.skip_after.unwrap_or(self.latency);
@@ -286,6 +360,9 @@ impl ReassemblyBuffer {
             .skip_after
             .map(|v| v.min(self.latency))
             .unwrap_or(self.latency);
+
+        // Set after a gap skip; cleared after the next packet is released.
+        let mut discont = false;
 
         // While loop to process available packets or skip gaps
         loop {
@@ -298,7 +375,7 @@ impl ReassemblyBuffer {
                 if now.duration_since(packet.arrival_time) >= release_after {
                     let p = self.buffer[idx].take().unwrap();
                     self.buffered = self.buffered.saturating_sub(1);
-                    released.push(p.payload);
+                    released.push((p.payload, std::mem::take(&mut discont)));
                     self.next_seq += 1;
                     continue;
                 }
@@ -313,6 +390,7 @@ impl ReassemblyBuffer {
                 let skipped = first_seq.saturating_sub(self.next_seq);
                 self.lost_packets += skipped;
                 self.advance_window(first_seq);
+                discont = true;
                 continue;
             }
 
@@ -392,7 +470,7 @@ mod tests {
         // Tick after latency
         let out = buf.tick(start + Duration::from_millis(100));
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0], p1);
+        assert_eq!(out[0].0, p1);
     }
 
     #[test]
@@ -410,9 +488,9 @@ mod tests {
 
         // Should come out as P0, P1, P2
         assert_eq!(out.len(), 3);
-        assert_eq!(out[0], Bytes::from_static(b"P0"));
-        assert_eq!(out[1], Bytes::from_static(b"P1"));
-        assert_eq!(out[2], Bytes::from_static(b"P2"));
+        assert_eq!(out[0].0, Bytes::from_static(b"P0"));
+        assert_eq!(out[1].0, Bytes::from_static(b"P1"));
+        assert_eq!(out[2].0, Bytes::from_static(b"P2"));
     }
 
     #[test]
@@ -430,7 +508,7 @@ mod tests {
 
         let out = buf.tick(start + Duration::from_millis(50));
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0], Bytes::from_static(b"P1"));
+        assert_eq!(out[0].0, Bytes::from_static(b"P1"));
     }
 
     #[test]
@@ -511,7 +589,7 @@ mod tests {
         // At 30ms, aggressive skip should release P1
         let out = buf.tick(start + Duration::from_millis(30));
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0], Bytes::from_static(b"P1"));
+        assert_eq!(out[0].0, Bytes::from_static(b"P1"));
     }
 
     #[test]
@@ -528,7 +606,7 @@ mod tests {
         buf.push(20, Bytes::from_static(b"P20"), start);
         let out = buf.tick(start + Duration::from_millis(10));
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0], Bytes::from_static(b"P20"));
+        assert_eq!(out[0].0, Bytes::from_static(b"P20"));
         assert!(buf.lost_packets > 0);
     }
 
@@ -757,6 +835,73 @@ mod tests {
         );
     }
 
+    /// Regression: after a stall inflates latency via loss_penalty, clearing
+    /// the loss must ramp latency back down quickly (using ramp_up_alpha, not
+    /// the slow ramp_down_alpha) when current_ms > target_ms * 2.0.
+    ///
+    /// Before the fix the slow path was always taken, leaving latency stuck at
+    /// 200+ ms for many seconds after loss cleared — causing A/V sync issues
+    /// and head-of-line blocking on recovered links.
+    #[test]
+    fn stall_recovery_ramp_down_fast() {
+        // ramp_up_alpha=1.0 → instant ramp-up; ramp_down_alpha=0.02 (slow default)
+        // Without the fast-ramp-down path, after 5 push() calls latency would
+        // still be ~200ms when loss clears; with it, it should be ≤ start_latency.
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(20),
+            buffer_capacity: 256,
+            skip_after: Some(Duration::from_millis(5)),
+            ramp_up_alpha: 1.0,
+            ramp_down_alpha: 0.02, // very slow — without the fast path we'd stay high
+            loss_penalty_ms: 500.0,
+            stability_threshold_ms: 0, // no stability wait
+            ..Default::default()
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        // Phase 1: push 50 packets with a gap to drive loss_rate_smoothed up,
+        // then tick to register the losses.
+        for i in 0u64..50 {
+            buf.push(
+                i,
+                Bytes::from(vec![i as u8]),
+                start + Duration::from_millis(i),
+            );
+        }
+        // Create a big gap — skip to seq 200 so ~150 packets appear lost
+        let t_gap = start + Duration::from_millis(100);
+        buf.push(200, Bytes::from_static(b"jump"), t_gap);
+        let _ = buf.tick(t_gap + Duration::from_millis(10));
+
+        // Manually inflate loss_rate_smoothed and latency to worst-case
+        buf.loss_rate_smoothed = 1.0;
+        buf.latency = Duration::from_millis(500);
+        buf.target_latency = Duration::from_millis(500);
+
+        let bloated_latency = buf.latency;
+
+        // Phase 2: loss clears — push steady in-order packets so the buffer
+        // computes a low target (start_latency + 0 loss_penalty = 20ms).
+        // current_ms(500) > target_ms(20) * 2 → fast ramp-down path fires.
+        let t_clear = t_gap + Duration::from_millis(200);
+        buf.loss_rate_smoothed = 0.0; // loss cleared
+        for i in 0u64..20 {
+            buf.push(
+                201 + i,
+                Bytes::from(vec![i as u8]),
+                t_clear + Duration::from_millis(i * 10),
+            );
+        }
+
+        assert!(
+            buf.latency < bloated_latency / 2,
+            "fast ramp-down should halve bloated latency quickly: still at {:?} (started at {:?})",
+            buf.latency,
+            bloated_latency,
+        );
+    }
+
     #[test]
     fn test_loss_increases_latency() {
         let config = ReassemblyConfig {
@@ -970,5 +1115,245 @@ mod tests {
             500,
             "Default max_latency_ms should be 500"
         );
+    }
+
+    // ── Regression: resync resets adaptive latency state ─────────────
+
+    /// After the desync reset (100 consecutive late packets), the buffer's
+    /// adaptive latency state should be fully cleared so that new packets
+    /// arriving after the reset are not immediately classified as "late".
+    ///
+    /// Before the fix, loss_rate_smoothed stayed at 1.0, latency stayed at
+    /// max (500ms), and target_latency stayed at max — so every packet that
+    /// arrived after the resync was also classified as late, triggering
+    /// another resync → infinite loop.
+    #[test]
+    fn resync_resets_adaptive_latency() {
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(20),
+            buffer_capacity: 64,
+            skip_after: Some(Duration::from_millis(5)),
+            // Fast ramp-up so loss penalty inflates latency quickly
+            ramp_up_alpha: 1.0,
+            loss_penalty_ms: 500.0,
+            max_latency_ms: 500,
+            ..Default::default()
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        // Phase 1: Normal delivery of packets 0..10
+        for i in 0u64..10 {
+            buf.push(i, Bytes::from(vec![i as u8]), start);
+        }
+        let _ = buf.tick(start + Duration::from_millis(20));
+        assert_eq!(buf.packets_delivered, 10);
+
+        // Phase 2: Force high loss_rate_smoothed by skipping many packets.
+        // Push seq 200 far ahead — window advance skips 190 packets (all "lost"),
+        // then tick to register the loss in loss_rate_smoothed.
+        let t2 = start + Duration::from_millis(100);
+        buf.push(200, Bytes::from_static(b"far"), t2);
+        let _ = buf.tick(t2 + Duration::from_millis(10));
+        // loss_rate_smoothed should now be elevated
+        assert!(
+            buf.loss_rate_smoothed > 0.0,
+            "loss rate should be elevated after mass loss"
+        );
+
+        // Also manually set latency to max to simulate the worst case
+        buf.latency = Duration::from_millis(500);
+        buf.target_latency = Duration::from_millis(500);
+        buf.loss_rate_smoothed = 1.0;
+
+        // Phase 3: Send 100 consecutive "late" packets (seq < next_seq)
+        // to trigger the desync reset.
+        let t3 = t2 + Duration::from_millis(200);
+        let resume_seq = 50u64; // well below next_seq (~201)
+        for i in 0u64..100 {
+            buf.push(
+                resume_seq + i,
+                Bytes::from(vec![(resume_seq + i) as u8]),
+                t3 + Duration::from_millis(i),
+            );
+        }
+
+        // The resync should have fired. Verify latency state was reset.
+        assert_eq!(
+            buf.loss_rate_smoothed, 0.0,
+            "loss_rate_smoothed must be cleared on resync"
+        );
+        assert_eq!(
+            buf.latency,
+            Duration::from_millis(20),
+            "latency must revert to start_latency on resync"
+        );
+        assert_eq!(
+            buf.target_latency,
+            Duration::from_millis(20),
+            "target_latency must revert to start_latency on resync"
+        );
+        assert!(
+            buf.stable_since.is_none(),
+            "stable_since must be cleared on resync"
+        );
+
+        // Phase 4: Verify that packets arriving after the resync are delivered,
+        // not immediately dropped as "late" again.
+        let t4 = t3 + Duration::from_millis(200);
+        let post_resync_start = buf.next_seq;
+        for i in 0u64..10 {
+            buf.push(
+                post_resync_start + i,
+                Bytes::from(vec![i as u8]),
+                t4 + Duration::from_millis(i * 5),
+            );
+        }
+        let out = buf.tick(t4 + Duration::from_millis(100));
+        assert!(
+            !out.is_empty(),
+            "packets after resync must be delivered normally (got {} late, {} delivered)",
+            buf.late_packets,
+            buf.packets_delivered
+        );
+    }
+
+    // ── Regression: desync recovery after burst loss ──────────────────
+
+    /// After a large gap-skip pushes next_seq far ahead, subsequent packets
+    /// from the sender all have seq < next_seq and are dropped as "late".
+    /// The desync detector should reset next_seq after 100 consecutive late
+    /// arrivals, allowing delivery to resume.
+    #[test]
+    fn test_desync_recovery_after_burst_loss() {
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(10),
+            buffer_capacity: 64,
+            skip_after: Some(Duration::from_millis(5)),
+            ..Default::default()
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        // Phase 1: Normal delivery of packets 0..50
+        for i in 0u64..50 {
+            buf.push(i, Bytes::from(vec![i as u8]), start);
+        }
+        let _ = buf.tick(start + Duration::from_millis(10));
+        assert_eq!(buf.packets_delivered, 50);
+
+        // Phase 2: Simulate burst loss — a packet arrives far ahead,
+        // causing next_seq to jump (gap-skip via the capacity overflow path).
+        let burst_time = start + Duration::from_millis(100);
+        buf.push(5000, Bytes::from_static(b"far-ahead"), burst_time);
+        let _ = buf.tick(burst_time + Duration::from_millis(10));
+
+        // next_seq should now be well ahead of 50
+        assert!(
+            buf.next_seq > 100,
+            "next_seq should have jumped: {}",
+            buf.next_seq
+        );
+
+        // Phase 3: Sender continues from seq 60 (it doesn't know about our jump).
+        // All of these will be "late" since 60 < next_seq (~4937+).
+        let resume_time = burst_time + Duration::from_millis(200);
+        for i in 60u64..260 {
+            buf.push(
+                i,
+                Bytes::from(vec![i as u8]),
+                resume_time + Duration::from_millis(i - 60),
+            );
+        }
+
+        // After 100 consecutive late packets, desync recovery should fire.
+        // Packets after the reset should be insertable.
+        // next_seq should have been reset to somewhere around seq 160.
+        assert!(
+            buf.next_seq < 5000,
+            "next_seq should have been reset after desync: {}",
+            buf.next_seq
+        );
+
+        // Deliver the packets that were inserted after the resync
+        let out = buf.tick(resume_time + Duration::from_millis(300));
+        assert!(
+            !out.is_empty(),
+            "Should deliver packets after desync recovery (delivered {} total)",
+            buf.packets_delivered,
+        );
+    }
+
+    /// The desync counter resets when a normal (non-late) packet arrives,
+    /// so occasional late arrivals during normal operation don't falsely
+    /// trigger a reset.
+    #[test]
+    fn test_desync_counter_resets_on_normal_arrival() {
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(10),
+            buffer_capacity: 64,
+            skip_after: Some(Duration::from_millis(5)),
+            ..Default::default()
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        // Deliver packets 0..10
+        for i in 0u64..10 {
+            buf.push(i, Bytes::from(vec![0; 10]), start);
+        }
+        let _ = buf.tick(start + Duration::from_millis(10));
+
+        // Send 50 late packets (below next_seq=10), then a normal one
+        for i in 0u64..50 {
+            buf.push(
+                i,
+                Bytes::from(vec![0; 10]),
+                start + Duration::from_millis(20),
+            );
+        }
+        // Interrupt with a valid in-sequence packet
+        buf.push(
+            10,
+            Bytes::from(vec![0; 10]),
+            start + Duration::from_millis(20),
+        );
+
+        // Counter should have been reset. Send 50 more late packets —
+        // total late is 100 but the counter only reached 50 each time.
+        for i in 0u64..50 {
+            buf.push(
+                i,
+                Bytes::from(vec![0; 10]),
+                start + Duration::from_millis(30),
+            );
+        }
+
+        // next_seq should NOT have been reset — seq 10 was accepted but
+        // not yet released (needs tick), so next_seq stays at 10.
+        assert_eq!(
+            buf.next_seq, 10,
+            "next_seq should not reset with intermittent normal arrivals"
+        );
+    }
+
+    #[test]
+    fn tick_sets_discont_after_gap_skip() {
+        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(50));
+        let start = Instant::now();
+
+        // Push seq 0 and seq 2 (gap at seq 1)
+        buf.push(0, Bytes::from_static(b"P0"), start);
+        buf.push(2, Bytes::from_static(b"P2"), start);
+
+        // Tick after latency — seq 0 released, then gap at 1 skipped, then seq 2 released
+        let out = buf.tick(start + Duration::from_millis(50));
+        assert_eq!(out.len(), 2);
+        // First packet had no gap before it
+        assert_eq!(out[0].0, Bytes::from_static(b"P0"));
+        assert!(!out[0].1, "P0 should NOT have discont flag");
+        // Second packet was preceded by a gap (seq 1 skipped)
+        assert_eq!(out[1].0, Bytes::from_static(b"P2"));
+        assert!(out[1].1, "P2 should have discont flag after gap skip");
     }
 }

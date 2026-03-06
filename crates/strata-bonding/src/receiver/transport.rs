@@ -34,11 +34,17 @@ use tracing::{debug, warn};
 ///
 /// The jitter-buffer thread ticks the buffer and emits ordered payloads on
 /// `output_rx`, matching the same interface as the legacy `BondingReceiver`.
+/// A delivered payload with a discontinuity flag.
+///
+/// When `discont` is `true`, one or more packets were lost before this
+/// payload — downstream consumers (e.g. GStreamer tsdemux) should resync.
+pub type DeliveredPayload = (Bytes, bool);
+
 pub struct TransportBondingReceiver {
     input_tx: Option<Sender<Packet>>,
-    output_tx: Option<Sender<Bytes>>,
+    output_tx: Option<Sender<DeliveredPayload>>,
     /// Public so GStreamer (or any consumer) can pull ordered payloads.
-    pub output_rx: Receiver<Bytes>,
+    pub output_rx: Receiver<DeliveredPayload>,
     running: Arc<AtomicBool>,
     stats: Arc<Mutex<ReassemblyStats>>,
     thread_handles: Mutex<Vec<thread::JoinHandle<()>>>,
@@ -53,8 +59,8 @@ impl TransportBondingReceiver {
     }
 
     pub fn new_with_config(config: ReassemblyConfig) -> Self {
-        let (output_tx, output_rx) = bounded(100);
-        let (input_tx, input_rx) = bounded::<Packet>(1000);
+        let (output_tx, output_rx) = bounded::<DeliveredPayload>(config.buffer_capacity);
+        let (input_tx, input_rx) = bounded::<Packet>(config.buffer_capacity);
         let running = Arc::new(AtomicBool::new(true));
         let stats = Arc::new(Mutex::new(ReassemblyStats::default()));
 
@@ -97,7 +103,7 @@ impl TransportBondingReceiver {
                         // Dropping late frames is better than deadlocking
                         // the entire receive pipeline.
                         if output_tx_clone.try_send(p).is_err() {
-                            break;
+                            tracing::warn!("output channel full, dropping packet");
                         }
                     }
                 }
@@ -559,7 +565,7 @@ mod tests {
 
         // Wait for the packet to arrive and be processed
         match rcv.output_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(received) => {
+            Ok((received, _discont)) => {
                 assert_eq!(received, payload);
             }
             Err(e) => {
@@ -612,7 +618,7 @@ mod tests {
         );
 
         // Verify order
-        for (i, data) in received.iter().enumerate() {
+        for (i, (data, _discont)) in received.iter().enumerate() {
             let expected = format!("packet-{}", i);
             assert_eq!(data, &Bytes::from(expected), "packet {} mismatch", i);
         }

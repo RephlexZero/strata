@@ -202,6 +202,7 @@ impl LossDetector {
     /// past sequences whose NACK budget is exhausted and that are present
     /// in `received_above`, catching up the contiguous frontier.
     pub fn advance_past_irrecoverable(&mut self) {
+        let now = Instant::now();
         loop {
             let next = self.highest_contiguous + 1;
             if self.received_above.contains(&next) {
@@ -213,11 +214,33 @@ impl LossDetector {
                     // Exhausted NACK budget — skip this packet
                     self.nacked.remove(&next);
                     self.highest_contiguous = next;
+                } else if now.duration_since(state.first_nacked_at) >= self.playout_deadline {
+                    // Packet has been missing longer than the playout
+                    // deadline — even though NACKs remain, it's too late
+                    // to be useful.  Skip to prevent frontier stall.
+                    self.nacked.remove(&next);
+                    self.highest_contiguous = next;
                 } else {
                     break; // Still waiting for recovery
                 }
+            } else if !self.received_above.is_empty() {
+                // Packet was never NACKed (gap appeared between NACK
+                // cycles).  Seed it into the NACK tracker so the next
+                // generate_nacks() / advance cycle can process it, and
+                // immediately mark it with max_nacks-1 so it has one
+                // remaining attempt before being declared irrecoverable.
+                self.nacked.insert(
+                    next,
+                    NackState {
+                        first_nacked_at: now,
+                        last_nacked_at: now,
+                        nack_count: self.max_nacks_per_seq.saturating_sub(1),
+                        max_nacks: self.max_nacks_per_seq,
+                    },
+                );
+                break; // Give it one more cycle to recover
             } else {
-                break; // Haven't observed a gap here yet
+                break; // No evidence of gap
             }
         }
         // Clean up stale NACK state below the new contiguous point
@@ -499,6 +522,87 @@ mod tests {
 
         let nack = det.generate_nacks();
         assert!(nack.is_none(), "should not NACK enormous gaps");
+    }
+
+    // ─── advance_past_irrecoverable regression tests ─────────────────────
+
+    /// Regression: gap that appeared between two generate_nacks() calls was
+    /// never NACKed, so the old code hit the `else { break }` branch and the
+    /// frontier stalled permanently.
+    ///
+    /// Fix: the un-NACKed branch seeds the sequence into `nacked` at
+    /// max_nacks-1 so the next advance cycle can declare it irrecoverable.
+    #[test]
+    fn irrecoverable_gap_un_nacked_advances_frontier() {
+        let mut det = LossDetector::new();
+        det.set_max_nacks(3);
+        det.set_rearm_interval(Duration::from_millis(0));
+
+        // Receive seq 0 then seq 2 (gap at 1), but never call generate_nacks()
+        // before advance_past_irrecoverable — so seq 1 is un-NACKed.
+        det.record_received(0);
+        det.record_received(2); // received_above = {2}, gap at 1
+
+        // highest_contiguous is still 0; seq 1 was never NACKed.
+        assert_eq!(det.highest_contiguous(), 0);
+        assert_eq!(det.nack_tracking_count(), 0);
+
+        // First advance call: seq 1 is un-NACKed but received_above is
+        // non-empty → seed into nacked at max_nacks-1 (one retry left).
+        det.advance_past_irrecoverable();
+        assert_eq!(
+            det.nack_tracking_count(),
+            1,
+            "seq 1 should be seeded into nacked"
+        );
+        // Frontier should NOT have advanced yet (one retry remaining)
+        assert_eq!(det.highest_contiguous(), 0);
+
+        // generate_nacks() fires the last NACK attempt — now nack_count == max_nacks
+        let nack = det.generate_nacks();
+        assert!(nack.is_some(), "should produce one last NACK for seq 1");
+
+        // Second advance call: nack_count >= max_nacks → skip and advance
+        det.advance_past_irrecoverable();
+        assert_eq!(
+            det.highest_contiguous(),
+            2,
+            "frontier should advance past irrecoverable seq 1 and through buffered seq 2"
+        );
+        assert_eq!(
+            det.pending_count(),
+            0,
+            "received_above should be empty after advancing through seq 2"
+        );
+    }
+
+    /// When a packet has been NACKed and the playout deadline has elapsed,
+    /// advance_past_irrecoverable() should skip it even though retries remain.
+    #[test]
+    fn advance_skips_nacked_packet_past_playout_deadline() {
+        let mut det = LossDetector::new();
+        det.set_max_nacks(10); // many retries remaining
+        det.set_rearm_interval(Duration::from_millis(0));
+        // Deadline of zero means any elapsed time qualifies
+        det.set_playout_deadline(Duration::from_nanos(0));
+
+        det.record_received(0);
+        det.record_received(2); // gap at 1
+
+        // NACK seq 1 (adds it to the nacked map with nack_count=1)
+        let nack = det.generate_nacks();
+        assert!(nack.is_some());
+        assert_eq!(det.nack_tracking_count(), 1);
+
+        // With deadline=0 the elapsed time is always >= deadline.
+        // advance() should skip seq 1 (deadline expired) and advance through seq 2.
+        det.advance_past_irrecoverable();
+
+        assert_eq!(
+            det.highest_contiguous(),
+            2,
+            "frontier must advance past deadline-expired seq 1 and through buffered seq 2"
+        );
     }
 
     // ─── Retransmit Tracker Tests ───────────────────────────────────────

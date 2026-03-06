@@ -92,6 +92,14 @@ pub struct TransportLink {
     paced_queue: Mutex<std::collections::VecDeque<strata_transport::sender::OutputPacket>>,
     /// Capacity oracle — independent of BBR btl_bw.
     oracle: Mutex<CapacityOracle>,
+    /// Previous retransmissions snapshot for per-interval loss_rate.
+    prev_retransmissions: AtomicU64,
+    /// Previous packets_sent snapshot for per-interval loss_rate.
+    prev_loss_pkts_sent: AtomicU64,
+    /// Consecutive high-loss windows (loss > 50%). When this reaches 3,
+    /// the link reports `alive = false` so the scheduler stops routing
+    /// packets into a black hole.
+    consecutive_high_loss: std::sync::atomic::AtomicU32,
 }
 
 impl TransportLink {
@@ -104,6 +112,24 @@ impl TransportLink {
             .expect("socket must be connected before creating TransportLink");
         // Non-blocking so recv_feedback() can poll without stalling the worker.
         socket.set_nonblocking(true).ok();
+        // Increase kernel send buffer to absorb initial encoder burst before
+        // BBR pacing kicks in. Default ~212KB is too small for HD video
+        // keyframes; 512KB prevents EAGAIN storms at startup.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = socket.as_raw_fd();
+            let buf_size: libc::c_int = 524_288; // 512 KB
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &buf_size as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
         let udp_state = UdpSocketState::new(UdpSockRef::from(&socket))
             .expect("failed to initialize quinn-udp socket state");
         TransportLink {
@@ -136,6 +162,9 @@ impl TransportLink {
             }),
             paced_queue: Mutex::new(std::collections::VecDeque::new()),
             oracle: Mutex::new(CapacityOracle::new()),
+            prev_retransmissions: AtomicU64::new(0),
+            prev_loss_pkts_sent: AtomicU64::new(0),
+            consecutive_high_loss: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -149,6 +178,13 @@ impl TransportLink {
 
         let mut q = self.paced_queue.lock().unwrap();
         q.extend(outputs);
+        // Cap queue to prevent bufferbloat from retransmits.
+        // BDP at 5Mbps/100ms ≈ 44 packets; 100 gives 2× margin.
+        // At 500, queue holds 700KB = 2.8s at 2Mbps → RTT bloats to 500ms+.
+        const MAX_PACED_QUEUE: usize = 100;
+        while q.len() > MAX_PACED_QUEUE {
+            q.pop_front();
+        }
         drop(q);
 
         self.flush_paced();
@@ -196,18 +232,30 @@ impl TransportLink {
         drop(p);
 
         if !to_send.is_empty() {
-            let total_bytes = self.send_batch(&to_send);
+            let (total_bytes, pkts_sent) = self.send_batch(&to_send);
+
+            if pkts_sent < to_send.len() {
+                let mut q = self.paced_queue.lock().unwrap();
+                let mut p = self.pacing.lock().unwrap();
+                // Refund tokens and push back in REVERSE order to maintain sequence
+                for pkt in to_send.into_iter().skip(pkts_sent).rev() {
+                    p.tokens += pkt.data.len() as f64;
+                    q.push_front(pkt);
+                }
+            }
+
             self.bytes_sent
                 .fetch_add(total_bytes as u64, Ordering::Relaxed);
             self.packets_sent
-                .fetch_add(to_send.len() as u64, Ordering::Relaxed);
+                .fetch_add(pkts_sent as u64, Ordering::Relaxed);
         }
     }
 
     /// Batch-send outputs via quinn-udp with GSO when possible.
-    fn send_batch(&self, outputs: &[strata_transport::sender::OutputPacket]) -> usize {
+    /// Returns `(bytes_sent, packets_sent)`.
+    fn send_batch(&self, outputs: &[strata_transport::sender::OutputPacket]) -> (usize, usize) {
         if outputs.is_empty() {
-            return 0;
+            return (0, 0);
         }
 
         let mut max_gso = self.udp_state.max_gso_segments();
@@ -221,6 +269,7 @@ impl TransportLink {
         }
 
         let mut total_bytes = 0;
+        let mut pkts_sent = 0;
 
         if max_gso > 1 {
             // Try GSO: group consecutive same-size outputs into batches
@@ -264,33 +313,72 @@ impl TransportLink {
                         .udp_state
                         .send(UdpSockRef::from(&self.socket), &transmit)
                     {
-                        Ok(()) => total_bytes += buf.len(),
+                        Ok(()) => {
+                            total_bytes += buf.len();
+                            pkts_sent += end - i;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            break;
+                        }
                         Err(e) => {
                             tracing::warn!(link_id = self.id, error = %e, "GSO send failed, falling back");
                             // Fallback: send individually
                             for output in &outputs[i..end] {
-                                total_bytes += self.send_single(&output.data);
+                                match self.send_single(&output.data) {
+                                    Ok(len) => {
+                                        total_bytes += len;
+                                        pkts_sent += 1;
+                                    }
+                                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                                        return (total_bytes, pkts_sent);
+                                    }
+                                    Err(_) => {
+                                        pkts_sent += 1; // Count as processed to avoid retry loops on permanent errors
+                                    }
+                                }
                             }
                         }
                     }
                 } else {
                     // Single packet — no GSO needed
-                    total_bytes += self.send_single(&outputs[i].data);
+                    match self.send_single(&outputs[i].data) {
+                        Ok(len) => {
+                            total_bytes += len;
+                            pkts_sent += 1;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            break;
+                        }
+                        Err(_) => {
+                            pkts_sent += 1;
+                        }
+                    }
                 }
                 i = end;
             }
         } else {
             // No GSO support — send individually
             for output in outputs {
-                total_bytes += self.send_single(&output.data);
+                match self.send_single(&output.data) {
+                    Ok(len) => {
+                        total_bytes += len;
+                        pkts_sent += 1;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        break;
+                    }
+                    Err(_) => {
+                        pkts_sent += 1;
+                    }
+                }
             }
         }
 
-        total_bytes
+        (total_bytes, pkts_sent)
     }
 
     /// Send a single datagram via quinn-udp.
-    fn send_single(&self, data: &[u8]) -> usize {
+    fn send_single(&self, data: &[u8]) -> std::io::Result<usize> {
         let transmit = Transmit {
             destination: self.peer_addr,
             ecn: None,
@@ -303,10 +391,12 @@ impl TransportLink {
             .udp_state
             .send(UdpSockRef::from(&self.socket), &transmit)
         {
-            Ok(()) => data.len(),
+            Ok(()) => Ok(data.len()),
             Err(e) => {
-                tracing::warn!(link_id = self.id, error = %e, "send failed");
-                0
+                if e.kind() != std::io::ErrorKind::WouldBlock {
+                    tracing::warn!(link_id = self.id, error = %e, "send failed");
+                }
+                Err(e)
             }
         }
     }
@@ -419,6 +509,20 @@ impl TransportLink {
                 }
                 ControlBody::Nack(nack) => {
                     sender.process_nack(nack);
+                    // Drain retransmits into paced queue so they actually get
+                    // sent. Without this, retransmits pile up in the sender's
+                    // internal output_queue and inflate queue_depth, keeping
+                    // the BDP cap permanently blocked.
+                    let outputs: Vec<_> = sender.drain_output().collect();
+                    if !outputs.is_empty() {
+                        let mut q = self.paced_queue.lock().unwrap();
+                        q.extend(outputs);
+                        // Cap queue — same as transport_send.
+                        const MAX_PACED_QUEUE: usize = 100;
+                        while q.len() > MAX_PACED_QUEUE {
+                            q.pop_front();
+                        }
+                    }
                 }
                 ControlBody::Pong(pong) => {
                     let mut rtt = self.rtt.lock().unwrap();
@@ -569,7 +673,10 @@ impl LinkSender for TransportLink {
         // The CapacityOracle provides a stable, feedback-loop-free capacity
         // estimate for EDPF scheduling. btl_bw is only used as a fallback
         // before the first saturation probe completes.
-        let cc = self.congestion.lock().unwrap();
+        let mut cc = self.congestion.lock().unwrap();
+        // Drive ProbeRtt phase transitions — without this, RTprop never
+        // re-probes and BBR capacity estimates go stale on cellular links.
+        cc.tick();
         let phase = match cc.state {
             BiscayState::PreHandover => LinkPhase::Degrade,
             BiscayState::Cautious => LinkPhase::Degrade,
@@ -661,16 +768,53 @@ impl LinkSender for TransportLink {
         oracle.tick();
 
         // Check for downshift conditions (handover/severe degradation)
-        let loss_rate = if stats.packets_acked > 0 && stats.packets_sent > 0 {
+        // Uses cumulative retransmit_ratio — correct for detecting handovers.
+        let cumulative_loss = if stats.packets_acked > 0 && stats.packets_sent > 0 {
             stats.retransmit_ratio()
         } else {
             0.0
         };
-        if oracle.should_reset(rtt_ms, loss_rate) {
+        if oracle.should_reset(rtt_ms, cumulative_loss) {
             oracle.reset_on_downshift();
         }
 
-        // Capacity: prefer Oracle, fall back to btl_bw before first probe
+        // Per-interval loss_rate for the scheduling/adaptation layer.
+        // Cumulative retransmit_ratio is permanently inflated by startup
+        // burst losses — same bug we fixed receiver-side for loss_after_fec.
+        let prev_retx = self.prev_retransmissions.load(Ordering::Relaxed);
+        let prev_sent = self.prev_loss_pkts_sent.load(Ordering::Relaxed);
+        let delta_retx = stats.retransmissions.saturating_sub(prev_retx);
+        let delta_sent = stats.packets_sent.saturating_sub(prev_sent).max(1);
+        self.prev_retransmissions
+            .store(stats.retransmissions, Ordering::Relaxed);
+        self.prev_loss_pkts_sent
+            .store(stats.packets_sent, Ordering::Relaxed);
+        let loss_rate = (delta_retx as f64 / delta_sent as f64).clamp(0.0, 1.0);
+
+        // Track consecutive high-loss windows for link death detection.
+        // Mark dead when loss > 50% for 3+ consecutive metric windows so the
+        // scheduler stops routing packets into a black hole.
+        // Require sufficient packet volume to avoid false positives during
+        // idle periods when delta_sent is just 1 (the .max(1) floor).
+        if loss_rate > 0.50 && delta_sent >= 5 {
+            self.consecutive_high_loss.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.consecutive_high_loss.store(0, Ordering::Relaxed);
+        }
+        let high_loss_count = self.consecutive_high_loss.load(Ordering::Relaxed);
+        let alive = high_loss_count < 3;
+        if !alive {
+            tracing::warn!(
+                link_id = self.id,
+                loss_rate = loss_rate,
+                consecutive_windows = high_loss_count,
+                "link marked dead: sustained high loss"
+            );
+        }
+
+        // Capacity: prefer Oracle → BBR btl_bw → ack_delivery_bps fallback.
+        // When Oracle and BBR are both stale (no real bandwidth samples),
+        // use ack_delivery_bps as a direct proxy for achievable throughput.
         let oracle_cap = oracle.estimated_cap();
         let btl_bw_capped = if btl_bw_bps > 0.0 {
             let capped = if per_link_ack_rate > 100_000.0 {
@@ -684,8 +828,15 @@ impl LinkSender for TransportLink {
         };
         let capacity_bps = if oracle_cap > 0.0 {
             oracle_cap
-        } else {
+        } else if btl_bw_capped > 0.0 {
             btl_bw_capped
+        } else if per_link_ack_rate > 100_000.0 {
+            // Fallback: use ack delivery rate with 20% headroom as capacity.
+            // This prevents the adapter from using the 5 Mbps floor when
+            // actual achievable throughput is known from ACK measurements.
+            per_link_ack_rate * 1.2
+        } else {
+            0.0
         };
         drop(oracle);
 
@@ -726,7 +877,7 @@ impl LinkSender for TransportLink {
             observed_bytes: total_bytes,
             queue_depth: sender_queue_depth + self.paced_queue.lock().unwrap().len(),
             max_queue: 0,
-            alive: true,
+            alive,
             phase,
             os_up: Some(true),
             mtu: None,
@@ -788,11 +939,11 @@ impl LinkSender for TransportLink {
         };
         // Send directly, bypassing pacing, to keep packets back-to-back
         if !pair.is_empty() {
-            let total_bytes = self.send_batch(&pair);
+            let (total_bytes, pkts_sent) = self.send_batch(&pair);
             self.bytes_sent
                 .fetch_add(total_bytes as u64, Ordering::Relaxed);
             self.packets_sent
-                .fetch_add(pair.len() as u64, Ordering::Relaxed);
+                .fetch_add(pkts_sent as u64, Ordering::Relaxed);
         }
     }
 
