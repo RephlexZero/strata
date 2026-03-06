@@ -130,7 +130,7 @@ fn handles_burst_reordering_pattern() {
     // Tick after latency — all should come out in order
     let out = buf.tick(start + Duration::from_millis(51));
     assert_eq!(out.len(), 10, "all 10 packets should be delivered");
-    for (i, data) in out.iter().enumerate() {
+    for (i, (data, _discont)) in out.iter().enumerate() {
         assert_eq!(data, &Bytes::from(format!("p{i}")), "packet {i} mismatch");
     }
     assert_eq!(buf.lost_packets, 0, "no packets should be lost");

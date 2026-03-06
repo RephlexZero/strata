@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use strata_bonding::adaptation::{AdaptationConfig, BitrateAdapter, LinkCapacity};
+use strata_bonding::config::SchedulerConfig;
 use strata_bonding::media::priority::DegradationStage;
 use strata_bonding::modem::health::RfMetrics;
 use strata_bonding::modem::supervisor::{ModemSupervisor, SupervisorConfig, SupervisorEvent};
@@ -357,7 +358,11 @@ fn critical_packets_broadcast_during_partial_failure() {
     let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
     let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 15.0));
 
-    let mut scheduler = BondingScheduler::new();
+    // critical_broadcast is off by default; enable it explicitly (snag #16)
+    let mut scheduler = BondingScheduler::with_config(SchedulerConfig {
+        critical_broadcast: true,
+        ..SchedulerConfig::default()
+    });
     scheduler.add_link(l1.clone());
     scheduler.add_link(l2.clone());
     scheduler.refresh_metrics();

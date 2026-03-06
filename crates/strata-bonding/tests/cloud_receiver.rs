@@ -74,7 +74,7 @@ fn standalone_receiver_multi_link_reassembly() {
     }
 
     assert_eq!(received.len(), 10, "should receive all 10 packets");
-    for (i, data) in received.iter().enumerate() {
+    for (i, (data, _discont)) in received.iter().enumerate() {
         assert_eq!(data, &Bytes::from(format!("pkt-{i}")));
     }
 }

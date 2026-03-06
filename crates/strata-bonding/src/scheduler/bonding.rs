@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 /// Top-level bonding packet scheduler.
 ///
@@ -578,7 +578,7 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             blest_ok
         };
 
-        // Step 3: EDPF selection (lowest predicted arrival time, BDP-aware)
+        // Step 3: EDPF selection (lowest predicted arrival time)
         if let Some(link) = self.scheduler.select_from_links(packet_len, &candidates) {
             let link_id = link.id();
             // IoDS bookkeeping — track for observability
@@ -586,10 +586,8 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             return Some(link);
         }
 
-        // Step 4: Last resort — any alive link
-        alive_ids
-            .first()
-            .and_then(|&id| self.scheduler.get_link(id))
+        // All candidates filtered by phase/os_up — should be rare.
+        None
     }
 
     /// Forwards RF metrics from the modem supervisor to the matching link's
@@ -788,29 +786,61 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             }
         }
 
-        // All links dead — escalate logging based on consecutive failures.
+        // All links dead or BDP-blocked — drop the packet.
         self.consecutive_dead_count += 1;
         self.total_dead_drops.fetch_add(1, Ordering::Relaxed);
+
+        let alive_count = self
+            .scheduler
+            .get_active_links()
+            .iter()
+            .filter(|(_, m)| m.alive)
+            .count();
+        let is_backpressure = alive_count > 0;
 
         // Log at escalating severity: first occurrence is a warning,
         // sustained failures (100+ consecutive) escalate to error.
         if self.consecutive_dead_count == 1 {
-            warn!("All links dead: dropped packet (seq={})", self.next_seq);
+            if is_backpressure {
+                debug!(
+                    "All links BDP-blocked: backpressure drop (seq={})",
+                    self.next_seq
+                );
+            } else {
+                warn!("All links dead: dropped packet (seq={})", self.next_seq);
+            }
         } else if self.consecutive_dead_count == 100 {
             error!(
-                "All links dead for {} consecutive packets — total drops: {}",
+                "All links {} for {} consecutive packets — total drops: {}",
+                if is_backpressure {
+                    "BDP-blocked"
+                } else {
+                    "dead"
+                },
                 self.consecutive_dead_count,
                 self.total_dead_drops.load(Ordering::Relaxed)
             );
         } else if self.consecutive_dead_count.is_multiple_of(1000) {
             error!(
-                "All links still dead after {} consecutive drops (total: {})",
+                "All links still {} after {} consecutive drops (total: {})",
+                if is_backpressure {
+                    "BDP-blocked"
+                } else {
+                    "dead"
+                },
                 self.consecutive_dead_count,
                 self.total_dead_drops.load(Ordering::Relaxed)
             );
         }
 
-        Err(anyhow::anyhow!("Link selection failed (all links dead)"))
+        Err(anyhow::anyhow!(
+            "Link selection failed (all links {})",
+            if is_backpressure {
+                "BDP-blocked"
+            } else {
+                "dead"
+            }
+        ))
     }
 }
 
@@ -1902,5 +1932,50 @@ mod tests {
             l1.ppd_probe_count.load(Ordering::Relaxed) > 0,
             "Degrade-phase link should still receive PPD probes"
         );
+    }
+
+    // ── Regression: BDP-blocked backpressure ─────────────────────────
+
+    /// When all links are dead, intelligent_select must return None
+    /// and send() must return Err — not silently drop or bypass.
+    /// The old "last resort: any alive link" fallback defeated BDP
+    /// capping and caused 100K+ packet queue growth in field tests.
+    #[test]
+    fn test_bdp_blocked_returns_backpressure_error() {
+        let mut scheduler = BondingScheduler::new();
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
+
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+        scheduler.refresh_metrics();
+
+        // Mark both links as dead — intelligent_select should return None.
+        {
+            let mut m = l1.metrics.lock().unwrap();
+            m.alive = false;
+        }
+        {
+            let mut m = l2.metrics.lock().unwrap();
+            m.alive = false;
+        }
+        scheduler.refresh_metrics();
+
+        let payload = Bytes::from_static(b"Data");
+        let profile = crate::scheduler::PacketProfile {
+            is_critical: false,
+            can_drop: true,
+            size_bytes: payload.len(),
+        };
+
+        let result = scheduler.send(payload, profile);
+        assert!(
+            result.is_err(),
+            "send should fail when all links are blocked"
+        );
+
+        // No packets should have been sent to either link
+        assert_eq!(l1.sent_packets.lock().unwrap().len(), 0);
+        assert_eq!(l2.sent_packets.lock().unwrap().len(), 0);
     }
 }

@@ -63,7 +63,7 @@ fn runtime_to_receiver_single_link() {
     }
 
     assert_eq!(received.len(), count);
-    for (i, data) in received.iter().enumerate() {
+    for (i, (data, _discont)) in received.iter().enumerate() {
         let expected = format!("e2e-{}", i);
         assert_eq!(data, &Bytes::from(expected), "packet {} mismatch", i);
     }
@@ -120,7 +120,7 @@ fn runtime_to_receiver_multi_link() {
 
     // Verify all payloads are present (order may differ due to multi-link reassembly)
     let mut found = vec![false; count];
-    for data in &received {
+    for (data, _discont) in &received {
         let s = String::from_utf8(data.to_vec()).unwrap();
         if let Some(idx) = s.strip_prefix("multi-")
             && let Ok(i) = idx.parse::<usize>()
@@ -161,7 +161,7 @@ fn transport_link_direct_to_receiver() {
     }
 
     assert_eq!(received.len(), 10);
-    for (i, data) in received.iter().enumerate() {
+    for (i, (data, _discont)) in received.iter().enumerate() {
         assert_eq!(data, &Bytes::from(format!("direct-{}", i)));
     }
 }
@@ -212,7 +212,7 @@ fn critical_broadcast_deduplication() {
     // both sockets but the reassembly buffer deduplicates by seq_id.
     // We should get exactly 1 output packet.
     match rcv.output_rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(data) => {
+        Ok((data, _discont)) => {
             assert_eq!(data, Bytes::from("critical-0"));
         }
         Err(_) => panic!("Did not receive critical packet"),
@@ -243,7 +243,7 @@ fn large_payload_integrity() {
     link.send(&wrapped).unwrap();
 
     match rcv.output_rx.recv_timeout(Duration::from_secs(3)) {
-        Ok(data) => {
+        Ok((data, _discont)) => {
             assert_eq!(data.len(), payload.len(), "Payload size mismatch");
             assert_eq!(data.to_vec(), payload, "Payload content mismatch");
         }
@@ -346,7 +346,7 @@ fn three_link_heterogeneous_all_delivered() {
 
     // Verify all payloads are present
     let mut found = vec![false; count];
-    for data in &received {
+    for (data, _discont) in &received {
         let s = String::from_utf8(data.to_vec()).unwrap();
         if let Some(idx) = s.strip_prefix("hetero-")
             && let Ok(i) = idx.parse::<usize>()
@@ -430,7 +430,7 @@ fn link_failure_mid_stream_failover() {
     // Verify pre-failure packets arrived
     let pre_count = received
         .iter()
-        .filter(|d| String::from_utf8(d.to_vec()).unwrap().starts_with("pre-"))
+        .filter(|(d, _)| String::from_utf8(d.to_vec()).unwrap().starts_with("pre-"))
         .count();
     assert!(
         pre_count >= 25,
@@ -440,7 +440,7 @@ fn link_failure_mid_stream_failover() {
     // Verify post-failure packets arrived (seamless failover)
     let post_count = received
         .iter()
-        .filter(|d| String::from_utf8(d.to_vec()).unwrap().starts_with("post-"))
+        .filter(|(d, _)| String::from_utf8(d.to_vec()).unwrap().starts_with("post-"))
         .count();
     assert!(
         post_count >= 25,

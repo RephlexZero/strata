@@ -7,36 +7,19 @@
 //!
 //! ```text
 //! Predicted_Arrival(link) = In_Flight_Bytes / (Capacity_bps / 8) + Base_RTT
-//! Selected = argmin(Predicted_Arrival) over all alive, non-blocked links
+//! Selected = argmin(Predicted_Arrival) over all alive links
 //! ```
 //!
-//! Combined with BDP hard-capping, this eliminates the DWRR starvation trap
-//! (where capacity estimates are self-fulfilling prophecies) and prevents
-//! cellular bufferbloat at the source.
-//!
-//! ## BDP Hard-Capping
-//!
-//! Each link enforces:
-//! ```text
-//! Max_In_Flight_Bytes = (Capacity_bps / 8) * Base_RTT_secs * bdp_margin
-//! ```
-//!
-//! When a link hits this limit it is marked "blocked" and cannot receive
-//! new packets until ACKs drain the in-flight window. This keeps the
-//! delay signal pristine for EDPF routing decisions.
+//! For transport-backed links, the in-flight estimate is derived from the
+//! actual queue depth (paced_queue + sender output queue) each refresh cycle.
+//! The transport layer's own congestion control (BBR/Biscay) and paced_queue
+//! cap handle rate limiting and backpressure.
 
 use crate::config::SchedulerConfig;
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
 use quanta::Instant;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-/// BDP margin multiplier: Max_In_Flight = BDP * this factor.
-/// 1.2 = 20% headroom above the theoretical BDP.
-const DEFAULT_BDP_MARGIN: f64 = 1.2;
-
-/// Minimum in-flight cap in bytes (prevents starvation on very low BDP links).
-const MIN_IN_FLIGHT_CAP: u64 = 14_000; // ~10 packets
 
 /// Per-link state tracked by the EDPF scheduler.
 pub(crate) struct LinkState<L: ?Sized> {
@@ -83,28 +66,17 @@ impl<L: ?Sized> LinkState<L> {
         (self.metrics.rtt_ms / 1000.0).max(0.001)
     }
 
-    /// Minimum RTT in seconds, strictly for BDP cap calculation.
+    /// Estimated capacity in bytes per second, discounted by observed loss rate.
     ///
-    /// The BDP cap must use the *clean-path* RTT so that a queued link
-    /// doesn't self-justify a larger window and deepen its own queue.
-    /// - Prefers BBR rtprop (true minimum RTT, capped at 200 ms).
-    /// - Falls back to rtt_ms / 2 as a single-hop propagation proxy.
-    /// - Never exceeds 200 ms (prevents pathological BDP on broken paths).
-    fn min_rtt_for_bdp_secs(&self) -> f64 {
-        let ms = if let Some(rtprop) = self.metrics.rtprop_ms
-            && rtprop > 0.0
-        {
-            rtprop
-        } else {
-            // Half of smoothed RTT is a reasonable one-way propagation proxy.
-            self.metrics.rtt_ms / 2.0
-        };
-        (ms.min(200.0) / 1000.0).max(0.001)
-    }
-
-    /// Estimated capacity in bytes per second.
+    /// A link with 80% loss is only delivering 20% of its nominal capacity.
+    /// Applying the discount here ensures predicted-arrival calculations
+    /// route fewer packets to high-loss links, preventing the ARQ queue
+    /// from building up unboundedly when oracle estimates are stale.
     fn capacity_bytes_per_sec(&self) -> f64 {
-        (self.metrics.capacity_bps / 8.0).max(1.0)
+        // Clamp to 0.99 so a link never appears to have exactly 0 capacity;
+        // the fallback routing path can still use it as a last resort.
+        let loss = self.metrics.loss_rate.clamp(0.0, 0.99);
+        (self.metrics.capacity_bps / 8.0 * (1.0 - loss)).max(1.0)
     }
 
     /// Predicted arrival time (seconds from now) for a packet of `size_bytes`.
@@ -115,39 +87,17 @@ impl<L: ?Sized> LinkState<L> {
             (self.in_flight_bytes as f64 + size_bytes as f64) / self.capacity_bytes_per_sec();
         queue_drain + self.base_rtt_secs()
     }
-
-    /// Maximum in-flight bytes before this link is BDP-blocked.
-    ///
-    /// `max = capacity_Bps * min_rtt * margin`
-    ///
-    /// Uses the clean-path minimum RTT (not smoothed RTT) so that a queued
-    /// link cannot use its inflated RTT to justify a larger window.
-    fn bdp_cap(&self, margin: f64) -> u64 {
-        let bdp = self.capacity_bytes_per_sec() * self.min_rtt_for_bdp_secs() * margin;
-        (bdp as u64).max(MIN_IN_FLIGHT_CAP)
-    }
-
-    /// Whether this link is BDP-blocked (in-flight >= cap).
-    /// Only applies to transport-backed links with real ACK feedback.
-    fn is_bdp_blocked(&self, margin: f64) -> bool {
-        // BDP blocking requires real transport feedback. Non-transport links
-        // have their in-flight reset each refresh cycle, so the BDP cap
-        // would be meaningless — EDPF arrival-time routing alone handles load
-        // distribution correctly.
-        self.metrics.transport.is_some() && self.in_flight_bytes >= self.bdp_cap(margin)
-    }
 }
 
 /// Earliest Delivery Path First (EDPF) packet scheduler.
 ///
-/// Routes each packet to the link predicted to deliver it earliest,
-/// with BDP hard-capping to prevent cellular bufferbloat.
+/// Routes each packet to the link predicted to deliver it earliest.
+/// The transport layer's congestion control (BBR/Biscay) and paced_queue
+/// cap handle rate limiting and backpressure.
 pub struct Edpf<L: LinkSender + ?Sized + 'static> {
     links: HashMap<usize, LinkState<L>>,
     sorted_ids: Vec<usize>,
     config: SchedulerConfig,
-    /// BDP margin multiplier (default 1.2).
-    bdp_margin: f64,
     /// When set, routes all traffic to this link for saturation probing.
     probe_boost_link: Option<usize>,
 }
@@ -172,7 +122,6 @@ impl<L: LinkSender + ?Sized + 'static> Edpf<L> {
             links: HashMap::new(),
             sorted_ids: Vec::new(),
             config,
-            bdp_margin: DEFAULT_BDP_MARGIN,
             probe_boost_link: None,
         }
     }
@@ -250,16 +199,23 @@ impl<L: LinkSender + ?Sized + 'static> Edpf<L> {
 
         for state in self.links.values_mut() {
             let now = Instant::now();
-            let prev_ack_bytes = state.metrics.ack_bytes;
             state.metrics = state.link.get_metrics();
 
-            // Update in-flight estimate from ACK progress.
-            // For transport-backed links, in-flight drains as ACKs arrive.
-            // For non-transport links (mock/test), estimate drain based on
-            // elapsed time and capacity (simulating what ACKs would do).
+            // Update in-flight estimate for predicted-arrival routing.
+            //
+            // For transport-backed links: use the actual queue depth as the
+            // in-flight estimate. This replaces the old ACK-delta counter
+            // which leaked upward permanently when queue-capped packets
+            // (dropped from paced_queue front) were never ACKed.
+            //
+            // BDP hard-capping is disabled for transport links because the
+            // transport layer's own congestion control (BBR/Biscay) handles
+            // rate limiting and the paced_queue cap provides backpressure.
             if state.metrics.transport.is_some() {
-                let ack_delta = state.metrics.ack_bytes.saturating_sub(prev_ack_bytes);
-                state.in_flight_bytes = state.in_flight_bytes.saturating_sub(ack_delta);
+                // Use queue_depth * estimated packet size for predicted_arrival.
+                // queue_depth = paced_queue.len() + sender_output_queue.len()
+                const EST_PKT_SIZE: u64 = 1400;
+                state.in_flight_bytes = (state.metrics.queue_depth as u64) * EST_PKT_SIZE;
             } else {
                 // Estimate bytes drained since last refresh based on capacity.
                 let dt = now
@@ -466,10 +422,8 @@ impl<L: LinkSender + ?Sized + 'static> Edpf<L> {
         }
 
         let any_alive = self.links.values().any(|state| state.metrics.alive);
-        let margin = self.bdp_margin;
-
-        // Collect (link_id, predicted_arrival, bdp_blocked) for alive candidates
-        let mut scored: Vec<(usize, f64, bool)> = Vec::new();
+        // Collect (link_id, predicted_arrival) for alive candidates
+        let mut scored: Vec<(usize, f64)> = Vec::new();
         for &id in candidates {
             if let Some(state) = self.links.get(&id)
                 && (state.metrics.alive || !any_alive)
@@ -479,8 +433,7 @@ impl<L: LinkSender + ?Sized + 'static> Edpf<L> {
                 let os_ok = !matches!(state.metrics.os_up, Some(false));
                 if phase_ok && os_ok {
                     let arrival = state.predicted_arrival(packet_len);
-                    let blocked = state.is_bdp_blocked(margin);
-                    scored.push((id, arrival, blocked));
+                    scored.push((id, arrival));
                 }
             }
         }
@@ -497,37 +450,20 @@ impl<L: LinkSender + ?Sized + 'static> Edpf<L> {
             return None;
         }
 
-        // Prefer non-blocked links; among those, pick lowest predicted arrival.
-        let non_blocked: Vec<_> = scored.iter().filter(|s| !s.2).collect();
-        let best = if non_blocked.is_empty() {
-            // All links BDP-blocked — graceful degradation: pick least loaded
-            scored
-                .iter()
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        } else {
-            non_blocked
-                .iter()
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .copied()
-        };
+        // Pick the link with lowest predicted arrival time.
+        // BDP hard-capping has been removed: transport links have their own
+        // congestion control (BBR/Biscay) and paced_queue cap for backpressure.
+        // EDPF's predicted_arrival naturally routes away from loaded links
+        // because higher queue depth → longer drain time → higher arrival.
+        let best = scored
+            .iter()
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        if let Some(&(id, _arrival, _blocked)) = best {
+        if let Some(&(id, _arrival)) = best {
             return self.links.get(&id).map(|s| s.link.clone());
         }
 
         None
-    }
-
-    /// Returns whether a specific link is BDP-blocked.
-    pub fn is_link_blocked(&self, id: usize) -> bool {
-        self.links
-            .get(&id)
-            .is_some_and(|s| s.is_bdp_blocked(self.bdp_margin))
-    }
-
-    /// Returns the BDP cap for a link in bytes.
-    pub fn link_bdp_cap(&self, id: usize) -> Option<u64> {
-        self.links.get(&id).map(|s| s.bdp_cap(self.bdp_margin))
     }
 
     /// Returns in-flight bytes for a link.
@@ -640,10 +576,9 @@ mod tests {
     }
 
     #[test]
-    fn bdp_cap_blocks_overloaded_transport_link() {
+    fn transport_link_routes_to_least_loaded() {
+        // Transport link with high in-flight → EDPF routes to the other
         let mut edpf = Edpf::new();
-        // Transport-backed links enable BDP blocking
-        // 10 Mbps, 10ms RTT → BDP cap = 10M/8 * 0.01 * 1.2 = 15000 bytes
         let l1 = Arc::new(MockLink::with_transport(
             1,
             10_000_000.0,
@@ -652,7 +587,7 @@ mod tests {
         ));
         let l2 = Arc::new(MockLink::with_transport(
             2,
-            5_000_000.0,
+            10_000_000.0,
             10.0,
             LinkPhase::Live,
         ));
@@ -661,30 +596,103 @@ mod tests {
         edpf.add_link(l2.clone());
         edpf.refresh_metrics();
 
-        // Push L1 past BDP cap
-        edpf.record_send(1, 16_000);
-        assert!(edpf.is_link_blocked(1));
-        assert!(!edpf.is_link_blocked(2));
+        // Load L1 heavily — predicted arrival becomes worse
+        edpf.record_send(1, 100_000);
 
-        // Selection must skip L1
+        // EDPF should pick L2 (lower predicted arrival)
         let selected = edpf.select_link(1400).unwrap();
         assert_eq!(selected.id(), 2);
     }
 
     #[test]
-    fn all_blocked_graceful_degradation() {
+    fn transport_link_never_returns_none() {
+        // With BDP blocking removed, transport links always return Some
         let mut edpf = Edpf::new();
-        // Transport-backed links for BDP blocking
         let l1 = Arc::new(MockLink::with_transport(
             1,
             10_000_000.0,
             10.0,
             LinkPhase::Live,
         ));
+        edpf.add_link(l1.clone());
+        edpf.refresh_metrics();
+
+        // Even with massive in-flight, select_link returns Some
+        edpf.record_send(1, 10_000_000);
+        let selected = edpf.select_link(1400);
+        assert!(
+            selected.is_some(),
+            "transport links should never return None (CC handles congestion)"
+        );
+    }
+
+    #[test]
+    fn transport_in_flight_resets_from_queue_depth() {
+        // After refresh_metrics, in_flight should reflect queue_depth
+        let mut edpf = Edpf::new();
+        let l1 = Arc::new(MockLink::with_transport(
+            1,
+            10_000_000.0,
+            10.0,
+            LinkPhase::Live,
+        ));
+        edpf.add_link(l1.clone());
+        edpf.refresh_metrics();
+
+        // Send a lot — in_flight grows via record_send
+        edpf.record_send(1, 500_000);
+        assert_eq!(edpf.link_in_flight(1), Some(500_000));
+
+        // Set queue_depth to 100 packets and refresh
+        l1.metrics.lock().unwrap().queue_depth = 100;
+        edpf.refresh_metrics();
+
+        // in_flight should now be queue_depth * 1400, NOT 500_000
+        assert_eq!(
+            edpf.link_in_flight(1),
+            Some(100 * 1400),
+            "transport in_flight should reset to queue_depth * pkt_size"
+        );
+    }
+
+    #[test]
+    fn non_transport_in_flight_drains_with_time() {
+        let mut edpf = Edpf::new();
+        // Non-transport link — uses time-based drain
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0, LinkPhase::Live));
+        edpf.add_link(l1.clone());
+        edpf.refresh_metrics();
+
+        edpf.record_send(1, 50_000);
+        let before = edpf.link_in_flight(1).unwrap();
+        assert_eq!(before, 50_000);
+
+        // After refresh, time-based drain should reduce in_flight
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        edpf.refresh_metrics();
+        let after = edpf.link_in_flight(1).unwrap();
+        assert!(
+            after < before,
+            "non-transport in_flight should drain over time ({} < {})",
+            after,
+            before
+        );
+    }
+
+    #[test]
+    fn rapid_sends_always_route_to_best_link() {
+        // Verifies that rapid sends never deadlock — always returns Some
+        let mut edpf = Edpf::new();
+        let l1 = Arc::new(MockLink::with_transport(
+            1,
+            5_000_000.0,
+            80.0,
+            LinkPhase::Live,
+        ));
         let l2 = Arc::new(MockLink::with_transport(
             2,
             5_000_000.0,
-            10.0,
+            160.0,
             LinkPhase::Live,
         ));
 
@@ -692,61 +700,47 @@ mod tests {
         edpf.add_link(l2.clone());
         edpf.refresh_metrics();
 
-        // Block both links
-        edpf.record_send(1, 20_000);
-        edpf.record_send(2, 20_000);
-        assert!(edpf.is_link_blocked(1));
-        assert!(edpf.is_link_blocked(2));
-
-        // Should still select (graceful degradation) — picks least loaded
-        let selected = edpf.select_link(1400);
-        assert!(selected.is_some());
+        // 10,000 rapid sends — should never return None
+        for _ in 0..10_000 {
+            let selected = edpf.select_link(1400);
+            assert!(selected.is_some(), "should never deadlock");
+            edpf.record_send(selected.unwrap().id(), 1400);
+        }
     }
 
     #[test]
-    fn bdp_cap_scales_with_capacity_and_rtt() {
+    fn queue_depth_refresh_prevents_in_flight_leak() {
+        // Simulates the field-test scenario: sends + queue drops → leak
+        // Verify refresh_metrics resets in_flight from queue_depth
         let mut edpf = Edpf::new();
-        // 5 Mbps, 50ms RTT → BDP cap = 5M/8 * 0.05 * 1.2 = 37500 bytes
-        let l1 = Arc::new(MockLink::new(1, 5_000_000.0, 50.0, LinkPhase::Live));
-        edpf.add_link(l1.clone());
-        edpf.refresh_metrics();
-
-        let cap = edpf.link_bdp_cap(1).unwrap();
-        assert_eq!(cap, 37500);
-    }
-
-    #[test]
-    fn ack_drains_in_flight() {
-        let mut edpf = Edpf::new();
-        // Transport-backed link so ACK drain (not synthetic) is used
         let l1 = Arc::new(MockLink::with_transport(
             1,
-            10_000_000.0,
-            10.0,
+            5_000_000.0,
+            80.0,
             LinkPhase::Live,
         ));
         edpf.add_link(l1.clone());
         edpf.refresh_metrics();
 
-        edpf.record_send(1, 10_000);
-        assert_eq!(edpf.link_in_flight(1), Some(10_000));
+        // Simulate lots of sends that would leak the old counter
+        for _ in 0..1000 {
+            edpf.record_send(1, 1400);
+        }
+        let leaked = edpf.link_in_flight(1).unwrap();
+        assert_eq!(leaked, 1000 * 1400); // 1.4MB leaked in-flight
 
-        // Simulate ACK progress by updating ack_bytes in metrics
-        l1.metrics.lock().unwrap().ack_bytes = 5_000;
-        edpf.refresh_metrics();
-        assert_eq!(edpf.link_in_flight(1), Some(5_000));
-    }
-
-    #[test]
-    fn non_transport_links_not_bdp_blocked() {
-        let mut edpf = Edpf::new();
-        // Non-transport link — BDP blocking should NOT apply
-        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0, LinkPhase::Live));
-        edpf.add_link(l1.clone());
+        // Now simulate that the actual queue only has 50 packets
+        // (the rest were dropped by queue cap or paced out)
+        l1.metrics.lock().unwrap().queue_depth = 50;
         edpf.refresh_metrics();
 
-        // Even with massive in-flight, non-transport links are never BDP-blocked
-        edpf.record_send(1, 1_000_000);
-        assert!(!edpf.is_link_blocked(1));
+        let actual = edpf.link_in_flight(1).unwrap();
+        assert_eq!(
+            actual,
+            50 * 1400,
+            "refresh should reset in_flight to queue_depth ({} vs {})",
+            actual,
+            50 * 1400
+        );
     }
 }

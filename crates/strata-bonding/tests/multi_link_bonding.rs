@@ -11,6 +11,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 
+use strata_bonding::config::SchedulerConfig;
 use strata_bonding::net::interface::{LinkMetrics, LinkPhase, LinkSender};
 use strata_bonding::scheduler::PacketProfile;
 use strata_bonding::scheduler::bonding::BondingScheduler;
@@ -326,7 +327,10 @@ fn link_recovery_resumes_traffic() {
 /// Dead links must be excluded from the broadcast.
 #[test]
 fn critical_broadcast_with_three_links_one_dead() {
-    let mut scheduler = BondingScheduler::new();
+    let mut scheduler = BondingScheduler::with_config(SchedulerConfig {
+        critical_broadcast: true,
+        ..Default::default()
+    });
 
     let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
     let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 20.0));

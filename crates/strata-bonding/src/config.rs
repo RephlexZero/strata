@@ -217,7 +217,7 @@ impl Default for SchedulerConfig {
             capacity_floor_bps: 5_000_000.0,
             penalty_decay: 0.7,
             penalty_recovery: 0.05,
-            jitter_latency_multiplier: 4.0,
+            jitter_latency_multiplier: 2.0,
             max_latency_ms: 500,
             stats_interval_ms: 1000,
             channel_capacity: 1000,
