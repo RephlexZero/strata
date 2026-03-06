@@ -75,10 +75,53 @@ mod tests {
         pipeline.set_state(gst::State::Null).unwrap();
     }
 
+    /// Regression: `stratasrc` must advertise `is-live = true` as soon as the
+    /// object is constructed — before `BaseSrcImpl::start()` is ever called.
+    ///
+    /// If this property is first set inside `start()` (which runs during the
+    /// READY→PAUSED transition), GStreamer has already decided whether to wait
+    /// for a preroll buffer.  That race causes the pipeline to stall forever
+    /// in PAUSED waiting for data that `stratasrc` refuses to produce until
+    /// the pipeline reaches PLAYING.
     #[test]
-    fn test_src_pipeline() {
+    fn stratasrc_is_live_before_start() {
+        use gst_base::prelude::BaseSrcExt;
         gst::init().unwrap();
+        gst::Element::register(
+            None,
+            "stratasrc",
+            gst::Rank::NONE,
+            src::StrataSrc::static_type(),
+        )
+        .unwrap();
 
+        // Just creating the element — no pipeline, no state change.
+        let src = gst::ElementFactory::make("stratasrc").build().unwrap();
+        let base_src = src.downcast_ref::<gst_base::BaseSrc>().unwrap();
+
+        // The element must already know it is live at object-construction time
+        // (ObjectImpl::constructed), not after start() sets the flag.
+        assert!(
+            base_src.is_live(),
+            "stratasrc must be is-live=true at construction time. \
+             If this fails, the Preroll deadlock has been reintroduced: \
+             set_live(true) must live in ObjectImpl::constructed(), not start()."
+        );
+    }
+
+    /// Regression: a `stratasrc ! fakesink` pipeline must reach PLAYING within
+    /// a 2-second wall-clock deadline.
+    ///
+    /// Previously the pipeline would stall at PAUSED indefinitely because
+    /// `stratasrc` set `is-live = true` too late (inside `start()`).  GStreamer
+    /// saw a non-live source, demanded a preroll buffer, and `stratasrc`'s
+    /// create thread waited for PLAYING before producing one — deadlock.
+    ///
+    /// This test will time-out (and thus FAIL) rather than hang the test
+    /// suite, making the regression immediately visible in CI.
+    #[test]
+    fn stratasrc_no_preroll_deadlock() {
+        gst::init().unwrap();
         gst::Element::register(
             None,
             "stratasrc",
@@ -90,16 +133,39 @@ mod tests {
         let pipeline = gst::Pipeline::new();
         let src = gst::ElementFactory::make("stratasrc").build().unwrap();
         let sink = gst::ElementFactory::make("fakesink").build().unwrap();
-
         pipeline.add(&src).unwrap();
         pipeline.add(&sink).unwrap();
         src.link(&sink).unwrap();
 
-        pipeline.set_state(gst::State::Playing).unwrap();
-
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // The specific failure mode of the Preroll deadlock was that
+        // `pipeline.set_state(Playing)` would NEVER RETURN — it blocked
+        // forever inside GLib's g_cond_wait() in stratasrc's create thread,
+        // waiting for the pipeline to reach PLAYING, while the pipeline was
+        // itself waiting for a preroll buffer from stratasrc.
+        //
+        // The correct regression test is therefore to assert that set_state
+        // RETURNS within a short deadline, not that the pipeline reaches PLAYING
+        // (which for a live source with fakesink may be Async anyway).
+        let t0 = std::time::Instant::now();
+        let ret = pipeline.set_state(gst::State::Playing);
+        let elapsed = t0.elapsed();
 
         pipeline.set_state(gst::State::Null).unwrap();
+
+        // A live PushSrc must return StateChangeReturn::Async immediately.
+        // Any blocking (>200 ms) means the Preroll deadlock is reintroduced.
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "pipeline.set_state(Playing) took {elapsed:?} — should be <200 ms. \
+             The Preroll deadlock has been reintroduced. Ensure \
+             ObjectImpl::constructed() calls set_live(true) on stratasrc."
+        );
+        // A live source MUST return Async (not Error, not Success).
+        assert!(
+            matches!(ret, Ok(gst::StateChangeSuccess::Async)),
+            "Expected StateChangeReturn::Async for live source, got {ret:?}. \
+             If Success: is-live may not be set. If Error: pipeline setup failed."
+        );
     }
 
     #[test]
