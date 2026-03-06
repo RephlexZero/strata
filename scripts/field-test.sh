@@ -19,8 +19,11 @@
 #   STRATA_MIN_BITRATE     — Min kbps (default: 200)
 #   STRATA_MAX_BITRATE     — Max kbps (default: 1500)
 #   STRATA_LINK_IFACES     — Comma-separated interfaces (e.g. "enp2s0f0u4,enp2s0f0u3")
-#   STRATA_MAX_LATENCY_MS  — Receiver jitter buffer ceiling (default: 3000)
+#   STRATA_MAX_LATENCY_MS  — Receiver jitter buffer ceiling (default: 1000)
 #   STRATA_DURATION_SECS   — How long to stream before stopping (default: 60)
+#   STRATA_NO_BUILD=1      — Skip building and installing the sender binary
+#   STRATA_NO_DEPLOY=1     — Skip cross-compiling and deploying receiver binary
+#   STRATA_DEPLOY_IFACE    — Network interface for SSH/SCP deploy (e.g. "wlan0" to avoid cellular)
 #
 # Usage:
 #   export STRATA_RECEIVER_HOST=MyServer
@@ -61,9 +64,17 @@ CODEC="${STRATA_CODEC:-h265}"
 BITRATE="${STRATA_BITRATE:-500}"
 MIN_BITRATE="${STRATA_MIN_BITRATE:-200}"
 MAX_BITRATE="${STRATA_MAX_BITRATE:-1500}"
-MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-3000}"
+MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-1000}"
 DURATION="${STRATA_DURATION_SECS:-60}"
 HOST="${STRATA_RECEIVER_HOST}"
+
+# SSH/SCP options — bind to a specific interface (e.g. WiFi) so deploys
+# don't go through the cellular links you're about to bond.
+SSH_OPTS=(-o ConnectTimeout=10)
+if [[ -n "${STRATA_DEPLOY_IFACE:-}" ]]; then
+    SSH_OPTS+=(-o "BindInterface=${STRATA_DEPLOY_IFACE}")
+    info "Deploy will use interface ${STRATA_DEPLOY_IFACE} for SSH/SCP"
+fi
 
 # Parse ports and interfaces
 IFS=',' read -ra PORTS <<< "${STRATA_RECEIVER_PORTS}"
@@ -75,10 +86,21 @@ if [[ ${#IFACES[@]} -gt 0 && ${#IFACES[@]} -ne "$NUM_LINKS" ]]; then
     fail "STRATA_LINK_IFACES has ${#IFACES[@]} entries but STRATA_RECEIVER_PORTS has $NUM_LINKS"
 fi
 
-# ── Pre-flight checks ───────────────────────────────────────────────
+# ── Build and install sender binary ─────────────────────────────────
 echo "═══ Strata Field Test ═══"
 echo ""
 
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [[ "${STRATA_NO_BUILD:-0}" == "1" ]]; then
+    warn "Skipping build/install (STRATA_NO_BUILD=1)"
+else
+    echo "── Building and installing strata-pipeline ──"
+    make -C "$REPO_ROOT" install || fail "make install failed"
+    info "strata-pipeline built and installed"
+fi
+echo ""
+
+# ── Pre-flight checks ───────────────────────────────────────────────
 # 1. Binary exists
 command -v strata-pipeline >/dev/null 2>&1 || fail "strata-pipeline not found in PATH"
 info "strata-pipeline binary found"
@@ -136,10 +158,21 @@ if [[ ${#IFACES[@]} -gt 0 ]]; then
 fi
 
 # 7. Check SSH connectivity to receiver
-if ssh -o ConnectTimeout=5 "$HOST" "echo ok" >/dev/null 2>&1; then
+if ssh "${SSH_OPTS[@]}" "$HOST" "echo ok" >/dev/null 2>&1; then
     info "SSH to $HOST is reachable"
 else
     fail "Cannot SSH to $HOST"
+fi
+
+# 8. Cross-compile and deploy receiver binary to remote
+if [[ "${STRATA_NO_DEPLOY:-0}" == "1" ]]; then
+    warn "Skipping receiver deploy (STRATA_NO_DEPLOY=1)"
+else
+    echo ""
+    echo "── Deploying receiver to $HOST (aarch64 cross-compile) ──"
+    REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+    STRATA_DEPLOY_HOST="$HOST" make -C "$REPO_ROOT" deploy-aarch64
+    info "Receiver binary deployed"
 fi
 
 # ── Generate TOML configs ───────────────────────────────────────────
@@ -161,7 +194,7 @@ RECEIVER_TOML=$(mktemp /tmp/strata-receiver-XXXXXX.toml)
             echo "uri = \"$PORT\""
         else
             # Need STRATA_RECEIVER_IP for this case
-            RECEIVER_IP=$(ssh -o ConnectTimeout=5 "$HOST" "hostname -I | awk '{print \$1}'" 2>/dev/null || echo "")
+            RECEIVER_IP=$(ssh "${SSH_OPTS[@]}" "$HOST" "hostname -I | awk '{print \$1}'" 2>/dev/null || echo "")
             [[ -z "$RECEIVER_IP" ]] && fail "Cannot resolve receiver IP — use full host:port in STRATA_RECEIVER_PORTS"
             echo "uri = \"${RECEIVER_IP}:${PORT}\""
         fi
@@ -183,12 +216,12 @@ RECEIVER_TOML=$(mktemp /tmp/strata-receiver-XXXXXX.toml)
 # Receiver TOML
 {
     echo "[receiver]"
-    echo "start_latency_ms = 500"
+    echo "start_latency_ms = 100"
     echo "buffer_capacity = 4096"
     echo ""
     echo "[scheduler]"
     echo "max_latency_ms = $MAX_LATENCY_MS"
-    echo "jitter_latency_multiplier = 4.0"
+    echo "jitter_latency_multiplier = 2.0"
 } > "$RECEIVER_TOML"
 
 info "Sender config: $SENDER_TOML"
@@ -213,17 +246,17 @@ done
 echo "── Starting receiver on $HOST ──"
 
 # Kill any existing receiver
-ssh "$HOST" "kill \$(pgrep strata-pipeline) 2>/dev/null; sleep 1; echo ok" 2>/dev/null || true
+ssh "${SSH_OPTS[@]}" "$HOST" "kill \$(pgrep strata-pipeline) 2>/dev/null; sleep 1; echo ok" 2>/dev/null || true
 
 # Copy receiver config
-scp -q "$RECEIVER_TOML" "$HOST:/tmp/strata-receiver.toml"
+scp "${SSH_OPTS[@]}" -q "$RECEIVER_TOML" "$HOST:/tmp/strata-receiver.toml"
 
 # Write receiver start script (avoids SSH quoting issues — snag #11)
 RECEIVER_SCRIPT=$(mktemp /tmp/strata-receiver-start-XXXXXX.sh)
 cat > "$RECEIVER_SCRIPT" << ENDSCRIPT
 #!/bin/bash
 export GST_PLUGIN_PATH=\$HOME/.local/share/gstreamer-1.0/plugins
-nohup /usr/local/bin/strata-pipeline receiver \\
+nohup env GST_DEBUG="tsdemux:4,strata*:4" /usr/local/bin/strata-pipeline receiver \\
   --bind "$BIND_STR" \\
   --relay-url "$STRATA_RELAY_URL" \\
   --codec "$CODEC" \\
@@ -233,11 +266,11 @@ echo "PID: \$!"
 disown
 ENDSCRIPT
 
-scp -q "$RECEIVER_SCRIPT" "$HOST:/tmp/start-receiver.sh"
-ssh "$HOST" "chmod +x /tmp/start-receiver.sh && bash /tmp/start-receiver.sh"
+scp "${SSH_OPTS[@]}" -q "$RECEIVER_SCRIPT" "$HOST:/tmp/start-receiver.sh"
+ssh "${SSH_OPTS[@]}" "$HOST" "chmod +x /tmp/start-receiver.sh && bash /tmp/start-receiver.sh"
 sleep 2
 
-RECEIVER_PID=$(ssh "$HOST" "pgrep -n strata-pipeline" 2>/dev/null || echo "")
+RECEIVER_PID=$(ssh "${SSH_OPTS[@]}" "$HOST" "pgrep -n strata-pipeline" 2>/dev/null || echo "")
 if [[ -z "$RECEIVER_PID" ]]; then
     fail "Receiver failed to start — check $HOST:/tmp/strata-receiver.log"
 fi
@@ -249,7 +282,7 @@ for port in "${PORTS[@]}"; do
     if [[ "$port" == *:* ]]; then
         DEST_STR="${DEST_STR:+$DEST_STR,}$port"
     else
-        RECEIVER_IP=$(ssh -o ConnectTimeout=5 "$HOST" "hostname -I | awk '{print \$1}'" 2>/dev/null)
+        RECEIVER_IP=$(ssh "${SSH_OPTS[@]}" "$HOST" "hostname -I | awk '{print \$1}'" 2>/dev/null)
         DEST_STR="${DEST_STR:+$DEST_STR,}${RECEIVER_IP}:${port}"
     fi
 done
@@ -277,7 +310,7 @@ if [[ "$VIDEO_SOURCE" == "v4l2" ]]; then
 fi
 
 # Enable adaptation debug logging unless user already set RUST_LOG
-export RUST_LOG="${RUST_LOG:-warn,strata::adapt=info}"
+export RUST_LOG="${RUST_LOG:-warn,strata::adapt=info,strata_bonding::scheduler::edpf=debug}"
 
 strata-pipeline "${SENDER_ARGS[@]}" > /tmp/strata-sender.log 2>&1 &
 SENDER_PID=$!
@@ -295,7 +328,7 @@ cleanup() {
     echo ""
     echo "── Shutting down ──"
     kill "$SENDER_PID" 2>/dev/null; wait "$SENDER_PID" 2>/dev/null || true
-    ssh "$HOST" "kill \$(pgrep strata-pipeline) 2>/dev/null; echo ok" 2>/dev/null || true
+    ssh "${SSH_OPTS[@]}" "$HOST" "kill \$(pgrep strata-pipeline) 2>/dev/null; echo ok" 2>/dev/null || true
     rm -f "$SENDER_TOML" "$RECEIVER_TOML" "$RECEIVER_SCRIPT"
     echo ""
 
@@ -309,6 +342,10 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+PREV_LOST=0
+PREV_LATE=0
+PREV_DELIVERED=0
+
 while [[ $ELAPSED -lt $DURATION ]]; do
     sleep 5
     ELAPSED=$((ELAPSED + 5))
@@ -319,23 +356,46 @@ while [[ $ELAPSED -lt $DURATION ]]; do
         break
     fi
 
-    # Receiver stats
-    STATS=$(ssh "$HOST" "tail -1 /tmp/strata-receiver.log 2>/dev/null | grep -oE 'next_seq=[^,;]+|lost_packets=[^,;]+|late_packets=[^,;]+|current_latency_ms=[^,;]+'" 2>/dev/null || echo "")
+    # Receiver stats (last 3 lines — the log line with counters)
+    RX_RAW=$(ssh "${SSH_OPTS[@]}" "$HOST" "tail -5 /tmp/strata-receiver.log 2>/dev/null" 2>/dev/null || echo "")
+    STATS=$(echo "$RX_RAW" | grep -oE 'next_seq=[^,;]+|lost_packets=[^,;]+|late_packets=[^,;]+|current_latency_ms=[^,;]+|target_latency_ms=[^,;]+|jitter_estimate_ms=[^,;]+|loss_rate=[^,;]+|packets_delivered=[^,;]+|queue_depth=[^,;]+' | head -9 | tr '\n' ' ')
+
+    # Extract numbers for delta calculation (handle GStreamer type annotations like =(guint64)123)
+    CUR_LOST=$(echo "$STATS" | grep -oP 'lost_packets=\([^)]*\)\K[0-9]+' || echo "0")
+    CUR_LATE=$(echo "$STATS" | grep -oP 'late_packets=\([^)]*\)\K[0-9]+' || echo "0")
+    CUR_DELIVERED=$(echo "$STATS" | grep -oP 'packets_delivered=\([^)]*\)\K[0-9]+' || echo "0")
+    DELTA_LOST=$((CUR_LOST - PREV_LOST))
+    DELTA_LATE=$((CUR_LATE - PREV_LATE))
+    DELTA_DELIVERED=$((CUR_DELIVERED - PREV_DELIVERED))
+    PREV_LOST=$CUR_LOST; PREV_LATE=$CUR_LATE; PREV_DELIVERED=$CUR_DELIVERED
 
     # Segment count
-    SEG_INFO=$(ssh "$HOST" "ls -1 $HLS_DIR/*.ts 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+    SEG_INFO=$(ssh "${SSH_OPTS[@]}" "$HOST" "ls -1 $HLS_DIR/*.ts 2>/dev/null | wc -l" 2>/dev/null || echo "0")
     SEGMENT_COUNT=$SEG_INFO
 
-    # Sender adaptation
-    SENDER_STATE=$(grep 'Bitrate:' /tmp/strata-sender.log 2>/dev/null | tail -1 || echo "(no adaptation yet)")
-    ADAPT_STATE=$(grep '\[adapt\]' /tmp/strata-sender.log 2>/dev/null | tail -1 | sed 's/.*\[adapt\]/[adapt]/' || echo "")
-    LINK_STATE=$(grep 'strata::adapt.*link' /tmp/strata-sender.log 2>/dev/null | tail -2 | sed 's/.*link=/  link=/' | tr '\n' ' ' || echo "")
+    # Sender: last adaptation + feedback lines
+    ADAPT_LINE=$(grep '\[adapt\] agg=' /tmp/strata-sender.log 2>/dev/null | tail -1 | sed 's/.*\[adapt\]/[adapt]/' || echo "")
+    FB_LINE=$(grep '\[adapt\] fb:' /tmp/strata-sender.log 2>/dev/null | tail -1 | sed 's/.*\[adapt\]/[adapt]/' || echo "")
+    CMD_LINE=$(grep '\[adapt\] CMD' /tmp/strata-sender.log 2>/dev/null | tail -1 | sed 's/.*\[adapt\]/[adapt]/' || echo "")
+    LINK_LINES=$(grep 'strata::adapt.*link=' /tmp/strata-sender.log 2>/dev/null | tail -2 | sed 's/.*link=/  link=/' | tr '\n' '\n' || echo "")
 
-    echo "[${ELAPSED}s] segments=$SEGMENT_COUNT | $STATS | $SENDER_STATE"
-    [[ -n "$ADAPT_STATE" ]] && echo "        $ADAPT_STATE"
-    [[ -n "$LINK_STATE" ]] && echo "        $LINK_STATE"
+    echo ""
+    echo "╌╌╌ [${ELAPSED}s] segments=$SEGMENT_COUNT ╌╌╌"
+    echo "  RX: $STATS"
+    echo "  Δ5s: delivered=$DELTA_DELIVERED lost=$DELTA_LOST late=$DELTA_LATE"
+    [[ -n "$ADAPT_LINE" ]] && echo "  $ADAPT_LINE"
+    [[ -n "$FB_LINE" ]]    && echo "  $FB_LINE"
+    [[ -n "$CMD_LINE" ]]   && echo "  $CMD_LINE"
+    [[ -n "$LINK_LINES" ]] && echo "$LINK_LINES"
 done
 
 echo ""
 echo "── Final state ──"
-ssh "$HOST" "ls -lh $HLS_DIR/ 2>/dev/null" || warn "No HLS directory found"
+echo "Receiver log (last 20 lines):"
+ssh "${SSH_OPTS[@]}" "$HOST" "tail -20 /tmp/strata-receiver.log 2>/dev/null" || warn "No receiver log"
+echo ""
+echo "Sender log (last 20 lines):"
+tail -20 /tmp/strata-sender.log 2>/dev/null || warn "No sender log"
+echo ""
+echo "HLS directory:"
+ssh "${SSH_OPTS[@]}" "$HOST" "ls -lh $HLS_DIR/ 2>/dev/null" || warn "No HLS directory found"

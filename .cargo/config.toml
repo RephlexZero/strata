@@ -1,6 +1,13 @@
 # Preset dev environment variables so `cargo run` just works
 # without needing env var prefixes on every command.
 
+[target.x86_64-unknown-linux-gnu]
+# rust-lld is stricter than GNU ld about undefined symbols in shared libs.
+# GStreamer .so files reference g_once_init_enter_pointer (added in GLib 2.75)
+# but the system ships GLib 2.74.6 — the symbol resolves at runtime via the
+# inline/alias machinery, but lld's static check rejects it.
+rustflags = ["-C", "link-arg=-Wl,--allow-shlib-undefined"]
+
 [env]
 DATABASE_URL = "postgres://strata:dev-only-password@localhost/strata"
 DEV_SEED = "1"

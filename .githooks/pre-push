@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pre-push: the real gate. Catches what would fail CI.
-# Format is checked (not auto-fixed) because this is about verification.
+# Pre-push: verify format wasn't bypassed with --no-verify.
+# Tests already ran in pre-commit, so we just double-check format + lint.
 
 echo "[pre-push] Format check..."
 cargo fmt --all -- --check
 
 echo "[pre-push] Clippy..."
 cargo clippy --workspace --all-targets -- -D warnings
-
-echo "[pre-push] Unit tests..."
-cargo test --workspace --lib
 
 echo "[pre-push] ✓ All checks passed"
 exit 0

@@ -29,3 +29,38 @@ for g in "${GROUPS_WANTED[@]}"; do
         sudo usermod -aG "$g" "$(whoami)" 2>/dev/null || true
     fi
 done
+
+# ── De-prioritize cellular/USB links for general traffic ─────────────
+# With --network=host the container shares the host routing table.
+# DHCP on LTE dongles installs low-metric default routes that can steal
+# traffic from apt-get, cargo builds, Docker pulls, etc.
+# We raise those metrics so high (20000) that the primary interface
+# (wlan0 / eno1) always wins, while SO_BINDTODEVICE in strata-pipeline
+# still routes each link's packets correctly.
+#
+# Interface detection order:
+#   1. STRATA_LINK_IFACES from .env (explicit list, most reliable)
+#   2. Auto-detect USB ethernet by predictable name suffix 'u' (enp*u*)
+CELLULAR_METRIC=20000
+mapfile -t _CELLULAR_IFACES < <(
+    {
+        if [[ -f /workspaces/strata/.env ]]; then
+            grep -oP '(?<=STRATA_LINK_IFACES=)[^\s#"]+' /workspaces/strata/.env \
+                | tr ',' '\n'
+        fi
+        find /sys/class/net -maxdepth 1 -name 'enp*u*' -printf '%f\n' 2>/dev/null
+    } | sort -u | grep -v '^$'
+)
+for _iface in "${_CELLULAR_IFACES[@]}"; do
+    _current=$(ip route show default dev "$_iface" 2>/dev/null \
+                | grep -oP 'metric \K[0-9]+' | head -1)
+    [[ -z "$_current" || "$_current" -ge "$CELLULAR_METRIC" ]] && continue
+    _via=$(ip route show default dev "$_iface" 2>/dev/null \
+            | grep -oP 'via \K\S+' | head -1)
+    [[ -z "$_via" ]] && continue
+    sudo ip route del default via "$_via" dev "$_iface" metric "$_current" 2>/dev/null || true
+    sudo ip route add default via "$_via" dev "$_iface" \
+        metric "$CELLULAR_METRIC" 2>/dev/null || true
+    echo "[devcontainer] Raised default route metric: $_iface via $_via  $_current → $CELLULAR_METRIC"
+done
+unset _CELLULAR_IFACES _iface _current _via CELLULAR_METRIC

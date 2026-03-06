@@ -16,7 +16,8 @@
                 "vadimcn.vscode-lldb",
                 "fill-labs.dependi",
                 "github.vscode-github-actions",
-                "GitHub.copilot-chat"
+                "GitHub.copilot-chat",
+                "Anthropic.claude-code"
             ]
         }
     },

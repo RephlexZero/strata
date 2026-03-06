@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Pre-commit: fast checks only. Must not slow you down.
-# Clippy is a superset of `cargo check`, so we only run clippy.
+# Pre-commit: format, lint, and test.
+# Excludes crates that require external infrastructure:
+#   strata-sim     — needs root + Linux network namespaces (tc netem)
+#   strata-control — needs a running PostgreSQL instance
 
 echo "[pre-commit] Formatting..."
 cargo fmt --all
 
 echo "[pre-commit] Clippy..."
 cargo clippy --workspace --all-targets -- -D warnings
+
+echo "[pre-commit] Tests..."
+cargo test --workspace \
+  --exclude strata-sim \
+  --exclude strata-control
 
 exit 0

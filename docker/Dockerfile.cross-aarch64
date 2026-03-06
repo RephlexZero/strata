@@ -37,6 +37,30 @@ PKG_CONFIG_SYSROOT_DIR = "/"
 EOF
 
 WORKDIR /src
+
+# ── Dependency pre-fetch (cached until Cargo.toml/lock change) ───
+COPY Cargo.toml Cargo.lock ./
+COPY crates/strata-bonding/Cargo.toml crates/strata-bonding/Cargo.toml
+COPY crates/strata-common/Cargo.toml crates/strata-common/Cargo.toml
+COPY crates/strata-control/Cargo.toml crates/strata-control/Cargo.toml
+COPY crates/strata-gst/Cargo.toml crates/strata-gst/Cargo.toml
+COPY crates/strata-receiver/Cargo.toml crates/strata-receiver/Cargo.toml
+COPY crates/strata-sender/Cargo.toml crates/strata-sender/Cargo.toml
+COPY crates/strata-transport/Cargo.toml crates/strata-transport/Cargo.toml
+COPY crates/strata-sim/Cargo.toml crates/strata-sim/Cargo.toml
+COPY crates/strata-dashboard/Cargo.toml crates/strata-dashboard/Cargo.toml
+COPY crates/strata-portal/Cargo.toml crates/strata-portal/Cargo.toml
+# Stub lib.rs so cargo can resolve the workspace and fetch deps
+RUN find crates -name Cargo.toml -exec sh -c 'dir=$(dirname "$1") && mkdir -p "$dir/src" && echo "" > "$dir/src/lib.rs"' _ {} \;
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git/db \
+    cargo fetch --target aarch64-unknown-linux-gnu || true
+
+# ── Source copy (always fresh – Makefile passes a timestamp as CACHEBUST) ───
+# This ARG is placed here intentionally so every layer above stays cached
+# (toolchain, deps fetch) while this layer and everything below it is
+# unconditionally re-run on every `make cross-aarch64` invocation.
+ARG CACHEBUST=1
 COPY . .
 
 ENV PKG_CONFIG_PATH="/usr/lib/aarch64-linux-gnu/pkgconfig"
@@ -45,19 +69,27 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc"
 ENV CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc"
 ENV CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++"
 
-# Build the plugin + all binaries
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git/db \
+# Build the plugin + all binaries.
+# The target dir is a cache mount so incremental compilation works even
+# when the COPY layer above is invalidated by source changes.
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git/db \
+    --mount=type=cache,target=/src/target \
     cargo build --release --target aarch64-unknown-linux-gnu \
     -p strata-gst \
     -p strata-control \
     -p strata-sender \
-    -p strata-receiver
+    -p strata-receiver \
+    && cp target/aarch64-unknown-linux-gnu/release/libgststrata.so /tmp/ \
+    && cp target/aarch64-unknown-linux-gnu/release/strata-pipeline /tmp/ \
+    && cp target/aarch64-unknown-linux-gnu/release/strata-control /tmp/ \
+    && cp target/aarch64-unknown-linux-gnu/release/strata-sender /tmp/ \
+    && cp target/aarch64-unknown-linux-gnu/release/strata-receiver /tmp/
 
 # ── Stage 2: Extract artifacts ───────────────────────────────
 FROM scratch AS export
-COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/libgststrata.so /libgststrata.so
-COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/strata-pipeline /strata-pipeline
-COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/strata-control /strata-control
-COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/strata-sender /strata-sender
-COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/strata-receiver /strata-receiver
+COPY --from=builder /tmp/libgststrata.so /libgststrata.so
+COPY --from=builder /tmp/strata-pipeline /strata-pipeline
+COPY --from=builder /tmp/strata-control /strata-control
+COPY --from=builder /tmp/strata-sender /strata-sender
+COPY --from=builder /tmp/strata-receiver /strata-receiver
