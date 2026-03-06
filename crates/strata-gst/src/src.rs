@@ -2,6 +2,7 @@ use crate::util::lock_or_recover;
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
+use gst_base::prelude::BaseSrcExt;
 use gst_base::subclass::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,6 +37,9 @@ mod imp {
         pub(crate) receiver: Mutex<Option<ReceiverBackend>>,
         stats_running: Arc<AtomicBool>,
         stats_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+        /// Set by `unlock()` to interrupt the blocking `recv()` in `create()`.
+        /// Cleared by `unlock_stop()` when the pipeline resumes.
+        flushing: AtomicBool,
     }
 
     impl StrataSrc {
@@ -169,6 +173,14 @@ mod imp {
                 }
             }
         }
+
+        fn constructed(&self) {
+            self.parent_constructed();
+            let obj = self.obj();
+            obj.set_live(true);
+            obj.set_format(gst::Format::Time);
+            obj.set_do_timestamp(true);
+        }
     }
 
     impl GstObjectImpl for StrataSrc {}
@@ -211,6 +223,8 @@ mod imp {
 
     impl BaseSrcImpl for StrataSrc {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
+            self.flushing.store(false, Ordering::SeqCst);
+
             let settings = lock_or_recover(&self.settings);
             let mut receiver_guard = lock_or_recover(&self.receiver);
 
@@ -275,6 +289,10 @@ mod imp {
                                     .field("lost_packets", stats.lost_packets)
                                     .field("late_packets", stats.late_packets)
                                     .field("current_latency_ms", stats.current_latency_ms)
+                                    .field("target_latency_ms", stats.target_latency_ms)
+                                    .field("packets_delivered", stats.packets_delivered)
+                                    .field("loss_rate", stats.loss_rate)
+                                    .field("jitter_estimate_ms", stats.jitter_estimate_ms)
                                     .build();
                                 let _ = element.post_message(gst::message::Element::new(msg));
                                 stats_seq = stats_seq.wrapping_add(1);
@@ -306,10 +324,17 @@ mod imp {
         }
 
         fn unlock(&self) -> Result<(), gst::ErrorMessage> {
-            let mut receiver_guard = lock_or_recover(&self.receiver);
-            if let Some(receiver) = &mut *receiver_guard {
-                receiver.shutdown();
-            }
+            // Signal the blocking recv() in create() to bail out.
+            // We must NOT call receiver.shutdown() here — that permanently
+            // destroys the receiver.  GStreamer calls unlock() during
+            // state transitions (PLAYING→PAUSED) and expects create()
+            // to return quickly; the receiver must survive for reuse.
+            self.flushing.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn unlock_stop(&self) -> Result<(), gst::ErrorMessage> {
+            self.flushing.store(false, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -328,14 +353,32 @@ mod imp {
             };
             drop(receiver_guard);
 
-            match rx.recv() {
-                Ok(bytes) => {
-                    let buffer = gst::Buffer::from_slice(bytes);
-                    Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(
-                        buffer,
-                    ))
+            // Use recv_timeout so we can check the flushing flag
+            // periodically instead of blocking forever (which would
+            // prevent unlock() from taking effect).
+            loop {
+                if self.flushing.load(Ordering::SeqCst) {
+                    return Err(gst::FlowError::Flushing);
                 }
-                Err(_) => Err(gst::FlowError::Eos),
+                match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok((bytes, discont)) => {
+                        let mut buffer = gst::Buffer::from_slice(bytes);
+                        if discont {
+                            let buf_ref = buffer.get_mut().unwrap();
+                            buf_ref.set_flags(gst::BufferFlags::DISCONT);
+                        } else {
+                            // Suppress tracing for every packet to avoid log spam
+                            // println!("StrataSrc: producing buffer");
+                        }
+                        return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(
+                            buffer,
+                        ));
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        return Err(gst::FlowError::Eos);
+                    }
+                }
             }
         }
     }

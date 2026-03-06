@@ -1493,8 +1493,8 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "stratasrc links=\"{bind}\" name=src latency=200 ! \
              queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
              tsdemux name=d \
-             d. ! queue ! {parser} ! hls.video \
-             d. ! queue ! aacparse ! hls.audio \
+             queue name=vq ! {parser} ! hls.video \
+             queue name=aq ! aacparse ! hls.audio \
              hlssink2 name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
              target-duration=2 max-files=10 send-keyframe-requests=true",
             bind = bind_str,
@@ -1508,9 +1508,9 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "stratasrc links=\"{bind}\" name=src latency=200 ! \
              queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
              tsdemux name=d \
-             d. ! queue ! {parser} ! {relay} \
+             queue name=vq ! {parser} ! {relay} \
              rtmpsink location=\"{url}\" sync=false \
-             d. ! queue ! aacparse ! fmux.",
+             queue name=aq ! aacparse ! fmux.",
             bind = bind_str,
             parser = relay_parser,
             relay = relay_frag,
@@ -1542,6 +1542,30 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let pipeline = gst::parse::launch(&pipeline_str)?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "Failed to cast to pipeline")?;
+
+    // Dynamically link tsdemux pads to the respective queues.
+    // Static `d. !` linking is unsafe because tsdemux pad creation order is not guaranteed.
+    if use_relay && let Some(d) = pipeline.by_name("d") {
+        let vq = pipeline.by_name("vq").ok_or("Failed to find vq element")?;
+        let aq = pipeline.by_name("aq").ok_or("Failed to find aq element")?;
+        d.connect_pad_added(move |_, pad| {
+            let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
+            if let Some(s) = caps.structure(0) {
+                let name = s.name();
+                if name.starts_with("video/") {
+                    if let Some(sink_pad) = vq.static_pad("sink") {
+                        let _ = pad.link(&sink_pad);
+                        eprintln!("Linked tsdemux video pad to vq");
+                    }
+                } else if name.starts_with("audio/")
+                    && let Some(sink_pad) = aq.static_pad("sink")
+                {
+                    let _ = pad.link(&sink_pad);
+                    eprintln!("Linked tsdemux audio pad to aq");
+                }
+            }
+        });
+    }
 
     // Apply TOML config file if provided
     if !config_path.is_empty()
