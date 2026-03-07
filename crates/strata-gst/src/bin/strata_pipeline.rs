@@ -295,7 +295,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     //
     // The initial source (--source flag) determines which branch is active.
     // Additional branches are added dynamically via the control socket.
-    let key_int = framerate * 2;
+    let key_int = framerate;
 
     // Parse codec type
     let codec_type = gststrata::codec::CodecType::from_str_loose(codec_str).unwrap_or_else(|| {
@@ -368,7 +368,10 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // For software encoders this is a cheap passthrough.
     let parser_fragment = match codec_ctrl.codec() {
         gststrata::codec::CodecType::Fake => "identity".to_string(),
-        ct => format!("{} config-interval=-1", ct.parser_factory()),
+        ct => format!(
+            "{} config-interval=-1 disable-passthrough=true",
+            ct.parser_factory()
+        ),
     };
 
     // VA-API and Vulkan encoders negotiate 10-bit (P010_10LE) input by default when
@@ -391,7 +394,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
          {hw_fmt_conv}! {enc_fragment} \
          ! {parser_fragment} \
          {video_to_mux}{audio} \
-         mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 \
+         mpegtsmux name=mux alignment=7 pat-interval=9000 pmt-interval=9000 \
          ! stratasink name=rsink",
         w = res_w,
         h = res_h,
@@ -702,7 +705,7 @@ fn run_sender_passthrough(
     let pipeline_str = format!(
         "uridecodebin name=urisrc uri=\"{uri}\" \
          ! parsebin name=pbin \
-         mpegtsmux name=mux alignment=7 pat-interval=10 pmt-interval=10 \
+         mpegtsmux name=mux alignment=7 pat-interval=9000 pmt-interval=9000 \
          ! stratasink name=rsink",
         uri = source_uri,
     );
@@ -1490,11 +1493,11 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let seg_location = hls_dir.join("segment%05d.ts");
         let pl_location = hls_dir.join("playlist.m3u8");
         format!(
-            "stratasrc links=\"{bind}\" name=src latency=200 ! \
+            "stratasrc links=\"{bind}\" name=src latency=50 ! \
              queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
              tsdemux name=d \
-             queue name=vq ! {parser} ! hls.video \
-             queue name=aq ! aacparse ! hls.audio \
+             d. ! queue ! {parser} ! hls.video \
+             d. ! queue ! aacparse ! hls.audio \
              hlssink2 name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
              target-duration=2 max-files=10 send-keyframe-requests=true",
             bind = bind_str,
@@ -1505,12 +1508,12 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     } else if use_relay {
         let relay_frag = gststrata::codec::CodecController::new(codec_type).relay_muxer_fragment();
         format!(
-            "stratasrc links=\"{bind}\" name=src latency=200 ! \
+            "stratasrc links=\"{bind}\" name=src latency=50 ! \
              queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
              tsdemux name=d \
-             queue name=vq ! {parser} ! {relay} \
+             d. ! queue ! {parser} ! {relay} \
              rtmpsink location=\"{url}\" sync=false \
-             queue name=aq ! aacparse ! fmux.",
+             d. ! queue ! aacparse ! fmux.",
             bind = bind_str,
             parser = relay_parser,
             relay = relay_frag,
@@ -1542,30 +1545,6 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let pipeline = gst::parse::launch(&pipeline_str)?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "Failed to cast to pipeline")?;
-
-    // Dynamically link tsdemux pads to the respective queues.
-    // Static `d. !` linking is unsafe because tsdemux pad creation order is not guaranteed.
-    if use_relay && let Some(d) = pipeline.by_name("d") {
-        let vq = pipeline.by_name("vq").ok_or("Failed to find vq element")?;
-        let aq = pipeline.by_name("aq").ok_or("Failed to find aq element")?;
-        d.connect_pad_added(move |_, pad| {
-            let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
-            if let Some(s) = caps.structure(0) {
-                let name = s.name();
-                if name.starts_with("video/") {
-                    if let Some(sink_pad) = vq.static_pad("sink") {
-                        let _ = pad.link(&sink_pad);
-                        eprintln!("Linked tsdemux video pad to vq");
-                    }
-                } else if name.starts_with("audio/")
-                    && let Some(sink_pad) = aq.static_pad("sink")
-                {
-                    let _ = pad.link(&sink_pad);
-                    eprintln!("Linked tsdemux audio pad to aq");
-                }
-            }
-        });
-    }
 
     // Apply TOML config file if provided
     if !config_path.is_empty()

@@ -631,12 +631,11 @@ impl BitrateAdapter {
             // over-pressure on the very next tick.
             let safe_ceiling = (usable_kbps * (self.config.pressure_threshold - 0.05)) as u32;
             let target = target.min(safe_ceiling);
+            // Cap ramp-up to 1.3x EWMA goodput — sender-side capacity is
+            // optimistic on lossy links; real throughput is what matters.
+            // This prevents the classic overshoot-crash-ramp cycle.
             let target = if self.ewma_goodput_bps > 0.0 {
-                // Cap ramp-up to 1.1x EWMA goodput — a 30% jump was too
-                // aggressive and caused sawtooth crashes. 10% allows smooth
-                // upward probing without immediately overflowing bottleneck
-                // queues and triggering the 0.73x loss reduction.
-                let gp_ceiling = (self.ewma_goodput_bps * 1.1 / 1000.0) as u32;
+                let gp_ceiling = (self.ewma_goodput_bps * 1.3 / 1000.0) as u32;
                 target.min(gp_ceiling)
             } else {
                 target

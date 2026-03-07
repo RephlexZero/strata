@@ -24,8 +24,8 @@ mod imp {
         fn default() -> Self {
             Self {
                 links: String::new(),
-                latency: 100,
-                max_latency_ms: 500,
+                latency: 50,
+                max_latency_ms: 800,
                 config_toml: String::new(),
             }
         }
