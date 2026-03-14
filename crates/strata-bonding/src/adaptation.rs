@@ -184,6 +184,11 @@ pub struct BitrateAdapter {
     /// and dips from Oracle/BBR/ack-rate estimates on lossy LTE links.
     /// α=0.3 gives ~2s half-life at 500ms update intervals.
     capacity_ewma: HashMap<usize, f64>,
+    /// When the last burst-loss cut happened.  Ramp-up is suppressed for a
+    /// cooldown period after a burst to prevent the classic sawtooth where the
+    /// adapter ramps back to the same level that triggered the burst within
+    /// 3-4 seconds, only to get punished again.
+    last_burst_time: Option<Instant>,
 }
 
 impl BitrateAdapter {
@@ -209,6 +214,7 @@ impl BitrateAdapter {
             ewma_loss_fec: 0.0,
             ewma_goodput_bps: 0.0,
             capacity_ewma: HashMap::new(),
+            last_burst_time: None,
         }
     }
 
@@ -507,6 +513,19 @@ impl BitrateAdapter {
         let goodput_ok = self.ewma_goodput_bps > 0.0
             && self.ewma_goodput_bps >= target_before_update as f64 * 1000.0 * 0.80;
         let loss_pressure = self.ewma_loss_fec > 0.15 && !goodput_ok;
+        // Instantaneous severe loss: if a single reporting window shows >50%
+        // loss-after-FEC, that is unambiguously bad regardless of what EWMA or
+        // goodput say.  LTE loss is bursty (0% → 85% → 0% in consecutive
+        // windows) so the EWMA is structurally too slow to react — by the time
+        // it crosses any threshold the burst is over.  This check catches burst
+        // events immediately, bypasses goodput_ok (which stays stale-high during
+        // bursts), and bypasses grace (no point waiting 5s when half the packets
+        // just vanished).
+        // Gate on goodput > 0: when the reorder buffer stalls (one link dies),
+        // loss_after_fec reads 1.0 with goodput=0 — that's an artifact, not real
+        // congestion.  Real burst loss always has *some* goodput (degraded but
+        // non-zero) because the working link is still delivering packets.
+        let burst_loss = feedback.loss_after_fec > 0.50 && feedback.goodput_bps > 0;
         // Jitter > 3s indicates real buffer bloat; user is OK with 2s delay.
         let bufferbloat = feedback.jitter_buffer_ms > 3000;
         // EWMA-smooth goodput (α=0.3) to filter end-of-window noise artifacts
@@ -520,6 +539,25 @@ impl BitrateAdapter {
                     0.3 * feedback.goodput_bps as f64 + 0.7 * self.ewma_goodput_bps;
             }
         }
+        // Goodput-anchor the current target: if the SINR/CQI oracle is over-
+        // estimating capacity (common with USB LTE dongles where theoretical
+        // downlink >> actual uplink), the adapter can ramp above what the links
+        // can actually deliver.  Cap the current target at goodput / (1-headroom)
+        // so the effective ceiling stays grounded in observed delivery rate.
+        // Clearing last_increase_time prevents grace from blocking the loss/
+        // goodput feedback reduction that will fire later in this same tick.
+        if self.ewma_goodput_bps > 0.0 {
+            let goodput_ceil_kbps =
+                (self.ewma_goodput_bps / 1000.0 / (1.0 - self.config.headroom)) as u32;
+            let goodput_ceil_kbps = goodput_ceil_kbps.max(self.config.min_bitrate_kbps);
+            if self.current_target_kbps > goodput_ceil_kbps {
+                self.current_target_kbps = goodput_ceil_kbps;
+                self.last_increase_time = None;
+                self.last_command_time = Some(Instant::now());
+                result = Some(self.make_command(goodput_ceil_kbps, AdaptationReason::Congestion));
+            }
+        }
+
         // Compare smoothed goodput against the PRE-update target since goodput
         // lags the encoder rate by at least one RTT.
         let goodput_shortfall = self.ewma_goodput_bps > 0.0
@@ -533,21 +571,24 @@ impl BitrateAdapter {
         let feedback_grace = self
             .last_increase_time
             .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5));
+        // Burst loss bypasses grace — when >50% of packets vanish in a single
+        // window, waiting 5s for stale metrics to settle only deepens the damage.
         let feedback_reduction = if feedback_grace {
-            bufferbloat
+            bufferbloat || burst_loss
         } else {
-            loss_pressure || bufferbloat || goodput_shortfall
+            loss_pressure || bufferbloat || goodput_shortfall || burst_loss
         };
 
         info!(
             target: "strata::adapt",
-            "[adapt] fb: loss_fec={:.3} ewma_loss={:.3} jitter={}ms gp={}kbps ewma_gp={}kbps | loss_p={} bb={} gp_short={} grace={} → reduce={}",
+            "[adapt] fb: loss_fec={:.3} ewma_loss={:.3} jitter={}ms gp={}kbps ewma_gp={}kbps | loss_p={} burst={} bb={} gp_short={} grace={} → reduce={}",
             feedback.loss_after_fec,
             self.ewma_loss_fec,
             feedback.jitter_buffer_ms,
             feedback.goodput_bps / 1000,
             self.ewma_goodput_bps as u64 / 1000,
             loss_pressure,
+            burst_loss,
             bufferbloat,
             goodput_shortfall,
             feedback_grace,
@@ -565,8 +606,11 @@ impl BitrateAdapter {
                 self.last_command_time = Some(Instant::now());
                 self.consecutive_decreases += 1;
                 self.consecutive_increases = 0;
+                if burst_loss {
+                    self.last_burst_time = Some(Instant::now());
+                }
 
-                let reason = if loss_pressure {
+                let reason = if loss_pressure || burst_loss {
                     AdaptationReason::Congestion
                 } else {
                     AdaptationReason::Capacity
@@ -623,8 +667,13 @@ impl BitrateAdapter {
             return (target, reason);
         }
 
-        // Under-pressure with stable capacity: ramp up
-        if pressure < 0.7 && self.consecutive_increases >= 3 {
+        // Under-pressure with stable capacity: ramp up.
+        // Suppress ramp-up for 10s after a burst-loss cut — LTE burst loss
+        // comes every 5-10s, so ramping back in 3s just recreates the sawtooth.
+        let burst_cooldown = self
+            .last_burst_time
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(10));
+        if pressure < 0.7 && self.consecutive_increases >= 3 && !burst_cooldown {
             let target = current + self.config.ramp_up_kbps_per_step;
             let target = target.min(self.config.max_bitrate_kbps);
             // Cap below the pressure threshold to avoid overshooting into
@@ -949,33 +998,43 @@ mod tests {
     fn feedback_high_loss_forces_ramp_down() {
         let mut adapter = BitrateAdapter::new(AdaptationConfig {
             max_bitrate_kbps: 10_000,
+            min_bitrate_kbps: 100, // low floor so loss-pressure cuts have room to operate
             min_interval: Duration::ZERO,
             ..Default::default()
         });
 
         let links = make_links(&[(10_000.0, true)]);
-        adapter.update(&links); // prime the adapter
 
-        // Use 60% loss with degraded goodput (below 80% of target).
-        // After 3 calls: EWMA ≈ 0.3*0.6 + 0.7*(0.3*0.6 + 0.7*(0.3*0.6)) ≈ 0.36 > 0.15
-        // goodput=500kbps is below 80% of the expected ~7000kbps target → goodput_ok=false.
-        let feedback = ReceiverFeedback {
-            goodput_bps: 500_000, // degraded — well below 80% of target
+        // Establish a high baseline with healthy feedback so the adapter ramps
+        // up well above the loss-constrained ceiling we're about to trigger.
+        let healthy = ReceiverFeedback {
+            goodput_bps: 6_000_000,
+            fec_repair_rate: 0.0,
+            jitter_buffer_ms: 50,
+            loss_after_fec: 0.0,
+        };
+        for _ in 0..8 {
+            adapter.update_with_feedback(&links, &healthy);
+        }
+        let baseline = adapter.current_target_kbps();
+
+        // Inject severe loss — goodput_ceil drops, EWMA loss builds, adapter must cut.
+        // After ~3 ticks ewma_loss_fec > 0.25 (extreme_loss) which bypasses grace.
+        let bad = ReceiverFeedback {
+            goodput_bps: 500_000, // 500 kbps — severely degraded
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
-            loss_after_fec: 0.60, // severe loss — well above 15% EWMA threshold
+            loss_after_fec: 0.60,
         };
+        adapter.update_with_feedback(&links, &bad);
+        adapter.update_with_feedback(&links, &bad);
+        let cmd = adapter.update_with_feedback(&links, &bad);
 
-        // Warm up EWMA (needs ~3 ticks to exceed 15% threshold)
-        adapter.update_with_feedback(&links, &feedback);
-        adapter.update_with_feedback(&links, &feedback);
-        let before = adapter.current_target_kbps();
-        let cmd = adapter.update_with_feedback(&links, &feedback);
         assert!(cmd.is_some(), "should emit command on sustained high loss");
         assert!(
-            adapter.current_target_kbps() < before,
-            "target should decrease: was {} now {}",
-            before,
+            adapter.current_target_kbps() < baseline,
+            "target should decrease from baseline {}: now {}",
+            baseline,
             adapter.current_target_kbps()
         );
     }

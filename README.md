@@ -10,7 +10,7 @@
 
 ---
 
-Strata bonds 2–6 unreliable network interfaces — USB cellular modems, WiFi, Ethernet, satellite — into a single resilient live video stream. It ships as a **GStreamer plugin** (`stratasink` / `stratasrc`), a standalone CLI (`strata-pipeline`), and a complete **management platform** with a web dashboard, control plane API, and field-device sender daemon.
+Strata bonds 2–6 unreliable network interfaces — USB cellular modems, WiFi, Ethernet, satellite — into a single resilient live video stream. It ships as a **GStreamer plugin** (`stratasink` / `stratasrc`) and a standalone CLI (`strata-pipeline`).
 
 Built for field deployment on commodity ARM64 hardware (Orange Pi 5 Plus, Raspberry Pi 5) with off-the-shelf USB modems. Pure Rust from the wire protocol up — no C transport dependencies, no vendor lock-in.
 
@@ -21,69 +21,163 @@ Built for field deployment on commodity ARM64 hardware (Orange Pi 5 Plus, Raspbe
 | N-link bonding | ✓ (6+) | ✓ (12) | ✓ (3-6) | Limited | Load share | **2-6 links** |
 | Per-packet scheduling | ✓ | ✓ | ✓ | Round-robin | — | **IoDS / BLEST** |
 | RF-aware routing | ✓ | ✓ | ✓ | ✗ | ✗ | **Biscay CC** |
-| Predictive handover | ✓ | ✓ | ✓ | ✗ | ✗ | **Kalman + modem supervisor** |
 | Adaptive FEC | Dynamic | RaptorQ | — | ✗ | ✗ | **TAROT cost function** |
 | Media-aware priority | ✓ | ✓ | ✓ | ✗ | ✗ | **NAL classification** |
 | Encoder feedback loop | ✓ | ✓ | ✓ | ✗ | TR-06-04 | **Built-in** |
-| Fleet management | ✓ | ✓ | ✓ | ✗ | ✗ | **Web dashboard** |
+| Hardware encoder support | ✓ | ✓ | ✓ | Manual | Manual | **Auto-detect** |
 | Open source | ✗ | ✗ | ✗ | ✓ | Spec only | **✓** |
 | Price | $15K+ | $15K+ | $15K+ | Free | Free | **Free** |
 
 ---
 
-## Quick Start
+## Quick Start — Cellular Bonding to YouTube
 
-### Install a Release
+The primary use case: stream live video from a field device over 2+ USB cellular modems, bonded into a single stream and relayed to YouTube.
+
+### What You Need
+
+**Sender (field device):**
+- Orange Pi 5 Plus (or any ARM64 Linux SBC)
+- 2–3 USB cellular modems with SIM cards on **different carriers**
+- HDMI capture card (or USB camera)
+
+**Receiver (cloud):**
+- Any Linux VPS (Hetzner, DigitalOcean, etc.)
+- Firewall open on 2–3 UDP ports (one per link)
+
+### 1. Install on Both Machines
 
 Pre-built binaries for **x86_64** and **aarch64** Linux are on the [Releases](https://github.com/RephlexZero/strata/releases) page.
 
 ```bash
-VERSION="v0.1.4"  # check Releases page for latest
+VERSION="v0.6.0"  # check Releases page for latest
 ARCH="$(uname -m)"
-curl -LO "https://github.com/RephlexZero/strata/releases/download/${VERSION}/strata-${VERSION}-${ARCH}-linux-gnu.so"
-sudo cp strata-*-linux-gnu.so /usr/lib/${ARCH}-linux-gnu/gstreamer-1.0/libgststrata.so
+curl -LO "https://github.com/RephlexZero/strata/releases/download/${VERSION}/strata-${VERSION}-${ARCH}-linux-gnu.tar.gz"
+tar xzf strata-*.tar.gz
+sudo install -m 755 strata-pipeline /usr/local/bin/
+sudo install -m 644 libgststrata.so /usr/lib/${ARCH}-linux-gnu/gstreamer-1.0/
 gst-inspect-1.0 stratasink   # verify
 ```
 
-Only GStreamer 1.x is needed at runtime — the transport is pure Rust with no C dependencies.
-
-### Send and Receive
-
-**Sender** — bonded stream over two links:
+Only GStreamer 1.x runtime packages are needed — the transport is pure Rust with no C dependencies.
 
 ```bash
-strata-pipeline sender --source test --bitrate 3000 \
-  --dest 192.168.1.100:5000,10.0.0.100:5000
+# Sender (Orange Pi / ARM64) — also needs encoder plugins
+sudo apt-get install -y \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+  gstreamer1.0-libav gstreamer1.0-tools
+
+# Receiver (VPS / x86_64) — same packages
+sudo apt-get install -y \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+  gstreamer1.0-libav gstreamer1.0-tools
 ```
 
-**Receiver** — reassemble and relay to YouTube:
+> **Hardware encoding:** `strata-pipeline` auto-detects hardware encoders. On Orange Pi 5 Plus, install the Rockchip MPP GStreamer plugin for hardware H.265 encoding. On x86 with Intel, VA-API is auto-detected. Falls back to software x265enc/x264enc if no hardware encoder is found.
+
+### 2. Set Up Cellular Modems (Sender)
+
+Each modem must be on a **different subnet** — this is the most common gotcha. If both modems default to `192.168.8.0/24` (common with Huawei HiLink dongles), change one to `192.168.9.0/24` via the modem's admin UI at `http://192.168.8.1`.
 
 ```bash
-strata-pipeline receiver --bind 0.0.0.0:5000,0.0.0.0:5002 \
-  --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
+# Verify each modem has its own subnet and can reach the internet
+ip addr show   # look for your modem interfaces (enx..., wwan0, usb0, etc.)
+curl --interface enp2s0f0u4 https://ifconfig.me    # modem 1
+curl --interface enp2s0f0u3 https://ifconfig.me    # modem 2
 ```
 
-Or use GStreamer directly:
+See the [Cellular Modem Setup](https://github.com/RephlexZero/strata/wiki/Cellular-Modem-Setup) wiki page for detailed instructions including policy routing.
+
+> **Important:** `SO_BINDTODEVICE` requires `CAP_NET_RAW`. Either run with `sudo` or grant the capability:
+> ```bash
+> sudo setcap cap_net_raw+ep /usr/local/bin/strata-pipeline
+> ```
+
+### 3. Start the Receiver (VPS)
+
+```bash
+strata-pipeline receiver \
+  --bind 0.0.0.0:5000,0.0.0.0:5002 \
+  --relay-url "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY" \
+  --codec h265
+```
+
+For YouTube HLS upload instead of RTMP:
+
+```bash
+strata-pipeline receiver \
+  --bind 0.0.0.0:5000,0.0.0.0:5002 \
+  --relay-url "https://a.upload.youtube.com/http_upload_hls?cid=YOUR_CID&copy=0&file=" \
+  --codec h265
+```
+
+### 4. Start the Sender (Orange Pi)
+
+```bash
+# Create sender config
+cat > sender.toml << 'EOF'
+[[links]]
+id = 0
+uri = "YOUR_VPS_IP:5000"
+interface = "enp2s0f0u4"    # first modem interface
+
+[[links]]
+id = 1
+uri = "YOUR_VPS_IP:5002"
+interface = "enp2s0f0u3"    # second modem interface
+
+[scheduler]
+critical_broadcast = false   # disable for LTE — see real-world-snags.md #16
+failover_enabled = true
+failover_duration_ms = 3000
+EOF
+
+# Start streaming (test pattern first to verify)
+strata-pipeline sender \
+  --dest YOUR_VPS_IP:5000,YOUR_VPS_IP:5002 \
+  --source test --codec h265 --audio \
+  --bitrate 1500 --min-bitrate 200 --max-bitrate 3000 \
+  --config sender.toml
+
+# Once working, switch to HDMI capture
+strata-pipeline sender \
+  --dest YOUR_VPS_IP:5000,YOUR_VPS_IP:5002 \
+  --source v4l2 --device /dev/video0 --codec h265 --audio \
+  --bitrate 1500 --min-bitrate 200 --max-bitrate 3000 \
+  --config sender.toml
+```
+
+The sender automatically adapts bitrate based on cellular conditions. Logs show per-second adaptation decisions.
+
+### 5. Verify
+
+Check the sender logs for per-link stats:
+
+```
+[adapt] agg=1500 target=1200 ewma_gp=1100 ewma_loss=0.02 burst=false
+```
+
+Check YouTube Studio for incoming stream health.
+
+---
+
+## Using GStreamer Directly
+
+If you prefer raw GStreamer pipelines:
 
 ```bash
 # Sender
-gst-launch-1.0 videotestsrc is-live=true ! x264enc tune=zerolatency bitrate=3000 ! \
-  mpegtsmux ! stratasink destinations="192.168.1.100:5000,10.0.0.100:5000"
+gst-launch-1.0 videotestsrc is-live=true ! \
+  video/x-raw,width=1280,height=720,framerate=30/1 ! \
+  x264enc tune=zerolatency bitrate=3000 ! mpegtsmux ! \
+  stratasink destinations="192.168.1.100:5000,10.0.0.100:5000"
 
 # Receiver
 gst-launch-1.0 stratasrc links="0.0.0.0:5000" latency=100 ! \
   tsdemux ! h264parse ! avdec_h264 ! autovideosink
 ```
-
-### Run the Full Platform
-
-```bash
-docker compose up --build -d
-# Dashboard:  http://localhost:3000  (dev@strata.local / development)
-# Portal:     http://localhost:3001
-```
-
-This starts PostgreSQL, the control plane, a simulated sender with tc-netem cellular impairments across 3 isolated bridge networks, and a receiver — a complete end-to-end demo with realistic network conditions.
 
 ---
 
@@ -91,33 +185,27 @@ This starts PostgreSQL, the control plane, a simulated sender with tc-netem cell
 
 ```mermaid
 graph TB
-    subgraph Edge["EDGE NODE"]
-        Encoder["Encoder<br/>H.264 / H.265 / AV1"] --> Classifier["Media Classifier<br/>NAL parse"]
+    subgraph Edge["SENDER (Orange Pi 5 Plus)"]
+        Encoder["Encoder<br/>H.264 / H.265"] --> Classifier["Media Classifier<br/>NAL parse"]
         Classifier --> Coding["FEC Codec<br/>XOR + TAROT"]
         Coding --> Reactor["Network Reactor<br/>per-link"]
-        Reactor --> L1["Link 1<br/>DWRR Q"]
-        Reactor --> L2["Link 2<br/>DWRR Q"]
-        Reactor --> L3["Link 3<br/>DWRR Q"]
-        Reactor --> LN["Link N<br/>DWRR Q"]
-        L1 & L2 & L3 & LN --> Modem["Modem Supervisor<br/>QMI/MBIM: RSRP · RSRQ · SINR · CQI"]
+        Reactor --> L1["Modem 1<br/>DWRR Q"]
+        Reactor --> L2["Modem 2<br/>DWRR Q"]
+        Reactor --> L3["Modem N<br/>DWRR Q"]
     end
 
-    Modem -->|"UDP × N links"| Gateway
+    L1 -->|"UDP"| Gateway
+    L2 -->|"UDP"| Gateway
+    L3 -->|"UDP"| Gateway
 
-    subgraph Gateway["CLOUD GATEWAY"]
+    subgraph Gateway["RECEIVER (VPS)"]
         NetRx["Network Receiver"] --> FECDec["FEC Decoder"]
         FECDec --> Jitter["Jitter Buffer"]
-        Jitter --> Output["RTMP / SRT / HLS / Record"]
-    end
-
-    Gateway --> Control
-
-    subgraph Control["CONTROL PLANE"]
-        CP["Web Dashboard (Leptos) · REST API (Axum) · Fleet Management<br/>PostgreSQL · WebSocket Telemetry · Remote Config"]
+        Jitter --> Output["RTMP / HLS / SRT / Record"]
     end
 ```
 
-Strata is a **three-layer system**: a custom wire protocol (`strata-transport`), a multi-link bonding engine (`strata-bonding`), and a management platform. Each layer is a separate Rust crate.
+Strata is a **three-layer system**: a custom wire protocol (`strata-transport`), a multi-link bonding engine (`strata-bonding`), and GStreamer integration (`strata-gst`). Each layer is a separate Rust crate.
 
 ### Transport Protocol (`strata-transport`)
 
@@ -125,7 +213,7 @@ A custom UDP protocol purpose-built for bonded video, replacing RIST/SRT:
 
 - **Custom wire format** — 12-byte header with QUIC-style VarInt sequence numbers (62-bit space), media-aware flags (keyframe, codec config, fragment markers)
 - **Hybrid FEC + ARQ** — systematic XOR-based FEC with NACK-triggered coded repair; TAROT cost function auto-tunes FEC rate per link
-- **Biscay congestion control** — BBRv3 base with cellular radio feed-forward (SINR→capacity ceiling, CQI derivative tracking, handover detection)
+- **Biscay congestion control** — BBRv3 base with cellular radio feed-forward (SINR capacity ceiling, CQI derivative tracking, handover detection)
 - **Session management** — handshake, keepalive, link join/leave, RTT tracking (RFC 6298 SRTT/RTTVAR)
 
 ### Bonding Engine (`strata-bonding`)
@@ -135,17 +223,21 @@ Multi-link scheduling and orchestration:
 - **DWRR scheduler** — per-link Deficit Weighted Round Robin queues with capacity-proportional weights
 - **IoDS** — In-order Delivery Scheduler enforcing monotonic arrival constraint to minimize receiver reordering
 - **BLEST** — Blocking estimation guard prevents head-of-line blocking on slow links
-- **Thompson Sampling** — contextual bandit link selection with Beta distribution priors
 - **Kalman filter** — smooths RTT/capacity estimates, tracks RSRP trend for handover prediction
-- **Media awareness** — NAL unit parser (H.264/H.265/AV1) classifies packets by priority; keyframes broadcast to all links
-- **Modem supervisor** — QMI/MBIM polling for RSRP, RSRQ, SINR, CQI; band management and link health scoring
+- **Media awareness** — NAL unit parser (H.264/H.265/AV1) classifies packets by priority
+- **Adaptive bitrate** — goodput-capped encoder feedback with burst-loss detection and cooldown
 
-### Management Platform
+### Codec Support
 
-- **Control plane** (`strata-control`) — Axum REST API, WebSocket hubs for senders and dashboards, PostgreSQL, JWT auth
-- **Operator dashboard** (`strata-dashboard`) — Leptos WASM SPA with live sender status, stream management, destination CRUD
-- **Sender daemon** (`strata-sender`) — field device daemon with hardware scanning, interface management, GStreamer pipeline lifecycle
-- **Sender portal** (`strata-portal`) — local WASM UI for on-site enrollment, configuration, and diagnostics
+`strata-pipeline` auto-detects the best available encoder at startup:
+
+| Priority | H.264 | H.265 |
+|---|---|---|
+| 1 | NVENC (`nvh264enc`) | NVENC (`nvh265enc`) |
+| 2 | VA-API (`vah264enc`) | VA-API (`vah265enc`) |
+| 3 | QSV (`qsvh264enc`) | QSV (`qsvh265enc`) |
+| 4 | Vulkan (`vulkanh264enc`) | SVT-HEVC (`svthevcenc`) |
+| 5 | x264enc (software) | x265enc (software) |
 
 ---
 
@@ -157,25 +249,11 @@ crates/
   strata-bonding/        Bonding engine — DWRR/IoDS/BLEST scheduler, modem, media
   strata-gst/            GStreamer plugin (stratasink/stratasrc) + strata-pipeline CLI
   strata-sim/            Network simulation — Linux netns + tc-netem
-  strata-common/         Shared types, protocol messages, auth (JWT + ed25519)
-  strata-control/        Control plane — Axum API, WebSocket, PostgreSQL
-  strata-sender/         Sender daemon (field devices)
-  strata-dashboard/      Operator dashboard — Leptos CSR WASM + Tailwind/DaisyUI
-  strata-portal/         Field device portal — Leptos CSR WASM + Tailwind/DaisyUI
+  strata-common/         Shared types, protocol messages
+scripts/
+  field-test.sh          End-to-end field test automation script
 docker/
   Dockerfile.cross-aarch64   Cross-compile for Orange Pi / aarch64
-docker-compose.yml           Full dev stack with simulated impaired networks
-```
-
-### Dependency Graph
-
-```mermaid
-graph LR
-    strata-gst --> strata-bonding --> strata-transport
-    strata-bonding --> strata-common
-    strata-control --> strata-common
-    strata-agent --> strata-common
-    strata-sim --> strata-bonding
 ```
 
 ---
@@ -193,72 +271,44 @@ The fastest path — zero local setup:
 
 Includes Rust, GStreamer dev libs, network tooling (`iproute2`, `tc`, `tcpdump`), and all build dependencies.
 
-### Development Workflow
-
-**The Makefile catches issues before CI does:**
-
-```bash
-make help           # Show all commands
-make install-hooks  # Install git hooks (do this first!)
-make check          # Fast compilation check
-make test           # Run unit tests
-make pre-push       # Run all pre-push checks (format, lint, tests)
-make release-check  # Full release verification
-```
-
-**Git hooks run automatically:**
-- **Pre-commit**: Format code, check compilation, run clippy
-- **Pre-push**: All of the above + unit tests
-
-This catches compilation errors, formatting issues, test failures, and lint warnings **before** you push, saving CI time and avoiding "trivial fix" commits.
-
 ### Building
 
 ```bash
 cargo build                          # Debug
 cargo build --release                # Release (LTO)
 cargo build --release -p strata-gst  # Plugin only
-```
-
-```bash
-export GST_PLUGIN_PATH="$PWD/target/release:$GST_PLUGIN_PATH"
-gst-inspect-1.0 stratasink
+make install                         # Build + install with cap_net_raw
 ```
 
 ### Cross-compiling for aarch64
 
 ```bash
-docker build -f docker/Dockerfile.cross-aarch64 -o dist/ .
-# Output: dist/libgststrata.so (aarch64)
+make cross-aarch64
+# Output: target/aarch64-unknown-linux-gnu/release/strata-pipeline
+# Output: target/aarch64-unknown-linux-gnu/release/libgststrata.so
 ```
 
 ### Testing
 
 ```bash
-make test                                             # Unit tests (fast, pre-push runs these)
-cargo test --workspace --lib                          # Same, but via cargo
-cargo test -p strata-transport                        # Transport protocol tests
-cargo test -p strata-common                           # Platform model + protocol tests
-cargo test -p strata-control                          # API integration (needs PostgreSQL)
-sudo cargo test -p strata-sim --test tier3_netem      # Network simulation (needs NET_ADMIN)
-make test-all                                         # All tests including ignored ones
+make test           # Unit tests
+make pre-push       # Format + lint + tests
+make release-check  # Full release verification
 ```
 
-### Releasing
+---
 
-Before creating a release tag:
+## Field-Tested
 
-```bash
-make release-check  # Runs format, lint, tests, version consistency
-```
+Strata has been tested with real cellular hardware (Huawei E3372h-320 HiLink dongles over Vodafone LTE). See [real-world-snags.md](real-world-snags.md) for 16 issues encountered and resolved during field testing, including:
 
-Then:
+- HiLink modems defaulting to the same subnet (both on 192.168.8.x)
+- `SO_BINDTODEVICE` silently failing without `CAP_NET_RAW`
+- HLS segment creation stalling with `send-keyframe-requests=true`
+- `critical_broadcast` doubling IDR burst load on constrained LTE links
+- TOML interface bindings being overridden by routing-table lookup
 
-```bash
-cargo release -p strata-gst patch --execute
-```
-
-GitHub Actions builds x86_64 + aarch64 and creates a release with `.so` assets.
+Each snag has a regression test or guard preventing it from returning silently.
 
 ---
 
@@ -268,16 +318,14 @@ Full documentation is in the **[Wiki](https://github.com/RephlexZero/strata/wiki
 
 | Page | Description |
 |---|---|
-| [Architecture](https://github.com/RephlexZero/strata/wiki/Architecture) | Transport protocol, bonding engine, scheduling algorithms, FEC/ARQ design |
-| [Getting Started](https://github.com/RephlexZero/strata/wiki/Getting-Started) | Install, build, quick start, dev container, cross-compilation |
-| [Strata Platform](https://github.com/RephlexZero/strata/wiki/Strata-Platform) | Control plane, dashboard, agent, portal — full platform guide |
-| [Configuration Reference](https://github.com/RephlexZero/strata/wiki/Configuration-Reference) | Complete TOML config — links, scheduler, CC, FEC, lifecycle, receiver |
-| [GStreamer Elements](https://github.com/RephlexZero/strata/wiki/GStreamer-Elements) | `stratasink` / `stratasrc` properties, pads, pipeline examples |
-| [Strata Node CLI](https://github.com/RephlexZero/strata/wiki/Strata-Node) | `strata-node` sender/receiver usage, source hot-swap, RTMP relay |
-| [Cellular Modem Setup](https://github.com/RephlexZero/strata/wiki/Cellular-Modem-Setup) | USB modem config, policy routing, band management |
+| [Getting Started](https://github.com/RephlexZero/strata/wiki/Getting-Started) | Install, build, deploy to Orange Pi + VPS |
+| [Architecture](https://github.com/RephlexZero/strata/wiki/Architecture) | Transport protocol, bonding engine, scheduling algorithms |
+| [Configuration Reference](https://github.com/RephlexZero/strata/wiki/Configuration-Reference) | Complete TOML config — links, scheduler, CC, FEC, receiver |
+| [Strata Pipeline CLI](https://github.com/RephlexZero/strata/wiki/Strata-Node) | CLI reference — sender/receiver options, hot-swap, relay |
+| [Cellular Modem Setup](https://github.com/RephlexZero/strata/wiki/Cellular-Modem-Setup) | USB modem config, subnet gotchas, policy routing |
+| [Deployment](https://github.com/RephlexZero/strata/wiki/Deployment) | Production setup, systemd, privileges, cross-compilation |
 | [Telemetry](https://github.com/RephlexZero/strata/wiki/Telemetry) | Stats schema, JSON relay, Prometheus metrics |
 | [Testing](https://github.com/RephlexZero/strata/wiki/Testing) | Test matrix, simulation framework, CI workflows |
-| [Deployment](https://github.com/RephlexZero/strata/wiki/Deployment) | Production setup, privileges, performance budgets, troubleshooting |
 
 ---
 

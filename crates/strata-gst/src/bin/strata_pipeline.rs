@@ -394,7 +394,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
          {hw_fmt_conv}! {enc_fragment} \
          ! {parser_fragment} \
          {video_to_mux}{audio} \
-         mpegtsmux name=mux alignment=7 pat-interval=9000 pmt-interval=9000 \
+         mpegtsmux name=mux alignment=7 pat-interval=1 pmt-interval=1 \
          ! stratasink name=rsink",
         w = res_w,
         h = res_h,
@@ -705,7 +705,7 @@ fn run_sender_passthrough(
     let pipeline_str = format!(
         "uridecodebin name=urisrc uri=\"{uri}\" \
          ! parsebin name=pbin \
-         mpegtsmux name=mux alignment=7 pat-interval=9000 pmt-interval=9000 \
+         mpegtsmux name=mux alignment=7 pat-interval=1 pmt-interval=1 \
          ! stratasink name=rsink",
         uri = source_uri,
     );
@@ -1493,7 +1493,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let seg_location = hls_dir.join("segment%05d.ts");
         let pl_location = hls_dir.join("playlist.m3u8");
         format!(
-            "stratasrc links=\"{bind}\" name=src latency=50 ! \
+            "stratasrc links=\"{bind}\" name=src latency=200 ! \
              queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
              tsdemux name=d \
              d. ! queue ! {parser} ! hls.video \
@@ -1508,7 +1508,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     } else if use_relay {
         let relay_frag = gststrata::codec::CodecController::new(codec_type).relay_muxer_fragment();
         format!(
-            "stratasrc links=\"{bind}\" name=src latency=50 ! \
+            "stratasrc links=\"{bind}\" name=src latency=200 ! \
              queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
              tsdemux name=d \
              d. ! queue ! {parser} ! {relay} \

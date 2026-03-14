@@ -178,47 +178,56 @@ impl Default for LinkHealth {
     }
 }
 
-/// CQI → approximate maximum throughput mapping (3GPP TS 36.213 Table 7.2.3-1).
+/// CQI → approximate uplink throughput in kbps for a USB LTE dongle.
 ///
-/// Returns throughput in kbps for a 10 MHz LTE channel.
+/// Derived from 3GPP TS 36.213 Table 7.2.3-1 (10 MHz downlink peaks) scaled
+/// by ~0.2 to reflect typical LTE uplink vs downlink ratio and USB-dongle
+/// overhead.  These values are used as a soft capacity ceiling only — the
+/// goodput-anchor in the adaptation layer will further constrain to observed
+/// delivery rate.
 pub fn cqi_to_throughput_kbps(cqi: u8) -> f64 {
     match cqi {
         0 => 0.0,
-        1 => 1_000.0,
-        2 => 2_000.0,
-        3 => 3_500.0,
-        4 => 5_000.0,
-        5 => 7_500.0,
-        6 => 10_000.0,
-        7 => 13_000.0,
-        8 => 17_000.0,
-        9 => 22_000.0,
-        10 => 28_000.0,
-        11 => 35_000.0,
-        12 => 43_000.0,
-        13 => 52_000.0,
-        14 => 63_000.0,
-        15 => 75_000.0,
-        _ => 75_000.0,
+        1 => 200.0,
+        2 => 400.0,
+        3 => 700.0,
+        4 => 1_000.0,
+        5 => 1_500.0,
+        6 => 2_000.0,
+        7 => 2_600.0,
+        8 => 3_400.0,
+        9 => 4_400.0,
+        10 => 5_600.0,
+        11 => 7_000.0,
+        12 => 8_600.0,
+        13 => 10_400.0,
+        14 => 12_600.0,
+        15 => 15_000.0,
+        _ => 15_000.0,
     }
 }
 
-/// SINR → rough capacity ceiling in kbps (empirical mapping for LTE 10 MHz).
+/// SINR → rough uplink capacity ceiling in kbps for a USB LTE dongle.
+///
+/// Based on empirical LTE 10 MHz mapping scaled by ~0.2 for uplink reality.
+/// Theoretical downlink values were 5-10× too high in field tests, causing
+/// the adaptation oracle to report 10–15 Mbps aggregate while actual uplink
+/// goodput was 1–4 Mbps combined.
 pub fn sinr_to_capacity_kbps(sinr_db: f64) -> f64 {
     if sinr_db < -5.0 {
         0.0
     } else if sinr_db < 0.0 {
-        1000.0
+        200.0
     } else if sinr_db < 5.0 {
-        5000.0
+        1_000.0
     } else if sinr_db < 10.0 {
-        15000.0
+        3_000.0
     } else if sinr_db < 15.0 {
-        30000.0
+        6_000.0
     } else if sinr_db < 20.0 {
-        50000.0
+        10_000.0
     } else {
-        75000.0
+        15_000.0
     }
 }
 
@@ -344,7 +353,7 @@ mod tests {
 
     #[test]
     fn cqi_15_is_max() {
-        assert_eq!(cqi_to_throughput_kbps(15), 75_000.0);
+        assert_eq!(cqi_to_throughput_kbps(15), 15_000.0);
     }
 
     #[test]
@@ -361,7 +370,7 @@ mod tests {
 
     #[test]
     fn sinr_high_is_max() {
-        assert_eq!(sinr_to_capacity_kbps(25.0), 75_000.0);
+        assert_eq!(sinr_to_capacity_kbps(25.0), 15_000.0);
     }
 
     // ─── Prediction ─────────────────────────────────────────────────────
