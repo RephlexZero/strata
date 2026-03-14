@@ -1,6 +1,6 @@
 [package]
 name = "strata-common"
-version = "0.2.0"
+version = "0.6.0"
 edition = "2024"
 description = "Shared types, protocol messages, auth, and database models for the Strata platform"
 publish = false

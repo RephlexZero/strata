@@ -1,6 +1,6 @@
 [package]
 name = "strata-dashboard"
-version = "0.2.0"
+version = "0.6.0"
 edition = "2024"
 description = "Strata platform dashboard — Leptos CSR WASM app"
 publish = false
