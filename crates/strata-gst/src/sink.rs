@@ -542,16 +542,36 @@ mod imp {
                                     .post_message(gst::message::Element::new(msg_struct.build()));
 
                                 // Aggregate receiver reports into feedback
-                                let feedback = metrics
-                                    .values()
-                                    .filter_map(|m| m.receiver_report.as_ref())
-                                    .next()
-                                    .map(|r| ReceiverFeedback {
-                                        goodput_bps: r.goodput_bps,
-                                        fec_repair_rate: r.fec_repair_rate,
-                                        jitter_buffer_ms: r.jitter_buffer_ms,
-                                        loss_after_fec: r.loss_after_fec,
-                                    });
+                                let mut total_goodput = 0;
+                                let mut max_jitter = 0;
+                                let mut total_loss_weight = 0.0;
+                                let mut total_fec_weight = 0.0;
+                                let mut weight_sum = 0.0;
+                                let mut has_report = false;
+
+                                for m in metrics.values() {
+                                    if let Some(r) = &m.receiver_report {
+                                        has_report = true;
+                                        total_goodput += r.goodput_bps;
+                                        max_jitter = max_jitter.max(r.jitter_buffer_ms);
+                                        // Weight loss by goodput (with a floor so 0-goodput links still count)
+                                        let weight = (r.goodput_bps as f64).max(10_000.0);
+                                        total_loss_weight += r.loss_after_fec as f64 * weight;
+                                        total_fec_weight += r.fec_repair_rate as f64 * weight;
+                                        weight_sum += weight;
+                                    }
+                                }
+
+                                let feedback = if has_report && weight_sum > 0.0 {
+                                    Some(ReceiverFeedback {
+                                        goodput_bps: total_goodput,
+                                        fec_repair_rate: (total_fec_weight / weight_sum) as f32,
+                                        jitter_buffer_ms: max_jitter,
+                                        loss_after_fec: (total_loss_weight / weight_sum) as f32,
+                                    })
+                                } else {
+                                    None
+                                };
 
                                 // Feed BitrateAdapter and post command if target changed
                                 let cmd = if let Some(ref fb) = feedback {

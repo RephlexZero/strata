@@ -385,6 +385,7 @@ impl Receiver {
                 self.events.push(ReceiverEvent::Deliver(delivered));
             }
         }
+        self.stats.highest_delivered_seq = self.next_deliver_seq;
 
         // Cleanup old fragment chains
         self.assembler.cleanup_stale(self.next_deliver_seq, 1000);
@@ -415,6 +416,7 @@ impl Receiver {
             }
             self.next_deliver_seq += 1;
         }
+        self.stats.highest_delivered_seq = self.next_deliver_seq;
         // Continue delivering any consecutive packets after the gap.
         self.deliver_in_order();
     }

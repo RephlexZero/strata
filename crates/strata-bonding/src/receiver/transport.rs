@@ -218,7 +218,7 @@ async fn link_reader_async(
     let mut prev_bytes_delivered: u64 = 0;
     let mut prev_report_time = std::time::Instant::now();
     // Track packet counters for per-interval loss (not cumulative lifetime).
-    let mut prev_packets_received: u64 = 0;
+    let mut prev_highest_seq: u64 = 0;
     let mut prev_packets_delivered: u64 = 0;
     // Most recently seen sender address on this socket.
     let mut sender_addr: Option<std::net::SocketAddr> = None;
@@ -348,17 +348,20 @@ async fn link_reader_async(
                         // Residual loss over this interval (delta, not cumulative).
                         // Using lifetime totals causes startup queue-flood losses to
                         // permanently inflate the ratio even after recovery.
-                        let delta_recv = rx_stats
-                            .packets_received
-                            .saturating_sub(prev_packets_received)
-                            .max(1);
+                        let delta_seq = rx_stats
+                            .highest_delivered_seq
+                            .saturating_sub(prev_highest_seq);
                         let delta_delivered = rx_stats
                             .packets_delivered
                             .saturating_sub(prev_packets_delivered);
-                        prev_packets_received = rx_stats.packets_received;
+                        prev_highest_seq = rx_stats.highest_delivered_seq;
                         prev_packets_delivered = rx_stats.packets_delivered;
-                        let residual = delta_recv.saturating_sub(delta_delivered);
-                        let loss_after_fec = (residual as f64 / delta_recv as f64).clamp(0.0, 1.0);
+                        let residual = delta_seq.saturating_sub(delta_delivered);
+                        let loss_after_fec = if delta_seq > 0 {
+                            (residual as f64 / delta_seq as f64).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
 
                         let report = strata_transport::wire::ReceiverReportPacket {
                             goodput_bps,
