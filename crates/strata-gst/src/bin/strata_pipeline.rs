@@ -295,7 +295,9 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     //
     // The initial source (--source flag) determines which branch is active.
     // Additional branches are added dynamically via the control socket.
-    let key_int = framerate;
+    // YouTube Live requires a 2-second IDR (keyframe) interval.
+    // key-int-max is in frames, so multiply by 2 to get the correct interval.
+    let key_int = framerate * 2;
 
     // Parse codec type
     let codec_type = gststrata::codec::CodecType::from_str_loose(codec_str).unwrap_or_else(|| {

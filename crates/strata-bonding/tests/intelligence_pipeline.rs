@@ -275,6 +275,7 @@ fn adaptation_reduces_bitrate_on_capacity_drop() {
             queue_depth: None,
         },
     ];
+    adapter.update(&bad_caps);
     let cmd = adapter.update(&bad_caps);
     assert!(cmd.is_some(), "should produce bitrate reduction command");
     assert!(adapter.current_target_kbps() < 15_000);
