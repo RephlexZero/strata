@@ -9,7 +9,7 @@
 //! `/tmp/strata-pipeline.sock`.
 
 use std::process::{Child, ExitStatus};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use strata_common::protocol::StreamStartPayload;
 
@@ -18,6 +18,15 @@ pub const STATS_LISTEN_ADDR: &str = "127.0.0.1:9100";
 
 /// Unix socket path for pipeline control (hot-swap commands).
 pub const CONTROL_SOCK_PATH: &str = "/tmp/strata-pipeline.sock";
+
+const PIPELINE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+static TEST_PIPELINE_BIN: std::sync::Mutex<Option<std::ffi::OsString>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static TEST_PIPELINE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Pipeline manager state.
 pub struct PipelineManager {
@@ -49,6 +58,41 @@ fn send_to_control_socket(msg: &str) -> bool {
         Err(e) => {
             tracing::warn!(error = %e, "failed to connect to pipeline control socket");
             false
+        }
+    }
+}
+
+fn pipeline_binary() -> std::ffi::OsString {
+    #[cfg(test)]
+    if let Some(bin) = TEST_PIPELINE_BIN.lock().unwrap().clone() {
+        return bin;
+    }
+
+    std::env::var_os("STRATA_PIPELINE_BIN").unwrap_or_else(|| "strata-pipeline".into())
+}
+
+#[cfg(unix)]
+fn send_sigint(child: &Child) {
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: `child.id()` is the OS PID for this child process. `kill` is used
+    // only to deliver SIGINT to that child, and ESRCH is handled by the caller.
+    unsafe {
+        libc::kill(pid, libc::SIGINT);
+    }
+}
+
+#[cfg(not(unix))]
+fn send_sigint(_child: &Child) {}
+
+fn shutdown_child(child: &mut Child, timeout: Duration) {
+    send_sigint(child);
+
+    match wait_with_timeout(child, timeout) {
+        Ok(_) => tracing::info!("pipeline exited cleanly"),
+        Err(_) => {
+            tracing::warn!("pipeline didn't exit cleanly, killing");
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -127,30 +171,14 @@ impl PipelineManager {
 
     /// Stop the current pipeline.
     pub fn stop(&mut self) -> PipelineStopStats {
+        self.stop_with_timeout(PIPELINE_STOP_TIMEOUT)
+    }
+
+    fn stop_with_timeout(&mut self, timeout: Duration) -> PipelineStopStats {
         let duration_s = self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
 
         if let Some(mut child) = self.child.take() {
-            // Send SIGINT for graceful EOS shutdown
-            #[cfg(unix)]
-            {
-                let pid = child.id() as libc::pid_t;
-                // SAFETY: `child.id()` returns the OS process ID of our child.
-                // Sending SIGINT is safe; worst case is a no-op if the process
-                // already exited (kill returns -1 / ESRCH).
-                unsafe {
-                    libc::kill(pid, libc::SIGINT);
-                }
-            }
-
-            // Wait up to 5 seconds for clean exit
-            match wait_with_timeout(&mut child, std::time::Duration::from_secs(5)) {
-                Ok(_) => tracing::info!("pipeline exited cleanly"),
-                Err(_) => {
-                    tracing::warn!("pipeline didn't exit cleanly, killing");
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-            }
+            shutdown_child(&mut child, timeout);
         }
 
         let stats = PipelineStopStats {
@@ -284,8 +312,7 @@ impl PipelineManager {
 
 /// Spawn the `strata-pipeline` binary as a child process.
 fn spawn_pipeline(payload: &StreamStartPayload) -> anyhow::Result<Child> {
-    let bin =
-        std::env::var("STRATA_PIPELINE_BIN").unwrap_or_else(|_| "strata-pipeline".to_string());
+    let bin = pipeline_binary();
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg("sender");
 
@@ -393,5 +420,181 @@ fn wait_with_timeout(child: &mut Child, timeout: std::time::Duration) -> anyhow:
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use strata_common::protocol::{EncoderConfig, SourceConfig};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestPipelineBinGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for TestPipelineBinGuard {
+        fn drop(&mut self) {
+            *TEST_PIPELINE_BIN.lock().unwrap() = None;
+        }
+    }
+
+    struct TestPipelineScript {
+        dir: PathBuf,
+        script: PathBuf,
+        marker: PathBuf,
+        pidfile: PathBuf,
+    }
+
+    impl TestPipelineScript {
+        fn new(mode: &str) -> Self {
+            let unique = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "strata-sender-pipeline-{}-{}",
+                std::process::id(),
+                unique
+            ));
+            fs::create_dir_all(&dir).unwrap();
+
+            let script = dir.join("fake-pipeline.sh");
+            let marker = dir.join("events.log");
+            let pidfile = dir.join("pid");
+            let behavior = match mode {
+                "graceful" => "trap 'echo sigint >> \"$marker\"; exit 0' INT",
+                "stubborn" => "trap 'echo sigint >> \"$marker\"' INT",
+                other => panic!("unknown test pipeline mode: {other}"),
+            };
+            let body = format!(
+                "#!/usr/bin/env bash\nset -eu\nmarker='{marker}'\npidfile='{pidfile}'\necho $$ > \"$pidfile\"\necho started > \"$marker\"\n{behavior}\nwhile :; do\n  read -r -t 1 _ || true\ndone\n",
+                marker = marker.display(),
+                pidfile = pidfile.display(),
+                behavior = behavior,
+            );
+            fs::write(&script, body).unwrap();
+
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+
+            Self {
+                dir,
+                script,
+                marker,
+                pidfile,
+            }
+        }
+
+        fn wait_for_marker(&self, needle: &str) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if self.marker_contents().contains(needle) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for marker {needle}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn marker_contents(&self) -> String {
+            fs::read_to_string(&self.marker).unwrap_or_default()
+        }
+
+        fn pid(&self) -> i32 {
+            let pid = fs::read_to_string(&self.pidfile).unwrap();
+            pid.trim().parse().unwrap()
+        }
+    }
+
+    impl Drop for TestPipelineScript {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn set_test_pipeline_bin(path: &Path) -> TestPipelineBinGuard {
+        let lock = TEST_PIPELINE_LOCK.lock().unwrap();
+        *TEST_PIPELINE_BIN.lock().unwrap() = Some(path.as_os_str().to_os_string());
+        TestPipelineBinGuard { _lock: lock }
+    }
+
+    fn sample_payload() -> StreamStartPayload {
+        StreamStartPayload {
+            stream_id: "test-stream".into(),
+            source: SourceConfig {
+                mode: "test".into(),
+                device: None,
+                uri: None,
+                resolution: None,
+                framerate: None,
+                passthrough: None,
+            },
+            encoder: EncoderConfig {
+                bitrate_kbps: 1_000,
+                tune: None,
+                keyint_max: None,
+                codec: None,
+                min_bitrate_kbps: None,
+                max_bitrate_kbps: None,
+            },
+            destinations: Vec::new(),
+            bonding_config: serde_json::Value::Null,
+            psk: None,
+            relay_url: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 probes process existence without delivering a signal.
+        unsafe {
+            if libc::kill(pid, 0) == 0 {
+                return true;
+            }
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[test]
+    fn stop_sends_sigint_and_clears_state() {
+        let script = TestPipelineScript::new("graceful");
+        let _guard = set_test_pipeline_bin(&script.script);
+        let mut manager = PipelineManager::new();
+
+        manager.start(sample_payload()).unwrap();
+        script.wait_for_marker("started");
+        let pid = script.pid();
+
+        let stats = manager.stop_with_timeout(Duration::from_millis(500));
+
+        assert_eq!(stats.total_bytes, 0);
+        assert!(!manager.has_stream());
+        assert!(script.marker_contents().contains("sigint"));
+        assert!(!process_is_alive(pid));
+    }
+
+    #[test]
+    fn stop_kills_unresponsive_child_after_timeout() {
+        let script = TestPipelineScript::new("stubborn");
+        let _guard = set_test_pipeline_bin(&script.script);
+        let mut manager = PipelineManager::new();
+
+        manager.start(sample_payload()).unwrap();
+        script.wait_for_marker("started");
+        let pid = script.pid();
+
+        manager.stop_with_timeout(Duration::from_millis(200));
+
+        assert!(!manager.has_stream());
+        assert!(script.marker_contents().contains("sigint"));
+        assert!(!process_is_alive(pid));
     }
 }

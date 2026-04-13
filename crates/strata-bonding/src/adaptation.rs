@@ -151,6 +151,11 @@ pub struct ReceiverFeedback {
     pub jitter_buffer_ms: u32,
     /// Residual loss after FEC recovery (0.0–1.0).
     pub loss_after_fec: f32,
+    /// Fraction of packets that arrived past the playout deadline over the
+    /// reporting interval (0.0–1.0). Late packets are user-visible artifacts
+    /// even when outright loss is low, so the adapter treats a sustained
+    /// late-rate as delay pressure independent of jitter-buffer growth.
+    pub late_rate: f32,
 }
 
 /// Encoder Bitrate Adapter.
@@ -409,6 +414,20 @@ impl BitrateAdapter {
         }
         self.prev_capacity_kbps = aggregate_kbps;
 
+        // Per-link collapse: one link is clearly melting (high loss AND deep
+        // queue). The loss-weighted aggregate can still look "fine" because a
+        // healthy link masks the dying one, which lets compute_target() choose
+        // Recovery on the same tick that update_with_feedback() issues a cut.
+        // Suppress the ramp-up path by resetting the increase counter — the
+        // capacity path then holds, and the feedback path is free to reduce
+        // without fighting a concurrent increase.
+        let per_link_collapse = links
+            .iter()
+            .any(|l| l.alive && l.loss_rate >= 0.55 && l.queue_depth.unwrap_or(0) >= 60);
+        if per_link_collapse {
+            self.consecutive_increases = 0;
+        }
+
         // ─── Mode switching: MaxQuality ↔ MaxReliability ────────────
         // Switch to MaxReliability when encoder is at 80%+ of ceiling
         // and spare bandwidth exceeds threshold.
@@ -617,9 +636,14 @@ impl BitrateAdapter {
         }
         // Rapid queue growth under loss context indicates the links are being overdriven.
         let jitter_loss_context = feedback.loss_after_fec > 0.03 || self.ewma_loss_fec > 0.08;
+        // A sustained late-arrival rate is delay pressure even if the jitter
+        // buffer hasn't grown this tick — the receiver is already dropping
+        // frames past the playout deadline, which is user-visible.
+        let late_pressure = feedback.late_rate > 0.05;
         let delay_pressure = (jitter_growth_ms > 120 && jitter_loss_context)
             || feedback.jitter_buffer_ms > 3000
-            || max_queue_depth >= 90;
+            || max_queue_depth >= 90
+            || late_pressure;
         let bufferbloat = delay_pressure;
         // EWMA-smooth goodput (α=0.3) to filter end-of-window noise artifacts
         // that can appear as a single near-zero reading followed by a burst.
@@ -694,10 +718,11 @@ impl BitrateAdapter {
 
         info!(
             target: "strata::adapt",
-            "[adapt] fb: loss_fec={:.3} ewma_loss={:.3}→{:.3} jitter={}ms(+{}ms) qmax={} gp={}kbps peak_gp={}kbps | loss_p={} link_collapse={} burst={} severe={} bb={} gp_short={} grace={} cap_cut={} allow_cut={} inc_tick={} → reduce={}",
+            "[adapt] fb: loss_fec={:.3} ewma_loss={:.3}→{:.3} late={:.3} jitter={}ms(+{}ms) qmax={} gp={}kbps peak_gp={}kbps | loss_p={} link_collapse={} burst={} severe={} bb={} late_p={} gp_short={} grace={} cap_cut={} allow_cut={} inc_tick={} → reduce={}",
             feedback.loss_after_fec,
             ewma_loss_before,
             self.ewma_loss_fec,
+            feedback.late_rate,
             feedback.jitter_buffer_ms,
             jitter_growth_ms,
             max_queue_depth,
@@ -708,6 +733,7 @@ impl BitrateAdapter {
             burst_loss,
             severe_burst,
             bufferbloat,
+            late_pressure,
             goodput_shortfall,
             feedback_grace,
             capacity_already_cut,
@@ -1201,6 +1227,7 @@ mod tests {
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 50,
             loss_after_fec: 0.0,
+            late_rate: 0.0,
         };
         for _ in 0..8 {
             adapter.update_with_feedback(&links, &healthy);
@@ -1214,6 +1241,7 @@ mod tests {
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
             loss_after_fec: 0.60,
+            late_rate: 0.0,
         };
         adapter.update_with_feedback(&links, &bad);
         adapter.update_with_feedback(&links, &bad);
@@ -1244,7 +1272,8 @@ mod tests {
             goodput_bps: 8_000_000,
             fec_repair_rate: 0.01,
             jitter_buffer_ms: 50,
-            loss_after_fec: 0.03, // below 5% threshold
+            loss_after_fec: 0.03, // below 5% threshold,
+            late_rate: 0.0,
         };
 
         adapter.update_with_feedback(&links, &feedback);
@@ -1273,6 +1302,7 @@ mod tests {
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 1000,
             loss_after_fec: 0.20,
+            late_rate: 0.0,
         };
 
         let before = adapter.current_target_kbps();
@@ -1451,6 +1481,7 @@ mod tests {
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
             loss_after_fec: 1.0,
+            late_rate: 0.0,
         };
 
         for _ in 0..5 {
@@ -1470,6 +1501,7 @@ mod tests {
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
             loss_after_fec: 0.0,
+            late_rate: 0.0,
         };
 
         for _ in 0..3 {
@@ -1505,6 +1537,7 @@ mod tests {
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
             loss_after_fec: 0.10,
+            late_rate: 0.0,
         };
 
         let before = adapter.current_target_kbps();
@@ -1596,6 +1629,7 @@ mod tests {
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 120,
             loss_after_fec: 0.03,
+            late_rate: 0.0,
         };
 
         let before = adapter.current_target_kbps();
@@ -1628,6 +1662,7 @@ mod tests {
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
             loss_after_fec: 0.02,
+            late_rate: 0.0,
         };
         for _ in 0..5 {
             adapter.update_with_feedback(&links, &stable_fb);
@@ -1640,6 +1675,7 @@ mod tests {
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
             loss_after_fec: 1.0,
+            late_rate: 0.0,
         };
         for _ in 0..5 {
             adapter.update_with_feedback(&links, &stall_fb);
@@ -1659,6 +1695,7 @@ mod tests {
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
             loss_after_fec: 0.0,
+            late_rate: 0.0,
         };
         for _ in 0..10 {
             adapter.update_with_feedback(&links, &recover_fb);
@@ -1692,6 +1729,7 @@ mod tests {
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
             loss_after_fec: 0.0,
+            late_rate: 0.0,
         };
         adapter.update_with_feedback(&links, &seed_fb);
 
@@ -1701,6 +1739,7 @@ mod tests {
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
             loss_after_fec: 0.0,
+            late_rate: 0.0,
         };
 
         let before = adapter.current_target_kbps();
@@ -1744,6 +1783,7 @@ mod tests {
             jitter_buffer_ms: 100,
             loss_after_fec: 0.02,
             fec_repair_rate: 0.0,
+            late_rate: 0.0,
         };
         for _ in 0..3 {
             adapter.update_with_feedback(&links, &seed);
@@ -1761,6 +1801,7 @@ mod tests {
                 jitter_buffer_ms: 1500,
                 loss_after_fec: 1.0,
                 fec_repair_rate: 0.0,
+                late_rate: 0.0,
             };
             adapter.update_with_feedback(&links, &stall);
             adapter.update_with_feedback(&links, &stall);
@@ -1771,6 +1812,7 @@ mod tests {
                 jitter_buffer_ms: 1800,
                 loss_after_fec: 0.9, // Most packets expired during stall
                 fec_repair_rate: 0.0,
+                late_rate: 0.0,
             };
             adapter.update_with_feedback(&links, &unstall);
 
@@ -1790,6 +1832,7 @@ mod tests {
             jitter_buffer_ms: 200,
             loss_after_fec: 0.0,
             fec_repair_rate: 0.0,
+            late_rate: 0.0,
         };
         for _ in 0..10 {
             adapter.update_with_feedback(&links, &clean);
@@ -1832,6 +1875,7 @@ mod tests {
             jitter_buffer_ms: 800,
             loss_after_fec: 0.3, // 30% residual loss
             fec_repair_rate: 0.0,
+            late_rate: 0.0,
         };
 
         // Run 30 ticks. Track how many times the bitrate changes direction.
@@ -1896,6 +1940,7 @@ mod tests {
                 jitter_buffer_ms: 1999,
                 loss_after_fec: 1.0,
                 fec_repair_rate: 0.0,
+                late_rate: 0.0,
             };
             adapter.update_with_feedback(&links, &stalled);
             adapter.update_with_feedback(&links, &stalled);
@@ -1907,6 +1952,7 @@ mod tests {
                 jitter_buffer_ms: 1999,
                 loss_after_fec: 0.95,
                 fec_repair_rate: 0.0,
+                late_rate: 0.0,
             };
             adapter.update_with_feedback(&links, &blip);
         }
@@ -1943,6 +1989,7 @@ mod tests {
             jitter_buffer_ms: 100,
             loss_after_fec: 0.0,
             fec_repair_rate: 0.0,
+            late_rate: 0.0,
         };
         adapter.update_with_feedback(&links, &good);
         let after_increase = adapter.current_target_kbps();
@@ -1955,6 +2002,7 @@ mod tests {
             jitter_buffer_ms: 4000, // Severe bufferbloat
             loss_after_fec: 0.95,
             fec_repair_rate: 0.0,
+            late_rate: 0.0,
         };
         adapter.update_with_feedback(&links, &severe);
 
@@ -1989,6 +2037,7 @@ mod tests {
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
             loss_after_fec: 0.8,
+            late_rate: 0.0,
         };
         for _ in 0..10 {
             adapter.update_with_feedback(&links, &high_loss);
@@ -2004,7 +2053,8 @@ mod tests {
             goodput_bps: 0,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
-            loss_after_fec: 1.0, // ignored during stall
+            loss_after_fec: 1.0, // ignored during stall,
+            late_rate: 0.0,
         };
         for _ in 0..20 {
             adapter.update_with_feedback(&links, &stall);
@@ -2096,6 +2146,7 @@ mod tests {
             jitter_buffer_ms: 50,
             loss_after_fec: 0.0,
             fec_repair_rate: 0.0,
+            late_rate: 0.0,
         };
 
         for _ in 0..5 {

@@ -162,11 +162,36 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fallback_submit_sends_data_and_increments_tokens() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixDatagram;
+
+        let (tx, rx) = UnixDatagram::pair().unwrap();
+        let mut sender = FallbackSender::new();
+
+        let first = sender
+            .submit(tx.as_raw_fd(), &Bytes::from_static(b"hello"))
+            .unwrap();
+        let second = sender
+            .submit(tx.as_raw_fd(), &Bytes::from_static(b"world"))
+            .unwrap();
+
+        let mut buf = [0u8; 16];
+        let n1 = rx.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n1], b"hello");
+        let n2 = rx.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n2], b"world");
+
+        assert_eq!(first, SubmitToken(0));
+        assert_eq!(second, SubmitToken(1));
+    }
+
     #[test]
     fn fallback_token_increments() {
-        // We can't actually test submit with a real socket here without
-        // creating one, but we can verify the token logic by using
-        // socketpair or a memfd.  For now, just verify the struct layout.
+        // Keep a direct state-level assertion alongside the real send-path test
+        // so accidental changes to token accounting remain obvious.
         let mut sender = FallbackSender::new();
         assert_eq!(sender.next_token, 0);
         sender.next_token = 42;

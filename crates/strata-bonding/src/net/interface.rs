@@ -138,6 +138,8 @@ pub struct ReceiverReportMetrics {
     pub jitter_buffer_ms: u32,
     /// Residual loss after FEC recovery (0.0–1.0).
     pub loss_after_fec: f32,
+    /// Fraction of packets that arrived past the playout deadline (0.0–1.0).
+    pub late_rate: f32,
 }
 
 /// Transport-layer statistics from `strata-transport`.
@@ -214,4 +216,29 @@ pub trait LinkSender: Send + Sync {
     /// When active, the oracle suppresses delivery observations to prevent
     /// inflated traffic rates from corrupting the lower bound estimate.
     fn set_saturation_probe_active(&self, _active: bool) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_iface_ipv4_rejects_invalid_names() {
+        assert_eq!(resolve_iface_ipv4("../lo"), None);
+        assert_eq!(resolve_iface_ipv4("lo\n"), None);
+    }
+
+    #[test]
+    fn resolve_iface_ipv4_returns_none_for_missing_interface() {
+        assert_eq!(resolve_iface_ipv4("definitely_not_a_real_iface_123"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_iface_ipv4_finds_loopback() {
+        assert_eq!(
+            resolve_iface_ipv4("lo"),
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        );
+    }
 }

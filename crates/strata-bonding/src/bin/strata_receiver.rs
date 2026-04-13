@@ -77,10 +77,7 @@ fn main() -> anyhow::Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     {
         let running = running.clone();
-        ctrlc::handle(move || {
-            tracing::info!("shutting down...");
-            running.store(false, Ordering::Relaxed);
-        });
+        strata_bonding::signal::install_shutdown_flag(running)?;
     }
 
     // ── Output sink ─────────────────────────────────────────────
@@ -373,44 +370,4 @@ fn run_metrics_server(
     }
 
     Ok(())
-}
-
-// ─── Signal Handling ────────────────────────────────────────────────────────
-
-mod ctrlc {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    static HANDLER_SET: AtomicBool = AtomicBool::new(false);
-
-    pub fn handle(f: impl Fn() + Send + 'static) {
-        if HANDLER_SET.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let _ = std::thread::Builder::new()
-            .name("signal".into())
-            .spawn(move || {
-                wait_for_signal();
-                f();
-            });
-    }
-
-    #[cfg(unix)]
-    fn wait_for_signal() {
-        unsafe {
-            let mut mask: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut mask);
-            libc::sigaddset(&mut mask, libc::SIGINT);
-            libc::sigaddset(&mut mask, libc::SIGTERM);
-            let mut sig: libc::c_int = 0;
-            libc::sigwait(&mask, &mut sig);
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn wait_for_signal() {
-        // Fallback: busy-wait checking a flag (shouldn't happen in production)
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    }
 }

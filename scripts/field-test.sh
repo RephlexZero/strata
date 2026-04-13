@@ -20,7 +20,7 @@
 #   STRATA_MAX_BITRATE     — Max kbps (default: 1500)
 #   STRATA_LINK_IFACES     — Comma-separated interfaces (e.g. "enp2s0f0u4,enp2s0f0u3")
 #   STRATA_REDUNDANCY_ENABLED   — Sender scheduler redundancy flag (default: false)
-#   STRATA_CRITICAL_BROADCAST   — Broadcast critical stream headers (default: true)
+#   STRATA_CRITICAL_BROADCAST   — Broadcast critical stream headers (default: false)
 #   STRATA_FAILOVER_ENABLED     — Sender scheduler failover flag (default: true)
 #   STRATA_FAILOVER_DURATION_MS — Sender failover hold (default: 800)
 #   STRATA_MAX_LATENCY_MS  — Receiver jitter buffer ceiling (default: 1000)
@@ -81,7 +81,7 @@ BITRATE="${STRATA_BITRATE:-500}"
 MIN_BITRATE="${STRATA_MIN_BITRATE:-200}"
 MAX_BITRATE="${STRATA_MAX_BITRATE:-1500}"
 REDUNDANCY_ENABLED="${STRATA_REDUNDANCY_ENABLED:-false}"
-CRITICAL_BROADCAST="${STRATA_CRITICAL_BROADCAST:-true}"
+CRITICAL_BROADCAST="${STRATA_CRITICAL_BROADCAST:-false}"
 FAILOVER_ENABLED="${STRATA_FAILOVER_ENABLED:-true}"
 FAILOVER_DURATION_MS="${STRATA_FAILOVER_DURATION_MS:-800}"
 MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-1000}"
@@ -439,6 +439,20 @@ PREV_LOST=0
 PREV_LATE=0
 PREV_DELIVERED=0
 
+# Coerce a value to a non-negative integer (defaults to 0). Prevents
+# arithmetic / comparison failures under `set -e` when ssh/grep return
+# empty or non-numeric payloads during transient network blips.
+num() {
+    local v="${1:-0}"
+    [[ "$v" =~ ^[0-9]+$ ]] || v=0
+    echo "$v"
+}
+
+# The monitor loop intentionally relaxes errexit: a single ssh timeout or
+# grep-with-no-match must not abort the run before we reach the final
+# state dump. Re-enable it below the loop so cleanup still fails loudly.
+set +e
+
 while [[ $ELAPSED -lt $DURATION ]]; do
     sleep 5
     ELAPSED=$((ELAPSED + 5))
@@ -456,12 +470,14 @@ while [[ $ELAPSED -lt $DURATION ]]; do
     RX_LINK_STATS=$(echo "$RX_STATS_LINE" | grep -oE 'packets_received_link_[0-9]+=[^,;]+|packets_delivered_link_[0-9]+=[^,;]+|loss_link_[0-9]+=[^,;]+' | tr '\n' ' ')
 
     # Extract numbers for delta calculation (handle GStreamer type annotations like =(guint64)123)
-    CUR_LOST=$(echo "$STATS" | grep -oP 'lost_packets=\([^)]*\)\K[0-9]+' || echo "0")
-    CUR_LATE=$(echo "$STATS" | grep -oP 'late_packets=\([^)]*\)\K[0-9]+' || echo "0")
-    CUR_DELIVERED=$(echo "$STATS" | grep -oP 'packets_delivered=\([^)]*\)\K[0-9]+' || echo "0")
-    DELTA_LOST=$((CUR_LOST - PREV_LOST))
-    DELTA_LATE=$((CUR_LATE - PREV_LATE))
-    DELTA_DELIVERED=$((CUR_DELIVERED - PREV_DELIVERED))
+    CUR_LOST=$(num "$(echo "$STATS" | grep -oP 'lost_packets=\([^)]*\)\K[0-9]+' | head -1)")
+    CUR_LATE=$(num "$(echo "$STATS" | grep -oP 'late_packets=\([^)]*\)\K[0-9]+' | head -1)")
+    CUR_DELIVERED=$(num "$(echo "$STATS" | grep -oP 'packets_delivered=\([^)]*\)\K[0-9]+' | head -1)")
+    # A counter reset (receiver restart) would produce a negative delta.
+    # Clamp to 0 so the health math remains sane.
+    DELTA_LOST=$(( CUR_LOST >= PREV_LOST ? CUR_LOST - PREV_LOST : 0 ))
+    DELTA_LATE=$(( CUR_LATE >= PREV_LATE ? CUR_LATE - PREV_LATE : 0 ))
+    DELTA_DELIVERED=$(( CUR_DELIVERED >= PREV_DELIVERED ? CUR_DELIVERED - PREV_DELIVERED : 0 ))
     PREV_LOST=$CUR_LOST; PREV_LATE=$CUR_LATE; PREV_DELIVERED=$CUR_DELIVERED
 
     WINDOW_TOTAL=$((DELTA_DELIVERED + DELTA_LOST))
@@ -481,11 +497,11 @@ while [[ $ELAPSED -lt $DURATION ]]; do
 
     # Segment count
     SEG_INFO=$(ssh "${SSH_OPTS[@]}" "$HOST" "find '$HLS_DIR' -maxdepth 1 -type f -name '*.ts' 2>/dev/null | wc -l" 2>/dev/null || echo "0")
-    SEGMENT_COUNT=$SEG_INFO
+    SEGMENT_COUNT=$(num "$SEG_INFO")
     if [[ $SEGMENT_COUNT -gt $MAX_SEGMENT_COUNT ]]; then
         MAX_SEGMENT_COUNT=$SEGMENT_COUNT
     fi
-    PLAYLIST_COUNT=$(ssh "${SSH_OPTS[@]}" "$HOST" "find '$HLS_DIR' -maxdepth 1 -type f -name '*.m3u8' 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+    PLAYLIST_COUNT=$(num "$(ssh "${SSH_OPTS[@]}" "$HOST" "find '$HLS_DIR' -maxdepth 1 -type f -name '*.m3u8' 2>/dev/null | wc -l" 2>/dev/null || echo "0")")
     if [[ $PLAYLIST_COUNT -gt 0 ]]; then
         PLAYLIST_SEEN=1
     fi
@@ -520,6 +536,8 @@ while [[ $ELAPSED -lt $DURATION ]]; do
     [[ -n "$FEC_LINE" ]]   && echo "  $FEC_LINE"
     [[ -n "$LINK_LINES" ]] && echo "$LINK_LINES"
 done
+
+set -e
 
 echo ""
 echo "── Final state ──"

@@ -762,10 +762,15 @@ pub struct ReceiverReportPacket {
     pub jitter_buffer_ms: u32,
     /// Residual loss after FEC recovery (0.0–1.0), encoded as u16 (0–10000).
     pub loss_after_fec: u16,
+    /// Fraction of packets that arrived past the playout deadline over the
+    /// reporting interval (0.0–1.0), encoded as u16 (0–10000). Late packets
+    /// are user-visible artifacts even when outright loss is low — the
+    /// sender uses this as an independent delay-pressure input.
+    pub late_rate: u16,
 }
 
 impl ReceiverReportPacket {
-    pub const ENCODED_LEN: usize = 16; // 8 + 2 + 4 + 2
+    pub const ENCODED_LEN: usize = 18; // 8 + 2 + 4 + 2 + 2
 
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(ControlType::ReceiverReport as u8);
@@ -773,17 +778,31 @@ impl ReceiverReportPacket {
         buf.put_u16(self.fec_repair_rate);
         buf.put_u32(self.jitter_buffer_ms);
         buf.put_u16(self.loss_after_fec);
+        buf.put_u16(self.late_rate);
     }
 
     pub fn decode(buf: &mut impl Buf) -> Option<Self> {
-        if buf.remaining() < Self::ENCODED_LEN {
+        // Require the pre-late-rate prefix (16 bytes) so older senders/receivers
+        // still interoperate. The late_rate field is optional at the tail.
+        const LEGACY_LEN: usize = 16;
+        if buf.remaining() < LEGACY_LEN {
             return None;
         }
+        let goodput_bps = buf.get_u64();
+        let fec_repair_rate = buf.get_u16();
+        let jitter_buffer_ms = buf.get_u32();
+        let loss_after_fec = buf.get_u16();
+        let late_rate = if buf.remaining() >= 2 {
+            buf.get_u16()
+        } else {
+            0
+        };
         Some(ReceiverReportPacket {
-            goodput_bps: buf.get_u64(),
-            fec_repair_rate: buf.get_u16(),
-            jitter_buffer_ms: buf.get_u32(),
-            loss_after_fec: buf.get_u16(),
+            goodput_bps,
+            fec_repair_rate,
+            jitter_buffer_ms,
+            loss_after_fec,
+            late_rate,
         })
     }
 
@@ -795,6 +814,11 @@ impl ReceiverReportPacket {
     /// Residual loss after FEC as a float (0.0–1.0).
     pub fn loss_after_fec_f32(&self) -> f32 {
         self.loss_after_fec as f32 / 10000.0
+    }
+
+    /// Late-arrival rate as a float (0.0–1.0).
+    pub fn late_rate_f32(&self) -> f32 {
+        self.late_rate as f32 / 10000.0
     }
 }
 
@@ -1146,6 +1170,7 @@ mod tests {
             fec_repair_rate: 250, // 2.5%
             jitter_buffer_ms: 120,
             loss_after_fec: 50, // 0.5%
+            late_rate: 75,      // 0.75%
         };
         let mut buf = BytesMut::new();
         report.encode(&mut buf);
@@ -1165,6 +1190,7 @@ mod tests {
             fec_repair_rate: 1000, // 10%
             jitter_buffer_ms: 0,
             loss_after_fec: 10000, // 100%
+            late_rate: 0,
         };
         assert!((report.fec_repair_rate_f32() - 0.10).abs() < 1e-5);
         assert!((report.loss_after_fec_f32() - 1.0).abs() < 1e-5);

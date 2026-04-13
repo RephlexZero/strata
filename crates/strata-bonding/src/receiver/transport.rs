@@ -71,7 +71,14 @@ impl TransportBondingReceiver {
     }
 
     pub fn new_with_config(config: ReassemblyConfig) -> Self {
-        let (output_tx, output_rx) = bounded::<DeliveredPayload>(config.buffer_capacity);
+        // Decouple the downstream output channel from the reassembly capacity.
+        // The reassembly buffer sizes the per-sequence window; the output
+        // channel absorbs downstream back-pressure while the GStreamer sink
+        // is momentarily blocked (segment rotation, disk/tmpfs flush, etc.).
+        // Undersizing here turns a ~100ms sink stall into torrent of packet
+        // drops that looks like heavy network loss to the rest of the pipeline.
+        let output_capacity = config.buffer_capacity.saturating_mul(8).max(8192);
+        let (output_tx, output_rx) = bounded::<DeliveredPayload>(output_capacity);
         let (input_tx, input_rx) = bounded::<Packet>(config.buffer_capacity);
         let running = Arc::new(AtomicBool::new(true));
         let stats = Arc::new(Mutex::new(ReassemblyStats::default()));
@@ -87,6 +94,10 @@ impl TransportBondingReceiver {
             .spawn(move || {
                 let mut buffer = ReassemblyBuffer::with_config(0, config);
                 let tick_interval = Duration::from_millis(10);
+                let mut dropped_since_log: u64 = 0;
+                let mut total_dropped: u64 = 0;
+                let mut last_drop_log = Instant::now();
+                let drop_log_interval = Duration::from_secs(1);
 
                 while running_clone.load(Ordering::Relaxed) {
                     // Drain all available input packets (non-blocking after
@@ -129,8 +140,20 @@ impl TransportBondingReceiver {
                         // Dropping late frames is better than deadlocking
                         // the entire receive pipeline.
                         if output_tx_clone.try_send(p).is_err() {
-                            tracing::warn!("output channel full, dropping packet");
+                            dropped_since_log += 1;
+                            total_dropped += 1;
                         }
+                    }
+                    if dropped_since_log > 0
+                        && now.duration_since(last_drop_log) >= drop_log_interval
+                    {
+                        tracing::warn!(
+                            dropped = dropped_since_log,
+                            total = total_dropped,
+                            "output channel full, dropping packets (downstream stalled)"
+                        );
+                        dropped_since_log = 0;
+                        last_drop_log = now;
                     }
                 }
             })
@@ -265,6 +288,7 @@ async fn link_reader_async(
     // jitter issue handled by jitter_buffer_ms / delay_pressure).
     let mut prev_reassembly_lost: u64 = 0;
     let mut prev_reassembly_delivered: u64 = 0;
+    let mut prev_reassembly_late: u64 = 0;
     // Most recently seen sender address on this socket.
     let mut sender_addr: Option<std::net::SocketAddr> = None;
 
@@ -419,22 +443,34 @@ async fn link_reader_async(
                         // Including late packets caused false-positive EWMA
                         // spikes (~40%) from brief jitter bursts on LTE, leading
                         // to destructive bitrate oscillation.
-                        let reassembly_loss = if let Ok(snap) = reassembly_stats.lock() {
-                            let d_lost = snap.lost_packets.saturating_sub(prev_reassembly_lost);
-                            let d_del = snap
-                                .packets_delivered
-                                .saturating_sub(prev_reassembly_delivered);
-                            prev_reassembly_lost = snap.lost_packets;
-                            prev_reassembly_delivered = snap.packets_delivered;
-                            let total = d_lost + d_del;
-                            if total > 0 {
-                                (d_lost as f64 / total as f64).clamp(0.0, 1.0)
+                        let (reassembly_loss, late_rate_f) =
+                            if let Ok(snap) = reassembly_stats.lock() {
+                                let d_lost = snap.lost_packets.saturating_sub(prev_reassembly_lost);
+                                let d_del = snap
+                                    .packets_delivered
+                                    .saturating_sub(prev_reassembly_delivered);
+                                let d_late = snap.late_packets.saturating_sub(prev_reassembly_late);
+                                prev_reassembly_lost = snap.lost_packets;
+                                prev_reassembly_delivered = snap.packets_delivered;
+                                prev_reassembly_late = snap.late_packets;
+                                let total = d_lost + d_del;
+                                let loss = if total > 0 {
+                                    (d_lost as f64 / total as f64).clamp(0.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                                // Express late arrivals against delivered packets so
+                                // the ratio is directly comparable to loss_after_fec
+                                // for the sender's delay-pressure input.
+                                let late = if d_del > 0 {
+                                    (d_late as f64 / d_del as f64).clamp(0.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                                (loss, late)
                             } else {
-                                0.0
-                            }
-                        } else {
-                            0.0
-                        };
+                                (0.0, 0.0)
+                            };
 
                         // Use the worse signal: transport-layer FEC-residual OR
                         // reassembly-layer lost packets.  Transport catches
@@ -463,6 +499,7 @@ async fn link_reader_async(
                             fec_repair_rate: (fec_rate * 10000.0) as u16,
                             jitter_buffer_ms: jitter_ms,
                             loss_after_fec: (report_loss * 10000.0) as u16,
+                            late_rate: (late_rate_f * 10000.0) as u16,
                         };
                         let pkt_bytes = encode_receiver_report(&report, &clock);
                         let _ = socket.send_to(pkt_bytes, addr).await;

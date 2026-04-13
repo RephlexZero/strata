@@ -958,6 +958,7 @@ impl LinkSender for TransportLink {
                     fec_repair_rate: r.fec_repair_rate_f32(),
                     jitter_buffer_ms: r.jitter_buffer_ms,
                     loss_after_fec: r.loss_after_fec_f32(),
+                    late_rate: r.late_rate_f32(),
                 }
             }),
         }

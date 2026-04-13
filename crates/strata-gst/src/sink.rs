@@ -546,6 +546,7 @@ mod imp {
                                 let mut max_jitter = 0;
                                 let mut total_loss_weight = 0.0;
                                 let mut total_fec_weight = 0.0;
+                                let mut total_late_weight = 0.0;
                                 let mut weight_sum = 0.0;
                                 let mut has_report = false;
 
@@ -558,6 +559,7 @@ mod imp {
                                         let weight = (r.goodput_bps as f64).max(10_000.0);
                                         total_loss_weight += r.loss_after_fec as f64 * weight;
                                         total_fec_weight += r.fec_repair_rate as f64 * weight;
+                                        total_late_weight += r.late_rate as f64 * weight;
                                         weight_sum += weight;
                                     }
                                 }
@@ -568,6 +570,7 @@ mod imp {
                                         fec_repair_rate: (total_fec_weight / weight_sum) as f32,
                                         jitter_buffer_ms: max_jitter,
                                         loss_after_fec: (total_loss_weight / weight_sum) as f32,
+                                        late_rate: (total_late_weight / weight_sum) as f32,
                                     })
                                 } else {
                                     None

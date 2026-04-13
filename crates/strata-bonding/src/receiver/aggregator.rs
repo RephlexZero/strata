@@ -64,6 +64,11 @@ pub struct ReassemblyBuffer {
     /// resync target so we resume from the most recent sender position,
     /// not from an arbitrary old packet that happened to arrive last.
     max_late_seq: u64,
+    /// Highest seq_id actually emitted downstream. Resync must never rewind
+    /// to or below this — re-emitting an already-delivered sequence makes
+    /// the downstream MPEG-TS demuxer see a PTS/continuity regression and
+    /// post a fatal "Timestamping error on input streams".
+    last_emitted_seq: Option<u64>,
 }
 
 /// Configuration for the reassembly jitter buffer.
@@ -188,6 +193,7 @@ impl ReassemblyBuffer {
             last_late_arrival: None,
             consecutive_late: 0,
             max_late_seq: 0,
+            last_emitted_seq: None,
         }
     }
 
@@ -322,6 +328,30 @@ impl ReassemblyBuffer {
                 // retransmission) would reset next_seq to 0 or some stale
                 // value and permanently stall the receiver.
                 let resync_target = self.max_late_seq + 1;
+                // Never rewind across already-emitted sequences. Re-emitting
+                // a seq we've already delivered makes the downstream MPEG-TS
+                // demuxer see regressing PTS/continuity counters and post a
+                // fatal "Timestamping error on input streams" — killing the
+                // pipeline. Rewinding is only safe when the target is strictly
+                // greater than the highest seq we've actually emitted; i.e.
+                // when the gap between old next_seq and target consists purely
+                // of gap-skipped (never-emitted) sequences.
+                let emit_watermark = self.last_emitted_seq.map(|s| s + 1).unwrap_or(0);
+                if resync_target < emit_watermark {
+                    self.consecutive_late = 0;
+                    self.max_late_seq = 0;
+                    const LATE_HIT_MS: f64 = 3.0;
+                    let base_headroom_ms = self
+                        .max_latency
+                        .as_millis()
+                        .saturating_sub(self.start_latency.as_millis())
+                        as f64;
+                    let max_pressure = base_headroom_ms.min(600.0);
+                    self.late_pressure_ms = (self.late_pressure_ms + LATE_HIT_MS).min(max_pressure);
+                    self.last_late_arrival = Some(now);
+                    self.late_packets += 1;
+                    return;
+                }
                 tracing::warn!(
                     old_next_seq = self.next_seq,
                     new_next_seq = resync_target,
@@ -426,6 +456,7 @@ impl ReassemblyBuffer {
                     let p = self.buffer[idx].take().unwrap();
                     self.buffered = self.buffered.saturating_sub(1);
                     released.push((p.payload, std::mem::take(&mut discont)));
+                    self.last_emitted_seq = Some(self.next_seq);
                     self.next_seq += 1;
                     continue;
                 }
@@ -1202,19 +1233,14 @@ mod tests {
         let _ = buf.tick(start + Duration::from_millis(20));
         assert_eq!(buf.packets_delivered, 10);
 
-        // Phase 2: Force high loss_rate_smoothed by skipping many packets.
-        // Push seq 200 far ahead — window advance skips 190 packets (all "lost"),
-        // then tick to register the loss in loss_rate_smoothed.
+        // Phase 2: Advance next_seq far ahead via overflow without emitting
+        // the far-ahead packet downstream (no tick). This mirrors the real
+        // desync scenario where gap-skip leaves next_seq past the sender but
+        // nothing above the old next_seq has been emitted yet.
         let t2 = start + Duration::from_millis(100);
         buf.push(200, Bytes::from_static(b"far"), t2);
-        let _ = buf.tick(t2 + Duration::from_millis(10));
-        // loss_rate_smoothed should now be elevated
-        assert!(
-            buf.loss_rate_smoothed > 0.0,
-            "loss rate should be elevated after mass loss"
-        );
 
-        // Also manually set latency to max to simulate the worst case
+        // Manually set latency to max to simulate the worst case
         buf.latency = Duration::from_millis(500);
         buf.target_latency = Duration::from_millis(500);
         buf.loss_rate_smoothed = 1.0;
@@ -1222,7 +1248,9 @@ mod tests {
         // Phase 3: Send 100 consecutive "late" packets (seq < next_seq)
         // to trigger the desync reset.
         let t3 = t2 + Duration::from_millis(200);
-        let resume_seq = 50u64; // well below next_seq (~201)
+        // All pushed seqs must remain strictly below next_seq (which is at
+        // ~137 after the overflow advance) to register as consecutive late.
+        let resume_seq = 20u64;
         for i in 0u64..100 {
             buf.push(
                 resume_seq + i,
@@ -1324,6 +1352,51 @@ mod tests {
         );
     }
 
+    /// Regression for field-test receiver death: the desync detector used to
+    /// rewind `next_seq` below the last emitted sequence. Downstream
+    /// `tsdemux` then saw a PTS/continuity regression and posted a fatal
+    /// "Timestamping error on input streams", killing the receiver ~40s in
+    /// and never recovering. The fix: only allow resync when the target is
+    /// strictly above the last emitted seq; otherwise drop late packets.
+    #[test]
+    fn resync_never_rewinds_across_emitted_seqs() {
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(10),
+            buffer_capacity: 128,
+            skip_after: Some(Duration::from_millis(5)),
+            ..Default::default()
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        // Deliver a long stream so last_emitted_seq is well above any late arrival.
+        for i in 0u64..200 {
+            buf.push(i, Bytes::from(vec![i as u8]), start);
+        }
+        let _ = buf.tick(start + Duration::from_millis(20));
+        let emitted_before = buf.packets_delivered;
+        let next_seq_before = buf.next_seq;
+        assert!(next_seq_before >= 200);
+
+        // 100 genuinely late packets (old retransmissions) whose max seq is
+        // BELOW next_seq. The old code would rewind here — the new code must
+        // drop them and keep next_seq pinned forward.
+        let late_time = start + Duration::from_millis(500);
+        for i in 0u64..100 {
+            buf.push(10 + i, Bytes::from(vec![i as u8]), late_time);
+        }
+
+        assert_eq!(
+            buf.next_seq, next_seq_before,
+            "next_seq must not rewind when the late window sits below emitted range"
+        );
+        assert_eq!(
+            buf.packets_delivered, emitted_before,
+            "no spurious re-delivery after rejected resync"
+        );
+        assert!(buf.late_packets >= 100);
+    }
+
     // ── Regression: desync recovery after burst loss ──────────────────
 
     /// After a large gap-skip pushes next_seq far ahead, subsequent packets
@@ -1350,9 +1423,12 @@ mod tests {
 
         // Phase 2: Simulate burst loss — a packet arrives far ahead,
         // causing next_seq to jump (gap-skip via the capacity overflow path).
+        // We deliberately do NOT tick here: the far-ahead packet must remain
+        // unemitted so that a later resync can rewind next_seq without
+        // re-emitting an already-delivered sequence (which would kill the
+        // downstream MPEG-TS pipeline with a timestamping error).
         let burst_time = start + Duration::from_millis(100);
         buf.push(5000, Bytes::from_static(b"far-ahead"), burst_time);
-        let _ = buf.tick(burst_time + Duration::from_millis(10));
 
         // next_seq should now be well ahead of 50
         assert!(

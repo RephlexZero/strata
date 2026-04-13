@@ -1488,10 +1488,13 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let pl_location = hls_dir.join("playlist.m3u8");
         format!(
             "stratasrc links=\"{bind}\" name=src latency=200 ! \
-             queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
+             queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 \
+             leaky=downstream ! \
              tsdemux name=d \
-             d. ! queue ! {parser} ! hls.video \
-             d. ! queue ! aacparse ! hls.audio \
+             d. ! queue max-size-buffers=600 max-size-bytes=0 max-size-time=2000000000 \
+                   leaky=downstream ! {parser} ! hls.video \
+             d. ! queue max-size-buffers=200 max-size-bytes=0 max-size-time=2000000000 \
+                   leaky=downstream ! aacparse ! hls.audio \
              hlssink2 name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
              target-duration=2 max-files=10 send-keyframe-requests=true",
             bind = bind_str,
@@ -1503,11 +1506,14 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let relay_frag = gststrata::codec::CodecController::new(codec_type).relay_muxer_fragment();
         format!(
             "stratasrc links=\"{bind}\" name=src latency=200 ! \
-             queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 ! \
+             queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 \
+             leaky=downstream ! \
              tsdemux name=d \
-             d. ! queue ! {parser} ! {relay} \
+             d. ! queue max-size-buffers=600 max-size-bytes=0 max-size-time=2000000000 \
+                   leaky=downstream ! {parser} ! {relay} \
              rtmpsink location=\"{url}\" sync=false \
-             d. ! queue ! aacparse ! fmux.",
+             d. ! queue max-size-buffers=200 max-size-bytes=0 max-size-time=2000000000 \
+                   leaky=downstream ! aacparse ! fmux.",
             bind = bind_str,
             parser = relay_parser,
             relay = relay_frag,

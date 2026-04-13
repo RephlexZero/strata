@@ -22,6 +22,7 @@ pub mod protocol;
 pub mod receiver;
 pub mod runtime;
 pub mod scheduler;
+pub mod signal;
 
 /// Initialize the strata-bonding library.
 ///

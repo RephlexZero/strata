@@ -101,8 +101,39 @@ jobs:
           TEST_DATABASE_URL: postgres://strata:ci-test-password@localhost:5432/strata_test
         run: cargo test --workspace --lib
 
+      - name: Signal handler integration test
+        run: cargo test -p strata-bonding --test signal_shutdown
+
+      - name: Sender pipeline shutdown tests
+        run: cargo test -p strata-sender stop_
+
+      - name: Receiver pipeline shutdown tests
+        run: cargo test -p strata-receiver stop_
+
       - name: Doc tests
         run: cargo test --workspace --doc
+
+  aarch64-codec-smoke:
+    name: AArch64 Codec Smoke
+    needs: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Run strata-transport SIMD smoke test under arm64
+        run: |
+          docker run --rm --platform linux/arm64/v8 \
+            -v "$PWD":/workspaces/strata \
+            -w /workspaces/strata \
+            rust:bookworm \
+            bash -lc 'cargo test --manifest-path crates/strata-transport/Cargo.toml --lib gf_mul_acc_matches_scalar_for_all_coefficients -- --exact'
 
   # ── Network integration tests (needs sudo, heavier) ────────
   integration:
