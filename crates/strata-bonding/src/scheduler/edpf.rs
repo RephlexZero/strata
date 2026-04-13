@@ -66,17 +66,45 @@ impl<L: ?Sized> LinkState<L> {
         (self.metrics.rtt_ms / 1000.0).max(0.001)
     }
 
-    /// Estimated capacity in bytes per second, discounted by observed loss rate.
+    /// Estimated capacity in bytes per second, discounted by loss and delay.
     ///
-    /// A link with 80% loss is only delivering 20% of its nominal capacity.
-    /// Applying the discount here ensures predicted-arrival calculations
-    /// route fewer packets to high-loss links, preventing the ARQ queue
-    /// from building up unboundedly when oracle estimates are stale.
+    /// Cellular links frequently degrade via queue growth before hard loss.
+    /// We down-weight capacity by queue delay (`rtt - rtprop`) and receiver
+    /// jitter depth so EDPF shifts load away from bloating links earlier.
     fn capacity_bytes_per_sec(&self) -> f64 {
         // Clamp to 0.99 so a link never appears to have exactly 0 capacity;
         // the fallback routing path can still use it as a last resort.
         let loss = self.metrics.loss_rate.clamp(0.0, 0.99);
-        (self.metrics.capacity_bps / 8.0 * (1.0 - loss)).max(1.0)
+        let base_rtt_ms = self
+            .metrics
+            .rtprop_ms
+            .filter(|v| *v > 0.0)
+            .unwrap_or(self.metrics.rtt_ms.max(1.0));
+        let queue_delay_ms = (self.metrics.rtt_ms - base_rtt_ms).max(0.0);
+
+        // Start penalizing once persistent queueing exceeds ~80ms.
+        let queue_penalty = if queue_delay_ms <= 80.0 {
+            1.0
+        } else {
+            (1.0 - ((queue_delay_ms - 80.0) / 320.0)).clamp(0.35, 1.0)
+        };
+
+        // Receiver jitter buffer growth is a direct signal of reordering/queue pressure.
+        let jitter_penalty = self
+            .metrics
+            .receiver_report
+            .as_ref()
+            .map(|r| {
+                let jitter_ms = r.jitter_buffer_ms as f64;
+                if jitter_ms <= 200.0 {
+                    1.0
+                } else {
+                    (1.0 - ((jitter_ms - 200.0) / 2800.0)).clamp(0.40, 1.0)
+                }
+            })
+            .unwrap_or(1.0);
+
+        (self.metrics.capacity_bps / 8.0 * (1.0 - loss) * queue_penalty * jitter_penalty).max(1.0)
     }
 
     /// Predicted arrival time (seconds from now) for a packet of `size_bytes`.

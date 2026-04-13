@@ -6,15 +6,18 @@
 //! shared [`ReassemblyBuffer`] for multi-link jitter buffering.
 
 use crate::protocol::header::BondingHeader;
-use crate::receiver::aggregator::{Packet, ReassemblyBuffer, ReassemblyConfig, ReassemblyStats};
+use crate::receiver::aggregator::{
+    Packet, ReassemblyBuffer, ReassemblyConfig, ReassemblyLinkStats, ReassemblyStats,
+};
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use quanta::Instant;
+use std::collections::BTreeMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -40,6 +43,13 @@ use tracing::{debug, warn};
 /// payload — downstream consumers (e.g. GStreamer tsdemux) should resync.
 pub type DeliveredPayload = (Bytes, bool);
 
+#[derive(Clone, Debug, Default)]
+struct LinkRuntimeStats {
+    packets_received: u64,
+    packets_delivered: u64,
+    loss_rate: f64,
+}
+
 pub struct TransportBondingReceiver {
     input_tx: Option<Sender<Packet>>,
     output_tx: Option<Sender<DeliveredPayload>>,
@@ -47,6 +57,8 @@ pub struct TransportBondingReceiver {
     pub output_rx: Receiver<DeliveredPayload>,
     running: Arc<AtomicBool>,
     stats: Arc<Mutex<ReassemblyStats>>,
+    link_stats: Arc<Mutex<BTreeMap<usize, LinkRuntimeStats>>>,
+    next_link_id: AtomicUsize,
     thread_handles: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
@@ -63,8 +75,10 @@ impl TransportBondingReceiver {
         let (input_tx, input_rx) = bounded::<Packet>(config.buffer_capacity);
         let running = Arc::new(AtomicBool::new(true));
         let stats = Arc::new(Mutex::new(ReassemblyStats::default()));
+        let link_stats = Arc::new(Mutex::new(BTreeMap::<usize, LinkRuntimeStats>::new()));
 
         let stats_clone = stats.clone();
+        let link_stats_clone = link_stats.clone();
         let running_clone = running.clone();
         let output_tx_clone = output_tx.clone();
 
@@ -94,7 +108,19 @@ impl TransportBondingReceiver {
                     let ready = buffer.tick(now);
 
                     if let Ok(mut s) = stats_clone.lock() {
-                        *s = buffer.get_stats();
+                        let mut snapshot = buffer.get_stats();
+                        if let Ok(link) = link_stats_clone.lock() {
+                            snapshot.per_link = link
+                                .iter()
+                                .map(|(link_id, ls)| ReassemblyLinkStats {
+                                    link_id: *link_id,
+                                    packets_received: ls.packets_received,
+                                    packets_delivered: ls.packets_delivered,
+                                    loss_rate: ls.loss_rate,
+                                })
+                                .collect();
+                        }
+                        *s = snapshot;
                     }
 
                     for p in ready {
@@ -116,6 +142,8 @@ impl TransportBondingReceiver {
             output_rx,
             running,
             stats,
+            link_stats,
+            next_link_id: AtomicUsize::new(0),
             thread_handles: Mutex::new(vec![jitter_handle]),
         }
     }
@@ -134,6 +162,7 @@ impl TransportBondingReceiver {
     /// Add a link from an already-bound UDP socket.
     pub fn add_link_socket(&self, socket: UdpSocket) -> Result<()> {
         let local_addr = socket.local_addr()?;
+        let link_id = self.next_link_id.fetch_add(1, Ordering::Relaxed);
 
         let input_tx = self
             .input_tx
@@ -142,15 +171,17 @@ impl TransportBondingReceiver {
             .clone();
         let running = self.running.clone();
         let stats = self.stats.clone();
+        let link_stats = self.link_stats.clone();
 
         let handle = thread::Builder::new()
-            .name(format!("strata-rcv-{}", local_addr))
+            .name(format!("strata-rcv-{}-{}", link_id, local_addr))
             .spawn(move || {
                 let mut rt = crate::build_monoio_runtime!();
                 rt.block_on(async move {
                     let mono_socket = monoio::net::udp::UdpSocket::from_std(socket)
                         .expect("failed to convert socket for monoio");
-                    link_reader_async(mono_socket, input_tx, running, stats).await;
+                    link_reader_async(link_id, mono_socket, input_tx, running, stats, link_stats)
+                        .await;
                 });
             })?;
 
@@ -201,12 +232,20 @@ impl Drop for TransportBondingReceiver {
 /// and reorder. Delivered payloads have the bonding header stripped
 /// and are pushed into the shared reassembly channel.
 async fn link_reader_async(
+    link_id: usize,
     socket: monoio::net::udp::UdpSocket,
     input_tx: Sender<Packet>,
     running: Arc<AtomicBool>,
     reassembly_stats: Arc<Mutex<ReassemblyStats>>,
+    link_stats: Arc<Mutex<BTreeMap<usize, LinkRuntimeStats>>>,
 ) {
-    let mut transport_rx = TransportReceiver::new(ReceiverConfig::default());
+    let config = ReceiverConfig {
+        nack_rearm_ms: 100,      // Re-ask for lost frames less frantically
+        max_nack_retries: 10,    // Give cellular links up to 1000ms to deliver packets
+        reorder_capacity: 16384, // Ensure the buffer accommodates wider delay jumps
+        ..Default::default()
+    };
+    let mut transport_rx = TransportReceiver::new(config);
     let mut buf = vec![0u8; 65536];
     let clock = TimestampClock::new();
     let mut last_ack = std::time::Instant::now();
@@ -220,6 +259,12 @@ async fn link_reader_async(
     // Track packet counters for per-interval loss (not cumulative lifetime).
     let mut prev_highest_seq: u64 = 0;
     let mut prev_packets_delivered: u64 = 0;
+    let mut prev_fec_recoveries: u64 = 0;
+    // Track reassembly-level lost-packet counter for ground-truth loss.
+    // Only counts truly lost packets (not late arrivals — those are a
+    // jitter issue handled by jitter_buffer_ms / delay_pressure).
+    let mut prev_reassembly_lost: u64 = 0;
+    let mut prev_reassembly_delivered: u64 = 0;
     // Most recently seen sender address on this socket.
     let mut sender_addr: Option<std::net::SocketAddr> = None;
 
@@ -334,11 +379,6 @@ async fn link_reader_async(
                         prev_bytes_delivered = cur_bytes;
                         prev_report_time = now;
 
-                        // FEC repair rate
-                        let total = rx_stats.packets_received.max(1);
-                        let fec_rate =
-                            (rx_stats.fec_recoveries as f64 / total as f64).clamp(0.0, 1.0);
-
                         // Jitter buffer depth from reassembly stats
                         let jitter_ms = reassembly_stats
                             .lock()
@@ -354,8 +394,10 @@ async fn link_reader_async(
                         let delta_delivered = rx_stats
                             .packets_delivered
                             .saturating_sub(prev_packets_delivered);
+                        let delta_fec = rx_stats.fec_recoveries.saturating_sub(prev_fec_recoveries);
                         prev_highest_seq = rx_stats.highest_delivered_seq;
                         prev_packets_delivered = rx_stats.packets_delivered;
+                        prev_fec_recoveries = rx_stats.fec_recoveries;
                         let residual = delta_seq.saturating_sub(delta_delivered);
                         let loss_after_fec = if delta_seq > 0 {
                             (residual as f64 / delta_seq as f64).clamp(0.0, 1.0)
@@ -363,11 +405,64 @@ async fn link_reader_async(
                             0.0
                         };
 
+                        let fec_rate = if delta_seq > 0 {
+                            (delta_fec as f64 / delta_seq as f64).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+
+                        // Reassembly-level ground-truth loss: captures cross-link
+                        // reorder loss that is invisible to per-link transport
+                        // stats.  Only counts truly LOST packets, not late
+                        // arrivals — late packets are a jitter issue (addressed
+                        // by jitter_buffer_ms → delay_pressure) not congestion.
+                        // Including late packets caused false-positive EWMA
+                        // spikes (~40%) from brief jitter bursts on LTE, leading
+                        // to destructive bitrate oscillation.
+                        let reassembly_loss = if let Ok(snap) = reassembly_stats.lock() {
+                            let d_lost = snap.lost_packets.saturating_sub(prev_reassembly_lost);
+                            let d_del = snap
+                                .packets_delivered
+                                .saturating_sub(prev_reassembly_delivered);
+                            prev_reassembly_lost = snap.lost_packets;
+                            prev_reassembly_delivered = snap.packets_delivered;
+                            let total = d_lost + d_del;
+                            if total > 0 {
+                                (d_lost as f64 / total as f64).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            0.0
+                        };
+
+                        // Use the worse signal: transport-layer FEC-residual OR
+                        // reassembly-layer lost packets.  Transport catches
+                        // per-link FEC exhaustion; reassembly catches cross-link
+                        // reorder and irrecoverable loss.
+                        let report_loss = loss_after_fec.max(reassembly_loss);
+
+                        // Per-link diagnostic stats: use per-link transport loss
+                        // (not reassembly) so operators can tell WHICH link is
+                        // degraded.  Both readers share the same reassembly
+                        // counters, so using reassembly_loss here would make
+                        // all links show identical values.
+                        if let Ok(mut per_link) = link_stats.lock() {
+                            per_link.insert(
+                                link_id,
+                                LinkRuntimeStats {
+                                    packets_received: rx_stats.packets_received,
+                                    packets_delivered: rx_stats.packets_delivered,
+                                    loss_rate: loss_after_fec,
+                                },
+                            );
+                        }
+
                         let report = strata_transport::wire::ReceiverReportPacket {
                             goodput_bps,
                             fec_repair_rate: (fec_rate * 10000.0) as u16,
                             jitter_buffer_ms: jitter_ms,
-                            loss_after_fec: (loss_after_fec * 10000.0) as u16,
+                            loss_after_fec: (report_loss * 10000.0) as u16,
                         };
                         let pkt_bytes = encode_receiver_report(&report, &clock);
                         let _ = socket.send_to(pkt_bytes, addr).await;

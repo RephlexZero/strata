@@ -29,6 +29,32 @@ struct PacingState {
     tokens: f64,
     last_refill: std::time::Instant,
 }
+
+/// Compute a pacing throttle factor from smoothed RTT vs observed minimum RTT.
+///
+/// When `srtt` rises above `min_rtt` the forwarding queue is filling — we are
+/// pushing faster than the link drains.  Packet loss only starts AFTER the
+/// queue overflows, so this RTT-growth signal is strictly earlier than loss.
+///
+/// Returns a multiplier in `[0.25, 1.0]` to apply to the base pacing rate:
+///   ratio ≤ 1.5 → 1.0  (normal jitter, no throttle)
+///   ratio = 2.0 → 0.75
+///   ratio = 3.0 → 0.50
+///   ratio ≥ 6.0 → 0.25 (clamped floor — keep probing, don't stall fully)
+///
+/// The 0.25 floor prevents a feedback loop where the throttle collapses the
+/// link faster than its queue can drain.
+fn rtt_bufferbloat_throttle(srtt_us: f64, min_rtt_us: f64) -> f64 {
+    if srtt_us <= 0.0 || !min_rtt_us.is_finite() || min_rtt_us <= 0.0 {
+        return 1.0;
+    }
+    let ratio = srtt_us / min_rtt_us;
+    if ratio > 1.5 {
+        (1.5 / ratio).clamp(0.25, 1.0)
+    } else {
+        1.0
+    }
+}
 use strata_transport::pool::Priority;
 use strata_transport::pool::TimestampClock;
 use strata_transport::sender::{Sender, SenderConfig};
@@ -197,12 +223,37 @@ impl TransportLink {
     /// Flush any pending packets in the paced send queue.
     pub fn flush_paced(&self) {
         let cc_pacing_rate = self.congestion.lock().unwrap().pacing_rate();
-        // Floor: don't let the CC starve a link below 30% of the oracle's
+        // Floor: don't let the CC starve a link below 20% of the oracle's
         // slow-decaying peak estimate. Using peak_cap() (not estimated_cap())
         // prevents a death spiral where oracle collapse → pacing collapse →
         // less delivery → further oracle collapse.
         let peak_cap_bytes = self.oracle.lock().unwrap().peak_cap() / 8.0;
-        let pacing_rate = cc_pacing_rate.max(peak_cap_bytes * 0.5);
+        let floor_rate = peak_cap_bytes * 0.2;
+        let base_rate = cc_pacing_rate.max(floor_rate);
+
+        // RTT-aware bufferbloat throttle.
+        //
+        // When the smoothed RTT rises significantly above the link's minimum
+        // RTT, the forwarding queue is filling up — we are pushing faster than
+        // the link can drain.  Packet loss always starts AFTER the queue
+        // overflows, so waiting for loss to signal congestion is too late:
+        // by that point we have already tipped the link into collapse.
+        //
+        // Policy:
+        //   srtt / min_rtt ≤ 1.5  →  throttle = 1.0  (no change; normal jitter)
+        //   srtt / min_rtt  = 2.0  →  throttle = 0.75
+        //   srtt / min_rtt  = 3.0  →  throttle = 0.5
+        //   srtt / min_rtt ≥ 6.0  →  throttle = 0.25 (clamped floor)
+        //
+        // The floor of 0.25 prevents a feedback loop where throttle collapses
+        // a link faster than the queue can drain.  Throttle applies AFTER the
+        // CC floor because the floor exists to prevent CC-driven starvation,
+        // while THIS mechanism deliberately starves a bloated link to recover.
+        let rtt_throttle = {
+            let rtt = self.rtt.lock().unwrap();
+            rtt_bufferbloat_throttle(rtt.srtt_us(), rtt.min_rtt_us())
+        };
+        let pacing_rate = base_rate * rtt_throttle;
         let mut p = self.pacing.lock().unwrap();
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(p.last_refill).as_secs_f64();
@@ -784,12 +835,17 @@ impl LinkSender for TransportLink {
         let prev_retx = self.prev_retransmissions.load(Ordering::Relaxed);
         let prev_sent = self.prev_loss_pkts_sent.load(Ordering::Relaxed);
         let delta_retx = stats.retransmissions.saturating_sub(prev_retx);
-        let delta_sent = stats.packets_sent.saturating_sub(prev_sent).max(1);
+        let delta_sent = stats.packets_sent.saturating_sub(prev_sent);
         self.prev_retransmissions
             .store(stats.retransmissions, Ordering::Relaxed);
         self.prev_loss_pkts_sent
             .store(stats.packets_sent, Ordering::Relaxed);
-        let loss_rate = (delta_retx as f64 / delta_sent as f64).clamp(0.0, 1.0);
+        // Denominator is total on-the-wire traffic this window (originals + retries).
+        // Using only `delta_sent` (originals) lets retry bursts from older windows
+        // push the ratio past 1.0 and clamp to 1.0, producing phantom 100%-loss ticks
+        // and phantom link-death WARNs even when the link is healthy.
+        let total_wire = delta_sent.saturating_add(delta_retx).max(1);
+        let loss_rate = (delta_retx as f64 / total_wire as f64).clamp(0.0, 1.0);
 
         // Track consecutive high-loss windows for link death detection.
         // Mark dead when loss > 50% for 3+ consecutive metric windows so the
@@ -1054,5 +1110,55 @@ mod tests {
         let metrics = link.get_metrics();
         assert_eq!(metrics.observed_bytes, 0);
         assert_eq!(metrics.phase, LinkPhase::Probe);
+    }
+
+    #[test]
+    fn rtt_throttle_passes_through_when_rtt_unknown() {
+        // Cold start: no samples → min_rtt is f64::MAX, srtt is 0.
+        assert_eq!(rtt_bufferbloat_throttle(0.0, f64::MAX), 1.0);
+        assert_eq!(rtt_bufferbloat_throttle(1_000.0, f64::MAX), 1.0);
+        assert_eq!(rtt_bufferbloat_throttle(0.0, 80_000.0), 1.0);
+    }
+
+    #[test]
+    fn rtt_throttle_no_effect_at_baseline() {
+        // At baseline RTT, no throttle.
+        assert_eq!(rtt_bufferbloat_throttle(80_000.0, 80_000.0), 1.0);
+        // Within normal jitter zone (up to 1.5×), no throttle.
+        assert_eq!(rtt_bufferbloat_throttle(120_000.0, 80_000.0), 1.0);
+    }
+
+    #[test]
+    fn rtt_throttle_engages_on_queue_buildup() {
+        // srtt = 2× baseline → throttle = 1.5/2.0 = 0.75.
+        let t = rtt_bufferbloat_throttle(160_000.0, 80_000.0);
+        assert!((t - 0.75).abs() < 1e-9, "expected 0.75 got {t}");
+
+        // srtt = 3× baseline → throttle = 0.5.
+        let t = rtt_bufferbloat_throttle(240_000.0, 80_000.0);
+        assert!((t - 0.5).abs() < 1e-9, "expected 0.5 got {t}");
+
+        // srtt = 4× baseline (field-test scenario: 364ms vs 87ms baseline)
+        // → 1.5/4 = 0.375, safely inside the [0.25, 1.0] range.
+        let t = rtt_bufferbloat_throttle(360_000.0, 90_000.0);
+        assert!((t - 0.375).abs() < 1e-9, "expected 0.375 got {t}");
+    }
+
+    #[test]
+    fn rtt_throttle_clamps_at_floor() {
+        // Severe bloat: srtt = 10× baseline. Raw formula → 0.15, clamped 0.25.
+        let t = rtt_bufferbloat_throttle(800_000.0, 80_000.0);
+        assert!((t - 0.25).abs() < 1e-9, "expected 0.25 (clamped) got {t}");
+    }
+
+    #[test]
+    fn rtt_throttle_rejects_nonsense_inputs() {
+        // Negative srtt (should never happen but guard anyway).
+        assert_eq!(rtt_bufferbloat_throttle(-100.0, 80_000.0), 1.0);
+        // Zero min_rtt would cause div-by-zero.
+        assert_eq!(rtt_bufferbloat_throttle(100_000.0, 0.0), 1.0);
+        // NaN/Inf should not crash.
+        assert_eq!(rtt_bufferbloat_throttle(f64::NAN, 80_000.0), 1.0);
+        assert_eq!(rtt_bufferbloat_throttle(80_000.0, f64::INFINITY), 1.0);
     }
 }

@@ -138,7 +138,12 @@ pub struct LinkLifecycleConfig {
 impl Default for ReceiverConfig {
     fn default() -> Self {
         Self {
-            start_latency: Duration::from_millis(50),
+            // 300ms baseline: covers ~1.5 RTT of NACK-retransmit budget on
+            // typical 4G links (RTT 60-100ms).  The closed-loop late-pressure
+            // feedback in ReassemblyBuffer auto-widens further when needed,
+            // up to scheduler.max_latency_ms.  HLS consumers tolerate this
+            // easily — segment duration dominates end-to-end latency anyway.
+            start_latency: Duration::from_millis(300),
             buffer_capacity: 2048,
             skip_after: None,
         }
@@ -214,7 +219,7 @@ impl Default for SchedulerConfig {
             congestion_trigger_ratio: 0.90,
             ewma_alpha: 0.125,
             prediction_horizon_s: 0.5,
-            capacity_floor_bps: 5_000_000.0,
+            capacity_floor_bps: 1_500_000.0,
             penalty_decay: 0.7,
             penalty_recovery: 0.05,
             jitter_latency_multiplier: 2.0,

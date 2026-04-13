@@ -19,6 +19,10 @@
 #   STRATA_MIN_BITRATE     — Min kbps (default: 200)
 #   STRATA_MAX_BITRATE     — Max kbps (default: 1500)
 #   STRATA_LINK_IFACES     — Comma-separated interfaces (e.g. "enp2s0f0u4,enp2s0f0u3")
+#   STRATA_REDUNDANCY_ENABLED   — Sender scheduler redundancy flag (default: false)
+#   STRATA_CRITICAL_BROADCAST   — Broadcast critical stream headers (default: true)
+#   STRATA_FAILOVER_ENABLED     — Sender scheduler failover flag (default: true)
+#   STRATA_FAILOVER_DURATION_MS — Sender failover hold (default: 800)
 #   STRATA_MAX_LATENCY_MS  — Receiver jitter buffer ceiling (default: 1000)
 #   STRATA_DURATION_SECS   — How long to stream before stopping (default: 60)
 #   STRATA_NO_BUILD=1      — Skip building and installing the sender binary
@@ -38,10 +42,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/../.env"
 if [[ -f "$ENV_FILE" ]]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$ENV_FILE"
-    set +a
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            if [[ -z "${!key+x}" ]]; then
+                if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+                    value="${BASH_REMATCH[1]}"
+                elif [[ "$value" =~ ^\'(.*)\'$ ]]; then
+                    value="${BASH_REMATCH[1]}"
+                fi
+                export "$key=$value"
+            fi
+        fi
+    done < "$ENV_FILE"
 fi
 
 # ── Colours ──────────────────────────────────────────────────────────
@@ -64,6 +80,10 @@ CODEC="${STRATA_CODEC:-h265}"
 BITRATE="${STRATA_BITRATE:-500}"
 MIN_BITRATE="${STRATA_MIN_BITRATE:-200}"
 MAX_BITRATE="${STRATA_MAX_BITRATE:-1500}"
+REDUNDANCY_ENABLED="${STRATA_REDUNDANCY_ENABLED:-false}"
+CRITICAL_BROADCAST="${STRATA_CRITICAL_BROADCAST:-true}"
+FAILOVER_ENABLED="${STRATA_FAILOVER_ENABLED:-true}"
+FAILOVER_DURATION_MS="${STRATA_FAILOVER_DURATION_MS:-800}"
 MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-1000}"
 DURATION="${STRATA_DURATION_SECS:-60}"
 HOST="${STRATA_RECEIVER_HOST}"
@@ -71,9 +91,17 @@ HOST="${STRATA_RECEIVER_HOST}"
 # SSH/SCP options — bind to a specific interface (e.g. WiFi) so deploys
 # don't go through the cellular links you're about to bond.
 SSH_OPTS=(-o ConnectTimeout=10)
+DEPLOY_BIND_ADDR=""
 if [[ -n "${STRATA_DEPLOY_IFACE:-}" ]]; then
+    DEPLOY_BIND_ADDR="$(ip -o -4 addr show dev "${STRATA_DEPLOY_IFACE}" 2>/dev/null | awk '{print $4}' | head -n1 | cut -d/ -f1 || true)"
     SSH_OPTS+=(-o "BindInterface=${STRATA_DEPLOY_IFACE}")
-    info "Deploy will use interface ${STRATA_DEPLOY_IFACE} for SSH/SCP"
+    if [[ -n "$DEPLOY_BIND_ADDR" ]]; then
+        SSH_OPTS+=(-o "BindAddress=${DEPLOY_BIND_ADDR}")
+        info "Deploy will use interface ${STRATA_DEPLOY_IFACE} (source ${DEPLOY_BIND_ADDR}) for SSH/SCP"
+    else
+        warn "Could not resolve IPv4 for ${STRATA_DEPLOY_IFACE}; using BindInterface only"
+        info "Deploy will use interface ${STRATA_DEPLOY_IFACE} for SSH/SCP"
+    fi
 fi
 
 # Parse ports and interfaces
@@ -129,6 +157,11 @@ fi
 if [[ "$VIDEO_SOURCE" == "v4l2" ]]; then
     if [[ -e "$VIDEO_DEVICE" ]]; then
         info "Video device $VIDEO_DEVICE exists"
+        if command -v lsof >/dev/null 2>&1 && lsof "$VIDEO_DEVICE" >/dev/null 2>&1; then
+            warn "Video device $VIDEO_DEVICE appears busy"
+            lsof "$VIDEO_DEVICE" || true
+            fail "Video device $VIDEO_DEVICE is already in use"
+        fi
     else
         fail "Video device $VIDEO_DEVICE does not exist"
     fi
@@ -171,7 +204,10 @@ else
     echo ""
     echo "── Deploying receiver to $HOST (aarch64 cross-compile) ──"
     REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-    STRATA_DEPLOY_HOST="$HOST" make -C "$REPO_ROOT" deploy-aarch64
+    STRATA_DEPLOY_HOST="$HOST" \
+    STRATA_DEPLOY_IFACE="${STRATA_DEPLOY_IFACE:-}" \
+    STRATA_DEPLOY_BIND_ADDR="${DEPLOY_BIND_ADDR:-}" \
+    make -C "$REPO_ROOT" deploy-aarch64
     info "Receiver binary deployed"
 fi
 
@@ -205,23 +241,22 @@ RECEIVER_TOML=$(mktemp /tmp/strata-receiver-XXXXXX.toml)
     done
 
     echo "[scheduler]"
-    # Disable critical_broadcast for LTE (snag #16) — IDR duplication
-    # causes burst congestion on constrained links.
-    echo "redundancy_enabled = false"
-    echo "critical_broadcast = false"
-    echo "failover_enabled = true"
-    echo "failover_duration_ms = 3000"
+    echo "redundancy_enabled = $REDUNDANCY_ENABLED"
+    echo "critical_broadcast = $CRITICAL_BROADCAST"
+    echo "failover_enabled = $FAILOVER_ENABLED"
+    echo "failover_duration_ms = $FAILOVER_DURATION_MS"
 } > "$SENDER_TOML"
 
 # Receiver TOML
 {
     echo "[receiver]"
-    echo "start_latency_ms = 100"
     echo "buffer_capacity = 4096"
     echo ""
     echo "[scheduler]"
+    # Only the hard ceiling is user-set (from STRATA_MAX_LATENCY_MS).  The
+    # buffer self-tunes within this ceiling via closed-loop late-arrival
+    # feedback — no jitter/start-latency knobs to misconfigure.
     echo "max_latency_ms = $MAX_LATENCY_MS"
-    echo "jitter_latency_multiplier = 2.0"
 } > "$RECEIVER_TOML"
 
 info "Sender config: $SENDER_TOML"
@@ -246,7 +281,7 @@ done
 echo "── Starting receiver on $HOST ──"
 
 # Kill any existing receiver
-ssh "${SSH_OPTS[@]}" "$HOST" "kill \$(pgrep strata-pipeline) 2>/dev/null; sleep 1; echo ok" 2>/dev/null || true
+ssh "${SSH_OPTS[@]}" "$HOST" "pkill -INT strata-pipeline 2>/dev/null || true; sleep 2; pkill -TERM strata-pipeline 2>/dev/null || true; echo ok" 2>/dev/null || true
 
 # Copy receiver config
 scp "${SSH_OPTS[@]}" -q "$RECEIVER_TOML" "$HOST:/tmp/strata-receiver.toml"
@@ -275,6 +310,14 @@ if [[ -z "$RECEIVER_PID" ]]; then
     fail "Receiver failed to start — check $HOST:/tmp/strata-receiver.log"
 fi
 info "Receiver started (PID $RECEIVER_PID)"
+
+# Discover the actual HLS temp directory from receiver logs. This avoids
+# assuming /dev/shm in environments where the receiver falls back to /tmp.
+HLS_DIR=$(ssh "${SSH_OPTS[@]}" "$HOST" "grep -m1 'HLS temp dir:' /tmp/strata-receiver.log 2>/dev/null | sed -E 's/^.*HLS temp dir: ([^ ]+).*$/\\1/'" 2>/dev/null || echo "")
+if [[ -z "$HLS_DIR" ]]; then
+    HLS_DIR="/dev/shm/strata-hls-rx-${RECEIVER_PID}"
+fi
+info "Receiver HLS dir: $HLS_DIR"
 
 # ── Build dest string for sender ────────────────────────────────────
 DEST_STR=""
@@ -320,22 +363,72 @@ info "Sender started (PID $SENDER_PID)"
 echo ""
 echo "── Streaming for ${DURATION}s — monitoring every 5s ──"
 
-HLS_DIR="/dev/shm/strata-hls-rx-${RECEIVER_PID}"
 ELAPSED=0
 SEGMENT_COUNT=0
+MAX_SEGMENT_COUNT=0
+PLAYLIST_SEEN=0
+WORST_FB_LOSS_FEC="0.000"
+MAX_WINDOW_LOSS_BP=0
+MAX_DELTA_LATE=0
+UNHEALTHY_WINDOWS=0
+CLEANUP_DONE=0
 
 cleanup() {
+    if [[ $CLEANUP_DONE -eq 1 ]]; then
+        return
+    fi
+    CLEANUP_DONE=1
+
     echo ""
     echo "── Shutting down ──"
-    kill "$SENDER_PID" 2>/dev/null; wait "$SENDER_PID" 2>/dev/null || true
-    ssh "${SSH_OPTS[@]}" "$HOST" "kill \$(pgrep strata-pipeline) 2>/dev/null; echo ok" 2>/dev/null || true
+    kill "$SENDER_PID" 2>/dev/null || true
+    wait "$SENDER_PID" 2>/dev/null || true
+    ssh "${SSH_OPTS[@]}" "$HOST" "pkill -INT strata-pipeline 2>/dev/null || true; sleep 2; pkill -TERM strata-pipeline 2>/dev/null || true; echo ok" 2>/dev/null || true
+
+    # Final snapshot before verdict: if the sender exited before the first
+    # 5s monitor tick, MAX_SEGMENT_COUNT may still be 0 despite valid output.
+    FINAL_SEGMENT_COUNT=$(ssh "${SSH_OPTS[@]}" "$HOST" "find '$HLS_DIR' -maxdepth 1 -type f -name '*.ts' 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+    if [[ $FINAL_SEGMENT_COUNT -gt $MAX_SEGMENT_COUNT ]]; then
+        MAX_SEGMENT_COUNT=$FINAL_SEGMENT_COUNT
+    fi
+    FINAL_PLAYLIST_COUNT=$(ssh "${SSH_OPTS[@]}" "$HOST" "find '$HLS_DIR' -maxdepth 1 -type f -name '*.m3u8' 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+    if [[ $FINAL_PLAYLIST_COUNT -gt 0 ]]; then
+        PLAYLIST_SEEN=1
+    fi
+
     rm -f "$SENDER_TOML" "$RECEIVER_TOML" "$RECEIVER_SCRIPT"
     echo ""
 
-    if [[ $SEGMENT_COUNT -gt 2 ]]; then
-        info "SUCCESS: $SEGMENT_COUNT HLS segments produced and uploaded"
-    elif [[ $SEGMENT_COUNT -gt 0 ]]; then
-        warn "PARTIAL: Only $SEGMENT_COUNT segment(s) produced"
+    MAX_WINDOW_LOSS_PCT=$(awk "BEGIN { printf \"%.1f\", $MAX_WINDOW_LOSS_BP / 100.0 }")
+    HEALTH_SUMMARY="worst_loss_fec=${WORST_FB_LOSS_FEC} max_window_loss=${MAX_WINDOW_LOSS_PCT}% max_delta_late=${MAX_DELTA_LATE} unhealthy_windows=${UNHEALTHY_WINDOWS}"
+
+    severe_health_failure=0
+    degraded_health=0
+    if awk "BEGIN { exit !($WORST_FB_LOSS_FEC >= 0.55) }"; then
+        severe_health_failure=1
+    fi
+    if [[ $MAX_WINDOW_LOSS_BP -ge 2000 || $MAX_DELTA_LATE -ge 250 || $UNHEALTHY_WINDOWS -ge 3 ]]; then
+        severe_health_failure=1
+    fi
+    if awk "BEGIN { exit !($WORST_FB_LOSS_FEC >= 0.30) }"; then
+        degraded_health=1
+    fi
+    if [[ $MAX_WINDOW_LOSS_BP -ge 1000 || $MAX_DELTA_LATE -ge 120 || $UNHEALTHY_WINDOWS -ge 1 ]]; then
+        degraded_health=1
+    fi
+
+    if [[ $MAX_SEGMENT_COUNT -gt 2 ]]; then
+        if [[ $severe_health_failure -eq 1 ]]; then
+            fail "FAILED: Segments produced but stream health collapsed ($HEALTH_SUMMARY)"
+        elif [[ $degraded_health -eq 1 ]]; then
+            warn "PARTIAL: Segments produced but quality degraded ($HEALTH_SUMMARY)"
+        else
+            info "SUCCESS: $MAX_SEGMENT_COUNT HLS segments produced and uploaded ($HEALTH_SUMMARY)"
+        fi
+    elif [[ $MAX_SEGMENT_COUNT -gt 0 ]]; then
+        warn "PARTIAL: Only $MAX_SEGMENT_COUNT segment(s) produced ($HEALTH_SUMMARY)"
+    elif [[ $PLAYLIST_SEEN -gt 0 ]]; then
+        warn "PARTIAL: Playlist observed but no retained TS segments found ($HEALTH_SUMMARY)"
     else
         fail "FAILED: No HLS segments produced"
     fi
@@ -356,9 +449,11 @@ while [[ $ELAPSED -lt $DURATION ]]; do
         break
     fi
 
-    # Receiver stats (last 3 lines — the log line with counters)
-    RX_RAW=$(ssh "${SSH_OPTS[@]}" "$HOST" "tail -5 /tmp/strata-receiver.log 2>/dev/null" 2>/dev/null || echo "")
-    STATS=$(echo "$RX_RAW" | grep -oE 'next_seq=[^,;]+|lost_packets=[^,;]+|late_packets=[^,;]+|current_latency_ms=[^,;]+|target_latency_ms=[^,;]+|jitter_estimate_ms=[^,;]+|loss_rate=[^,;]+|packets_delivered=[^,;]+|queue_depth=[^,;]+' | head -9 | tr '\n' ' ')
+    # Receiver stats (last lines — include enough history for per-link fields)
+    RX_RAW=$(ssh "${SSH_OPTS[@]}" "$HOST" "tail -30 /tmp/strata-receiver.log 2>/dev/null" 2>/dev/null || echo "")
+    RX_STATS_LINE=$(echo "$RX_RAW" | grep 'strata-stats' | tail -1 || echo "")
+    STATS=$(echo "$RX_STATS_LINE" | grep -oE 'next_seq=[^,;]+|lost_packets=[^,;]+|late_packets=[^,;]+|current_latency_ms=[^,;]+|target_latency_ms=[^,;]+|jitter_estimate_ms=[^,;]+|loss_rate=[^,;]+|packets_delivered=[^,;]+|queue_depth=[^,;]+' | head -9 | tr '\n' ' ')
+    RX_LINK_STATS=$(echo "$RX_STATS_LINE" | grep -oE 'packets_received_link_[0-9]+=[^,;]+|packets_delivered_link_[0-9]+=[^,;]+|loss_link_[0-9]+=[^,;]+' | tr '\n' ' ')
 
     # Extract numbers for delta calculation (handle GStreamer type annotations like =(guint64)123)
     CUR_LOST=$(echo "$STATS" | grep -oP 'lost_packets=\([^)]*\)\K[0-9]+' || echo "0")
@@ -369,23 +464,60 @@ while [[ $ELAPSED -lt $DURATION ]]; do
     DELTA_DELIVERED=$((CUR_DELIVERED - PREV_DELIVERED))
     PREV_LOST=$CUR_LOST; PREV_LATE=$CUR_LATE; PREV_DELIVERED=$CUR_DELIVERED
 
+    WINDOW_TOTAL=$((DELTA_DELIVERED + DELTA_LOST))
+    WINDOW_LOSS_BP=0
+    if [[ $WINDOW_TOTAL -gt 0 ]]; then
+        WINDOW_LOSS_BP=$((DELTA_LOST * 10000 / WINDOW_TOTAL))
+    fi
+    if [[ $WINDOW_LOSS_BP -gt $MAX_WINDOW_LOSS_BP ]]; then
+        MAX_WINDOW_LOSS_BP=$WINDOW_LOSS_BP
+    fi
+    if [[ $DELTA_LATE -gt $MAX_DELTA_LATE ]]; then
+        MAX_DELTA_LATE=$DELTA_LATE
+    fi
+    if [[ $WINDOW_LOSS_BP -ge 1200 || $DELTA_LATE -ge 150 ]]; then
+        UNHEALTHY_WINDOWS=$((UNHEALTHY_WINDOWS + 1))
+    fi
+
     # Segment count
-    SEG_INFO=$(ssh "${SSH_OPTS[@]}" "$HOST" "ls -1 $HLS_DIR/*.ts 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+    SEG_INFO=$(ssh "${SSH_OPTS[@]}" "$HOST" "find '$HLS_DIR' -maxdepth 1 -type f -name '*.ts' 2>/dev/null | wc -l" 2>/dev/null || echo "0")
     SEGMENT_COUNT=$SEG_INFO
+    if [[ $SEGMENT_COUNT -gt $MAX_SEGMENT_COUNT ]]; then
+        MAX_SEGMENT_COUNT=$SEGMENT_COUNT
+    fi
+    PLAYLIST_COUNT=$(ssh "${SSH_OPTS[@]}" "$HOST" "find '$HLS_DIR' -maxdepth 1 -type f -name '*.m3u8' 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+    if [[ $PLAYLIST_COUNT -gt 0 ]]; then
+        PLAYLIST_SEEN=1
+    fi
 
     # Sender: last adaptation + feedback lines
     ADAPT_LINE=$(grep '\[adapt\] agg=' /tmp/strata-sender.log 2>/dev/null | tail -1 | sed 's/.*\[adapt\]/[adapt]/' || echo "")
     FB_LINE=$(grep '\[adapt\] fb:' /tmp/strata-sender.log 2>/dev/null | tail -1 | sed 's/.*\[adapt\]/[adapt]/' || echo "")
     CMD_LINE=$(grep '\[adapt\] CMD' /tmp/strata-sender.log 2>/dev/null | tail -1 | sed 's/.*\[adapt\]/[adapt]/' || echo "")
-    LINK_LINES=$(grep 'strata::adapt.*link=' /tmp/strata-sender.log 2>/dev/null | tail -2 | sed 's/.*link=/  link=/' | tr '\n' '\n' || echo "")
+    FEC_LINE=$(grep '\[fec\]' /tmp/strata-sender.log 2>/dev/null | tail -1 | sed 's/.*\[fec\]/[fec]/' || echo "")
+    LINK_LINES=$(grep '\[link\]' /tmp/strata-sender.log 2>/dev/null | tail -"$NUM_LINKS" | sed 's/.*\[link\]/  [link]/' || echo "")
+
+    CUR_FB_LOSS=$(echo "$FB_LINE" | grep -oP 'loss_fec=\K[0-9]+(\.[0-9]+)?' | head -1 || true)
+    if [[ -n "$CUR_FB_LOSS" ]]; then
+        if awk "BEGIN { exit !($CUR_FB_LOSS > $WORST_FB_LOSS_FEC) }"; then
+            WORST_FB_LOSS_FEC="$CUR_FB_LOSS"
+        fi
+        if awk "BEGIN { exit !($CUR_FB_LOSS >= 0.30) }"; then
+            UNHEALTHY_WINDOWS=$((UNHEALTHY_WINDOWS + 1))
+        fi
+    fi
+
+    WINDOW_LOSS_PCT=$(awk "BEGIN { printf \"%.1f\", $WINDOW_LOSS_BP / 100.0 }")
 
     echo ""
-    echo "╌╌╌ [${ELAPSED}s] segments=$SEGMENT_COUNT ╌╌╌"
+    echo "╌╌╌ [${ELAPSED}s] segments=$SEGMENT_COUNT (max=$MAX_SEGMENT_COUNT, playlist=$PLAYLIST_COUNT) ╌╌╌"
     echo "  RX: $STATS"
-    echo "  Δ5s: delivered=$DELTA_DELIVERED lost=$DELTA_LOST late=$DELTA_LATE"
+    [[ -n "$RX_LINK_STATS" ]] && echo "  RX links: $RX_LINK_STATS"
+    echo "  Δ5s: delivered=$DELTA_DELIVERED lost=$DELTA_LOST late=$DELTA_LATE win_loss=${WINDOW_LOSS_PCT}%"
     [[ -n "$ADAPT_LINE" ]] && echo "  $ADAPT_LINE"
     [[ -n "$FB_LINE" ]]    && echo "  $FB_LINE"
     [[ -n "$CMD_LINE" ]]   && echo "  $CMD_LINE"
+    [[ -n "$FEC_LINE" ]]   && echo "  $FEC_LINE"
     [[ -n "$LINK_LINES" ]] && echo "$LINK_LINES"
 done
 

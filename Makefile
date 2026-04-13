@@ -75,10 +75,10 @@ cross-aarch64: ## Cross-compile for aarch64 (outputs to target/aarch64-unknown-l
 deploy-aarch64: cross-aarch64 ## Cross-compile and deploy to STRATA_DEPLOY_HOST via scp
 	@test -n "$${STRATA_DEPLOY_HOST}" || { echo "Set STRATA_DEPLOY_HOST (SSH alias or user@host)"; exit 1; }
 	@echo "Deploying to $${STRATA_DEPLOY_HOST}..."
-	$(eval SCP_BIND := $(if $(STRATA_DEPLOY_IFACE),-o BindInterface=$(STRATA_DEPLOY_IFACE),))
-	$(eval SSH_BIND := $(if $(STRATA_DEPLOY_IFACE),-o BindInterface=$(STRATA_DEPLOY_IFACE),))
-	@scp $(SCP_BIND) target/aarch64-unknown-linux-gnu/release/strata-pipeline "$${STRATA_DEPLOY_HOST}:/tmp/strata-pipeline-new"
-	@scp $(SCP_BIND) target/aarch64-unknown-linux-gnu/release/libgststrata.so "$${STRATA_DEPLOY_HOST}:~/.local/share/gstreamer-1.0/plugins/libgststrata.so"
+	$(eval SSH_BIND := $(strip $(if $(STRATA_DEPLOY_IFACE),-o BindInterface=$(STRATA_DEPLOY_IFACE),) $(if $(STRATA_DEPLOY_BIND_ADDR),-o BindAddress=$(STRATA_DEPLOY_BIND_ADDR),)))
+	@echo "Deploy bind opts: $(SSH_BIND)"
+	@rsync -v --progress -z -e "ssh $(SSH_BIND)" target/aarch64-unknown-linux-gnu/release/strata-pipeline "$${STRATA_DEPLOY_HOST}:/tmp/strata-pipeline-new"
+	@rsync -v --progress -z -e "ssh $(SSH_BIND)" target/aarch64-unknown-linux-gnu/release/libgststrata.so "$${STRATA_DEPLOY_HOST}:~/.local/share/gstreamer-1.0/plugins/libgststrata.so"
 	@ssh $(SSH_BIND) "$${STRATA_DEPLOY_HOST}" 'pkill strata-pipeline 2>/dev/null; sleep 1; mv /tmp/strata-pipeline-new /usr/local/bin/strata-pipeline && chmod 755 /usr/local/bin/strata-pipeline && setcap cap_net_raw+ep /usr/local/bin/strata-pipeline'
 	@echo "✓ Deployed strata-pipeline + libgststrata.so to $${STRATA_DEPLOY_HOST}"
 

@@ -49,6 +49,14 @@ pub struct ReassemblyBuffer {
     loss_rate_smoothed: f64,
     loss_penalty_ms: f64,
 
+    // Adaptive latency — closed-loop late-arrival feedback.
+    // Every late packet is hard evidence our deadline was too tight, so we
+    // widen the buffer.  When clean (no late arrivals for a stable period),
+    // this drains back toward zero.  AIMD keeps the buffer at "just enough"
+    // regardless of the user's config, bounded only by max_latency.
+    late_pressure_ms: f64,
+    last_late_arrival: Option<Instant>,
+
     // Desync recovery: track consecutive late packets to detect when
     // next_seq has jumped ahead of the sender's actual sequence space.
     consecutive_late: u64,
@@ -83,11 +91,11 @@ pub struct ReassemblyConfig {
 impl Default for ReassemblyConfig {
     fn default() -> Self {
         Self {
-            start_latency: Duration::from_millis(50),
+            start_latency: Duration::from_millis(300),
             buffer_capacity: 2048,
             skip_after: None,
-            jitter_latency_multiplier: 2.0,
-            max_latency_ms: 500,
+            jitter_latency_multiplier: 4.0,
+            max_latency_ms: 2000,
             min_latency_ms: 10,
             ramp_up_alpha: 0.3,
             ramp_down_alpha: 0.05,
@@ -95,6 +103,15 @@ impl Default for ReassemblyConfig {
             loss_penalty_ms: 200.0,
         }
     }
+}
+
+/// Snapshot of per-link receive statistics for telemetry.
+#[derive(Default, Clone, Debug)]
+pub struct ReassemblyLinkStats {
+    pub link_id: usize,
+    pub packets_received: u64,
+    pub packets_delivered: u64,
+    pub loss_rate: f64,
 }
 
 /// Snapshot of reassembly buffer statistics for telemetry.
@@ -114,6 +131,8 @@ pub struct ReassemblyStats {
     pub loss_rate: f64,
     /// Packets successfully delivered.
     pub packets_delivered: u64,
+    /// Per-link receive/delivery stats from transport readers.
+    pub per_link: Vec<ReassemblyLinkStats>,
 }
 
 fn percentile(samples: &VecDeque<f64>, pct: f64) -> f64 {
@@ -165,6 +184,8 @@ impl ReassemblyBuffer {
             stability_threshold: Duration::from_millis(config.stability_threshold_ms),
             loss_rate_smoothed: 0.0,
             loss_penalty_ms: config.loss_penalty_ms,
+            late_pressure_ms: 0.0,
+            last_late_arrival: None,
             consecutive_late: 0,
             max_late_seq: 0,
         }
@@ -182,6 +203,7 @@ impl ReassemblyBuffer {
             jitter_estimate_ms: self.jitter_smoothed * 1000.0,
             loss_rate: self.loss_rate_smoothed,
             packets_delivered: self.packets_delivered,
+            per_link: Vec::new(),
         }
     }
 
@@ -218,9 +240,27 @@ impl ReassemblyBuffer {
             // Loss-aware component: more buffer when losing packets
             let loss_component = self.loss_rate_smoothed * self.loss_penalty_ms;
 
-            // Compute target latency
-            let target_ms =
-                self.start_latency.as_millis() as f64 + jitter_component + loss_component;
+            // Closed-loop drain: every STABLE_DRAIN_MS without a late arrival,
+            // shed 10ms of pressure.  This matches AIMD's multiplicative-decrease
+            // intent (slow) vs additive-increase (fast, on each miss).
+            const STABLE_DRAIN_MS: u128 = 500;
+            const DRAIN_STEP_MS: f64 = 40.0;
+            if let Some(last_late) = self.last_late_arrival
+                && now.duration_since(last_late).as_millis() >= STABLE_DRAIN_MS
+                && self.late_pressure_ms > 0.0
+            {
+                self.late_pressure_ms = (self.late_pressure_ms - DRAIN_STEP_MS).max(0.0);
+                // Reset the drain clock so we drain at most DRAIN_STEP_MS per
+                // STABLE_DRAIN_MS window, not per push.
+                self.last_late_arrival = Some(now);
+            }
+
+            // Compute target latency: formula gives the floor, late-pressure
+            // (closed-loop) widens when retransmits are landing past deadline.
+            let target_ms = self.start_latency.as_millis() as f64
+                + jitter_component
+                + loss_component
+                + self.late_pressure_ms;
             self.target_latency = Duration::from_millis(target_ms as u64)
                 .max(self.min_latency)
                 .min(self.max_latency);
@@ -300,16 +340,26 @@ impl ReassemblyBuffer {
                 self.next_seq = resync_target;
                 self.consecutive_late = 0;
                 self.max_late_seq = 0;
-                // Reset adaptive latency — the stall inflated it via
-                // loss_penalty and we need a fresh start to avoid the
-                // new packets immediately being classified as late too.
-                self.loss_rate_smoothed = 0.0;
+                // Reset latency state but preserve loss EWMA. Hard-resetting
+                // loss_rate_smoothed here masks real loss in telemetry and
+                // produces impossible near-zero loss estimates during churn.
                 self.latency = self.start_latency;
                 self.target_latency = self.start_latency;
                 self.stable_since = None;
                 // Fall through to insert this packet normally
             } else {
-                // Late packet, drop
+                // Late packet, drop.  Bump late_pressure — direct evidence
+                // our deadline was too tight.  Additive-increase step is
+                // larger than the drain step so a few late hits quickly
+                // open the window; drain is slow so we don't oscillate.
+                const LATE_HIT_MS: f64 = 3.0;
+                let base_headroom_ms =
+                    self.max_latency
+                        .as_millis()
+                        .saturating_sub(self.start_latency.as_millis()) as f64;
+                let max_pressure = base_headroom_ms.min(600.0);
+                self.late_pressure_ms = (self.late_pressure_ms + LATE_HIT_MS).min(max_pressure);
+                self.last_late_arrival = Some(now);
                 self.late_packets += 1;
                 return;
             }
@@ -1109,11 +1159,14 @@ mod tests {
         let _ = buf.tick(start + Duration::from_millis(5000));
         let _stats = buf.get_stats();
 
-        // Confirm the default ceiling is 500ms (regression guard)
+        // Confirm the default ceiling is 2000ms (regression guard).
+        // Raised from 500ms when the jitter buffer moved to closed-loop
+        // self-tuning — HLS tolerates generous headroom, and tight ceilings
+        // were forcing packet drops during retransmit-driven recovery.
         assert_eq!(
             ReassemblyConfig::default().max_latency_ms,
-            500,
-            "Default max_latency_ms should be 500"
+            2000,
+            "Default max_latency_ms should be 2000"
         );
     }
 
@@ -1178,10 +1231,11 @@ mod tests {
             );
         }
 
-        // The resync should have fired. Verify latency state was reset.
-        assert_eq!(
-            buf.loss_rate_smoothed, 0.0,
-            "loss_rate_smoothed must be cleared on resync"
+        // The resync should have fired. Verify latency state was reset
+        // but loss EWMA was preserved.
+        assert!(
+            buf.loss_rate_smoothed > 0.0,
+            "loss_rate_smoothed must not be clobbered on resync"
         );
         assert_eq!(
             buf.latency,
@@ -1215,6 +1269,58 @@ mod tests {
             "packets after resync must be delivered normally (got {} late, {} delivered)",
             buf.late_packets,
             buf.packets_delivered
+        );
+    }
+
+    #[test]
+    fn resync_does_not_clobber_loss_ewma() {
+        let config = ReassemblyConfig {
+            start_latency: Duration::from_millis(20),
+            buffer_capacity: 64,
+            skip_after: Some(Duration::from_millis(5)),
+            ..Default::default()
+        };
+        let mut buf = ReassemblyBuffer::with_config(0, config);
+        let start = Instant::now();
+
+        // Build baseline history and induce meaningful loss EWMA.
+        for i in 0u64..10 {
+            buf.push(i, Bytes::from(vec![i as u8]), start);
+        }
+        let _ = buf.tick(start + Duration::from_millis(20));
+
+        let t1 = start + Duration::from_millis(80);
+        buf.push(200, Bytes::from_static(b"far"), t1);
+        let _ = buf.tick(t1 + Duration::from_millis(10));
+        buf.loss_rate_smoothed = buf.loss_rate_smoothed.max(0.4);
+        let before_resync = buf.loss_rate_smoothed;
+
+        // Trigger desync resync path with 100 consecutive late packets.
+        let t2 = t1 + Duration::from_millis(100);
+        for i in 0u64..100 {
+            buf.push(
+                20 + i,
+                Bytes::from(vec![i as u8]),
+                t2 + Duration::from_millis(i),
+            );
+        }
+
+        assert!(
+            buf.loss_rate_smoothed >= before_resync * 0.9,
+            "resync should preserve loss EWMA: before {:.3}, after {:.3}",
+            before_resync,
+            buf.loss_rate_smoothed
+        );
+
+        // A clean interval should decay EWMA gradually, not collapse it.
+        let t3 = t2 + Duration::from_millis(250);
+        let seq = buf.next_seq;
+        buf.push(seq, Bytes::from_static(b"ok"), t3);
+        let _ = buf.tick(t3 + Duration::from_millis(30));
+        assert!(
+            buf.loss_rate_smoothed > 0.1,
+            "loss EWMA should decay gradually after resync, got {:.6}",
+            buf.loss_rate_smoothed
         );
     }
 

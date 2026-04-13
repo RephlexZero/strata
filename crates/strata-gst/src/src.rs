@@ -276,7 +276,7 @@ mod imp {
                                     .duration_since(UNIX_EPOCH)
                                     .map(|d| d.as_millis() as u64)
                                     .unwrap_or(0);
-                                let msg = gst::Structure::builder("strata-stats")
+                                let mut msg = gst::Structure::builder("strata-stats")
                                     .field("schema_version", 1i32)
                                     .field("stats_seq", stats_seq)
                                     .field("heartbeat", true)
@@ -292,9 +292,24 @@ mod imp {
                                     .field("target_latency_ms", stats.target_latency_ms)
                                     .field("packets_delivered", stats.packets_delivered)
                                     .field("loss_rate", stats.loss_rate)
-                                    .field("jitter_estimate_ms", stats.jitter_estimate_ms)
-                                    .build();
-                                let _ = element.post_message(gst::message::Element::new(msg));
+                                    .field("jitter_estimate_ms", stats.jitter_estimate_ms);
+                                for link in &stats.per_link {
+                                    msg = msg
+                                        .field(
+                                            format!("packets_received_link_{}", link.link_id),
+                                            link.packets_received,
+                                        )
+                                        .field(
+                                            format!("packets_delivered_link_{}", link.link_id),
+                                            link.packets_delivered,
+                                        )
+                                        .field(
+                                            format!("loss_link_{}", link.link_id),
+                                            link.loss_rate,
+                                        );
+                                }
+                                let _ =
+                                    element.post_message(gst::message::Element::new(msg.build()));
                                 stats_seq = stats_seq.wrapping_add(1);
                             }
                         } else {
