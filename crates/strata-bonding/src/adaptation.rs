@@ -280,12 +280,29 @@ impl BitrateAdapter {
         const BASE_OVERHEAD: f64 = 0.10;
         const MIN_LOSSY_OVERHEAD: f64 = 0.25;
         const MAX_OVERHEAD: f64 = 0.50;
+        // Ceiling used when we're in MaxQuality but the links have plenty of
+        // spare bandwidth. Kept conservative: FEC repair packets are emitted
+        // in bursts at packet-group boundaries, and pushing overhead higher
+        // than ~15% on cellular links turns those repair bursts into their
+        // own congestion source (microbursts overflow marginal-link buffers
+        // → late packets → reported loss → further FEC inflation). 15% is
+        // enough to meaningfully improve recovery while staying below the
+        // burst-induced-congestion knee observed in field testing.
+        const MAX_QUALITY_SPARE_CEILING: f64 = 0.15;
 
-        // Spare-driven scaling in MaxReliability mode.
-        let spare_scaled = if self.mode == ReliabilityMode::MaxReliability && self.spare_bw_kbps > 0
-        {
+        // Spare-driven scaling.
+        // MaxReliability mode: scale aggressively up to MAX_OVERHEAD.
+        // MaxQuality mode: still scale when spare exceeds the encode target,
+        // but cap at MAX_QUALITY_SPARE_CEILING so we never trade bitrate for
+        // protection when bandwidth is actually tight.
+        let spare_scaled = if self.spare_bw_kbps > 0 {
             let ratio = self.spare_bw_kbps as f64 / self.current_target_kbps.max(1) as f64;
-            (BASE_OVERHEAD + ratio * (MAX_OVERHEAD - BASE_OVERHEAD)).min(MAX_OVERHEAD)
+            let ceiling = if self.mode == ReliabilityMode::MaxReliability {
+                MAX_OVERHEAD
+            } else {
+                MAX_QUALITY_SPARE_CEILING
+            };
+            (BASE_OVERHEAD + ratio * (ceiling - BASE_OVERHEAD)).min(ceiling)
         } else {
             BASE_OVERHEAD
         };
@@ -636,10 +653,15 @@ impl BitrateAdapter {
         }
         // Rapid queue growth under loss context indicates the links are being overdriven.
         let jitter_loss_context = feedback.loss_after_fec > 0.03 || self.ewma_loss_fec > 0.08;
-        // A sustained late-arrival rate is delay pressure even if the jitter
-        // buffer hasn't grown this tick — the receiver is already dropping
-        // frames past the playout deadline, which is user-visible.
-        let late_pressure = feedback.late_rate > 0.05;
+        // A sustained late-arrival rate is delay pressure only when it
+        // coincides with actual loss evidence. Pure jitter without residual
+        // loss can't be fixed by cutting the encoder — doing so just
+        // degrades visible quality while the underlying OWD spike blows
+        // through.  Gate on jitter_loss_context (post-FEC or EWMA loss
+        // elevated) OR queue growth so jitter-only blips don't trigger
+        // oscillation.
+        let late_pressure =
+            feedback.late_rate > 0.05 && (jitter_loss_context || max_queue_depth >= 60);
         let delay_pressure = (jitter_growth_ms > 120 && jitter_loss_context)
             || feedback.jitter_buffer_ms > 3000
             || max_queue_depth >= 90
@@ -656,18 +678,26 @@ impl BitrateAdapter {
                     0.3 * feedback.goodput_bps as f64 + 0.7 * self.ewma_goodput_bps;
             }
 
-            // Windowed max-filter for peak goodput.  Tracks the best delivery
-            // rate over the last GOODPUT_WINDOW_SECS seconds so the anchor and
-            // ramp-up ceiling remember true link capacity across transient bursts.
+            // Windowed p75 of recent goodput.  Using the raw max let a single
+            // outlier sample (e.g. drained-backlog + live traffic clearing
+            // together) anchor the floor and ramp-up ceiling at a value the
+            // links could not sustain, which in field testing drove the
+            // adapter to target bitrates the network could not actually
+            // carry.  The 75th percentile tracks sustained high throughput
+            // without being hostage to a single burst window.
             self.goodput_window
                 .push_back((Instant::now(), feedback.goodput_bps as f64));
             self.goodput_window
                 .retain(|(t, _)| t.elapsed().as_secs_f64() < GOODPUT_WINDOW_SECS);
-            self.goodput_peak_bps = self
-                .goodput_window
-                .iter()
-                .map(|(_, g)| *g)
-                .fold(0.0_f64, f64::max);
+            let mut samples: Vec<f64> = self.goodput_window.iter().map(|(_, g)| *g).collect();
+            if !samples.is_empty() {
+                samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                // p75 = element at index floor(0.75 * (n-1)).  With small n
+                // this naturally approaches the max; by the time we have
+                // ~4+ samples it starts rejecting single-sample spikes.
+                let idx = ((samples.len() as f64 - 1.0) * 0.75).floor() as usize;
+                self.goodput_peak_bps = samples[idx];
+            }
         }
         // Goodput-anchor the current target using the windowed peak, not the
         // slow EWMA.  After a burst the EWMA decays toward the artificially
@@ -750,7 +780,7 @@ impl BitrateAdapter {
                 self.config.ramp_down_factor
             };
             let new_target = (self.current_target_kbps as f64 * reduction_factor) as u32;
-            let new_target = new_target.max(self.config.min_bitrate_kbps);
+            let new_target = new_target.max(self.effective_floor_kbps());
 
             if new_target < self.current_target_kbps {
                 self.current_target_kbps = new_target;
@@ -835,7 +865,7 @@ impl BitrateAdapter {
             if self.over_pressure_ticks >= 2 {
                 let target = (current as f64 * self.config.ramp_down_factor) as u32;
                 let target = target
-                    .max(self.config.min_bitrate_kbps)
+                    .max(self.effective_floor_kbps())
                     .min(usable_kbps as u32);
 
                 let reason = if self.over_pressure_ticks >= 3 {
@@ -923,6 +953,37 @@ impl BitrateAdapter {
             );
         }
         (current, AdaptationReason::Capacity)
+    }
+
+    /// Dynamic bitrate floor: never reduce below half of the recent windowed
+    /// peak goodput.  The static `min_bitrate_kbps` floor is far too low on
+    /// good multi-link setups (e.g. 500 kbps when links delivered 3–4 Mbps
+    /// sustained).  Collapsing to it during a transient burst produces a
+    /// visible soft-encode dip before ramp-up recovers — the dominant source
+    /// of residual artifacting on otherwise healthy runs.  Keeping the floor
+    /// tethered to recent real delivery lets bursts reduce the encode
+    /// without dropping off a cliff.
+    fn effective_floor_kbps(&self) -> u32 {
+        let static_floor = self.config.min_bitrate_kbps;
+        if self.goodput_peak_bps > 0.0 {
+            // Floor is the lesser of: half the windowed peak, or 80% of the
+            // smoothed goodput.  The dual-cap prevents a single high-peak
+            // sample from anchoring the floor above what the network can
+            // actually sustain (observed in field: peak=9.5 Mbps briefly, so
+            // 0.5*peak gave 4.7 Mbps floor on links that averaged ~3 Mbps).
+            // Smoothed goodput tracks recent sustained delivery and keeps
+            // the floor from following transient outliers.
+            let peak_half = self.goodput_peak_bps * 0.5;
+            let ewma_cap = if self.ewma_goodput_bps > 0.0 {
+                self.ewma_goodput_bps * 0.8
+            } else {
+                peak_half
+            };
+            let dynamic = (peak_half.min(ewma_cap) / 1000.0) as u32;
+            static_floor.max(dynamic)
+        } else {
+            static_floor
+        }
     }
 
     /// Force an immediate bitrate reduction (e.g., on link failure event).

@@ -28,6 +28,9 @@
 #   STRATA_NO_BUILD=1      — Skip building and installing the sender binary
 #   STRATA_NO_DEPLOY=1     — Skip cross-compiling and deploying receiver binary
 #   STRATA_DEPLOY_IFACE    — Network interface for SSH/SCP deploy (e.g. "wlan0" to avoid cellular)
+#   STRATA_LOG_LEVEL       — Rust log level (default: debug)
+#   YOUTUBE_API_KEY        — API key for fetching stream health
+#   YOUTUBE_STREAM_ID      — ID of the YouTube live stream to monitor
 #
 # Usage:
 #   export STRATA_RECEIVER_HOST=MyServer
@@ -86,6 +89,7 @@ FAILOVER_ENABLED="${STRATA_FAILOVER_ENABLED:-true}"
 FAILOVER_DURATION_MS="${STRATA_FAILOVER_DURATION_MS:-800}"
 MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-1000}"
 DURATION="${STRATA_DURATION_SECS:-60}"
+LOG_LEVEL="${STRATA_LOG_LEVEL:-debug,strata_bonding=debug,strata_transport=debug,strata::adapt=debug}"
 HOST="${STRATA_RECEIVER_HOST}"
 
 # SSH/SCP options — bind to a specific interface (e.g. WiFi) so deploys
@@ -291,7 +295,7 @@ RECEIVER_SCRIPT=$(mktemp /tmp/strata-receiver-start-XXXXXX.sh)
 cat > "$RECEIVER_SCRIPT" << ENDSCRIPT
 #!/bin/bash
 export GST_PLUGIN_PATH=\$HOME/.local/share/gstreamer-1.0/plugins
-nohup env GST_DEBUG="tsdemux:4,strata*:4" /usr/local/bin/strata-pipeline receiver \\
+nohup env RUST_LOG="$LOG_LEVEL" GST_DEBUG="tsdemux:4,strata*:4" /usr/local/bin/strata-pipeline receiver \\
   --bind "$BIND_STR" \\
   --relay-url "$STRATA_RELAY_URL" \\
   --codec "$CODEC" \\
@@ -353,7 +357,7 @@ if [[ "$VIDEO_SOURCE" == "v4l2" ]]; then
 fi
 
 # Enable adaptation debug logging unless user already set RUST_LOG
-export RUST_LOG="${RUST_LOG:-warn,strata::adapt=info,strata_bonding::scheduler::edpf=debug}"
+export RUST_LOG="$LOG_LEVEL"
 
 strata-pipeline "${SENDER_ARGS[@]}" > /tmp/strata-sender.log 2>&1 &
 SENDER_PID=$!
@@ -396,7 +400,13 @@ cleanup() {
         PLAYLIST_SEEN=1
     fi
 
-    rm -f "$SENDER_TOML" "$RECEIVER_TOML" "$RECEIVER_SCRIPT"
+    echo "── Fetching full logs for analysis (via ${STRATA_DEPLOY_IFACE:-SSH}) ──"
+    # This safely traverses wlan0 (or whatever STRATA_DEPLOY_IFACE is set to) so it doesn't affect active tests
+    scp "${SSH_OPTS[@]}" -q "$HOST:/tmp/strata-receiver.log" "./strata-receiver-${SENDER_PID}.log" || warn "Failed to fetch receiver log"
+    cp /tmp/strata-sender.log "./strata-sender-${SENDER_PID}.log" || warn "Failed to copy sender log"
+    info "Saved full logs to ./strata-sender-${SENDER_PID}.log and ./strata-receiver-${SENDER_PID}.log"
+
+    rm -f "$SENDER_TOML" "$RECEIVER_TOML" "$RECEIVER_SCRIPT" "/tmp/start-receiver.sh"
     echo ""
 
     MAX_WINDOW_LOSS_PCT=$(awk "BEGIN { printf \"%.1f\", $MAX_WINDOW_LOSS_BP / 100.0 }")
@@ -525,8 +535,16 @@ while [[ $ELAPSED -lt $DURATION ]]; do
 
     WINDOW_LOSS_PCT=$(awk "BEGIN { printf \"%.1f\", $WINDOW_LOSS_BP / 100.0 }")
 
+    # YouTube Health Polling
+    YT_HEALTH_STR=""
+    if [[ -n "${YOUTUBE_API_KEY:-}" && -n "${YOUTUBE_STREAM_ID:-}" ]]; then
+        # Run a quick curl with a timeout so it doesn't stall the monitor loop
+        YT_STATUS=$(curl -s --max-time 2 "https://www.googleapis.com/youtube/v3/liveStreams?part=status&id=${YOUTUBE_STREAM_ID}&key=${YOUTUBE_API_KEY}" | grep -oP '"healthStatus":\s*\{\s*"status":\s*"\K[^"]+' | head -1 || echo "unknown")
+        [[ -n "$YT_STATUS" ]] && YT_HEALTH_STR=" YT_Health=$YT_STATUS"
+    fi
+
     echo ""
-    echo "╌╌╌ [${ELAPSED}s] segments=$SEGMENT_COUNT (max=$MAX_SEGMENT_COUNT, playlist=$PLAYLIST_COUNT) ╌╌╌"
+    echo "╌╌╌ [${ELAPSED}s] segments=$SEGMENT_COUNT (max=$MAX_SEGMENT_COUNT)$YT_HEALTH_STR ╌╌╌"
     echo "  RX: $STATS"
     [[ -n "$RX_LINK_STATS" ]] && echo "  RX links: $RX_LINK_STATS"
     echo "  Δ5s: delivered=$DELTA_DELIVERED lost=$DELTA_LOST late=$DELTA_LATE win_loss=${WINDOW_LOSS_PCT}%"

@@ -207,7 +207,12 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            redundancy_enabled: true,
+            // Adaptive duplication and keyframe broadcast both default OFF:
+            // in the field they make bursty congestion worse (doubling the
+            // offered load right when a link is marginal) and interact badly
+            // with the FEC+ARQ protection already provided by the transport
+            // layer.  Enable only for specific topologies that require them.
+            redundancy_enabled: false,
             redundancy_spare_ratio: 0.5,
             redundancy_max_packet_bytes: 10_000,
             redundancy_target_links: 2,
