@@ -176,31 +176,53 @@ impl CapacityOracle {
         self.recompute();
     }
 
+    /// Maximum factor by which a single probe is allowed to raise the upper
+    /// bound. Even with receiver-side measurement, a probe is a 400 ms
+    /// snapshot of a single bonded link; allowing a 10× jump on one sample
+    /// is what created the bufferbloat-driven oscillation observed in
+    /// field tests. Capacity can still grow without bound across multiple
+    /// probes; this only bounds *per-probe* growth.
+    const PROBE_GROWTH_CAP: f64 = 2.0;
+
     /// Record the result of a saturation probe.
     ///
     /// The peak observed delivery rate during a 400ms window where this
     /// link received ~100% of traffic. Sets the upper bound and raises
     /// confidence to maximum.
+    ///
+    /// Per-probe growth is bounded by `PROBE_GROWTH_CAP` once an upper bound
+    /// exists. This prevents a single corrupted probe (e.g. one whose rate
+    /// reflects modem TX bufferbloat rather than air-interface throughput)
+    /// from causing scheduler over-allocation that produces the very
+    /// late-packet bursts the system is trying to avoid.
     pub fn complete_probe(&mut self, peak_bps: f64) {
         if peak_bps <= 0.0 {
             return;
         }
 
+        let raw_peak = peak_bps;
+        let capped_peak = if self.upper_bound > 100_000.0 {
+            peak_bps.min(self.upper_bound * Self::PROBE_GROWTH_CAP)
+        } else {
+            peak_bps
+        };
+
         tracing::info!(
             target: "strata::oracle",
-            peak_kbps = peak_bps / 1000.0,
+            raw_peak_kbps = raw_peak / 1000.0,
+            capped_peak_kbps = capped_peak / 1000.0,
             old_upper_kbps = self.upper_bound / 1000.0,
             lower_bound_kbps = self.lower_bound / 1000.0,
             "complete_probe"
         );
 
-        self.upper_bound = peak_bps;
+        self.upper_bound = capped_peak;
 
         // The lower bound should never exceed the probe result — cap it.
         // This handles the case where a spurious delivery spike inflated
         // the lower bound above the true capacity measured by saturation.
-        if self.lower_bound > peak_bps * 1.1 {
-            self.lower_bound = peak_bps;
+        if self.lower_bound > capped_peak * 1.1 {
+            self.lower_bound = capped_peak;
         }
 
         self.confidence = 1.0;

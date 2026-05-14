@@ -500,6 +500,11 @@ async fn link_reader_async(
                             jitter_buffer_ms: jitter_ms,
                             loss_after_fec: (report_loss * 10000.0) as u16,
                             late_rate: (late_rate_f * 10000.0) as u16,
+                            // Per-link cumulative bytes delivered to reassembly.
+                            // Sender's saturation-probe path uses this as the
+                            // true throughput signal (independent of the modem
+                            // TX queue, unlike sender-side observed_bytes).
+                            bytes_delivered: cur_bytes,
                         };
                         let pkt_bytes = encode_receiver_report(&report, &clock);
                         let _ = socket.send_to(pkt_bytes, addr).await;

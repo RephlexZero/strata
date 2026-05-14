@@ -83,6 +83,33 @@ pub struct BondingScheduler<L: LinkSender + ?Sized + 'static> {
     saturation_probe_start_ack_bytes: u64,
     /// Snapshot of observed_bytes at probe start (fallback for byte-level measurement).
     saturation_probe_start_obs_bytes: u64,
+    /// Snapshot of `recv_bytes_delivered()` at probe start. Captured at the
+    /// same instant as `saturation_probe_start_obs_bytes`. After the probe
+    /// window closes, the driver waits for a fresh ReceiverReport and then
+    /// uses (current_recv - this) as the authoritative probe measurement.
+    saturation_probe_start_recv_bytes: u64,
+    /// `std::time::Instant` of the most recent `recv_report_at()` observed
+    /// before the probe started. The driver considers a receiver report
+    /// "fresh" once `recv_report_at()` advances past this timestamp. This
+    /// uses `std::time::Instant` (rather than the `quanta::Instant` aliased
+    /// in this module) because it crosses the `LinkSender` trait boundary,
+    /// which is defined in terms of `std::time::Instant`.
+    saturation_probe_start_recv_report_at: Option<std::time::Instant>,
+    /// Sender-side observed-bytes rate from the most recent completed probe,
+    /// retained while the driver is waiting on a fresh ReceiverReport so the
+    /// final completion log can show both values side-by-side.
+    saturation_probe_pending_sender_rate_bps: f64,
+    /// Pre-probe receiver goodput EWMA snapshot (bps), captured at probe
+    /// start. Logged at completion so we can compare against the probe-window
+    /// receiver throughput.
+    saturation_probe_pre_recv_goodput_bps: f64,
+    /// When the sender-side probe window ended. Used to bound how long we
+    /// wait for a fresh ReceiverReport before falling back to the sender-side
+    /// measurement.
+    saturation_probe_sender_end: Instant,
+    /// Whether we have completed the sender-side measurement and are now
+    /// waiting on a receiver report to arrive (covering the probe window).
+    saturation_probe_awaiting_recv: bool,
 
     // ─── PPD (Packet-Pair Dispersion) probe state ───
     /// When the last PPD probe pair was injected per link (link_id → Instant).
@@ -130,6 +157,12 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             saturation_probe_peak_bps: 0.0,
             saturation_probe_start_ack_bytes: 0,
             saturation_probe_start_obs_bytes: 0,
+            saturation_probe_start_recv_bytes: 0,
+            saturation_probe_start_recv_report_at: None,
+            saturation_probe_pending_sender_rate_bps: 0.0,
+            saturation_probe_pre_recv_goodput_bps: 0.0,
+            saturation_probe_sender_end: now,
+            saturation_probe_awaiting_recv: false,
             last_ppd_probe: HashMap::new(),
             initial_probe_cycle_done: false,
             probed_links: HashSet::new(),
@@ -266,10 +299,160 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
         self.saturation_probe_link
     }
 
+    /// Maximum time the probe state machine will wait for a fresh
+    /// `ReceiverReport` covering the probe window before falling back to the
+    /// sender-side measurement. Receiver reports default to 1s cadence; this
+    /// bound gives ~1.5 reports of slack.
+    const PROBE_RECV_WAIT_MAX: Duration = Duration::from_millis(1600);
+
+    /// Poll for the receiver-side confirmation of a probe whose sender-side
+    /// window has already closed. Called each tick while the probe driver is
+    /// in Phase 2 (awaiting recv report).
+    ///
+    /// When a fresh `ReceiverReport` arrives — i.e. one whose local arrival
+    /// timestamp is later than the probe start snapshot — compute the
+    /// receiver-side rate over (latest_recv_report_at - probe_start_recv_report_at)
+    /// and feed that to the oracle. The receiver-side window will be wider
+    /// than the probe window (it spans ≈1 report interval), so the rate is a
+    /// conservative average: it dilutes the probe peak with surrounding
+    /// non-probe traffic. That bias is acceptable because the alternative —
+    /// sender-side rate inflated by modem TX bufferbloat — is much worse.
+    ///
+    /// On timeout (no fresh report within `PROBE_RECV_WAIT_MAX`), fall back to
+    /// the sender-side rate so the oracle still gets an update.
+    fn poll_probe_recv_confirmation(
+        &mut self,
+        probe_id: usize,
+        metrics: &[(usize, crate::net::interface::LinkMetrics)],
+    ) {
+        let sender_rate_bps = self.saturation_probe_pending_sender_rate_bps;
+        let waited = self.saturation_probe_sender_end.elapsed();
+
+        // If the LinkSender impl doesn't track receiver-side report
+        // timestamps (`recv_report_at()` returns `None`), there is no
+        // confirmation to wait for. Finalize immediately with the
+        // sender-side rate so mock links and tests don't stall.
+        let recv_tracking_supported = self.saturation_probe_start_recv_report_at.is_some();
+
+        // Has a fresh recv report arrived (one whose local arrival timestamp
+        // is later than the snapshot at probe start)?
+        let (fresh_report_seen, recv_rate_bps, recv_window_s) = if !recv_tracking_supported {
+            (false, 0.0, 0.0)
+        } else if let Some(link) = self.scheduler.get_link(probe_id) {
+            let now_recv_bytes = link.recv_bytes_delivered();
+            let now_recv_at = link.recv_report_at();
+            match (now_recv_at, self.saturation_probe_start_recv_report_at) {
+                (Some(now_at), Some(start_at)) if now_at > start_at => {
+                    let window_s = now_at.duration_since(start_at).as_secs_f64();
+                    let delta =
+                        now_recv_bytes.saturating_sub(self.saturation_probe_start_recv_bytes);
+                    let rate = if window_s > 0.0 {
+                        (delta as f64 * 8.0) / window_s
+                    } else {
+                        0.0
+                    };
+                    (true, rate, window_s)
+                }
+                _ => (false, 0.0, 0.0),
+            }
+        } else {
+            (false, 0.0, 0.0)
+        };
+
+        if recv_tracking_supported && !fresh_report_seen && waited < Self::PROBE_RECV_WAIT_MAX {
+            // Still waiting — also bail out if the link died.
+            if !metrics.iter().any(|(id, m)| *id == probe_id && m.alive) {
+                if let Some(link) = self.scheduler.get_link(probe_id) {
+                    link.set_saturation_probe_active(false);
+                }
+                self.saturation_probe_link = None;
+                self.saturation_probe_awaiting_recv = false;
+                self.saturation_probe_snapshot_taken = false;
+                self.last_saturation_probe_end = Instant::now();
+            }
+            return;
+        }
+
+        // Decide the final probe rate. Receiver-side rate is preferred; the
+        // sender-side rate acts as an upper bound (we can't have delivered
+        // more than we sent). If we timed out without a fresh report, fall
+        // back to the sender-side rate but flag it in the log so the
+        // diagnostic is unambiguous.
+        let final_rate_bps = if fresh_report_seen && recv_rate_bps > 0.0 {
+            recv_rate_bps.min(sender_rate_bps.max(recv_rate_bps))
+        } else {
+            sender_rate_bps
+        };
+
+        let pre_goodput = self.saturation_probe_pre_recv_goodput_bps;
+        let inflation_ratio = if recv_rate_bps > 0.0 {
+            sender_rate_bps / recv_rate_bps
+        } else {
+            f64::NAN
+        };
+
+        tracing::info!(
+            target: "strata::bonding",
+            link_id = probe_id,
+            sender_rate_kbps = sender_rate_bps / 1000.0,
+            recv_rate_kbps = recv_rate_bps / 1000.0,
+            recv_window_s = recv_window_s,
+            pre_probe_goodput_kbps = pre_goodput / 1000.0,
+            inflation_ratio = inflation_ratio,
+            final_rate_kbps = final_rate_bps / 1000.0,
+            fresh_report = fresh_report_seen,
+            waited_ms = waited.as_millis() as u64,
+            "saturation probe completed"
+        );
+
+        if final_rate_bps > 0.0 {
+            if let Some(link) = self.scheduler.get_link(probe_id) {
+                link.complete_saturation_probe(final_rate_bps);
+            }
+            self.probed_links.insert(probe_id);
+            if !self.initial_probe_cycle_done {
+                let alive_count = metrics.iter().filter(|(_, m)| m.alive).count();
+                if self.probed_links.len() >= alive_count {
+                    self.initial_probe_cycle_done = true;
+                    tracing::info!(
+                        target: "strata::bonding",
+                        probed = self.probed_links.len(),
+                        "initial probe cycle complete, switching to steady-state"
+                    );
+                }
+            }
+        }
+
+        // Clear probe-active flag so oracle resumes delivery observations.
+        if let Some(link) = self.scheduler.get_link(probe_id) {
+            link.set_saturation_probe_active(false);
+        }
+        self.saturation_probe_link = None;
+        self.saturation_probe_peak_bps = 0.0;
+        self.last_saturation_probe_end = Instant::now();
+        self.saturation_probe_snapshot_taken = false;
+        self.saturation_probe_awaiting_recv = false;
+        self.saturation_probe_pending_sender_rate_bps = 0.0;
+    }
+
     /// Drives the saturation probe state machine.
     ///
     /// Periodically routes 100% of traffic to one link at a time for a short
     /// window so the Oracle can measure the link's true physical capacity.
+    ///
+    /// The driver runs in three phases per probe:
+    ///   1. Active — DWRR credits pinned to the probe link, sender-side byte
+    ///      counter accruing send rate into the modem TX queue.
+    ///   2. Awaiting recv confirmation — boost released, waiting for a fresh
+    ///      `ReceiverReport` so the receiver-side delivered-byte counter can
+    ///      report what actually crossed the air interface.
+    ///   3. Finalized — feed the receiver-side rate to the oracle, log the
+    ///      sender-vs-receiver discrepancy for diagnosis.
+    ///
+    /// The receiver-side rate is the authoritative measurement: on cellular
+    /// links the modem can absorb hundreds of milliseconds of bufferbloat, so
+    /// sender-side `observed_bytes` reports the inflated *send* rate, not the
+    /// link's true physical capacity.
     fn drive_saturation_probe(&mut self, metrics: &[(usize, crate::net::interface::LinkMetrics)]) {
         use crate::net::interface::LinkPhase;
 
@@ -286,11 +469,18 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             Duration::from_secs_f64(config.saturation_probe_interval_s / num_links as f64);
 
         if let Some(probe_id) = self.saturation_probe_link {
-            // Active probe — check for completion
+            // Phase 2 — awaiting a fresh ReceiverReport that covers the probe
+            // window so we can compute receiver-side throughput.
+            if self.saturation_probe_awaiting_recv {
+                self.poll_probe_recv_confirmation(probe_id, metrics);
+                return;
+            }
 
-            // Delay the ACK-byte snapshot by 1 SRTT so bytes delivered
-            // before the probe window (still in the ACK pipeline) are
-            // excluded from the measurement.
+            // Phase 1 — active probe.
+
+            // Delay the byte-counter snapshot by 1 SRTT so traffic already
+            // in flight at probe start (still in the modem's TX pipeline)
+            // is excluded from the measurement window.
             if !self.saturation_probe_snapshot_taken {
                 let elapsed = self.saturation_probe_start.elapsed();
                 let srtt_ms = metrics
@@ -303,6 +493,18 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
                     if let Some((_, m)) = metrics.iter().find(|(id, _)| *id == probe_id) {
                         self.saturation_probe_start_ack_bytes = m.ack_bytes;
                         self.saturation_probe_start_obs_bytes = m.observed_bytes;
+                        // Capture pre-probe receiver goodput for the diagnostic
+                        // log so we can tell whether the probe actually moved
+                        // the air-interface needle or just filled a TX queue.
+                        self.saturation_probe_pre_recv_goodput_bps = m
+                            .receiver_report
+                            .as_ref()
+                            .map(|r| r.goodput_bps as f64)
+                            .unwrap_or(0.0);
+                    }
+                    if let Some(link) = self.scheduler.get_link(probe_id) {
+                        self.saturation_probe_start_recv_bytes = link.recv_bytes_delivered();
+                        self.saturation_probe_start_recv_report_at = link.recv_report_at();
                     }
                     self.saturation_probe_snapshot_taken = true;
                     // Reset the start time so the measurement window begins now
@@ -314,60 +516,46 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             let elapsed = self.saturation_probe_start.elapsed();
 
             if self.saturation_probe_snapshot_taken && elapsed >= probe_duration {
-                // Probe complete — compute average rate from byte deltas
+                // Sender-side measurement (raw send rate — includes any
+                // modem-internal bufferbloat). Used only as a diagnostic
+                // upper bound; the authoritative number comes from the
+                // receiver-side delivered-byte counter once the next
+                // ReceiverReport arrives.
                 let elapsed_s = elapsed.as_secs_f64();
-                let mut probe_rate_bps = 0.0;
-
+                let mut sender_rate_bps = 0.0;
                 if let Some((_, m)) = metrics.iter().find(|(id, _)| *id == probe_id) {
-                    // Use socket-level observed_bytes (pacing-limited send rate)
-                    // as primary measurement. The pacer rate-limits to the CC's
-                    // pacing_rate, so during a probe the send rate closely tracks
-                    // the bottleneck capacity. The pool-based ack_bytes counter
-                    // stalls when the sender pool fills up during traffic bursts.
                     let obs_delta = m
                         .observed_bytes
                         .saturating_sub(self.saturation_probe_start_obs_bytes);
                     if obs_delta > 0 {
-                        probe_rate_bps = (obs_delta as f64 * 8.0) / elapsed_s;
+                        sender_rate_bps = (obs_delta as f64 * 8.0) / elapsed_s;
                     }
                 }
 
-                if probe_rate_bps > 0.0 {
-                    if let Some(link) = self.scheduler.get_link(probe_id) {
-                        link.complete_saturation_probe(probe_rate_bps);
-                    }
-                    // Track startup cycle completion
-                    self.probed_links.insert(probe_id);
-                    if !self.initial_probe_cycle_done {
-                        let alive_count = metrics.iter().filter(|(_, m)| m.alive).count();
-                        if self.probed_links.len() >= alive_count {
-                            self.initial_probe_cycle_done = true;
-                            tracing::info!(
-                                target: "strata::bonding",
-                                probed = self.probed_links.len(),
-                                "initial probe cycle complete, switching to steady-state"
-                            );
-                        }
-                    }
-                    tracing::info!(
-                        target: "strata::bonding",
-                        link_id = probe_id,
-                        rate_kbps = probe_rate_bps / 1000.0,
-                        duration_ms = elapsed.as_millis(),
-                        "saturation probe completed"
-                    );
-                }
-                // Clear probe-active flag so oracle resumes delivery observations
-                if let Some(link) = self.scheduler.get_link(probe_id) {
-                    link.set_saturation_probe_active(false);
-                }
+                tracing::info!(
+                    target: "strata::bonding",
+                    link_id = probe_id,
+                    sender_rate_kbps = sender_rate_bps / 1000.0,
+                    duration_ms = elapsed.as_millis(),
+                    "saturation probe sender-side complete; awaiting recv report"
+                );
+
+                // Release the boost so traffic returns to normal weights.
+                // Oracle stays in probe_active so delivery observations from
+                // the tail of the probe window don't corrupt lower_bound.
                 self.scheduler.set_probe_boost_link(None);
-                self.saturation_probe_link = None;
-                self.saturation_probe_peak_bps = 0.0;
-                self.last_saturation_probe_end = Instant::now();
-                self.saturation_probe_snapshot_taken = false;
+
+                // Enter Phase 2: await receiver-side confirmation.
+                self.saturation_probe_pending_sender_rate_bps = sender_rate_bps;
+                self.saturation_probe_sender_end = Instant::now();
+                self.saturation_probe_awaiting_recv = true;
+
+                // Poll immediately. If the link doesn't expose receiver
+                // tracking (mock links / tests), this finalizes in one shot
+                // using the sender-side rate.
+                self.poll_probe_recv_confirmation(probe_id, metrics);
             } else if !metrics.iter().any(|(id, m)| *id == probe_id && m.alive) {
-                // Probe link died — cancel
+                // Probe link died — cancel without recording a measurement.
                 if let Some(link) = self.scheduler.get_link(probe_id) {
                     link.set_saturation_probe_active(false);
                 }
@@ -376,6 +564,7 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
                 self.saturation_probe_peak_bps = 0.0;
                 self.last_saturation_probe_end = Instant::now();
                 self.saturation_probe_snapshot_taken = false;
+                self.saturation_probe_awaiting_recv = false;
             }
         } else {
             // No active probe — check if we should start one
@@ -421,14 +610,20 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
                             self.saturation_probe_start = Instant::now();
                             self.saturation_probe_peak_bps = 0.0;
                             self.saturation_probe_snapshot_taken = false;
+                            self.saturation_probe_awaiting_recv = false;
+                            self.saturation_probe_pending_sender_rate_bps = 0.0;
+                            self.saturation_probe_pre_recv_goodput_bps = 0.0;
                             // Initial snapshot — will be retaken after 1 SRTT
                             if let Some((_, m)) = metrics.iter().find(|(id, _)| *id == candidate_id)
                             {
                                 self.saturation_probe_start_ack_bytes = m.ack_bytes;
                                 self.saturation_probe_start_obs_bytes = m.observed_bytes;
                             }
-                            // Suppress oracle delivery observations during probe
                             if let Some(link) = self.scheduler.get_link(candidate_id) {
+                                self.saturation_probe_start_recv_bytes =
+                                    link.recv_bytes_delivered();
+                                self.saturation_probe_start_recv_report_at = link.recv_report_at();
+                                // Suppress oracle delivery observations during probe
                                 link.set_saturation_probe_active(true);
                             }
                             // Route all traffic to probe link via EDPF
@@ -1066,7 +1261,12 @@ mod tests {
 
     #[test]
     fn test_adaptive_redundancy_with_spare_capacity() {
-        let mut scheduler = BondingScheduler::new();
+        // Redundancy is off by default; this test exercises the opt-in path.
+        let cfg = SchedulerConfig {
+            redundancy_enabled: true,
+            ..SchedulerConfig::default()
+        };
+        let mut scheduler = BondingScheduler::with_config(cfg);
 
         // Link 1: 10 Mbps capacity, 3 Mbps observed (70% spare)
         let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));

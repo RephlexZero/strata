@@ -13,6 +13,7 @@ use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use std::net::UdpSocket;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
 use crate::scheduler::oracle::CapacityOracle;
@@ -110,6 +111,15 @@ pub struct TransportLink {
     prev_pkts_acked_us: AtomicU64,
     /// Latest receiver report from the remote receiver (if any).
     receiver_report: Mutex<Option<ReceiverReportPacket>>,
+    /// Most recent receiver-side cumulative `bytes_delivered` for this link.
+    /// Updated on every ReceiverReport. Used by the sender's saturation-probe
+    /// path to compute receiver-observed throughput, which is independent of
+    /// modem TX queue depth (sender's `observed_bytes` is not).
+    last_recv_bytes_delivered: AtomicU64,
+    /// `Instant` when the most recent ReceiverReport for this link was
+    /// processed. Used to detect when a fresh report has arrived after a
+    /// saturation probe window closes.
+    last_recv_report_at: Mutex<Instant>,
     /// Network interface name (e.g. "eth1").
     iface: Option<String>,
     /// Token bucket pacer — limits per-link send rate to pacing_rate.
@@ -122,11 +132,41 @@ pub struct TransportLink {
     prev_retransmissions: AtomicU64,
     /// Previous packets_sent snapshot for per-interval loss_rate.
     prev_loss_pkts_sent: AtomicU64,
-    /// Consecutive high-loss windows (loss > 50%). When this reaches 3,
-    /// the link reports `alive = false` so the scheduler stops routing
-    /// packets into a black hole.
-    consecutive_high_loss: std::sync::atomic::AtomicU32,
+    /// Time-decayed EWMA of per-window `loss_rate`. Updated on every metric
+    /// refresh with a τ≈2 s time constant so brief cellular HARQ stalls don't
+    /// dominate. EDPF's capacity discount uses raw `loss_rate` for immediate
+    /// soft demotion; this EWMA only governs the harder `alive=false` flag.
+    loss_ewma: Mutex<f64>,
+    /// `Instant` of the most recent metric refresh that updated `loss_ewma`.
+    /// Used to size the EWMA time-step.
+    loss_ewma_last_update: Mutex<Option<Instant>>,
+    /// When `loss_ewma` first crossed `LOSS_DEATH_HI`. `None` while the link
+    /// is healthy. Cleared when `loss_ewma` drops below `LOSS_DEATH_LO`.
+    /// `alive` only flips to `false` once `loss_ewma` has been above the
+    /// high threshold for `LOSS_DEATH_DURATION`.
+    sustained_loss_since: Mutex<Option<Instant>>,
 }
+
+/// EWMA loss threshold at which a link is considered *at risk*. Above this
+/// value the sustained-loss timer starts; the link must stay above for
+/// `LOSS_DEATH_DURATION` before being marked dead. Picked high enough that
+/// normal cellular HARQ jitter (which produces brief 0.5–1.0 raw loss
+/// spikes) doesn't lift the smoothed EWMA over the threshold.
+const LOSS_DEATH_HI: f64 = 0.55;
+
+/// EWMA loss threshold for clearing the sustained-loss timer. Hysteresis
+/// gap prevents the death timer from flickering on/off near the boundary.
+const LOSS_DEATH_LO: f64 = 0.25;
+
+/// How long `loss_ewma` must stay above `LOSS_DEATH_HI` before the link
+/// flips to `alive=false`. Field-test data shows real cellular HARQ stalls
+/// recover within 500–800 ms; 4 s is far longer than any benign burst, but
+/// short enough that genuinely-dead links don't waste scheduling slots.
+const LOSS_DEATH_DURATION: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// EWMA time constant (seconds). The half-life is `ln(2) * τ ≈ 1.4 s`,
+/// so the EWMA forgets a brief 100 % loss burst within ~3 s.
+const LOSS_EWMA_TAU_S: f64 = 2.0;
 
 impl TransportLink {
     /// Create a new transport link.
@@ -181,6 +221,8 @@ impl TransportLink {
             prev_pkts_acked: AtomicU64::new(0),
             prev_pkts_acked_us: AtomicU64::new(0),
             receiver_report: Mutex::new(None),
+            last_recv_bytes_delivered: AtomicU64::new(0),
+            last_recv_report_at: Mutex::new(Instant::now()),
             iface,
             pacing: Mutex::new(PacingState {
                 tokens: 10_000.0, // Bootstrap burst — enough for initial probes
@@ -190,7 +232,9 @@ impl TransportLink {
             oracle: Mutex::new(CapacityOracle::new()),
             prev_retransmissions: AtomicU64::new(0),
             prev_loss_pkts_sent: AtomicU64::new(0),
-            consecutive_high_loss: std::sync::atomic::AtomicU32::new(0),
+            loss_ewma: Mutex::new(0.0),
+            loss_ewma_last_update: Mutex::new(None),
+            sustained_loss_since: Mutex::new(None),
         }
     }
 
@@ -587,6 +631,13 @@ impl TransportLink {
                 }
                 ControlBody::ReceiverReport(report) => {
                     *self.receiver_report.lock().unwrap() = Some(report.clone());
+                    // Record the receiver-side delivered byte counter and the
+                    // local timestamp at which we observed it. The saturation
+                    // probe driver uses these to compute receiver-observed
+                    // throughput across the probe window.
+                    self.last_recv_bytes_delivered
+                        .store(report.bytes_delivered, Ordering::Relaxed);
+                    *self.last_recv_report_at.lock().unwrap() = Instant::now();
                     let mut ewma = self.goodput_ewma_bps.lock().unwrap();
                     let goodput = report.goodput_bps as f64;
                     if *ewma == 0.0 {
@@ -594,7 +645,7 @@ impl TransportLink {
                     } else {
                         *ewma = 0.5 * goodput + 0.5 * *ewma;
                     }
-                    tracing::debug!(target: "strata::transport", link_id = self.id, goodput = goodput, ewma = *ewma, "Received ReceiverReport");
+                    tracing::debug!(target: "strata::transport", link_id = self.id, goodput = goodput, ewma = *ewma, bytes_delivered = report.bytes_delivered, "Received ReceiverReport");
                 }
                 ControlBody::PpdReport(ppd) => {
                     let capacity_bps = ppd.capacity_bps as f64;
@@ -847,26 +898,67 @@ impl LinkSender for TransportLink {
         let total_wire = delta_sent.saturating_add(delta_retx).max(1);
         let loss_rate = (delta_retx as f64 / total_wire as f64).clamp(0.0, 1.0);
 
-        // Track consecutive high-loss windows for link death detection.
-        // Mark dead when loss > 50% for 3+ consecutive metric windows so the
-        // scheduler stops routing packets into a black hole.
-        // Require sufficient packet volume to avoid false positives during
-        // idle periods when delta_sent is just 1 (the .max(1) floor).
-        if loss_rate > 0.50 && delta_sent >= 5 {
-            self.consecutive_high_loss.fetch_add(1, Ordering::Relaxed);
+        // Soft-demotion model: short-term high loss is reflected by
+        // `loss_rate` and is naturally factored into EDPF's per-link
+        // capacity discount (see `LinkState::capacity_bytes_per_sec`).
+        // The binary `alive=false` flag is reserved for genuinely sustained
+        // failures — a time-based EWMA of `loss_rate` must stay above
+        // `LOSS_DEATH_HI` for `LOSS_DEATH_DURATION` before the link is
+        // considered dead. This prevents brief HARQ retransmit bursts
+        // (300–800 ms, common on cellular) from cascading into
+        // scheduler-driven bufferbloat on the surviving link.
+        //
+        // The EWMA only updates when the link has carried meaningful
+        // traffic this window (`delta_sent >= 5`), so idle ticks can't
+        // drag the score in either direction.
+        let now = Instant::now();
+        let alive = if delta_sent >= 5 {
+            let mut ewma = self.loss_ewma.lock().unwrap();
+            let mut last_update = self.loss_ewma_last_update.lock().unwrap();
+            let alpha = match *last_update {
+                Some(prev) => {
+                    let dt = now.duration_since(prev).as_secs_f64();
+                    1.0 - (-dt / LOSS_EWMA_TAU_S).exp()
+                }
+                None => 1.0,
+            };
+            *ewma = alpha * loss_rate + (1.0 - alpha) * *ewma;
+            *last_update = Some(now);
+            let ewma_value = *ewma;
+            drop(ewma);
+            drop(last_update);
+
+            let mut sustained = self.sustained_loss_since.lock().unwrap();
+            if ewma_value >= LOSS_DEATH_HI {
+                if sustained.is_none() {
+                    *sustained = Some(now);
+                }
+            } else if ewma_value < LOSS_DEATH_LO {
+                *sustained = None;
+            }
+            let dead_for_long_enough = sustained
+                .map(|t| now.duration_since(t) >= LOSS_DEATH_DURATION)
+                .unwrap_or(false);
+            if dead_for_long_enough {
+                tracing::warn!(
+                    link_id = self.id,
+                    loss_rate = loss_rate,
+                    loss_ewma = ewma_value,
+                    sustained_ms = sustained.map(|t| now.duration_since(t).as_millis() as u64),
+                    "link marked dead: sustained high loss EWMA"
+                );
+                false
+            } else {
+                true
+            }
         } else {
-            self.consecutive_high_loss.store(0, Ordering::Relaxed);
-        }
-        let high_loss_count = self.consecutive_high_loss.load(Ordering::Relaxed);
-        let alive = high_loss_count < 3;
-        if !alive {
-            tracing::warn!(
-                link_id = self.id,
-                loss_rate = loss_rate,
-                consecutive_windows = high_loss_count,
-                "link marked dead: sustained high loss"
-            );
-        }
+            // No traffic this window — preserve last known state by reading
+            // the sustained-loss tracker without updating the EWMA.
+            let sustained = self.sustained_loss_since.lock().unwrap();
+            !sustained
+                .map(|t| now.duration_since(t) >= LOSS_DEATH_DURATION)
+                .unwrap_or(false)
+        };
 
         // Capacity: prefer Oracle → BBR btl_bw → ack_delivery_bps fallback.
         // When Oracle and BBR are both stale (no real bandwidth samples),
@@ -1006,6 +1098,14 @@ impl LinkSender for TransportLink {
 
     fn set_saturation_probe_active(&self, active: bool) {
         self.oracle.lock().unwrap().set_probe_active(active);
+    }
+
+    fn recv_bytes_delivered(&self) -> u64 {
+        self.last_recv_bytes_delivered.load(Ordering::Relaxed)
+    }
+
+    fn recv_report_at(&self) -> Option<Instant> {
+        Some(*self.last_recv_report_at.lock().unwrap())
     }
 
     fn recv_feedback(&self) -> usize {

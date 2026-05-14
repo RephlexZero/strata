@@ -767,10 +767,15 @@ pub struct ReceiverReportPacket {
     /// are user-visible artifacts even when outright loss is low — the
     /// sender uses this as an independent delay-pressure input.
     pub late_rate: u16,
+    /// Cumulative bytes successfully delivered to the receiver's reassembly
+    /// stage on this link since the receiver started. Used by the sender's
+    /// saturation-probe path to measure true receiver-observed throughput
+    /// independent of the modem TX queue depth.
+    pub bytes_delivered: u64,
 }
 
 impl ReceiverReportPacket {
-    pub const ENCODED_LEN: usize = 18; // 8 + 2 + 4 + 2 + 2
+    pub const ENCODED_LEN: usize = 26; // 8 + 2 + 4 + 2 + 2 + 8
 
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(ControlType::ReceiverReport as u8);
@@ -779,11 +784,13 @@ impl ReceiverReportPacket {
         buf.put_u32(self.jitter_buffer_ms);
         buf.put_u16(self.loss_after_fec);
         buf.put_u16(self.late_rate);
+        buf.put_u64(self.bytes_delivered);
     }
 
     pub fn decode(buf: &mut impl Buf) -> Option<Self> {
         // Require the pre-late-rate prefix (16 bytes) so older senders/receivers
-        // still interoperate. The late_rate field is optional at the tail.
+        // still interoperate. The late_rate and bytes_delivered fields are
+        // optional at the tail.
         const LEGACY_LEN: usize = 16;
         if buf.remaining() < LEGACY_LEN {
             return None;
@@ -797,12 +804,18 @@ impl ReceiverReportPacket {
         } else {
             0
         };
+        let bytes_delivered = if buf.remaining() >= 8 {
+            buf.get_u64()
+        } else {
+            0
+        };
         Some(ReceiverReportPacket {
             goodput_bps,
             fec_repair_rate,
             jitter_buffer_ms,
             loss_after_fec,
             late_rate,
+            bytes_delivered,
         })
     }
 
@@ -1171,6 +1184,7 @@ mod tests {
             jitter_buffer_ms: 120,
             loss_after_fec: 50, // 0.5%
             late_rate: 75,      // 0.75%
+            bytes_delivered: 12_345_678,
         };
         let mut buf = BytesMut::new();
         report.encode(&mut buf);
@@ -1181,6 +1195,7 @@ mod tests {
         assert_eq!(decoded.fec_repair_rate, 250);
         assert_eq!(decoded.jitter_buffer_ms, 120);
         assert_eq!(decoded.loss_after_fec, 50);
+        assert_eq!(decoded.bytes_delivered, 12_345_678);
     }
 
     #[test]
@@ -1191,6 +1206,7 @@ mod tests {
             jitter_buffer_ms: 0,
             loss_after_fec: 10000, // 100%
             late_rate: 0,
+            bytes_delivered: 0,
         };
         assert!((report.fec_repair_rate_f32() - 0.10).abs() < 1e-5);
         assert!((report.loss_after_fec_f32() - 1.0).abs() < 1e-5);

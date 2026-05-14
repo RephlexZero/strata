@@ -216,6 +216,22 @@ pub trait LinkSender: Send + Sync {
     /// When active, the oracle suppresses delivery observations to prevent
     /// inflated traffic rates from corrupting the lower bound estimate.
     fn set_saturation_probe_active(&self, _active: bool) {}
+
+    /// Cumulative bytes the remote receiver reports as delivered on this link
+    /// (from the most recent `ReceiverReport`). Returns `0` if no report has
+    /// been received yet. The probe driver uses this to compute true
+    /// receiver-observed throughput independent of the modem TX queue.
+    fn recv_bytes_delivered(&self) -> u64 {
+        0
+    }
+
+    /// `Instant` when the most recent `ReceiverReport` for this link was
+    /// processed (returns `None` if no report has arrived). The probe driver
+    /// uses this to detect when a fresh report has arrived after the probe
+    /// window closed.
+    fn recv_report_at(&self) -> Option<std::time::Instant> {
+        None
+    }
 }
 
 #[cfg(test)]
