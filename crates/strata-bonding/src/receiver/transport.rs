@@ -25,7 +25,7 @@ use strata_transport::pool::TimestampClock;
 use strata_transport::receiver::{Receiver as TransportReceiver, ReceiverConfig, ReceiverEvent};
 use strata_transport::session::RttTracker;
 use strata_transport::wire::{ControlBody, Packet as WirePacket, PacketHeader};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Multi-link bonding receiver backed by `strata-transport`.
 ///
@@ -292,11 +292,33 @@ async fn link_reader_async(
     // Most recently seen sender address on this socket.
     let mut sender_addr: Option<std::net::SocketAddr> = None;
 
+    // ── Per-link RX diagnostics ─────────────────────────────────────────
+    // A blackholed link receives nothing, so its receiver stats never
+    // appear in the aggregate strata-stats message — making the failure
+    // invisible. Log the first datagram ever seen on this link, then a
+    // periodic per-link RX heartbeat that fires EVEN WITH ZERO TRAFFIC so
+    // a dead link is visibly and continuously reported (rx=0) rather than
+    // silently absent.
+    let mut first_packet_logged = false;
+    let mut last_rx_log = std::time::Instant::now();
+    let rx_log_interval = Duration::from_secs(2);
+    let mut prev_rx_packets: u64 = 0;
+    let mut prev_rx_bytes: u64 = 0;
+
     while running.load(Ordering::Relaxed) {
         // Await next datagram with a timeout so we can check the running flag.
         match monoio::time::timeout(Duration::from_millis(50), socket.recv_from(buf)).await {
             Ok((Ok((n, addr)), returned_buf)) => {
                 sender_addr = Some(addr);
+                if !first_packet_logged {
+                    first_packet_logged = true;
+                    info!(
+                        link_id,
+                        peer = %addr,
+                        bytes = n,
+                        "rx link admitted: first datagram received"
+                    );
+                }
                 let raw = Bytes::copy_from_slice(&returned_buf[..n]);
 
                 // Check for control packets (Ping) before handing to transport_rx.
@@ -548,6 +570,29 @@ async fn link_reader_async(
                     packets_since_ack = 0;
                 }
             }
+        }
+
+        // Per-link RX heartbeat — runs every iteration regardless of the
+        // match arm, so a link that has received NOTHING still emits a
+        // line every `rx_log_interval` (rx_pkts=0), making a blackholed
+        // link continuously visible instead of silently absent.
+        if last_rx_log.elapsed() >= rx_log_interval {
+            let s = transport_rx.stats();
+            let d_pkts = s.packets_received.saturating_sub(prev_rx_packets);
+            let d_bytes = s.bytes_received.saturating_sub(prev_rx_bytes);
+            prev_rx_packets = s.packets_received;
+            prev_rx_bytes = s.bytes_received;
+            let secs = last_rx_log.elapsed().as_secs_f64().max(0.001);
+            info!(
+                link_id,
+                rx_pkts_total = s.packets_received,
+                rx_pkts_delta = d_pkts,
+                rx_kbps = (d_bytes as f64 * 8.0 / secs / 1000.0) as u64,
+                delivered_total = s.packets_delivered,
+                peer = sender_addr.map(|a| a.to_string()).unwrap_or_else(|| "<none>".into()),
+                "rx link heartbeat"
+            );
+            last_rx_log = std::time::Instant::now();
         }
     }
 }

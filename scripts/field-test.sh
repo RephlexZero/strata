@@ -542,6 +542,73 @@ num() {
 # state dump. Re-enable it below the loop so cleanup still fails loudly.
 set +e
 
+# ── Bidirectional link admission gate ───────────────────────────────
+#
+# The egress preflight (#7b) only proves packets LEAVE each interface;
+# it cannot see a return-path failure (carrier CGNAT dropping the
+# VPS→modem ACK/report leg) or a receiver that never accounts a link.
+# Those produce a run that silently loses ~50% of the stream while
+# every link still looks "alive" for the first few seconds.
+#
+# Run the REAL pipeline for a short admission window and require each
+# configured link to prove bidirectional liveness — ACK progress or a
+# receiver report — via the transport's ACK-starvation detector. A link
+# that egresses fine but gets no return traffic trips the
+# "ACK-starved blackhole" WARN; abort before wasting the full run and
+# print the receiver-side per-link RX heartbeat so the failure mode
+# (no bytes at receiver = CGNAT/sender-bind, vs bytes-but-no-ACK =
+# return path) is unambiguous.
+if [[ "${STRATA_SKIP_ADMISSION:-0}" == "1" ]]; then
+    warn "Link admission gate skipped (STRATA_SKIP_ADMISSION=1)"
+else
+    ADMISSION_WAIT="${STRATA_ADMISSION_WAIT_S:-12}"
+    echo ""
+    echo "── Link admission gate (${ADMISSION_WAIT}s bidirectional check) ──"
+    sleep "$ADMISSION_WAIT"
+
+    if ! kill -0 "$SENDER_PID" 2>/dev/null; then
+        fail "Sender exited during admission window — see /tmp/strata-sender.log"
+    fi
+
+    RX_HB=$(ssh "${SSH_OPTS[@]}" "$HOST" "grep 'rx link heartbeat' /tmp/strata-receiver.log 2>/dev/null | tail -20" 2>/dev/null || echo "")
+    ADMIT_BAD=()
+    for ((li=0; li<NUM_LINKS; li++)); do
+        # Authoritative fail signal: the transport's blackhole detector.
+        bh=$(grep -E "ACK-starved blackhole" /tmp/strata-sender.log 2>/dev/null \
+             | grep -E "link_id=${li}\b" | tail -1 || echo "")
+        # Corroborating signal: latest per-link line still shows the
+        # never-measured-RTT + not-alive state.
+        ll=$(grep -E "\[link\] id=${li} " /tmp/strata-sender.log 2>/dev/null | tail -1 || echo "")
+        not_alive=$(echo "$ll" | grep -c "alive=false" || true)
+        # Receiver-side: did ANY bytes reach this link's listener?
+        rx_delta=$(echo "$RX_HB" | grep -E "link_id=${li}\b" | tail -1 \
+                   | grep -oE "rx_pkts_total=[0-9]+" | head -1 | cut -d= -f2 || echo "")
+        rx_delta=$(num "$rx_delta")
+
+        if [[ -n "$bh" || "$not_alive" -ge 1 ]]; then
+            iface_str="${IFACES[$li]:-<routed>}"
+            port_str="${PORTS[$li]}"
+            if [[ "$rx_delta" -gt 0 ]]; then
+                diag="receiver RECEIVED ${rx_delta} pkts but sender got no ACKs ⇒ RETURN-PATH blackhole (carrier CGNAT on this SIM dropping VPS→modem, or receiver not replying on this link)"
+            else
+                diag="receiver received 0 pkts on this link ⇒ either sender failed to bind ${iface_str} (SO_BINDTODEVICE/cap_net_raw) or egress for this SIM is down"
+            fi
+            warn "Link $li ($iface_str → :${port_str}) FAILED admission: $diag"
+            ADMIT_BAD+=("$li")
+        else
+            info "Link $li (${IFACES[$li]:-<routed>} → :${PORTS[$li]}) admitted (bidirectional liveness OK)"
+        fi
+    done
+
+    if [[ ${#ADMIT_BAD[@]} -gt 0 ]]; then
+        echo ""
+        echo "── Receiver per-link RX heartbeat (last 20) ──"
+        echo "${RX_HB:-<no rx heartbeat lines — receiver logging not present?>}"
+        fail "Link admission failed for link(s): ${ADMIT_BAD[*]} — aborting before the ${DURATION}s run (set STRATA_SKIP_ADMISSION=1 to force)"
+    fi
+    info "All ${NUM_LINKS} links passed bidirectional admission"
+fi
+
 while [[ $ELAPSED -lt $DURATION ]]; do
     sleep 5
     ELAPSED=$((ELAPSED + 5))
