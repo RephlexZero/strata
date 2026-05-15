@@ -70,6 +70,7 @@ enum ControlMessage {
     AddLink(LinkConfig),
     RemoveLink(usize),
     SetDegradationStage(DegradationStage),
+    SetFecOverhead(f64),
     Shutdown,
 }
 
@@ -178,6 +179,13 @@ impl BondingRuntime {
         let _ = self
             .control_tx
             .send(ControlMessage::SetDegradationStage(stage));
+    }
+
+    /// Broadcasts an adaptive FEC overhead ratio (R/K) to all links
+    /// (thread-safe). Driven by the encoder `BitrateAdapter` so repair
+    /// strength tracks the measured loss regime.
+    pub fn set_fec_overhead(&self, ratio: f64) {
+        let _ = self.control_tx.send(ControlMessage::SetFecOverhead(ratio));
     }
 
     /// Returns a snapshot of all link metrics (thread-safe clone).
@@ -293,6 +301,9 @@ async fn runtime_worker_async(
                         }
                         ControlMessage::SetDegradationStage(stage) => {
                             scheduler.set_degradation_stage(stage);
+                        }
+                        ControlMessage::SetFecOverhead(ratio) => {
+                            scheduler.set_fec_overhead(ratio);
                         }
                         ControlMessage::Shutdown => return,
                     }

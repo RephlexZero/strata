@@ -125,6 +125,11 @@ pub struct LinkMetrics {
     pub owd_ms: f64,
     /// Latest receiver report from the remote receiver (if any).
     pub receiver_report: Option<ReceiverReportMetrics>,
+    /// True while a saturation probe is active on this link or within the
+    /// post-probe cooldown. The encoder `BitrateAdapter` skips receiver
+    /// feedback when any link reports this, since the probe traffic pin
+    /// contaminates loss/late/jitter signals for ~1 report interval.
+    pub probe_active: bool,
 }
 
 /// Receiver report metrics forwarded from the remote receiver.
@@ -232,6 +237,12 @@ pub trait LinkSender: Send + Sync {
     fn recv_report_at(&self) -> Option<std::time::Instant> {
         None
     }
+
+    /// Set the transport FEC redundancy as an overhead ratio (R/K), e.g.
+    /// `0.15` ≈ 15 % repair overhead. Driven by the `BitrateAdapter`'s
+    /// `recommended_fec_overhead` so protection tracks the measured loss
+    /// regime instead of a fixed default. Default no-op for mock links.
+    fn set_fec_overhead(&self, _ratio: f64) {}
 }
 
 #[cfg(test)]

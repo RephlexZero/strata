@@ -290,9 +290,21 @@ impl<L: LinkSender + ?Sized + 'static> Edpf<L> {
                 state.spare_capacity_bps = 0.0;
             }
 
-            // Bootstrap floor for uncalibrated links
+            // Bootstrap floor for uncalibrated links — but NOT for links
+            // that have sent real traffic and never had a single packet
+            // acknowledged. Such a link is unproven (likely blackholed):
+            // floored capacity would feed the adapter a fake aggregate
+            // (e.g. 2×1.5 Mbps) while half the stream silently vanishes.
+            // Leave its low/zero capacity so EDPF routes away and the
+            // encoder sees the true usable rate.
+            let unproven = state
+                .metrics
+                .transport
+                .as_ref()
+                .is_some_and(|t| t.packets_sent >= 40 && t.packets_acked == 0);
             if state.metrics.capacity_bps < 1_000_000.0
                 && matches!(state.metrics.phase, LinkPhase::Probe | LinkPhase::Warm)
+                && !unproven
             {
                 state.metrics.capacity_bps = capacity_floor;
                 state.metrics.estimated_capacity_bps = capacity_floor;
@@ -323,6 +335,11 @@ impl<L: LinkSender + ?Sized + 'static> Edpf<L> {
     /// Get a link reference by ID.
     pub fn get_link(&self, id: usize) -> Option<Arc<L>> {
         self.links.get(&id).map(|s| s.link.clone())
+    }
+
+    /// IDs of every registered link (alive or not).
+    pub fn link_ids(&self) -> Vec<usize> {
+        self.links.keys().copied().collect()
     }
 
     /// Record a successful send (updates in-flight and sent counters).
@@ -544,6 +561,7 @@ mod tests {
                     estimated_capacity_bps: 0.0,
                     owd_ms: 0.0,
                     receiver_report: None,
+                    probe_active: false,
                 }),
             }
         }

@@ -355,6 +355,11 @@ impl FecEncoder {
             return Vec::new();
         }
 
+        // Source seqs in a generation are contiguous (sender assigns from a
+        // monotonic counter), so the seq of index 0 anchors the whole
+        // generation: the decoder maps recovered index `i` → `base_seq + i`.
+        let base_seq = self.window.first().map(|(s, _)| *s).unwrap_or(0);
+
         let mut repairs = Vec::with_capacity(self.repair_count);
 
         for repair_idx in 0..self.repair_count {
@@ -371,6 +376,7 @@ impl FecEncoder {
                 symbol_index: repair_idx as u8,
                 k: k as u8,
                 r: self.repair_count as u8,
+                base_seq,
             };
 
             let payload_len = 1 + FecRepairHeader::ENCODED_LEN + repair_data.len();

@@ -57,7 +57,24 @@ pub struct AdaptationConfig {
     /// and encoder in sync from the first tick.  A value of 0 means "use
     /// max_bitrate_kbps" (legacy behaviour, kept for tests).
     pub initial_bitrate_kbps: u32,
+    /// How long a non-severe congestion signal must stay continuously
+    /// true before the adapter is allowed to issue a `Congestion`
+    /// reduction. See [`CONGESTION_SUSTAIN_DEFAULT`].
+    pub congestion_sustain: Duration,
 }
+
+/// Default sustain duration for non-severe congestion signals.
+///
+/// Cellular HARQ stalls produce single-tick `loss_pressure` /
+/// `link_collapse` / `late_pressure` signals that clear within
+/// 200–800 ms (see field-test data). Without a sustain gate, every such
+/// stall triggers a 30 % bitrate cut followed by a slow ramp-up,
+/// producing the sawtooth encoder behaviour visible as on-wire artifacts.
+///
+/// `severe_burst` (post-FEC loss > 50 % AND jitter > 200 ms in the same
+/// window) is treated as an emergency and bypasses this delay — it
+/// almost certainly indicates real link collapse, not a HARQ burst.
+pub const CONGESTION_SUSTAIN_DEFAULT: Duration = Duration::from_millis(1500);
 
 impl Default for AdaptationConfig {
     fn default() -> Self {
@@ -72,6 +89,7 @@ impl Default for AdaptationConfig {
             quality_cap_kbps: 6_000,
             reliability_spare_threshold_kbps: 3_000,
             initial_bitrate_kbps: 0,
+            congestion_sustain: CONGESTION_SUSTAIN_DEFAULT,
         }
     }
 }
@@ -217,6 +235,13 @@ pub struct BitrateAdapter {
     goodput_peak_bps: f64,
     /// Previous jitter buffer depth from receiver feedback.
     prev_jitter_buffer_ms: u32,
+    /// When the current non-severe congestion signal first became true.
+    /// `None` while the link is healthy. Cleared as soon as the signal
+    /// drops. A reduction is only allowed once the signal has been
+    /// continuously true for [`AdaptationConfig::congestion_sustain`];
+    /// `severe_burst` bypasses this gate so genuine collapses still
+    /// react immediately.
+    congestion_started: Option<Instant>,
 }
 
 impl BitrateAdapter {
@@ -248,6 +273,7 @@ impl BitrateAdapter {
             goodput_window: VecDeque::new(),
             goodput_peak_bps: 0.0,
             prev_jitter_buffer_ms: 0,
+            congestion_started: None,
         }
     }
 
@@ -698,6 +724,29 @@ impl BitrateAdapter {
                 let idx = ((samples.len() as f64 - 1.0) * 0.75).floor() as usize;
                 self.goodput_peak_bps = samples[idx];
             }
+        } else {
+            // Zero-goodput tick (real delivery stall, or a probe-suppressed
+            // update). Previously the EWMA and p75 peak froze at their last
+            // value, so the dynamic floor stayed optimistically high through
+            // the entire stall and the adapter held a target the links could
+            // not carry. Decay both toward zero so memory ages out instead
+            // of latching — symmetric with the loss EWMA's stall decay.
+            // Time-based half-life via GOODPUT_WINDOW eviction also prunes
+            // stale window samples so the p75 peak tracks the decay.
+            self.ewma_goodput_bps *= 0.8;
+            if self.ewma_goodput_bps < 1000.0 {
+                self.ewma_goodput_bps = 0.0;
+            }
+            self.goodput_window
+                .retain(|(t, _)| t.elapsed().as_secs_f64() < GOODPUT_WINDOW_SECS);
+            let mut samples: Vec<f64> = self.goodput_window.iter().map(|(_, g)| *g).collect();
+            if samples.is_empty() {
+                self.goodput_peak_bps = 0.0;
+            } else {
+                samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let idx = ((samples.len() as f64 - 1.0) * 0.75).floor() as usize;
+                self.goodput_peak_bps = samples[idx];
+            }
         }
         // Goodput-anchor the current target using the windowed peak, not the
         // slow EWMA.  After a burst the EWMA decays toward the artificially
@@ -733,11 +782,33 @@ impl BitrateAdapter {
             .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5));
         // Do not apply burst-loss cuts on the exact same tick as a capacity-path
         // increase. This avoids increase→burst-cut ping-pong from stale feedback.
-        let feedback_reduction = if feedback_grace {
+        let raw_signal = if feedback_grace {
             loss_pressure || delay_pressure || (burst_loss && !increased_this_tick)
         } else {
             loss_pressure || delay_pressure || goodput_shortfall || burst_loss
         };
+
+        // Sustained-duration gate: brief cellular HARQ bursts produce
+        // single-tick `link_collapse` / `late_pressure` / `burst_loss`
+        // signals that clear within ~800 ms. Reacting to each one creates
+        // the sawtooth encoder bitrate seen in field tests (47 commands /
+        // 120 s, ±500 kbps swings every 2-3 s, visible artifacts).
+        //
+        // Track when the signal first became true; only allow the cut
+        // once it has been continuously true for `CONGESTION_SUSTAIN`.
+        // `severe_burst` bypasses the gate so true collapse events still
+        // get an immediate reaction.
+        if raw_signal {
+            if self.congestion_started.is_none() {
+                self.congestion_started = Some(Instant::now());
+            }
+        } else {
+            self.congestion_started = None;
+        }
+        let sustained = self
+            .congestion_started
+            .is_some_and(|t| t.elapsed() >= self.config.congestion_sustain);
+        let feedback_reduction = severe_burst || sustained;
 
         // Skip the explicit feedback cut when the capacity-path update() already
         // reduced the target in this tick. The loss signal is baked into the
@@ -746,9 +817,13 @@ impl BitrateAdapter {
         let capacity_already_cut = target_after_capacity < target_before_update;
         let allow_feedback_cut = !capacity_already_cut || severe_burst;
 
+        let raw_held_ms = self
+            .congestion_started
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
         info!(
             target: "strata::adapt",
-            "[adapt] fb: loss_fec={:.3} ewma_loss={:.3}→{:.3} late={:.3} jitter={}ms(+{}ms) qmax={} gp={}kbps peak_gp={}kbps | loss_p={} link_collapse={} burst={} severe={} bb={} late_p={} gp_short={} grace={} cap_cut={} allow_cut={} inc_tick={} → reduce={}",
+            "[adapt] fb: loss_fec={:.3} ewma_loss={:.3}→{:.3} late={:.3} jitter={}ms(+{}ms) qmax={} gp={}kbps peak_gp={}kbps | loss_p={} link_collapse={} burst={} severe={} bb={} late_p={} gp_short={} grace={} cap_cut={} allow_cut={} inc_tick={} raw={} held_ms={} sustained={} → reduce={}",
             feedback.loss_after_fec,
             ewma_loss_before,
             self.ewma_loss_fec,
@@ -769,6 +844,9 @@ impl BitrateAdapter {
             capacity_already_cut,
             allow_feedback_cut,
             increased_this_tick,
+            raw_signal,
+            raw_held_ms,
+            sustained,
             feedback_reduction && allow_feedback_cut
         );
 
@@ -1276,6 +1354,7 @@ mod tests {
             max_bitrate_kbps: 10_000,
             min_bitrate_kbps: 100, // low floor so loss-pressure cuts have room to operate
             min_interval: Duration::ZERO,
+            congestion_sustain: Duration::ZERO,
             ..Default::default()
         });
 
@@ -1663,6 +1742,7 @@ mod tests {
             max_bitrate_kbps: 10_000,
             min_interval: Duration::ZERO,
             initial_bitrate_kbps: 2_000,
+            congestion_sustain: Duration::ZERO,
             ..Default::default()
         });
 

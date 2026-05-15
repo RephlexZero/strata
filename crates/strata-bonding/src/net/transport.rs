@@ -145,7 +145,44 @@ pub struct TransportLink {
     /// `alive` only flips to `false` once `loss_ewma` has been above the
     /// high threshold for `LOSS_DEATH_DURATION`.
     sustained_loss_since: Mutex<Option<Instant>>,
+    /// While `Some`, a saturation probe is active on this link OR within
+    /// the post-probe cooldown. Receiver reports covering this window are
+    /// contaminated by the probe's traffic pin (the disturbance shows up
+    /// ~1 report interval *after* the window closes), so the encoder
+    /// `BitrateAdapter` ignores feedback while this is set. `None` once the
+    /// cooldown has elapsed.
+    probe_feedback_block_until: Mutex<Option<Instant>>,
+    /// `packets_acked` snapshot from the previous `get_metrics`, used to
+    /// detect ACK *progress* (not just a nonzero total).
+    prev_acked_liveness: AtomicU64,
+    /// When ACK progress was last observed (packets_acked increased) OR a
+    /// receiver report last arrived. Seeded at construction so the
+    /// blackhole timer is measured from link start. A link that has sent
+    /// meaningful traffic but has had no ACK progress and no receiver
+    /// report for `BLACKHOLE_STALE` is treated as dead — the
+    /// retransmit-based `loss_rate` can't detect this because a blackholed
+    /// path produces no NACKs (delta_retx stays 0 → loss_rate 0.0).
+    last_ack_or_report: Mutex<Instant>,
 }
+
+/// A link that has sent at least this many packets but shown no ACK
+/// progress and no receiver report for `BLACKHOLE_STALE` is declared
+/// dead. The threshold gives startup a grace window so a link isn't
+/// killed before its first ACKs/reports have had time to return.
+const BLACKHOLE_MIN_SENT: u64 = 40;
+
+/// Maximum time a link may go without ACK progress or a receiver report
+/// (after sending meaningful traffic) before it is declared a blackhole.
+/// ~3 s comfortably exceeds a bonded cellular RTT plus the 1 s receiver
+/// report cadence, so a genuinely-live link refreshes this well within
+/// the window.
+const BLACKHOLE_STALE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Cooldown after a saturation probe's send window closes during which
+/// receiver feedback is still treated as contaminated. Receiver reports
+/// are sent at ~1 s cadence and the probe pin perturbs the link for the
+/// following report interval, so ~1.5 s covers the contaminated samples.
+const PROBE_FEEDBACK_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// EWMA loss threshold at which a link is considered *at risk*. Above this
 /// value the sustained-loss timer starts; the link must stay above for
@@ -235,6 +272,9 @@ impl TransportLink {
             loss_ewma: Mutex::new(0.0),
             loss_ewma_last_update: Mutex::new(None),
             sustained_loss_since: Mutex::new(None),
+            probe_feedback_block_until: Mutex::new(None),
+            prev_acked_liveness: AtomicU64::new(0),
+            last_ack_or_report: Mutex::new(Instant::now()),
         }
     }
 
@@ -637,7 +677,11 @@ impl TransportLink {
                     // throughput across the probe window.
                     self.last_recv_bytes_delivered
                         .store(report.bytes_delivered, Ordering::Relaxed);
-                    *self.last_recv_report_at.lock().unwrap() = Instant::now();
+                    let report_now = Instant::now();
+                    *self.last_recv_report_at.lock().unwrap() = report_now;
+                    // A receiver report is positive proof the path delivers,
+                    // even if ACKs are sparse — refresh the blackhole timer.
+                    *self.last_ack_or_report.lock().unwrap() = report_now;
                     let mut ewma = self.goodput_ewma_bps.lock().unwrap();
                     let goodput = report.goodput_bps as f64;
                     if *ewma == 0.0 {
@@ -960,6 +1004,35 @@ impl LinkSender for TransportLink {
                 .unwrap_or(false)
         };
 
+        // ── ACK-starvation / blackhole liveness ─────────────────────────
+        // The EWMA path above is driven by `loss_rate`, which is the
+        // retransmit ratio. A path that silently drops 100% of traffic
+        // (misrouted port, dead NAT mapping, receiver not listening)
+        // produces NO NACKs, so delta_retx stays 0, loss_rate is 0.0, and
+        // the link reports healthy forever while half the stream vanishes.
+        // Detect it directly: refresh a liveness timer on ACK *progress*
+        // (packets_acked increased) or a receiver report; if the link has
+        // sent meaningful traffic but the timer has been stale for
+        // `BLACKHOLE_STALE`, it is a blackhole.
+        let acked = stats.packets_acked;
+        let prev_acked = self.prev_acked_liveness.swap(acked, Ordering::Relaxed);
+        if acked > prev_acked {
+            *self.last_ack_or_report.lock().unwrap() = now;
+        }
+        let last_proof = *self.last_ack_or_report.lock().unwrap();
+        let blackholed = stats.packets_sent >= BLACKHOLE_MIN_SENT
+            && now.duration_since(last_proof) >= BLACKHOLE_STALE;
+        if blackholed && alive {
+            tracing::warn!(
+                link_id = self.id,
+                packets_sent = stats.packets_sent,
+                packets_acked = acked,
+                stale_ms = now.duration_since(last_proof).as_millis() as u64,
+                "link marked dead: ACK-starved blackhole (no ACK progress or receiver report)"
+            );
+        }
+        let alive = alive && !blackholed;
+
         // Capacity: prefer Oracle → BBR btl_bw → ack_delivery_bps fallback.
         // When Oracle and BBR are both stale (no real bandwidth samples),
         // use ack_delivery_bps as a direct proxy for achievable throughput.
@@ -1053,6 +1126,11 @@ impl LinkSender for TransportLink {
                     late_rate: r.late_rate_f32(),
                 }
             }),
+            probe_active: self
+                .probe_feedback_block_until
+                .lock()
+                .unwrap()
+                .is_some_and(|t| Instant::now() < t),
         }
     }
 
@@ -1098,6 +1176,14 @@ impl LinkSender for TransportLink {
 
     fn set_saturation_probe_active(&self, active: bool) {
         self.oracle.lock().unwrap().set_probe_active(active);
+        let mut block = self.probe_feedback_block_until.lock().unwrap();
+        if active {
+            // Hold the block open with a far-future deadline while the
+            // probe runs; the real cooldown starts when it ends.
+            *block = Some(Instant::now() + PROBE_FEEDBACK_COOLDOWN * 100);
+        } else {
+            *block = Some(Instant::now() + PROBE_FEEDBACK_COOLDOWN);
+        }
     }
 
     fn recv_bytes_delivered(&self) -> u64 {
@@ -1106,6 +1192,18 @@ impl LinkSender for TransportLink {
 
     fn recv_report_at(&self) -> Option<Instant> {
         Some(*self.last_recv_report_at.lock().unwrap())
+    }
+
+    fn set_fec_overhead(&self, ratio: f64) {
+        // Keep the generation size (K) fixed and vary the repair count (R)
+        // so `overhead ≈ R / K`. A fixed K keeps generation latency and
+        // decode cost predictable; only the protection strength adapts.
+        // R is clamped to [1, K]: at least one repair (FEC stays enabled,
+        // per the requirement) and never more repairs than sources.
+        const FEC_BASE_K: usize = 32;
+        let r = ((FEC_BASE_K as f64) * ratio).round() as usize;
+        let r = r.clamp(1, FEC_BASE_K);
+        self.sender.lock().unwrap().set_fec_rate(FEC_BASE_K, r);
     }
 
     fn recv_feedback(&self) -> usize {
@@ -1203,6 +1301,47 @@ mod tests {
         }
         let result = link.flush_fec();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn blackholed_link_marked_dead_after_stale() {
+        // Loopback socket with no feedback loop ⇒ packets_acked stays 0 and
+        // no receiver report ever arrives: a perfect blackhole.
+        let link = make_loopback_link(7);
+        for i in 0..60 {
+            link.send(format!("p{i}").as_bytes()).unwrap();
+        }
+
+        // Within the startup grace window the link is still considered
+        // alive (ACKs/reports might still be in flight).
+        assert!(
+            link.get_metrics().alive,
+            "link must not be killed before the blackhole grace window elapses"
+        );
+
+        // Backdate the liveness timer past BLACKHOLE_STALE.
+        *link.last_ack_or_report.lock().unwrap() =
+            std::time::Instant::now() - (BLACKHOLE_STALE + std::time::Duration::from_secs(1));
+
+        assert!(
+            !link.get_metrics().alive,
+            "link with traffic sent but zero ACK progress / reports for >{}s must be dead",
+            BLACKHOLE_STALE.as_secs()
+        );
+    }
+
+    #[test]
+    fn low_volume_link_not_falsely_blackholed() {
+        // Below BLACKHOLE_MIN_SENT the link is exempt even if stale —
+        // there simply hasn't been enough traffic to prove a blackhole.
+        let link = make_loopback_link(8);
+        link.send(b"hello").unwrap();
+        *link.last_ack_or_report.lock().unwrap() =
+            std::time::Instant::now() - (BLACKHOLE_STALE + std::time::Duration::from_secs(5));
+        assert!(
+            link.get_metrics().alive,
+            "a barely-used link must not be declared a blackhole"
+        );
     }
 
     #[test]

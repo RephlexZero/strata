@@ -209,6 +209,22 @@ impl FragmentAssembler {
 
 // ─── Receiver ───────────────────────────────────────────────────────────────
 
+/// Generation metadata learned from a FEC repair header. Lets a
+/// late-arriving source packet (repair-before-source reordering) also
+/// trigger a recovery attempt.
+#[derive(Debug, Clone, Copy)]
+struct FecGenInfo {
+    base_seq: u64,
+    k: u8,
+    r: u8,
+}
+
+/// How many sequence numbers of received source wire-bytes to retain for
+/// FEC. Must comfortably exceed the largest expected generation (K) plus
+/// reordering depth so the decoder can be fed every known source symbol
+/// of a generation when its repair arrives. 1024 ≈ 1.2 MB at 1200 B MTU.
+const FEC_SOURCE_CACHE_CAP: usize = 1024;
+
 /// Receiver state machine.
 pub struct Receiver {
     #[allow(dead_code)]
@@ -226,6 +242,15 @@ pub struct Receiver {
     /// PPD state: arrival time and wire size of the last PPD-flagged packet.
     last_ppd_arrival: Option<std::time::Instant>,
     last_ppd_wire_size: usize,
+    /// Full wire bytes of recently received DATA packets, keyed by seq.
+    /// Fed to the FEC decoder as known source symbols so the linear
+    /// system can be solved for the missing ones. Bounded by
+    /// `FEC_SOURCE_CACHE_CAP`.
+    fec_source_cache: BTreeMap<u64, Bytes>,
+    /// Generations for which a repair header has been seen, keyed by
+    /// generation id. Used to map recovered indices back to global seqs
+    /// and to retry recovery when a late source packet arrives.
+    fec_generations: std::collections::HashMap<u16, FecGenInfo>,
 }
 
 impl Receiver {
@@ -252,6 +277,8 @@ impl Receiver {
             initialized: false,
             last_ppd_arrival: None,
             last_ppd_wire_size: 0,
+            fec_source_cache: BTreeMap::new(),
+            fec_generations: std::collections::HashMap::new(),
         }
     }
 
@@ -260,20 +287,24 @@ impl Receiver {
     /// Deserializes, updates loss detector, handles FEC repair packets,
     /// buffers for reordering, and delivers in-order packets.
     pub fn receive(&mut self, raw: Bytes) {
-        let mut buf = raw;
+        // Keep the original wire bytes — for DATA packets these are cached
+        // verbatim as FEC source symbols (the encoder protects the full
+        // wire packet, so the decoder must be fed the same bytes).
+        let mut buf = raw.clone();
         let pkt = match Packet::decode(&mut buf) {
             Some(p) => p,
             None => return, // Invalid packet — silently drop
         };
 
         match pkt.header.packet_type {
-            PacketType::Data => self.handle_data_packet(pkt),
+            PacketType::Data => self.handle_data_packet(pkt, raw),
             PacketType::Control => self.handle_control_packet(pkt),
         }
     }
 
-    /// Process a pre-decoded data packet.
-    fn handle_data_packet(&mut self, pkt: Packet) {
+    /// Process a pre-decoded data packet. `raw` is the full wire encoding
+    /// (header + payload) as received, used as the FEC source symbol.
+    fn handle_data_packet(&mut self, pkt: Packet, raw: Bytes) {
         let seq = pkt.header.sequence.value();
 
         if !self.initialized {
@@ -329,6 +360,15 @@ impl Receiver {
             self.last_ppd_wire_size = wire_size;
         }
 
+        // Cache the full wire bytes as a potential FEC source symbol, then
+        // bound the cache. A monotonic seq stream means dropping the lowest
+        // keys evicts the oldest packets.
+        self.fec_source_cache.insert(seq, raw);
+        while self.fec_source_cache.len() > FEC_SOURCE_CACHE_CAP {
+            let oldest = *self.fec_source_cache.keys().next().unwrap();
+            self.fec_source_cache.remove(&oldest);
+        }
+
         // Buffer for reordering
         self.reorder_buf.insert(
             seq,
@@ -341,29 +381,126 @@ impl Receiver {
 
         // Try to deliver in-order packets
         self.deliver_in_order();
+
+        // Repair-before-source reordering: if this packet falls inside a
+        // generation whose repair already arrived, a fresh source symbol
+        // may now make the linear system solvable.
+        let pending_gen = self.fec_generations.iter().find_map(|(g, info)| {
+            let end = info.base_seq + info.k as u64;
+            (seq >= info.base_seq && seq < end).then_some(*g)
+        });
+        if let Some(gen_id) = pending_gen {
+            self.attempt_fec_recovery(gen_id);
+        }
     }
 
     /// Handle a control packet (FEC repair, etc.)
     fn handle_control_packet(&mut self, pkt: Packet) {
         let mut payload = pkt.payload;
         if let Some(ControlBody::FecRepair(fec_hdr)) = ControlBody::decode(&mut payload) {
-            // Remaining payload is the repair data
+            // Record generation geometry so we can map recovered indices
+            // back to global seqs and retry on late source arrivals.
+            self.fec_generations.insert(
+                fec_hdr.generation_id,
+                FecGenInfo {
+                    base_seq: fec_hdr.base_seq,
+                    k: fec_hdr.k,
+                    r: fec_hdr.r,
+                },
+            );
+
+            // Remaining payload is the repair data.
             self.fec_decoder
                 .add_repair_symbol(&fec_hdr, payload.to_vec());
 
-            // Attempt recovery for this generation
-            let recovered = self.fec_decoder.try_recover(fec_hdr.generation_id);
-            for (_idx, data) in recovered {
-                self.stats.fec_recoveries += 1;
-                // TODO: Map FEC generation index back to actual sequence numbers.
-                // For now, recovered data cannot be reinserted without sequence
-                // tracking in the FEC generation.  Log the recovery for stats.
-                tracing::trace!(
-                    "FEC recovered {} bytes (generation {})",
-                    data.len(),
-                    fec_hdr.generation_id
-                );
+            self.attempt_fec_recovery(fec_hdr.generation_id);
+        }
+    }
+
+    /// Feed every cached source symbol of `gen_id` into the decoder, run
+    /// Gaussian elimination, and reinsert any recovered packets into the
+    /// reorder buffer at their true global sequence numbers.
+    fn attempt_fec_recovery(&mut self, gen_id: u16) {
+        let info = match self.fec_generations.get(&gen_id) {
+            Some(i) => *i,
+            None => return,
+        };
+        let k = info.k as usize;
+        if k == 0 {
+            return;
+        }
+
+        // Feed known source symbols (full wire bytes) for this generation
+        // so the decoder can reduce the linear system. `add_source` is
+        // idempotent per index, so re-feeding across repair/source arrivals
+        // is safe.
+        for idx in 0..k {
+            let seq = info.base_seq + idx as u64;
+            if let Some(raw) = self.fec_source_cache.get(&seq) {
+                self.fec_decoder
+                    .add_source_symbol(gen_id, idx, k, info.r as usize, raw.clone());
             }
+        }
+
+        let recovered = self.fec_decoder.try_recover(gen_id);
+        if recovered.is_empty() {
+            return;
+        }
+
+        let mut reinserted = false;
+        for (idx, data) in recovered {
+            let seq = info.base_seq + idx as u64;
+
+            // Already delivered, buffered, or directly received — nothing
+            // to do. (try_recover re-reports the same symbols on every
+            // call; these guards make reinsertion idempotent.)
+            if seq < self.next_deliver_seq
+                || self.reorder_buf.contains_key(&seq)
+                || self.fec_source_cache.contains_key(&seq)
+            {
+                continue;
+            }
+
+            // The recovered symbol is a full wire packet (header+payload),
+            // zero-padded to the generation's max symbol length.
+            // `Packet::decode` reads `payload_len` from the header and
+            // ignores the trailing padding, so it is self-describing.
+            let mut buf = data;
+            let rpkt = match Packet::decode(&mut buf) {
+                Some(p) => p,
+                None => continue, // corrupt recovery — drop
+            };
+            if rpkt.header.packet_type != PacketType::Data {
+                continue;
+            }
+            // Sanity: the decoded seq must match the index→seq mapping.
+            if rpkt.header.sequence.value() != seq {
+                continue;
+            }
+
+            self.stats.fec_recoveries += 1;
+            self.loss_detector.record_received(seq);
+            self.reorder_buf.insert(
+                seq,
+                BufferedPacket {
+                    header: rpkt.header,
+                    payload: rpkt.payload,
+                    fec_recovered: true,
+                },
+            );
+            reinserted = true;
+            tracing::trace!("FEC reinserted seq {} (generation {})", seq, gen_id);
+        }
+
+        if reinserted {
+            self.deliver_in_order();
+        }
+
+        // Drop generation bookkeeping once it can no longer help: every
+        // source seq is below the delivery frontier.
+        if info.base_seq + k as u64 <= self.next_deliver_seq {
+            self.fec_generations.remove(&gen_id);
+            self.fec_decoder.remove_generation(gen_id);
         }
     }
 
@@ -1195,5 +1332,129 @@ mod tests {
         // All recovery packets plus the skip past 99 should deliver
         assert_eq!(rx.stats().packets_delivered, 60);
         assert_eq!(rx.next_expected_seq(), 110);
+    }
+
+    // ─── End-to-End FEC Reinsertion ─────────────────────────────────────
+
+    /// A source packet lost on the wire but covered by FEC repair must be
+    /// recovered AND actually delivered to the application — not merely
+    /// counted. Drives the real `Sender` so the encoding matches
+    /// production exactly.
+    #[test]
+    fn fec_recovers_and_delivers_lost_source_packet() {
+        use crate::pool::Priority;
+        use crate::sender::{Sender, SenderConfig};
+
+        // Small generation so one send() fills it and emits repairs.
+        let mut tx = Sender::new(SenderConfig {
+            fec_k: 8,
+            fec_r: 4,
+            ..SenderConfig::default()
+        });
+
+        // 8 distinct unfragmented payloads → one full generation (seqs 0..8)
+        // plus 4 repair symbols.
+        for i in 0..8u64 {
+            tx.send(Bytes::from(vec![i as u8 + 1; 200]), Priority::Standard);
+        }
+        let outputs: Vec<_> = tx.drain_output().collect();
+
+        let repairs = outputs.iter().filter(|o| o.is_fec_repair).count();
+        assert!(repairs >= 1, "sender should emit FEC repair packets");
+
+        let mut rx = default_receiver();
+
+        // Deliver everything except source seq 3, which we "lose" on the
+        // wire. Repairs are delivered so FEC can reconstruct it.
+        const LOST_SEQ: u64 = 3;
+        for o in &outputs {
+            if !o.is_fec_repair && o.sequence == LOST_SEQ {
+                continue;
+            }
+            rx.receive(o.data.clone());
+        }
+
+        let delivered: Vec<_> = rx
+            .drain_events()
+            .filter_map(|e| match e {
+                ReceiverEvent::Deliver(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+
+        // The lost packet must be recovered via FEC and delivered with the
+        // correct payload and the fec_recovered flag set.
+        assert!(
+            rx.stats().fec_recoveries >= 1,
+            "expected at least one FEC recovery, got {}",
+            rx.stats().fec_recoveries
+        );
+        let lost = delivered
+            .iter()
+            .find(|d| d.sequence == LOST_SEQ)
+            .expect("lost seq 3 should be recovered and delivered");
+        assert_eq!(
+            lost.payload,
+            &vec![LOST_SEQ as u8 + 1; 200][..],
+            "recovered payload must match the original"
+        );
+        assert!(
+            lost.fec_recovered,
+            "delivered packet must be flagged fec_recovered"
+        );
+        // All 8 source packets ultimately delivered, in order.
+        assert_eq!(rx.next_expected_seq(), 8, "all 8 sources delivered");
+    }
+
+    /// FEC must still recover when the repair arrives BEFORE the surviving
+    /// source packets (reordering across links is common on cellular).
+    #[test]
+    fn fec_recovers_when_repair_arrives_before_sources() {
+        use crate::pool::Priority;
+        use crate::sender::{Sender, SenderConfig};
+
+        let mut tx = Sender::new(SenderConfig {
+            fec_k: 6,
+            fec_r: 3,
+            ..SenderConfig::default()
+        });
+        for i in 0..6u64 {
+            tx.send(Bytes::from(vec![i as u8 + 10; 150]), Priority::Standard);
+        }
+        let outputs: Vec<_> = tx.drain_output().collect();
+
+        let mut rx = default_receiver();
+        const LOST_SEQ: u64 = 2;
+
+        // Repairs first…
+        for o in outputs.iter().filter(|o| o.is_fec_repair) {
+            rx.receive(o.data.clone());
+        }
+        // …then the surviving sources (seq 2 stays lost).
+        for o in outputs.iter().filter(|o| !o.is_fec_repair) {
+            if o.sequence == LOST_SEQ {
+                continue;
+            }
+            rx.receive(o.data.clone());
+        }
+
+        let delivered: Vec<_> = rx
+            .drain_events()
+            .filter_map(|e| match e {
+                ReceiverEvent::Deliver(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            rx.stats().fec_recoveries >= 1,
+            "repair-before-source ordering must still recover"
+        );
+        let lost = delivered
+            .iter()
+            .find(|d| d.sequence == LOST_SEQ)
+            .expect("seq 2 should be recovered despite repair-first ordering");
+        assert_eq!(lost.payload, &vec![LOST_SEQ as u8 + 10; 150][..]);
+        assert_eq!(rx.next_expected_seq(), 6);
     }
 }

@@ -576,11 +576,20 @@ mod imp {
                                     None
                                 };
 
+                                // Suppress feedback while any link is in a
+                                // saturation-probe window (or its cooldown):
+                                // the traffic pin contaminates the receiver
+                                // loss/late/jitter signals, and reacting to
+                                // it is a self-inflicted disturbance the
+                                // encoder loop would otherwise chase.
+                                let probe_contaminated = metrics.values().any(|m| m.probe_active);
+
                                 // Feed BitrateAdapter and post command if target changed
-                                let cmd = if let Some(ref fb) = feedback {
-                                    adapter.update_with_feedback(&link_caps, fb)
-                                } else {
-                                    adapter.update(&link_caps)
+                                let cmd = match feedback {
+                                    Some(ref fb) if !probe_contaminated => {
+                                        adapter.update_with_feedback(&link_caps, fb)
+                                    }
+                                    _ => adapter.update(&link_caps),
                                 };
                                 if let Some(cmd) = cmd {
                                     let msg = gst::Structure::builder("bitrate-command")
@@ -789,6 +798,15 @@ impl StrataSink {
         let runtime = lock_or_recover(&self.imp().runtime);
         if let Some(rt) = runtime.as_ref() {
             rt.set_degradation_stage(stage);
+        }
+    }
+
+    /// Forwards the adaptive FEC overhead ratio (R/K) to the bonding
+    /// scheduler, which broadcasts it to every link's transport encoder.
+    pub fn set_fec_overhead(&self, ratio: f64) {
+        let runtime = lock_or_recover(&self.imp().runtime);
+        if let Some(rt) = runtime.as_ref() {
+            rt.set_fec_overhead(ratio);
         }
     }
 

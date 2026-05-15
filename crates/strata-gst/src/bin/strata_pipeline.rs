@@ -655,6 +655,13 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                     _ => strata_bonding::media::priority::DegradationStage::Normal,
                                 };
                             strata_sink.set_degradation_stage(stage);
+
+                            // Forward adaptive FEC overhead to the transport
+                            // encoders so repair strength tracks the measured
+                            // loss regime instead of the fixed default.
+                            if let Ok(fec_overhead) = s.get::<f64>("fec-overhead") {
+                                strata_sink.set_fec_overhead(fec_overhead);
+                            }
                         }
                     } else if s.name() == "strata-stats"
                         && let Some(sock) = &stats_socket

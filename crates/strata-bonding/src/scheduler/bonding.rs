@@ -185,6 +185,18 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
         self.degradation_stage = stage;
     }
 
+    /// Broadcast an adaptive FEC overhead ratio (R/K) to every link's
+    /// transport encoder. Driven by the `BitrateAdapter`'s
+    /// `recommended_fec_overhead` so repair strength tracks the measured
+    /// loss regime instead of the fixed transport default.
+    pub fn set_fec_overhead(&self, ratio: f64) {
+        for id in self.scheduler.link_ids() {
+            if let Some(link) = self.scheduler.get_link(id) {
+                link.set_fec_overhead(ratio);
+            }
+        }
+    }
+
     /// Returns the current degradation stage.
     pub fn degradation_stage(&self) -> DegradationStage {
         self.degradation_stage
@@ -1085,6 +1097,7 @@ mod tests {
                     estimated_capacity_bps: 0.0,
                     owd_ms: 0.0,
                     receiver_report: None,
+                    probe_active: false,
                 }),
                 sent_packets: Mutex::new(Vec::new()),
                 ppd_probe_count: AtomicUsize::new(0),

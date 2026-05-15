@@ -23,7 +23,7 @@
 #   STRATA_CRITICAL_BROADCAST   — Broadcast critical stream headers (default: false)
 #   STRATA_FAILOVER_ENABLED     — Sender scheduler failover flag (default: true)
 #   STRATA_FAILOVER_DURATION_MS — Sender failover hold (default: 800)
-#   STRATA_MAX_LATENCY_MS  — Receiver jitter buffer ceiling (default: 1000)
+#   STRATA_MAX_LATENCY_MS  — Receiver jitter buffer ceiling (default: 2000)
 #   STRATA_DURATION_SECS   — How long to stream before stopping (default: 60)
 #   STRATA_NO_BUILD=1      — Skip building and installing the sender binary
 #   STRATA_NO_DEPLOY=1     — Skip cross-compiling and deploying receiver binary
@@ -87,7 +87,7 @@ REDUNDANCY_ENABLED="${STRATA_REDUNDANCY_ENABLED:-false}"
 CRITICAL_BROADCAST="${STRATA_CRITICAL_BROADCAST:-false}"
 FAILOVER_ENABLED="${STRATA_FAILOVER_ENABLED:-true}"
 FAILOVER_DURATION_MS="${STRATA_FAILOVER_DURATION_MS:-800}"
-MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-1000}"
+MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-2000}"
 DURATION="${STRATA_DURATION_SECS:-60}"
 LOG_LEVEL="${STRATA_LOG_LEVEL:-debug,strata_bonding=debug,strata_transport=debug,strata::adapt=debug}"
 HOST="${STRATA_RECEIVER_HOST}"
@@ -199,6 +199,85 @@ if ssh "${SSH_OPTS[@]}" "$HOST" "echo ok" >/dev/null 2>&1; then
     info "SSH to $HOST is reachable"
 else
     fail "Cannot SSH to $HOST"
+fi
+
+# 7b. Per-link UDP path preflight.
+#
+# The interface-exists check (#6) only proves the NIC is present, not that
+# packets bound to it actually reach the receiver's UDP port. A blackholed
+# link (bad route/NAT/firewall on one path) otherwise produces a run that
+# silently loses ~50% of the stream while every link still reports
+# "alive". For each configured link, send a short UDP burst FROM that
+# interface's source IP to host:port and confirm the receiver host
+# actually observes packets on that port (via tcpdump, which sees wire
+# arrivals regardless of whether the receiver app is bound yet).
+#
+# Degrades to a warning (not a hard fail) if the required tooling
+# (tcpdump on the receiver, python3 locally) is unavailable, so the
+# harness still runs in minimal environments.
+if [[ ${#IFACES[@]} -gt 0 && -n "$RECEIVER_IP" ]]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 not found locally — skipping per-link path preflight"
+    elif ! ssh "${SSH_OPTS[@]}" "$HOST" "command -v tcpdump" >/dev/null 2>&1; then
+        warn "tcpdump not found on $HOST — skipping per-link path preflight"
+    else
+        for ((i=0; i<NUM_LINKS; i++)); do
+            pf_iface="${IFACES[$i]}"
+            pf_port_raw="${PORTS[$i]}"
+            pf_port="${pf_port_raw##*:}"   # strip host: if present
+            pf_src=$(ip -o -4 addr show dev "$pf_iface" 2>/dev/null \
+                | awk '{print $4}' | head -n1 | cut -d/ -f1 || true)
+            if [[ -z "$pf_src" ]]; then
+                warn "No IPv4 on $pf_iface — cannot path-check link $i; skipping"
+                continue
+            fi
+
+            pf_marker="/tmp/strata-preflight-${pf_port}.$$"
+            # Start a one-shot capture on the receiver (exits on first
+            # matching packet or after 6s), backgrounded server-side.
+            ssh "${SSH_OPTS[@]}" "$HOST" \
+                "nohup sh -c 'timeout 6 tcpdump -n -c 1 -i any udp and dst port ${pf_port} >${pf_marker} 2>&1; echo DONE >>${pf_marker}' >/dev/null 2>&1 &" \
+                >/dev/null 2>&1
+            sleep 1  # let tcpdump bind before we send
+
+            # Send a small UDP burst bound to this interface's source IP.
+            python3 - "$pf_src" "$RECEIVER_IP" "$pf_port" <<'PYEOF' || true
+import socket, sys, time
+src, dst, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.bind((src, 0))
+    for _ in range(20):
+        s.sendto(b"strata-preflight", (dst, port))
+        time.sleep(0.05)
+except OSError as e:
+    print(f"bind/send failed from {src}: {e}", file=sys.stderr)
+    sys.exit(1)
+finally:
+    s.close()
+PYEOF
+
+            # Give the capture up to ~5s to flush and report.
+            pf_seen=""
+            for _ in $(seq 1 10); do
+                pf_out=$(ssh "${SSH_OPTS[@]}" "$HOST" "cat ${pf_marker} 2>/dev/null" 2>/dev/null || true)
+                if echo "$pf_out" | grep -q "DONE"; then
+                    pf_seen="$pf_out"
+                    break
+                fi
+                sleep 0.5
+            done
+            ssh "${SSH_OPTS[@]}" "$HOST" "rm -f ${pf_marker}" >/dev/null 2>&1 || true
+
+            if echo "$pf_seen" | grep -qE "IP .* > .*\.${pf_port}:"; then
+                info "Link $i path OK: $pf_iface ($pf_src) → ${RECEIVER_IP}:${pf_port}"
+            elif [[ -z "$pf_seen" ]]; then
+                warn "Link $i path UNVERIFIED: capture did not report in time ($pf_iface → :${pf_port})"
+            else
+                fail "Link $i BLACKHOLED: no UDP from $pf_iface ($pf_src) reached ${RECEIVER_IP}:${pf_port} — check routing/NAT/firewall for this interface"
+            fi
+        done
+    fi
 fi
 
 # 8. Cross-compile and deploy receiver binary to remote

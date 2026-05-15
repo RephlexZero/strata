@@ -393,12 +393,14 @@ proptest! {
         symbol_index in any::<u8>(),
         k in 1u8..=255,
         r in 1u8..=255,
+        base_seq in any::<u64>(),
     ) {
         let header = FecRepairHeader {
             generation_id,
             symbol_index,
             k,
             r,
+            base_seq,
         };
 
         let mut buf = BytesMut::new();
@@ -410,5 +412,6 @@ proptest! {
         prop_assert_eq!(decoded.symbol_index, symbol_index);
         prop_assert_eq!(decoded.k, k);
         prop_assert_eq!(decoded.r, r);
+        prop_assert_eq!(decoded.base_seq, base_seq);
     }
 }

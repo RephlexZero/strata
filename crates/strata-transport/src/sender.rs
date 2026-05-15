@@ -161,8 +161,16 @@ impl Sender {
             self.stats.packets_sent += 1;
             self.stats.bytes_sent += payload.len() as u64;
 
-            // Feed FEC encoder (Bytes::clone is cheap — ref-counted)
-            let fec_repairs = self.fec_encoder.add_source_symbol(seq, payload.clone());
+            // Feed the FULL wire packet (header + payload) to the FEC
+            // encoder, not just the payload. A recovered symbol is then a
+            // complete, self-describing packet: its header carries the
+            // fragment flags, keyframe/config bits, timestamp, and
+            // `payload_len` needed to decode it and reinsert it into the
+            // in-order delivery stream. (FEC zero-pads to the generation's
+            // max symbol length; `Packet::decode` reads `payload_len` and
+            // ignores the trailing padding, so this is self-describing.)
+            // Bytes::clone is a cheap refcount bump.
+            let fec_repairs = self.fec_encoder.add_source_symbol(seq, wire_bytes.clone());
             for repair_data in fec_repairs {
                 self.output_queue.push_back(OutputPacket {
                     data: repair_data,

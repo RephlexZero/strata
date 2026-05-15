@@ -494,10 +494,17 @@ pub struct FecRepairHeader {
     pub k: u8,
     /// Total repair symbols generated.
     pub r: u8,
+    /// Global sequence number of source symbol index 0 in this generation.
+    /// Source seqs within a generation are contiguous (the sender assigns
+    /// them from a monotonic counter), so the receiver maps a recovered
+    /// generation index `i` back to its global seq via `base_seq + i`.
+    /// Without this, recovered symbols cannot be reinserted into the
+    /// in-order delivery stream.
+    pub base_seq: u64,
 }
 
 impl FecRepairHeader {
-    pub const ENCODED_LEN: usize = 5;
+    pub const ENCODED_LEN: usize = 13;
 
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(ControlType::FecRepair as u8);
@@ -505,6 +512,7 @@ impl FecRepairHeader {
         buf.put_u8(self.symbol_index);
         buf.put_u8(self.k);
         buf.put_u8(self.r);
+        buf.put_u64(self.base_seq);
     }
 
     pub fn decode(buf: &mut impl Buf) -> Option<Self> {
@@ -516,6 +524,7 @@ impl FecRepairHeader {
             symbol_index: buf.get_u8(),
             k: buf.get_u8(),
             r: buf.get_u8(),
+            base_seq: buf.get_u64(),
         })
     }
 }
