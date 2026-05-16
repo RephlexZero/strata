@@ -404,13 +404,75 @@ fn parse_uri(uri: &str) -> Option<SocketAddr> {
     host_port.parse::<SocketAddr>().ok()
 }
 
+/// Resolve the first IPv4 address assigned to `iface` via `getifaddrs(3)`.
+///
+/// A per-link socket must source its packets from the cellular modem's
+/// own subnet address. Binding `0.0.0.0` and letting `connect()` choose
+/// the source makes the kernel consult the routing table — whose route to
+/// the receiver is the WiFi/default interface — so it stamps the WiFi
+/// source IP onto a socket that `SO_BINDTODEVICE` then forces out a
+/// cellular NIC. The modem's carrier NAT non-deterministically
+/// black-holes those foreign-sourced packets, producing a link that
+/// "sends" but is never acknowledged. Binding explicitly to the
+/// interface address (as a working raw probe does) prevents this.
+fn interface_ipv4(iface: &str) -> Option<std::net::Ipv4Addr> {
+    use std::net::Ipv4Addr;
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs allocates a linked list we free via freeifaddrs.
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 || ifap.is_null() {
+        return None;
+    }
+    let mut result = None;
+    let mut cur = ifap;
+    while !cur.is_null() {
+        // SAFETY: cur is non-null and points at a valid ifaddrs node.
+        let node = unsafe { &*cur };
+        if !node.ifa_name.is_null() && !node.ifa_addr.is_null() {
+            // SAFETY: ifa_name is a NUL-terminated C string.
+            let name = unsafe { std::ffi::CStr::from_ptr(node.ifa_name) };
+            // SAFETY: ifa_addr points at a sockaddr; sa_family is always
+            // readable to discriminate the address family.
+            let family = unsafe { (*node.ifa_addr).sa_family };
+            if name.to_bytes() == iface.as_bytes() && family as i32 == libc::AF_INET {
+                // SAFETY: AF_INET ⇒ ifa_addr is a sockaddr_in.
+                let sin = unsafe { &*(node.ifa_addr as *const libc::sockaddr_in) };
+                let be = u32::from_be(sin.sin_addr.s_addr);
+                let ip = Ipv4Addr::from(be);
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    result = Some(ip);
+                    break;
+                }
+            }
+        }
+        cur = node.ifa_next;
+    }
+    // SAFETY: ifap was allocated by getifaddrs and not yet freed.
+    unsafe { libc::freeifaddrs(ifap) };
+    result
+}
+
 /// Create a `TransportLink` from a `LinkConfig`.
 fn create_transport_link(link: &LinkConfig) -> anyhow::Result<TransportLink> {
     let addr = parse_uri(&link.uri)
         .ok_or_else(|| anyhow::anyhow!("Invalid URI for transport: {}", link.uri))?;
 
     let socket = if let Some(ref iface) = link.interface {
-        let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        // Bind to the interface's OWN IPv4 (not 0.0.0.0) so packets are
+        // sourced from the modem's subnet address. Without this, the
+        // post-connect() source becomes the default-route (WiFi) address
+        // and the carrier NAT black-holes the link non-deterministically.
+        let bind_addr: SocketAddr = match interface_ipv4(iface) {
+            Some(ip) => SocketAddr::new(std::net::IpAddr::V4(ip), 0),
+            None => {
+                warn!(
+                    "link {}: could not resolve IPv4 for interface {:?}; \
+                     falling back to 0.0.0.0 (SO_BINDTODEVICE still applied, \
+                     but the carrier NAT may black-hole this link)",
+                    link.id, iface
+                );
+                "0.0.0.0:0".parse().unwrap()
+            }
+        };
         let sock = UdpSocket::bind(bind_addr)?;
         // Bind to specific interface via SO_BINDTODEVICE (requires CAP_NET_RAW or root).
         #[cfg(target_os = "linux")]

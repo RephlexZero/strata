@@ -589,7 +589,9 @@ async fn link_reader_async(
                 rx_pkts_delta = d_pkts,
                 rx_kbps = (d_bytes as f64 * 8.0 / secs / 1000.0) as u64,
                 delivered_total = s.packets_delivered,
-                peer = sender_addr.map(|a| a.to_string()).unwrap_or_else(|| "<none>".into()),
+                peer = sender_addr
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "<none>".into()),
                 "rx link heartbeat"
             );
             last_rx_log = std::time::Instant::now();

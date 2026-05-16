@@ -201,26 +201,32 @@ else
     fail "Cannot SSH to $HOST"
 fi
 
-# 7b. Per-link UDP path preflight.
+# 7b. Per-link UDP egress preflight (advisory).
 #
 # The interface-exists check (#6) only proves the NIC is present, not that
-# packets bound to it actually reach the receiver's UDP port. A blackholed
-# link (bad route/NAT/firewall on one path) otherwise produces a run that
-# silently loses ~50% of the stream while every link still reports
-# "alive". For each configured link, send a short UDP burst FROM that
-# interface's source IP to host:port and confirm the receiver host
-# actually observes packets on that port (via tcpdump, which sees wire
-# arrivals regardless of whether the receiver app is bound yet).
+# packets bound to it actually reach the receiver's UDP port. For each
+# configured link, send a short SO_BINDTODEVICE'd UDP burst to host:port
+# and confirm the receiver host observes it via a SYNCHRONOUS foreground
+# tcpdump on its primary interface (an earlier marker-file/`-i any`
+# backgrounded capture raced and produced false negatives — see commit
+# history).
 #
-# Degrades to a warning (not a hard fail) if the required tooling
-# (tcpdump on the receiver, python3 locally) is unavailable, so the
-# harness still runs in minimal environments.
+# This is ADVISORY only: it proves egress but cannot see the return
+# path. The authoritative blackhole check is the bidirectional link
+# admission gate below, which exercises the real pipeline. So a failed
+# egress probe here warns loudly but does not abort — the admission
+# gate makes the final call with a precise diagnosis.
 if [[ ${#IFACES[@]} -gt 0 && -n "$RECEIVER_IP" ]]; then
     if ! command -v python3 >/dev/null 2>&1; then
-        warn "python3 not found locally — skipping per-link path preflight"
+        warn "python3 not found locally — skipping per-link egress preflight"
     elif ! ssh "${SSH_OPTS[@]}" "$HOST" "command -v tcpdump" >/dev/null 2>&1; then
-        warn "tcpdump not found on $HOST — skipping per-link path preflight"
+        warn "tcpdump not found on $HOST — skipping per-link egress preflight"
     else
+        # VPS primary interface (the one its default route uses).
+        PF_VPS_IFACE=$(ssh "${SSH_OPTS[@]}" "$HOST" \
+            "ip route show default 2>/dev/null | grep -oP 'dev \K\S+' | head -n1" \
+            2>/dev/null || true)
+        PF_VPS_IFACE="${PF_VPS_IFACE:-any}"
         for ((i=0; i<NUM_LINKS; i++)); do
             pf_iface="${IFACES[$i]}"
             pf_port_raw="${PORTS[$i]}"
@@ -232,49 +238,42 @@ if [[ ${#IFACES[@]} -gt 0 && -n "$RECEIVER_IP" ]]; then
                 continue
             fi
 
-            pf_marker="/tmp/strata-preflight-${pf_port}.$$"
-            # Start a one-shot capture on the receiver (exits on first
-            # matching packet or after 6s), backgrounded server-side.
-            ssh "${SSH_OPTS[@]}" "$HOST" \
-                "nohup sh -c 'timeout 6 tcpdump -n -c 1 -i any udp and dst port ${pf_port} >${pf_marker} 2>&1; echo DONE >>${pf_marker}' >/dev/null 2>&1 &" \
-                >/dev/null 2>&1
-            sleep 1  # let tcpdump bind before we send
-
-            # Send a small UDP burst bound to this interface's source IP.
-            python3 - "$pf_src" "$RECEIVER_IP" "$pf_port" <<'PYEOF' || true
+            # Background sender: wait for the remote capture to be ready,
+            # then a ~1.2s SO_BINDTODEVICE burst (matches the validated
+            # diagnostic methodology).
+            ( sleep 2
+              python3 - "$pf_src" "$pf_iface" "$RECEIVER_IP" "$pf_port" <<'PYEOF'
 import socket, sys, time
-src, dst, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+src, iface, dst, port = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
+    s.setsockopt(socket.SOL_SOCKET, 25, (iface + "\0").encode())
     s.bind((src, 0))
-    for _ in range(20):
-        s.sendto(b"strata-preflight", (dst, port))
-        time.sleep(0.05)
+    for _ in range(40):
+        s.sendto(b"strata-egress-preflight", (dst, port))
+        time.sleep(0.03)
 except OSError as e:
     print(f"bind/send failed from {src}: {e}", file=sys.stderr)
-    sys.exit(1)
 finally:
     s.close()
 PYEOF
+            ) &
+            pf_send_pid=$!
 
-            # Give the capture up to ~5s to flush and report.
-            pf_seen=""
-            for _ in $(seq 1 10); do
-                pf_out=$(ssh "${SSH_OPTS[@]}" "$HOST" "cat ${pf_marker} 2>/dev/null" 2>/dev/null || true)
-                if echo "$pf_out" | grep -q "DONE"; then
-                    pf_seen="$pf_out"
-                    break
-                fi
-                sleep 0.5
-            done
-            ssh "${SSH_OPTS[@]}" "$HOST" "rm -f ${pf_marker}" >/dev/null 2>&1 || true
+            # Foreground synchronous capture on the VPS — output streams
+            # straight back over the SSH channel (no marker file, no race).
+            pf_hits=$(ssh "${SSH_OPTS[@]}" "$HOST" \
+                "timeout 8 tcpdump -nn -i ${PF_VPS_IFACE} \"udp and dst port ${pf_port}\" 2>/dev/null | grep -c '\.${pf_port}:'" \
+                2>/dev/null || echo 0)
+            wait "$pf_send_pid" 2>/dev/null || true
+            # Inline integer coercion (num() is defined later in the script).
+            pf_hits="${pf_hits//[^0-9]/}"
+            [[ -z "$pf_hits" ]] && pf_hits=0
 
-            if echo "$pf_seen" | grep -qE "IP .* > .*\.${pf_port}:"; then
-                info "Link $i path OK: $pf_iface ($pf_src) → ${RECEIVER_IP}:${pf_port}"
-            elif [[ -z "$pf_seen" ]]; then
-                warn "Link $i path UNVERIFIED: capture did not report in time ($pf_iface → :${pf_port})"
+            if [[ "$pf_hits" -gt 0 ]]; then
+                info "Link $i egress OK: $pf_iface ($pf_src) → ${RECEIVER_IP}:${pf_port} (${pf_hits} pkts seen)"
             else
-                fail "Link $i BLACKHOLED: no UDP from $pf_iface ($pf_src) reached ${RECEIVER_IP}:${pf_port} — check routing/NAT/firewall for this interface"
+                warn "Link $i egress UNVERIFIED: no UDP from $pf_iface ($pf_src) seen at ${RECEIVER_IP}:${pf_port} — advisory only; the bidirectional admission gate will make the authoritative call"
             fi
         done
     fi
