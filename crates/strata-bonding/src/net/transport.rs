@@ -132,19 +132,6 @@ pub struct TransportLink {
     prev_retransmissions: AtomicU64,
     /// Previous packets_sent snapshot for per-interval loss_rate.
     prev_loss_pkts_sent: AtomicU64,
-    /// Time-decayed EWMA of per-window `loss_rate`. Updated on every metric
-    /// refresh with a τ≈2 s time constant so brief cellular HARQ stalls don't
-    /// dominate. EDPF's capacity discount uses raw `loss_rate` for immediate
-    /// soft demotion; this EWMA only governs the harder `alive=false` flag.
-    loss_ewma: Mutex<f64>,
-    /// `Instant` of the most recent metric refresh that updated `loss_ewma`.
-    /// Used to size the EWMA time-step.
-    loss_ewma_last_update: Mutex<Option<Instant>>,
-    /// When `loss_ewma` first crossed `LOSS_DEATH_HI`. `None` while the link
-    /// is healthy. Cleared when `loss_ewma` drops below `LOSS_DEATH_LO`.
-    /// `alive` only flips to `false` once `loss_ewma` has been above the
-    /// high threshold for `LOSS_DEATH_DURATION`.
-    sustained_loss_since: Mutex<Option<Instant>>,
     /// While `Some`, a saturation probe is active on this link OR within
     /// the post-probe cooldown. Receiver reports covering this window are
     /// contaminated by the probe's traffic pin (the disturbance shows up
@@ -156,54 +143,42 @@ pub struct TransportLink {
     /// detect ACK *progress* (not just a nonzero total).
     prev_acked_liveness: AtomicU64,
     /// When ACK progress was last observed (packets_acked increased) OR a
-    /// receiver report last arrived. Seeded at construction so the
-    /// blackhole timer is measured from link start. A link that has sent
-    /// meaningful traffic but has had no ACK progress and no receiver
-    /// report for `BLACKHOLE_STALE` is treated as dead — the
-    /// retransmit-based `loss_rate` can't detect this because a blackholed
-    /// path produces no NACKs (delta_retx stays 0 → loss_rate 0.0).
+    /// receiver report last arrived. Seeded at construction. Used purely to
+    /// detect a link that is *currently* delivering nothing so its
+    /// scheduling weight can be crushed (NOT to latch it dead).
     last_ack_or_report: Mutex<Instant>,
 }
 
-/// A link that has sent at least this many packets but shown no ACK
-/// progress and no receiver report for `BLACKHOLE_STALE` is declared
-/// dead. The threshold gives startup a grace window so a link isn't
-/// killed before its first ACKs/reports have had time to return.
-const BLACKHOLE_MIN_SENT: u64 = 40;
+/// A link is only treated as delivery-starved once it has sent at least
+/// this many packets — gives startup a grace window before the first
+/// ACKs/reports have had time to return.
+const STARVED_MIN_SENT: u64 = 40;
 
-/// Maximum time a link may go without ACK progress or a receiver report
-/// (after sending meaningful traffic) before it is declared a blackhole.
-/// ~3 s comfortably exceeds a bonded cellular RTT plus the 1 s receiver
-/// report cadence, so a genuinely-live link refreshes this well within
-/// the window.
-const BLACKHOLE_STALE: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long a link may go without ACK progress or a receiver report
+/// (after sending meaningful traffic) before its scheduling weight is
+/// crushed to a probe trickle. ~3 s comfortably exceeds a bonded cellular
+/// RTT plus the 1 s receiver-report cadence.
+///
+/// Crucially this is NOT a death sentence: the link stays `alive`, keeps
+/// receiving a thin trickle (and periodic saturation probes), and its
+/// capacity is restored automatically on the *next* metric tick after a
+/// single ACK or receiver report arrives. There is no sticky "dead"
+/// state — a transient cellular loss burst can no longer permanently
+/// remove a link from the bond.
+const STARVED_STALE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Capacity (bits/sec) a delivery-starved link is pinned to. Small enough
+/// that EDPF deprioritises it to a trickle (its `predicted_arrival`
+/// balloons) yet non-zero so it still gets occasional packets and
+/// periodic saturation probes — the mechanism by which a recovered link
+/// re-admits itself. Roughly one 1300 B packet every ~150 ms.
+const STARVED_CAPACITY_FLOOR_BPS: f64 = 64_000.0;
 
 /// Cooldown after a saturation probe's send window closes during which
 /// receiver feedback is still treated as contaminated. Receiver reports
 /// are sent at ~1 s cadence and the probe pin perturbs the link for the
 /// following report interval, so ~1.5 s covers the contaminated samples.
 const PROBE_FEEDBACK_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(1500);
-
-/// EWMA loss threshold at which a link is considered *at risk*. Above this
-/// value the sustained-loss timer starts; the link must stay above for
-/// `LOSS_DEATH_DURATION` before being marked dead. Picked high enough that
-/// normal cellular HARQ jitter (which produces brief 0.5–1.0 raw loss
-/// spikes) doesn't lift the smoothed EWMA over the threshold.
-const LOSS_DEATH_HI: f64 = 0.55;
-
-/// EWMA loss threshold for clearing the sustained-loss timer. Hysteresis
-/// gap prevents the death timer from flickering on/off near the boundary.
-const LOSS_DEATH_LO: f64 = 0.25;
-
-/// How long `loss_ewma` must stay above `LOSS_DEATH_HI` before the link
-/// flips to `alive=false`. Field-test data shows real cellular HARQ stalls
-/// recover within 500–800 ms; 4 s is far longer than any benign burst, but
-/// short enough that genuinely-dead links don't waste scheduling slots.
-const LOSS_DEATH_DURATION: std::time::Duration = std::time::Duration::from_secs(4);
-
-/// EWMA time constant (seconds). The half-life is `ln(2) * τ ≈ 1.4 s`,
-/// so the EWMA forgets a brief 100 % loss burst within ~3 s.
-const LOSS_EWMA_TAU_S: f64 = 2.0;
 
 impl TransportLink {
     /// Create a new transport link.
@@ -269,9 +244,6 @@ impl TransportLink {
             oracle: Mutex::new(CapacityOracle::new()),
             prev_retransmissions: AtomicU64::new(0),
             prev_loss_pkts_sent: AtomicU64::new(0),
-            loss_ewma: Mutex::new(0.0),
-            loss_ewma_last_update: Mutex::new(None),
-            sustained_loss_since: Mutex::new(None),
             probe_feedback_block_until: Mutex::new(None),
             prev_acked_liveness: AtomicU64::new(0),
             last_ack_or_report: Mutex::new(Instant::now()),
@@ -942,96 +914,55 @@ impl LinkSender for TransportLink {
         let total_wire = delta_sent.saturating_add(delta_retx).max(1);
         let loss_rate = (delta_retx as f64 / total_wire as f64).clamp(0.0, 1.0);
 
-        // Soft-demotion model: short-term high loss is reflected by
-        // `loss_rate` and is naturally factored into EDPF's per-link
-        // capacity discount (see `LinkState::capacity_bytes_per_sec`).
-        // The binary `alive=false` flag is reserved for genuinely sustained
-        // failures — a time-based EWMA of `loss_rate` must stay above
-        // `LOSS_DEATH_HI` for `LOSS_DEATH_DURATION` before the link is
-        // considered dead. This prevents brief HARQ retransmit bursts
-        // (300–800 ms, common on cellular) from cascading into
-        // scheduler-driven bufferbloat on the surviving link.
+        // ── Continuous liveness model (no binary death) ─────────────────
         //
-        // The EWMA only updates when the link has carried meaningful
-        // traffic this window (`delta_sent >= 5`), so idle ticks can't
-        // drag the score in either direction.
+        // A configured, OS-up link is ALWAYS `alive`. Cellular links take
+        // transient loss bursts, HARQ stalls and handovers constantly;
+        // binary-killing one on a blip — and then never re-admitting it
+        // because exclusion starves the very traffic needed to prove
+        // recovery — permanently destroys half the bond from one hiccup.
+        //
+        // Instead, degradation is purely continuous:
+        //   * Ordinary loss → already discounted by EDPF's `(1-loss)`
+        //     per-link capacity factor (`capacity_bytes_per_sec`).
+        //   * A link *currently* delivering nothing (sent meaningful
+        //     traffic but zero ACK progress / receiver reports for
+        //     `STARVED_STALE`) has its reported `capacity_bps` crushed to
+        //     `STARVED_CAPACITY_FLOOR_BPS` (applied at capacity
+        //     finalisation below). EDPF then trickles it instead of
+        //     dumping the stream into it.
+        //
+        // `delivery_starved` is recomputed every call from a non-latching
+        // timer: the instant one ACK or receiver report arrives,
+        // `last_ack_or_report` refreshes and the next tick restores full
+        // capacity. The link never leaves the bond, so the existing
+        // saturation-probe rotation keeps re-testing it and it re-admits
+        // itself automatically. There is no sticky "dead" state.
         let now = Instant::now();
-        let alive = if delta_sent >= 5 {
-            let mut ewma = self.loss_ewma.lock().unwrap();
-            let mut last_update = self.loss_ewma_last_update.lock().unwrap();
-            let alpha = match *last_update {
-                Some(prev) => {
-                    let dt = now.duration_since(prev).as_secs_f64();
-                    1.0 - (-dt / LOSS_EWMA_TAU_S).exp()
-                }
-                None => 1.0,
-            };
-            *ewma = alpha * loss_rate + (1.0 - alpha) * *ewma;
-            *last_update = Some(now);
-            let ewma_value = *ewma;
-            drop(ewma);
-            drop(last_update);
-
-            let mut sustained = self.sustained_loss_since.lock().unwrap();
-            if ewma_value >= LOSS_DEATH_HI {
-                if sustained.is_none() {
-                    *sustained = Some(now);
-                }
-            } else if ewma_value < LOSS_DEATH_LO {
-                *sustained = None;
-            }
-            let dead_for_long_enough = sustained
-                .map(|t| now.duration_since(t) >= LOSS_DEATH_DURATION)
-                .unwrap_or(false);
-            if dead_for_long_enough {
-                tracing::warn!(
-                    link_id = self.id,
-                    loss_rate = loss_rate,
-                    loss_ewma = ewma_value,
-                    sustained_ms = sustained.map(|t| now.duration_since(t).as_millis() as u64),
-                    "link marked dead: sustained high loss EWMA"
-                );
-                false
-            } else {
-                true
-            }
-        } else {
-            // No traffic this window — preserve last known state by reading
-            // the sustained-loss tracker without updating the EWMA.
-            let sustained = self.sustained_loss_since.lock().unwrap();
-            !sustained
-                .map(|t| now.duration_since(t) >= LOSS_DEATH_DURATION)
-                .unwrap_or(false)
-        };
-
-        // ── ACK-starvation / blackhole liveness ─────────────────────────
-        // The EWMA path above is driven by `loss_rate`, which is the
-        // retransmit ratio. A path that silently drops 100% of traffic
-        // (misrouted port, dead NAT mapping, receiver not listening)
-        // produces NO NACKs, so delta_retx stays 0, loss_rate is 0.0, and
-        // the link reports healthy forever while half the stream vanishes.
-        // Detect it directly: refresh a liveness timer on ACK *progress*
-        // (packets_acked increased) or a receiver report; if the link has
-        // sent meaningful traffic but the timer has been stale for
-        // `BLACKHOLE_STALE`, it is a blackhole.
         let acked = stats.packets_acked;
         let prev_acked = self.prev_acked_liveness.swap(acked, Ordering::Relaxed);
         if acked > prev_acked {
             *self.last_ack_or_report.lock().unwrap() = now;
         }
         let last_proof = *self.last_ack_or_report.lock().unwrap();
-        let blackholed = stats.packets_sent >= BLACKHOLE_MIN_SENT
-            && now.duration_since(last_proof) >= BLACKHOLE_STALE;
-        if blackholed && alive {
+        let delivery_starved = stats.packets_sent >= STARVED_MIN_SENT
+            && now.duration_since(last_proof) >= STARVED_STALE;
+        if delivery_starved {
+            // Observability only — NOT a death. Logged at most ~1/s via
+            // the natural metric-refresh cadence; the link stays in the
+            // bond at trickle weight and self-heals on first ACK/report.
             tracing::warn!(
                 link_id = self.id,
                 packets_sent = stats.packets_sent,
                 packets_acked = acked,
                 stale_ms = now.duration_since(last_proof).as_millis() as u64,
-                "link marked dead: ACK-starved blackhole (no ACK progress or receiver report)"
+                "link delivery-starved: crushing to probe trickle (NOT dead — \
+                 auto-recovers on next ACK/report)"
             );
         }
-        let alive = alive && !blackholed;
+        // The link itself never self-reports dead; OS-down is handled
+        // separately by the `os_up` field.
+        let alive = true;
 
         // Capacity: prefer Oracle → BBR btl_bw → ack_delivery_bps fallback.
         // When Oracle and BBR are both stale (no real bandwidth samples),
@@ -1060,6 +991,17 @@ impl LinkSender for TransportLink {
             0.0
         };
         drop(oracle);
+
+        // Continuous demotion (replaces binary death): a link that is
+        // currently delivering nothing is pinned to the trickle floor so
+        // EDPF deprioritises it instead of dumping the stream into a hole.
+        // It stays in the bond; the probe rotation re-tests it and the
+        // floor lifts automatically on the next tick after an ACK/report.
+        let capacity_bps = if delivery_starved {
+            capacity_bps.min(STARVED_CAPACITY_FLOOR_BPS)
+        } else {
+            capacity_bps
+        };
 
         let btlbw_bps = if btl_bw_bps > 0.0 {
             Some(btl_bw_bps)
@@ -1304,43 +1246,61 @@ mod tests {
     }
 
     #[test]
-    fn blackholed_link_marked_dead_after_stale() {
+    fn delivery_starved_link_is_crushed_but_stays_alive_and_recovers() {
         // Loopback socket with no feedback loop ⇒ packets_acked stays 0 and
-        // no receiver report ever arrives: a perfect blackhole.
+        // no receiver report ever arrives: a perfect delivery starvation.
         let link = make_loopback_link(7);
         for i in 0..60 {
             link.send(format!("p{i}").as_bytes()).unwrap();
         }
 
-        // Within the startup grace window the link is still considered
-        // alive (ACKs/reports might still be in flight).
+        // Within the startup grace window: full participation.
+        let m = link.get_metrics();
+        assert!(m.alive, "link must never self-report dead");
+
+        // Backdate the liveness timer past STARVED_STALE.
+        *link.last_ack_or_report.lock().unwrap() =
+            std::time::Instant::now() - (STARVED_STALE + std::time::Duration::from_secs(1));
+
+        let m = link.get_metrics();
         assert!(
-            link.get_metrics().alive,
-            "link must not be killed before the blackhole grace window elapses"
+            m.alive,
+            "a starved link must STILL be alive — no binary death; it is \
+             only demoted so the probe rotation can re-admit it"
+        );
+        assert!(
+            m.capacity_bps <= STARVED_CAPACITY_FLOOR_BPS,
+            "starved link capacity must be crushed to the trickle floor, got {}",
+            m.capacity_bps
         );
 
-        // Backdate the liveness timer past BLACKHOLE_STALE.
-        *link.last_ack_or_report.lock().unwrap() =
-            std::time::Instant::now() - (BLACKHOLE_STALE + std::time::Duration::from_secs(1));
-
+        // A single fresh ACK/report timestamp restores full capacity on the
+        // very next tick — no sticky dead state.
+        *link.last_ack_or_report.lock().unwrap() = std::time::Instant::now();
+        let m = link.get_metrics();
+        assert!(m.alive);
         assert!(
-            !link.get_metrics().alive,
-            "link with traffic sent but zero ACK progress / reports for >{}s must be dead",
-            BLACKHOLE_STALE.as_secs()
+            m.capacity_bps > STARVED_CAPACITY_FLOOR_BPS || m.capacity_bps == 0.0, // 0.0 = no capacity estimate yet (loopback), still un-crushed
+            "capacity must lift off the floor immediately once delivery \
+             resumes, got {}",
+            m.capacity_bps
         );
     }
 
     #[test]
-    fn low_volume_link_not_falsely_blackholed() {
-        // Below BLACKHOLE_MIN_SENT the link is exempt even if stale —
-        // there simply hasn't been enough traffic to prove a blackhole.
+    fn low_volume_link_not_falsely_starved() {
+        // Below STARVED_MIN_SENT the link is exempt even if stale — there
+        // simply hasn't been enough traffic to conclude it is starved.
         let link = make_loopback_link(8);
         link.send(b"hello").unwrap();
         *link.last_ack_or_report.lock().unwrap() =
-            std::time::Instant::now() - (BLACKHOLE_STALE + std::time::Duration::from_secs(5));
+            std::time::Instant::now() - (STARVED_STALE + std::time::Duration::from_secs(5));
+        let m = link.get_metrics();
+        assert!(m.alive, "links never self-report dead");
         assert!(
-            link.get_metrics().alive,
-            "a barely-used link must not be declared a blackhole"
+            m.capacity_bps == 0.0 || m.capacity_bps > STARVED_CAPACITY_FLOOR_BPS,
+            "a barely-used link must not be crushed as starved, got {}",
+            m.capacity_bps
         );
     }
 
