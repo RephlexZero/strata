@@ -130,6 +130,16 @@ pub struct LinkMetrics {
     /// feedback when any link reports this, since the probe traffic pin
     /// contaminates loss/late/jitter signals for ~1 report interval.
     pub probe_active: bool,
+    /// Inferred (or operator-pinned) path regime — observability only, the
+    /// control path never branches on it. `None` until classified.
+    pub inferred_regime: Option<String>,
+    /// Bandwidth-delay product in bytes (`btl_bw × windowed-min RTprop`).
+    /// `0.0` until both are known. Exposed so the BDP-relative cap the
+    /// system chose is visible in metrics.
+    pub bdp_bytes: f64,
+    /// The inflight / paced-queue cap in bytes the link is enforcing
+    /// (`k × BDP`, or the bootstrap budget before BDP converges).
+    pub inflight_cap_bytes: f64,
 }
 
 /// Receiver report metrics forwarded from the remote receiver.
@@ -145,6 +155,9 @@ pub struct ReceiverReportMetrics {
     pub loss_after_fec: f32,
     /// Fraction of packets that arrived past the playout deadline (0.0–1.0).
     pub late_rate: f32,
+    /// Relative one-way-delay gradient in microseconds (F3): the
+    /// queue-building magnitude measured receiver-side, drift-immune.
+    pub delay_gradient_us: u32,
 }
 
 /// Transport-layer statistics from `strata-transport`.
@@ -243,6 +256,18 @@ pub trait LinkSender: Send + Sync {
     /// `recommended_fec_overhead` so protection tracks the measured loss
     /// regime instead of a fixed default. Default no-op for mock links.
     fn set_fec_overhead(&self, _ratio: f64) {}
+
+    /// Pin this link's path regime (operator escape hatch, F6). `None` or
+    /// `"auto"` re-enables auto-inference. Only affects the regime reported
+    /// in metrics — the control path stays path-relative. Default no-op.
+    fn set_profile(&self, _regime: Option<&str>) {}
+
+    /// Opportunistic modem flow-control (F5). A modem backend that exposes
+    /// QMAP DFC (Qualcomm/rmnet) or vendor AT transmit-backpressure stats
+    /// calls this with `slow_down = true` when the modem's own TX ring is
+    /// backing up, `false` when grants are restored. Strictly additive:
+    /// the default no-op means absence of such a backend changes nothing.
+    fn on_modem_flow_control(&self, _slow_down: bool) {}
 }
 
 #[cfg(test)]

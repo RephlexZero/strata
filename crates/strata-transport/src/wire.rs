@@ -781,10 +781,17 @@ pub struct ReceiverReportPacket {
     /// saturation-probe path to measure true receiver-observed throughput
     /// independent of the modem TX queue depth.
     pub bytes_delivered: u64,
+    /// Relative one-way delay GRADIENT for this link in microseconds (F3):
+    /// `ewma(arrival_us − send_ts_us) − windowed_min(arrival_us − send_ts_us)`.
+    /// The constant sender/receiver clock offset cancels in the subtraction
+    /// (this is a gradient, not absolute OWD — no PTP needed). A sustained
+    /// positive value means the bottleneck queue is filling *before* loss.
+    /// Optional wire tail: legacy peers omit it and it decodes as 0.
+    pub delay_gradient_us: u32,
 }
 
 impl ReceiverReportPacket {
-    pub const ENCODED_LEN: usize = 26; // 8 + 2 + 4 + 2 + 2 + 8
+    pub const ENCODED_LEN: usize = 30; // 8 + 2 + 4 + 2 + 2 + 8 + 4
 
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(ControlType::ReceiverReport as u8);
@@ -794,6 +801,7 @@ impl ReceiverReportPacket {
         buf.put_u16(self.loss_after_fec);
         buf.put_u16(self.late_rate);
         buf.put_u64(self.bytes_delivered);
+        buf.put_u32(self.delay_gradient_us);
     }
 
     pub fn decode(buf: &mut impl Buf) -> Option<Self> {
@@ -818,6 +826,11 @@ impl ReceiverReportPacket {
         } else {
             0
         };
+        let delay_gradient_us = if buf.remaining() >= 4 {
+            buf.get_u32()
+        } else {
+            0
+        };
         Some(ReceiverReportPacket {
             goodput_bps,
             fec_repair_rate,
@@ -825,6 +838,7 @@ impl ReceiverReportPacket {
             loss_after_fec,
             late_rate,
             bytes_delivered,
+            delay_gradient_us,
         })
     }
 
@@ -1194,6 +1208,7 @@ mod tests {
             loss_after_fec: 50, // 0.5%
             late_rate: 75,      // 0.75%
             bytes_delivered: 12_345_678,
+            delay_gradient_us: 8_400,
         };
         let mut buf = BytesMut::new();
         report.encode(&mut buf);
@@ -1205,6 +1220,33 @@ mod tests {
         assert_eq!(decoded.jitter_buffer_ms, 120);
         assert_eq!(decoded.loss_after_fec, 50);
         assert_eq!(decoded.bytes_delivered, 12_345_678);
+        assert_eq!(decoded.delay_gradient_us, 8_400);
+    }
+
+    #[test]
+    fn receiver_report_legacy_decode_without_gradient() {
+        // A legacy 26-byte report (no delay_gradient tail) must still
+        // decode, with the gradient defaulting to 0.
+        let report = ReceiverReportPacket {
+            goodput_bps: 1_000_000,
+            fec_repair_rate: 0,
+            jitter_buffer_ms: 10,
+            loss_after_fec: 0,
+            late_rate: 0,
+            bytes_delivered: 999,
+            delay_gradient_us: 0,
+        };
+        let mut buf = BytesMut::new();
+        buf.put_u64(report.goodput_bps);
+        buf.put_u16(report.fec_repair_rate);
+        buf.put_u32(report.jitter_buffer_ms);
+        buf.put_u16(report.loss_after_fec);
+        buf.put_u16(report.late_rate);
+        buf.put_u64(report.bytes_delivered);
+        // No gradient tail.
+        let decoded = ReceiverReportPacket::decode(&mut buf).unwrap();
+        assert_eq!(decoded.bytes_delivered, 999);
+        assert_eq!(decoded.delay_gradient_us, 0);
     }
 
     #[test]
@@ -1216,6 +1258,7 @@ mod tests {
             loss_after_fec: 10000, // 100%
             late_rate: 0,
             bytes_delivered: 0,
+            delay_gradient_us: 0,
         };
         assert!((report.fec_repair_rate_f32() - 0.10).abs() < 1e-5);
         assert!((report.loss_after_fec_f32() - 1.0).abs() < 1e-5);

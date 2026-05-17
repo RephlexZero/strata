@@ -26,6 +26,11 @@ pub struct LinkConfigInput {
     pub id: Option<usize>,
     pub uri: String,
     pub interface: Option<String>,
+    /// Per-link path-regime override (F6). One of
+    /// `auto|cellular|fiber|satellite|wifi|lossy`. Defaults to `auto`
+    /// (infer from measurement). Only affects the regime reported in
+    /// metrics — the control path stays path-relative regardless.
+    pub profile: Option<String>,
 }
 
 /// Raw receiver configuration from TOML input.
@@ -97,6 +102,16 @@ pub struct SchedulerConfigInput {
     pub stats_interval_ms: Option<u64>,
     /// Runtime packet channel depth
     pub channel_capacity: Option<usize>,
+    /// Interval between saturation probes for each link (seconds).
+    /// Set to a very large value (e.g. `1e9`) to effectively disable the
+    /// saturation probe without a scheduler-logic change (Phase-0 §3.3
+    /// isolation sentinel).
+    pub saturation_probe_interval_s: Option<f64>,
+    /// Duration of each saturation probe in seconds.
+    pub saturation_probe_duration_s: Option<f64>,
+    /// Interval between PPD (Packet-Pair Dispersion) probe pairs per link
+    /// (seconds). Set very large to disable PPD probing (isolation sentinel).
+    pub ppd_probe_interval_s: Option<f64>,
 }
 
 /// Resolved link configuration with concrete values.
@@ -105,6 +120,8 @@ pub struct LinkConfig {
     pub id: usize,
     pub uri: String,
     pub interface: Option<String>,
+    /// Path-regime override (`auto` → `None`). See [`LinkConfigInput::profile`].
+    pub profile: Option<String>,
 }
 
 /// Resolved receiver configuration.
@@ -357,9 +374,21 @@ impl SchedulerConfigInput {
                 .channel_capacity
                 .unwrap_or(defaults.channel_capacity)
                 .max(16),
-            saturation_probe_interval_s: defaults.saturation_probe_interval_s,
-            saturation_probe_duration_s: defaults.saturation_probe_duration_s,
-            ppd_probe_interval_s: defaults.ppd_probe_interval_s,
+            // Guard the interval against div-by-zero in the probe stagger
+            // calc (`saturation_probe_interval_s / num_links` at
+            // bonding.rs). The disable sentinel (e.g. 1e9) is preserved.
+            saturation_probe_interval_s: self
+                .saturation_probe_interval_s
+                .unwrap_or(defaults.saturation_probe_interval_s)
+                .max(0.01),
+            saturation_probe_duration_s: self
+                .saturation_probe_duration_s
+                .unwrap_or(defaults.saturation_probe_duration_s)
+                .max(0.01),
+            ppd_probe_interval_s: self
+                .ppd_probe_interval_s
+                .unwrap_or(defaults.ppd_probe_interval_s)
+                .max(0.01),
         }
     }
 }
@@ -412,10 +441,15 @@ impl BondingConfigInput {
                     name
                 ));
             }
+            let profile = link
+                .profile
+                .map(|p| p.trim().to_ascii_lowercase())
+                .filter(|p| !p.is_empty() && p != "auto");
             out.push(LinkConfig {
                 id,
                 uri: link.uri,
                 interface: iface,
+                profile,
             });
         }
 
@@ -603,6 +637,75 @@ mod tests {
     }
 
     #[test]
+    fn parse_toml_probe_config_overrides() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            saturation_probe_interval_s = 20.0
+            saturation_probe_duration_s = 0.6
+            ppd_probe_interval_s = 3.0
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!((cfg.scheduler.saturation_probe_interval_s - 20.0).abs() < 1e-6);
+        assert!((cfg.scheduler.saturation_probe_duration_s - 0.6).abs() < 1e-6);
+        assert!((cfg.scheduler.ppd_probe_interval_s - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_toml_probe_config_disable_sentinel() {
+        // The §3.3 isolation sentinel: a huge interval makes the probe never
+        // fire without any scheduler-logic edit.
+        let toml = r#"
+            version = 1
+            [scheduler]
+            saturation_probe_interval_s = 1000000000.0
+            ppd_probe_interval_s = 1000000000.0
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.scheduler.saturation_probe_interval_s >= 1e9);
+        assert!(cfg.scheduler.ppd_probe_interval_s >= 1e9);
+        // Duration unset → falls back to default.
+        let defaults = SchedulerConfig::default();
+        assert!(
+            (cfg.scheduler.saturation_probe_duration_s - defaults.saturation_probe_duration_s)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn parse_toml_probe_config_interval_div_zero_guard() {
+        let toml = r#"
+            version = 1
+            [scheduler]
+            saturation_probe_interval_s = 0.0
+            ppd_probe_interval_s = 0.0
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert!(cfg.scheduler.saturation_probe_interval_s >= 0.01);
+        assert!(cfg.scheduler.ppd_probe_interval_s >= 0.01);
+    }
+
+    #[test]
+    fn parse_toml_probe_config_defaults() {
+        let toml = r#"
+            version = 1
+            [[links]]
+            uri = "strata://10.0.0.1:5000"
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        let defaults = SchedulerConfig::default();
+        assert!(
+            (cfg.scheduler.saturation_probe_interval_s - defaults.saturation_probe_interval_s)
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            (cfg.scheduler.ppd_probe_interval_s - defaults.ppd_probe_interval_s).abs() < 1e-6
+        );
+    }
+
+    #[test]
     fn parse_toml_scheduler_defaults() {
         let toml = r#"
             version = 1
@@ -745,6 +848,29 @@ mod tests {
         "#;
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.scheduler.redundancy_target_links, 1);
+    }
+
+    #[test]
+    fn parse_toml_per_link_profile() {
+        let toml = r#"
+            version = 1
+            [[links]]
+            id = 1
+            uri = "strata://1.2.3.4:5000"
+            profile = "satellite"
+            [[links]]
+            id = 2
+            uri = "strata://5.6.7.8:5000"
+            profile = "auto"
+            [[links]]
+            id = 3
+            uri = "strata://9.0.1.2:5000"
+        "#;
+        let cfg = BondingConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.links[0].profile.as_deref(), Some("satellite"));
+        // "auto" and absent both resolve to None (infer from measurement).
+        assert_eq!(cfg.links[1].profile, None);
+        assert_eq!(cfg.links[2].profile, None);
     }
 
     #[test]

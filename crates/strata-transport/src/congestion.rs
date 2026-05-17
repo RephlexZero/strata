@@ -48,6 +48,57 @@ pub enum BiscayState {
     PreHandover,
 }
 
+/// Inferred (or operator-pinned) path regime.
+///
+/// Per the versatility doctrine the *control* path never branches on this —
+/// every mechanism is expressed relative to the link's own measured
+/// baseline/variance (BDP, delay-gradient). This classification exists
+/// purely so the system can **explain its own decisions** in metrics and so
+/// auto-detection mis-fires (a bloated Wi-Fi AP mimicking cellular) are
+/// visible and overridable, not so behaviour is configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PathRegime {
+    /// Not enough measurement yet to classify.
+    #[default]
+    Unknown,
+    /// ~ms RTT, near-zero loss, high capacity — loss is the signal, fill it.
+    Fiber,
+    /// Moderate RTT, variable capacity, deep buffers — delay-bounded.
+    Cellular,
+    /// Hundreds-of-ms RTT by design, low loss — must not be flagged stalled.
+    Satellite,
+    /// Low RTT but aggregation bursts / contention jitter.
+    Wifi,
+    /// Shallow buffer, persistent random loss — loss-driven, high util.
+    Lossy,
+}
+
+impl PathRegime {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PathRegime::Unknown => "unknown",
+            PathRegime::Fiber => "fiber",
+            PathRegime::Cellular => "cellular",
+            PathRegime::Satellite => "satellite",
+            PathRegime::Wifi => "wifi",
+            PathRegime::Lossy => "lossy",
+        }
+    }
+
+    /// Parse an operator override string (`auto` → `None`).
+    pub fn parse_override(s: &str) -> Option<PathRegime> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "" => None,
+            "fiber" => Some(PathRegime::Fiber),
+            "cellular" => Some(PathRegime::Cellular),
+            "satellite" => Some(PathRegime::Satellite),
+            "wifi" => Some(PathRegime::Wifi),
+            "lossy" => Some(PathRegime::Lossy),
+            _ => None,
+        }
+    }
+}
+
 /// BBRv3-inspired phase within Normal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BbrPhase {
@@ -107,9 +158,19 @@ pub struct BiscayController {
     // ─── RTT tracking ───
     /// Recent RTT samples (µs) for RTprop estimation.
     rtt_samples: VecDeque<f64>,
-    /// When RTprop was last updated.
+    /// Sliding window of `(timestamp, rtt_us)` whose minimum *is* RTprop.
+    ///
+    /// RTprop must be a windowed-min propagation delay, never a recent RTT:
+    /// a sample taken while the modem/RAN buffer is already bloated (e.g.
+    /// 500 ms) would, as a lifetime minimum, pin the BDP cap astronomically
+    /// high forever and the cap could never force a drain. Entries older
+    /// than `rt_prop_expiry` expire out of the window exactly like BBR's
+    /// windowed min_rtt, so any stale bloated sample self-heals.
+    rt_prop_window: VecDeque<(Instant, f64)>,
+    /// When the current windowed-min RTprop sample was observed.
     rt_prop_stamp: Instant,
-    /// RTprop expiry — probe RTT if this old.
+    /// RTprop expiry — also the sliding-window length. Probe RTT if the
+    /// current min is this old (forced drain keeps RTprop honest).
     rt_prop_expiry: Duration,
 
     // ─── Radio state ───
@@ -143,6 +204,31 @@ pub struct BiscayController {
     /// capacity. When `false`, pacing stays at 1.0× (cruise) to avoid
     /// simultaneous probing across all bonded links.
     probe_allowed: bool,
+
+    // ─── Path-regime observability (F6) ───
+    /// Operator override; `None` = auto-infer from measurement.
+    profile_override: Option<PathRegime>,
+    /// Slow EWMA of the per-interval loss rate (0.0–1.0). Fed by the
+    /// transport adapter; used only to *classify* the regime for metrics,
+    /// never to gate control (loss already drives backoff via the CC).
+    recent_loss_rate: f64,
+
+    // ─── Delay-gradient signal (F3) ───
+    /// EWMA of the receiver-reported relative-OWD gradient (µs). A
+    /// sustained positive value means the bottleneck queue is filling.
+    delay_grad_ewma: f64,
+    /// EWMA of the gradient's absolute deviation — the link's own
+    /// gradient *jitter*. "Queue building" is the gradient exceeding
+    /// `k × this`, so the trip point is path-relative, never a constant.
+    delay_grad_jitter: f64,
+    /// True once at least one receiver delay-gradient sample has arrived.
+    /// Until then the coarse RTT-ratio heuristic is the fallback delay
+    /// signal (signal fusion: whichever fires first drives backoff).
+    has_gradient_signal: bool,
+    /// Number of gradient samples seen (warm-up gate).
+    grad_samples: u32,
+    /// Throttle for gradient-driven drain updates.
+    last_grad_tick: Instant,
 }
 
 impl BiscayController {
@@ -163,6 +249,7 @@ impl BiscayController {
             bw_window: Duration::from_secs(10),
 
             rtt_samples: VecDeque::with_capacity(32),
+            rt_prop_window: VecDeque::with_capacity(64),
             rt_prop_stamp: now,
             rt_prop_expiry: Duration::from_secs(10),
 
@@ -176,6 +263,158 @@ impl BiscayController {
 
             drain_factor: 1.0,
             probe_allowed: true, // default: allowed until coordinator assigns tokens
+            profile_override: None,
+            recent_loss_rate: 0.0,
+            delay_grad_ewma: 0.0,
+            delay_grad_jitter: 0.0,
+            has_gradient_signal: false,
+            grad_samples: 0,
+            last_grad_tick: now,
+        }
+    }
+
+    /// Pin the path regime (operator escape hatch). `None` re-enables
+    /// auto-inference. Does not change control behaviour — only the
+    /// regime reported in metrics.
+    pub fn set_profile_override(&mut self, regime: Option<PathRegime>) {
+        self.profile_override = regime;
+    }
+
+    /// Feed the latest per-interval loss rate (0.0–1.0) so the regime
+    /// classifier can distinguish a lossy link from a clean one. Slow EWMA
+    /// so a single burst doesn't reclassify the path.
+    pub fn observe_loss_rate(&mut self, loss_rate: f64) {
+        let l = loss_rate.clamp(0.0, 1.0);
+        self.recent_loss_rate = if self.recent_loss_rate == 0.0 {
+            l
+        } else {
+            0.1 * l + 0.9 * self.recent_loss_rate
+        };
+    }
+
+    /// Multiple of the link's own gradient *jitter* beyond which a
+    /// sustained positive delay gradient counts as "queue building". This
+    /// is a statistical noise multiple (≈3σ), not a network constant — it
+    /// is correct on any path because `delay_grad_jitter` is measured
+    /// per-link.
+    const GRAD_TRIP_SIGMA: f64 = 3.0;
+
+    /// Feed a receiver-reported relative-OWD gradient sample (µs, F3).
+    ///
+    /// This is the *primary* delay-pressure signal: it fires strictly
+    /// before loss and, unlike the coarse RTT-ratio heuristic, is
+    /// path-relative (compared to the link's own gradient jitter) so the
+    /// same code is correct on fiber, cellular and satellite. It feeds the
+    /// shared `drain_factor` knob, so it composes with loss-driven backoff
+    /// (signal fusion — whichever fires first wins). The *specific* loading
+    /// link is demoted; there is no global all-links reaction.
+    pub fn on_delay_gradient_us(&mut self, grad_us: u32) {
+        let g = grad_us as f64;
+        // EWMA of the gradient and of its absolute deviation (jitter).
+        let dev = (g - self.delay_grad_ewma).abs();
+        self.delay_grad_ewma = if self.grad_samples == 0 {
+            g
+        } else {
+            0.2 * g + 0.8 * self.delay_grad_ewma
+        };
+        self.delay_grad_jitter = if self.grad_samples == 0 {
+            0.0
+        } else {
+            0.2 * dev + 0.8 * self.delay_grad_jitter
+        };
+        self.has_gradient_signal = true;
+        self.grad_samples = self.grad_samples.saturating_add(1);
+
+        // Need a propagation-delay reference to express the noise floor
+        // path-relatively, and a short warm-up so jitter is meaningful.
+        if self.rt_prop_us >= f64::MAX || self.grad_samples < 4 {
+            return;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.last_grad_tick) < Duration::from_millis(100) {
+            return;
+        }
+        self.last_grad_tick = now;
+
+        // Trip point: max(kσ of this link's gradient jitter, 5% of its
+        // own RTprop). Both terms are path-relative — no absolute constant.
+        let trip = (Self::GRAD_TRIP_SIGMA * self.delay_grad_jitter)
+            .max(0.05 * self.rt_prop_us);
+        if self.delay_grad_ewma > trip {
+            // Severity scales with how far past the trip point we are.
+            let over = (self.delay_grad_ewma / trip).clamp(1.0, 8.0);
+            let decay = 1.0 - 0.05 * (over - 1.0).min(3.0);
+            self.drain_factor = (self.drain_factor * decay).max(0.5);
+        } else if self.delay_grad_ewma < 0.5 * trip {
+            // Gradient back near baseline — queue drained, recover.
+            self.drain_factor = (self.drain_factor + 0.05).min(1.0);
+        }
+        self.update_pacing_rate();
+    }
+
+    /// Current smoothed delay-gradient (µs) — observability.
+    pub fn delay_gradient_us(&self) -> f64 {
+        self.delay_grad_ewma
+    }
+
+    /// Opportunistic modem flow-control hook (F5).
+    ///
+    /// Some modems expose explicit transmit backpressure — Qualcomm/rmnet
+    /// **QMAP DFC** (Data Flow Control) grant withdrawal, or vendor AT
+    /// stats. When such a backend reports "slow down", forward it here and
+    /// it composes with the loss/delay-gradient backoff through the same
+    /// `drain_factor` knob. This is **strictly additive**: if no modem
+    /// backend ever calls it, nothing changes (no QMI/MBIM dependency is
+    /// introduced). A grant restoration (`slow_down = false`) lets
+    /// `drain_factor` recover.
+    pub fn on_modem_flow_control(&mut self, slow_down: bool) {
+        if slow_down {
+            // The modem firmware itself says its TX ring is backing up —
+            // an authoritative, earliest-possible congestion signal. Drain
+            // gently toward the same safety floor the other signals use.
+            self.drain_factor = (self.drain_factor * 0.9).max(0.5);
+        } else {
+            self.drain_factor = (self.drain_factor + 0.05).min(1.0);
+        }
+        self.update_pacing_rate();
+    }
+
+    /// The regime currently in effect: the operator override if set,
+    /// otherwise inferred from the measured path. Pure observability — the
+    /// control path is path-relative and never branches on this.
+    ///
+    /// Inference is expressed against the link's own windowed-min RTprop
+    /// (`rt_prop_us`), capacity (`btl_bw`) and loss EWMA. The cut points are
+    /// classification boundaries for a human-readable label, not control
+    /// thresholds: a wrong label degrades observability, never behaviour.
+    pub fn inferred_regime(&self) -> PathRegime {
+        if let Some(forced) = self.profile_override {
+            return forced;
+        }
+        if self.rt_prop_us >= f64::MAX || self.btl_bw <= 0.0 {
+            return PathRegime::Unknown;
+        }
+        let rtprop_ms = self.rt_prop_us / 1000.0;
+        let loss = self.recent_loss_rate;
+        // Satellite: geostationary one-way ≈ 250 ms → RTT ≥ ~400 ms.
+        if rtprop_ms >= 400.0 {
+            return PathRegime::Satellite;
+        }
+        // Fiber: ~ms RTT and effectively loss-free.
+        if rtprop_ms <= 8.0 && loss < 0.005 {
+            return PathRegime::Fiber;
+        }
+        // Lossy: persistent random loss dominates regardless of RTT.
+        if loss >= 0.02 {
+            return PathRegime::Lossy;
+        }
+        // Wi-Fi vs cellular: both are buffered/jittery; without an RF feed
+        // the honest call at low RTT with some loss is Wi-Fi, otherwise the
+        // bonded-modem common case is cellular.
+        if rtprop_ms <= 20.0 {
+            PathRegime::Wifi
+        } else {
+            PathRegime::Cellular
         }
     }
 
@@ -243,6 +482,32 @@ impl BiscayController {
     /// Get the bufferbloat drain factor (0.2–1.0).
     pub fn drain_factor(&self) -> f64 {
         self.drain_factor
+    }
+
+    /// Bandwidth-delay product in bytes: `btl_bw × RTprop`.
+    ///
+    /// Returns `0.0` until both a bandwidth estimate and a windowed-min
+    /// RTprop exist. This is the scale-free anchor for the inflight / queue
+    /// cap: it auto-sizes to the path (satellite → huge, fiber → large,
+    /// cellular → modest) with no per-regime constant. Because RTprop is a
+    /// windowed minimum (see `rt_prop_window`), a one-off bloated RTT can
+    /// not inflate the BDP permanently.
+    pub fn bdp_bytes(&self) -> f64 {
+        if self.btl_bw > 0.0 && self.rt_prop_us < f64::MAX {
+            (self.btl_bw * (self.rt_prop_us / 1_000_000.0)).max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Inflight / queue cap in bytes: `k × BDP`.
+    ///
+    /// `k` is a small headroom multiple (~1.25). Returns `0.0` when the BDP
+    /// is not yet known, signalling the caller to fall back to its own
+    /// bootstrap bound rather than clamp to zero.
+    pub fn inflight_cap_bytes(&self, k: f64) -> f64 {
+        let bdp = self.bdp_bytes();
+        if bdp > 0.0 { bdp * k.max(1.0) } else { 0.0 }
     }
 
     // ─── BBR feedback processing ────────────────────────────────────────
@@ -343,11 +608,33 @@ impl BiscayController {
             self.rtt_samples.pop_front();
         }
 
-        // RTprop = min RTT observed
+        // RTprop = minimum over a sliding window (NOT a lifetime minimum).
+        // Push the sample, expire anything older than the window, then take
+        // the min of what remains. `rt_prop_stamp` tracks when the *current
+        // minimum* was seen so ProbeRtt fires a forced drain right as the
+        // honest low sample is about to age out.
         let prev_rt_prop = self.rt_prop_us;
-        if rtt_us < self.rt_prop_us {
-            self.rt_prop_us = rtt_us;
-            self.rt_prop_stamp = Instant::now();
+        let now = Instant::now();
+        self.rt_prop_window.push_back((now, rtt_us));
+        let cutoff = now.checked_sub(self.rt_prop_expiry);
+        while let Some(&(ts, _)) = self.rt_prop_window.front() {
+            if cutoff.is_some_and(|c| ts < c) {
+                self.rt_prop_window.pop_front();
+            } else {
+                break;
+            }
+        }
+        let mut min_rtt = f64::MAX;
+        let mut min_ts = now;
+        for &(ts, v) in &self.rt_prop_window {
+            if v < min_rtt {
+                min_rtt = v;
+                min_ts = ts;
+            }
+        }
+        if min_rtt < f64::MAX {
+            self.rt_prop_us = min_rtt;
+            self.rt_prop_stamp = min_ts;
         }
 
         debug!(
@@ -360,25 +647,28 @@ impl BiscayController {
             "RTT sample"
         );
 
-        // Detect bufferbloat: RTT >> RTprop → reduce drain_factor.
-        // RTT recovering toward RTprop → restore drain_factor.
-        // drain_factor is applied inside update_pacing_rate() so the
-        // reduction persists across recalculations.
+        // Coarse RTT-ratio bufferbloat heuristic — FALLBACK ONLY.
         //
-        // Thresholds are set for bonded cellular with deep modem TX buffers
-        // (500ms–2s).  Real eNodeB queues routinely inflate RTT to 5-10×
-        // rt_prop without indicating actual congestion.  Tight thresholds
-        // (e.g. 2×/4×) cause persistent drain that starves throughput.
-        //
-        // Guard: require rt_prop_us ≥ 1 ms to avoid drain_factor collapse
-        // from artificially low initial RTTs (e.g. first ping on docker
-        // networks before real traffic). Sub-millisecond RTTs are not
-        // realistic for cellular links and indicate a measurement artifact.
+        // The fixed 5×/3×/1.5× RTprop ratios are exactly the kind of
+        // trial-fitted cellular constant the versatility doctrine warns
+        // against (a stall detector on a 600 ms satellite link, an
+        // over-trigger on aggregating Wi-Fi). Once the receiver-reported,
+        // path-relative delay GRADIENT (F3) is live it is the authoritative
+        // queue-build signal and owns `drain_factor`. This block then only
+        // *recovers* drain_factor (never fights the gradient), and acts as
+        // the primary detector solely during the brief window before the
+        // first receiver report arrives (signal fusion: whichever fires
+        // first). rt_prop_us ≥ 1 ms guards against sub-ms startup artifacts.
         if self.rt_prop_us >= 1_000.0 && self.rt_prop_us < f64::MAX {
             // Only update drain_factor periodically to avoid per-ACK overreaction
-            let now = Instant::now();
             if now.duration_since(self.last_tick) > Duration::from_millis(100) {
-                if rtt_us > self.rt_prop_us * 5.0 {
+                if self.has_gradient_signal {
+                    // Gradient owns backoff; here we only let drain_factor
+                    // recover when RTT is unambiguously near baseline.
+                    if rtt_us < self.rt_prop_us * 1.5 {
+                        self.drain_factor = (self.drain_factor + 0.05).min(1.0);
+                    }
+                } else if rtt_us > self.rt_prop_us * 5.0 {
                     // Severe bloat — aggressive drain
                     self.drain_factor = (self.drain_factor * 0.85).max(0.5);
                 } else if rtt_us > self.rt_prop_us * 3.0 {
@@ -393,7 +683,6 @@ impl BiscayController {
         } else if self.drain_factor < 1.0 {
             // Time-based recovery: if rt_prop_us is stale/invalid, slowly
             // restore drain_factor so we don't stay permanently throttled.
-            let now = Instant::now();
             if now.duration_since(self.last_tick) > Duration::from_millis(100) {
                 self.drain_factor = (self.drain_factor + 0.02).min(1.0);
                 self.last_tick = now;
@@ -600,11 +889,17 @@ impl BiscayController {
                 > self.rt_prop_expiry + Duration::from_millis(200)
         {
             self.bbr_phase = BbrPhase::ProbeBw;
-            // Reset RTprop to the latest RTT sample so bandwidth samples
-            // aren't rejected as app-limited (BDP = btl_bw × ∞ when
-            // rt_prop=MAX). The next real RTT sample will refine it.
+            // The ProbeRtt drain exists precisely to obtain a fresh,
+            // un-bloated RTprop sample. Discard the stale window (it may be
+            // full of samples taken while the queue was bloated) and reseed
+            // it with the post-drain reading. This also prevents BDP from
+            // being computed against a stale inflated RTprop, and keeps
+            // bandwidth samples from being rejected as app-limited (BDP =
+            // btl_bw × ∞ when rt_prop = MAX).
             if let Some(&latest) = self.rtt_samples.back() {
                 self.rt_prop_us = latest;
+                self.rt_prop_window.clear();
+                self.rt_prop_window.push_back((now, latest));
             }
             self.rt_prop_stamp = now;
         }
@@ -801,6 +1096,227 @@ mod tests {
         let mut cc = BiscayController::new();
         cc.on_rtt_sample(-100.0);
         assert_eq!(cc.rt_prop_us(), f64::MAX);
+    }
+
+    // ─── F2: windowed-min RTprop + BDP cap ──────────────────────────────
+
+    #[test]
+    fn rtprop_is_windowed_min_not_lifetime_min() {
+        let mut cc = BiscayController::new();
+        // A clean low sample, then the link bloats (queue fills): RTprop
+        // must hold the low value while both are inside the window.
+        cc.on_rtt_sample(20_000.0);
+        assert_eq!(cc.rt_prop_us(), 20_000.0);
+        cc.on_rtt_sample(500_000.0); // bloated
+        assert_eq!(
+            cc.rt_prop_us(),
+            20_000.0,
+            "windowed min must ignore the bloated sample, not adopt it"
+        );
+
+        // Force the clean sample to age out of the window: only the bloated
+        // sample remains, so RTprop rises (cap can then force a drain).
+        cc.rt_prop_window
+            .iter_mut()
+            .for_each(|(ts, _)| *ts = Instant::now() - Duration::from_secs(20));
+        cc.on_rtt_sample(480_000.0);
+        assert!(
+            cc.rt_prop_us() > 100_000.0,
+            "stale low sample must expire so a bloated RTprop self-heals, got {}",
+            cc.rt_prop_us()
+        );
+    }
+
+    #[test]
+    fn bdp_zero_until_both_known() {
+        let mut cc = BiscayController::new();
+        assert_eq!(cc.bdp_bytes(), 0.0);
+        cc.on_rtt_sample(50_000.0); // RTprop known, btl_bw still 0
+        assert_eq!(cc.bdp_bytes(), 0.0);
+        cc.on_bandwidth_sample(1_000_000, 1_000_000, false); // 1 MB/s
+        // BDP = 1e6 B/s × 0.05 s = 50_000 B
+        assert!((cc.bdp_bytes() - 50_000.0).abs() < 1_000.0);
+    }
+
+    #[test]
+    fn inflight_cap_scales_with_path_no_constant() {
+        let mut cc_cell = BiscayController::new();
+        cc_cell.on_bandwidth_sample(1_000_000, 1_000_000, false); // 1 MB/s
+        cc_cell.on_rtt_sample(60_000.0); // 60 ms
+        let cell_cap = cc_cell.inflight_cap_bytes(1.25);
+
+        let mut cc_sat = BiscayController::new();
+        cc_sat.on_bandwidth_sample(1_000_000, 1_000_000, false); // 1 MB/s
+        cc_sat.on_rtt_sample(600_000.0); // 600 ms (satellite)
+        let sat_cap = cc_sat.inflight_cap_bytes(1.25);
+
+        // Same expression, no branch: satellite's huge RTprop yields a
+        // proportionally huge cap (it must fill its BDP, not be throttled).
+        assert!(
+            sat_cap > cell_cap * 5.0,
+            "cap must auto-scale with RTprop: cell={cell_cap} sat={sat_cap}"
+        );
+        assert_eq!(BiscayController::new().inflight_cap_bytes(1.25), 0.0);
+    }
+
+    // ─── F6: regime inference + override ────────────────────────────────
+
+    // ─── F5: opportunistic modem flow-control ──────────────────────────
+
+    #[test]
+    fn modem_flow_control_is_additive_and_recovers() {
+        let mut cc = BiscayController::new();
+        cc.on_bandwidth_sample(1_000_000, 1_000_000, false);
+        cc.on_rtt_sample(50_000.0);
+        let before = cc.drain_factor();
+        // Modem reports its TX ring backing up → gentle drain.
+        cc.on_modem_flow_control(true);
+        assert!(
+            cc.drain_factor() < before,
+            "modem backpressure must reduce pacing"
+        );
+        assert!(cc.drain_factor() >= 0.5, "must respect the safety floor");
+        // Grants restored → recovers.
+        for _ in 0..20 {
+            cc.on_modem_flow_control(false);
+        }
+        assert!(
+            cc.drain_factor() > 0.9,
+            "drain must recover once grants return, got {}",
+            cc.drain_factor()
+        );
+    }
+
+    #[test]
+    fn regime_unknown_before_measurement() {
+        let cc = BiscayController::new();
+        assert_eq!(cc.inferred_regime(), PathRegime::Unknown);
+    }
+
+    #[test]
+    fn regime_inference_from_measured_path() {
+        // Fiber: ~ms RTT, loss-free.
+        let mut fiber = BiscayController::new();
+        fiber.on_bandwidth_sample(100_000_000, 1_000_000, false);
+        fiber.on_rtt_sample(2_000.0);
+        assert_eq!(fiber.inferred_regime(), PathRegime::Fiber);
+
+        // Satellite: 600 ms RTT.
+        let mut sat = BiscayController::new();
+        sat.on_bandwidth_sample(2_000_000, 1_000_000, false);
+        sat.on_rtt_sample(600_000.0);
+        assert_eq!(sat.inferred_regime(), PathRegime::Satellite);
+
+        // Cellular: 60 ms RTT, light loss.
+        let mut cell = BiscayController::new();
+        cell.on_bandwidth_sample(3_000_000, 1_000_000, false);
+        cell.on_rtt_sample(60_000.0);
+        cell.observe_loss_rate(0.005);
+        assert_eq!(cell.inferred_regime(), PathRegime::Cellular);
+
+        // Lossy: persistent random loss.
+        let mut lossy = BiscayController::new();
+        lossy.on_bandwidth_sample(3_000_000, 1_000_000, false);
+        lossy.on_rtt_sample(40_000.0);
+        for _ in 0..30 {
+            lossy.observe_loss_rate(0.05);
+        }
+        assert_eq!(lossy.inferred_regime(), PathRegime::Lossy);
+    }
+
+    // ─── F3: delay-gradient signal fusion ──────────────────────────────
+
+    #[test]
+    fn delay_gradient_drains_when_queue_builds() {
+        let mut cc = BiscayController::new();
+        cc.on_bandwidth_sample(1_000_000, 1_000_000, false);
+        cc.on_rtt_sample(60_000.0); // 60 ms RTprop reference
+        let before = cc.drain_factor();
+
+        // Quiet baseline: tiny, low-jitter gradient → no drain.
+        for _ in 0..6 {
+            cc.on_delay_gradient_us(50);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            (cc.drain_factor() - before).abs() < 1e-9,
+            "a quiet gradient must not drain"
+        );
+
+        // Queue builds: gradient climbs far past its own jitter AND past
+        // 5% of RTprop (3 ms) → drain_factor must fall.
+        for _ in 0..12 {
+            cc.on_delay_gradient_us(40_000); // 40 ms of standing queue
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            cc.drain_factor() < before,
+            "sustained positive gradient must reduce drain_factor: {} !< {}",
+            cc.drain_factor(),
+            before
+        );
+        assert!(
+            cc.drain_factor() >= 0.5,
+            "drain must not collapse below the safety floor"
+        );
+    }
+
+    #[test]
+    fn gradient_signal_supersedes_rtt_ratio_heuristic() {
+        let mut cc = BiscayController::new();
+        cc.on_bandwidth_sample(1_000_000, 1_000_000, false);
+        cc.on_rtt_sample(50_000.0); // RTprop = 50 ms
+        // Gradient says the link is clean (queue empty).
+        for _ in 0..6 {
+            cc.on_delay_gradient_us(100);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let df = cc.drain_factor();
+        // A big RTT spike (8× RTprop) would, under the old fixed heuristic,
+        // slam drain_factor down. With the gradient signal live and clean,
+        // the coarse RTT path must NOT cut — it only recovers.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        cc.on_rtt_sample(400_000.0); // 8× RTprop
+        assert!(
+            cc.drain_factor() >= df,
+            "live clean gradient must veto the coarse RTT-ratio drain: {} < {}",
+            cc.drain_factor(),
+            df
+        );
+    }
+
+    #[test]
+    fn rtt_heuristic_still_fallback_before_gradient_arrives() {
+        // Before any receiver gradient sample, the coarse RTT heuristic is
+        // the fallback delay detector (signal fusion: whichever fires first).
+        let mut cc = BiscayController::new();
+        cc.on_bandwidth_sample(1_000_000, 1_000_000, false);
+        cc.on_rtt_sample(50_000.0);
+        let before = cc.drain_factor();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        cc.on_rtt_sample(400_000.0); // 8× RTprop, no gradient signal yet
+        assert!(
+            cc.drain_factor() < before,
+            "RTT heuristic must still protect before the gradient is live"
+        );
+    }
+
+    #[test]
+    fn regime_override_wins() {
+        let mut cc = BiscayController::new();
+        cc.on_bandwidth_sample(100_000_000, 1_000_000, false);
+        cc.on_rtt_sample(2_000.0);
+        assert_eq!(cc.inferred_regime(), PathRegime::Fiber);
+        cc.set_profile_override(Some(PathRegime::Cellular));
+        assert_eq!(cc.inferred_regime(), PathRegime::Cellular);
+        cc.set_profile_override(None);
+        assert_eq!(cc.inferred_regime(), PathRegime::Fiber);
+        assert_eq!(PathRegime::parse_override("auto"), None);
+        assert_eq!(
+            PathRegime::parse_override("satellite"),
+            Some(PathRegime::Satellite)
+        );
+        assert_eq!(PathRegime::parse_override("garbage"), None);
     }
 
     // ─── SINR Capacity Ceiling Tests ────────────────────────────────────

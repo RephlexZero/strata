@@ -212,6 +212,7 @@ async fn run_sender(
             id,
             uri: format!("strata://{}", dest),
             interface: None,
+            profile: None,
         })?;
     }
 

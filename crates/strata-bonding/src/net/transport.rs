@@ -147,6 +147,9 @@ pub struct TransportLink {
     /// detect a link that is *currently* delivering nothing so its
     /// scheduling weight can be crushed (NOT to latch it dead).
     last_ack_or_report: Mutex<Instant>,
+    /// `(last_resize_at, last_target_bytes)` throttle for the dynamic
+    /// `SO_SNDBUF` sizing (F2/ex-F4). `(_, 0)` = never resized yet.
+    sndbuf_state: Mutex<(std::time::Instant, usize)>,
 }
 
 /// A link is only treated as delivery-starved once it has sent at least
@@ -180,7 +183,124 @@ const STARVED_CAPACITY_FLOOR_BPS: f64 = 64_000.0;
 /// following report interval, so ~1.5 s covers the contaminated samples.
 const PROBE_FEEDBACK_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// Headroom multiple on the BDP for the inflight / paced-queue cap.
+/// `queue ≤ k·(btl_bw × RTprop)`. Auto-scales with the path — no
+/// per-regime constant. ~1.25 ≈ one quarter-BDP of slack for jitter.
+const BDP_QUEUE_K: f64 = 1.25;
+
+/// Bootstrap paced-queue byte budget used only until the BDP is known
+/// (no bandwidth/RTprop estimate yet). ~100 × 1400 B — the old fixed cap,
+/// retained purely as a startup guardrail before measurement converges.
+const PACED_QUEUE_BOOTSTRAP_BYTES: usize = 140_000;
+
+/// Hard floor for the BDP-derived paced-queue budget: one GSO superpacket
+/// (max UDP datagram). Never shrink the queue below a single batched send
+/// or a GSO flush would be starved mid-assembly.
+const GSO_SUPERPACKET_BYTES: usize = 65_536;
+
 impl TransportLink {
+    /// Enforce the BDP-relative byte bound on the paced queue with
+    /// keyframe-protected oldest-drop.
+    ///
+    /// The cap is `k·(btl_bw × RTprop)` — scale-free: satellite → huge
+    /// (never drops), fiber → huge, cellular → modest. This is the F2/F4
+    /// AQM: the only queue strata actually owns is this userspace one, so
+    /// we bound *it* instead of poking `tc`. Oldest low-priority packets
+    /// are dropped first; keyframes/config (priority ≥ Reference) are
+    /// preserved until nothing else remains.
+    fn enforce_paced_queue_bound(
+        &self,
+        q: &mut std::collections::VecDeque<strata_transport::sender::OutputPacket>,
+    ) {
+        let cap_bytes = {
+            let cc = self.congestion.lock().unwrap();
+            let bdp_cap = cc.inflight_cap_bytes(BDP_QUEUE_K);
+            if bdp_cap > 0.0 {
+                (bdp_cap as usize).max(GSO_SUPERPACKET_BYTES)
+            } else {
+                PACED_QUEUE_BOOTSTRAP_BYTES
+            }
+        };
+
+        let mut total: usize = q.iter().map(|p| p.data.len()).sum();
+        if total <= cap_bytes {
+            return;
+        }
+
+        // Drop the oldest non-keyframe packet repeatedly. Scan from the
+        // front (oldest) for the first droppable (priority < Reference);
+        // keyframes/config survive until they are all that is left.
+        while total > cap_bytes {
+            let drop_idx = q
+                .iter()
+                .position(|p| p.priority < Priority::Reference)
+                .or(if q.is_empty() { None } else { Some(0) });
+            match drop_idx {
+                Some(idx) => {
+                    if let Some(pkt) = q.remove(idx) {
+                        total -= pkt.data.len();
+                    } else {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Periodically size `SO_SNDBUF` toward the BDP (floored at one GSO
+    /// superpacket). Shrinking the kernel buffer converts silent kernel
+    /// absorption of an over-send into explicit `EAGAIN` backpressure that
+    /// the userspace pacer/AQM acts on, instead of letting the datagram
+    /// vanish into a deep socket buffer and bloat RTT. Throttled so we
+    /// don't `setsockopt` on every flush; only resized on a material change.
+    #[cfg(unix)]
+    fn maybe_resize_sndbuf(&self) {
+        use std::os::unix::io::AsRawFd;
+
+        let bdp_cap = {
+            let cc = self.congestion.lock().unwrap();
+            cc.inflight_cap_bytes(BDP_QUEUE_K)
+        };
+        if bdp_cap <= 0.0 {
+            return; // BDP unknown — keep the generous bootstrap buffer.
+        }
+        let target = (bdp_cap as usize).max(GSO_SUPERPACKET_BYTES);
+
+        let mut guard = self.sndbuf_state.lock().unwrap();
+        let (last_at, last_target) = *guard;
+        let now = std::time::Instant::now();
+        // Resize at most ~1/sec and only when the target moved ≥25%.
+        if now.duration_since(last_at) < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let changed = last_target == 0
+            || (target as f64 - last_target as f64).abs() / (last_target as f64) >= 0.25;
+        if !changed {
+            return;
+        }
+        let fd = self.socket.as_raw_fd();
+        let buf_size: libc::c_int = target as libc::c_int;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        *guard = (now, target);
+        tracing::debug!(
+            target: "strata::transport",
+            link_id = self.id,
+            sndbuf_target = target,
+            "resized SO_SNDBUF toward BDP (explicit backpressure)"
+        );
+    }
+
+    #[cfg(not(unix))]
+    fn maybe_resize_sndbuf(&self) {}
     /// Create a new transport link.
     ///
     /// `socket` should be bound and connected to the remote peer.
@@ -247,6 +367,7 @@ impl TransportLink {
             probe_feedback_block_until: Mutex::new(None),
             prev_acked_liveness: AtomicU64::new(0),
             last_ack_or_report: Mutex::new(Instant::now()),
+            sndbuf_state: Mutex::new((std::time::Instant::now(), 0)),
         }
     }
 
@@ -260,13 +381,9 @@ impl TransportLink {
 
         let mut q = self.paced_queue.lock().unwrap();
         q.extend(outputs);
-        // Cap queue to prevent bufferbloat from retransmits.
-        // BDP at 5Mbps/100ms ≈ 44 packets; 100 gives 2× margin.
-        // At 500, queue holds 700KB = 2.8s at 2Mbps → RTT bloats to 500ms+.
-        const MAX_PACED_QUEUE: usize = 100;
-        while q.len() > MAX_PACED_QUEUE {
-            q.pop_front();
-        }
+        // BDP-relative, keyframe-protected bound (F2/F4): scale-free so the
+        // same code is correct on fiber, cellular and satellite.
+        self.enforce_paced_queue_bound(&mut q);
         drop(q);
 
         self.flush_paced();
@@ -278,6 +395,9 @@ impl TransportLink {
 
     /// Flush any pending packets in the paced send queue.
     pub fn flush_paced(&self) {
+        // Keep the kernel send buffer sized to the BDP so an over-send
+        // surfaces as EAGAIN backpressure rather than silent bloat.
+        self.maybe_resize_sndbuf();
         let cc_pacing_rate = self.congestion.lock().unwrap().pacing_rate();
         // Floor: don't let the CC starve a link below 20% of the oracle's
         // slow-decaying peak estimate. Using peak_cap() (not estimated_cap())
@@ -624,11 +744,8 @@ impl TransportLink {
                     if !outputs.is_empty() {
                         let mut q = self.paced_queue.lock().unwrap();
                         q.extend(outputs);
-                        // Cap queue — same as transport_send.
-                        const MAX_PACED_QUEUE: usize = 100;
-                        while q.len() > MAX_PACED_QUEUE {
-                            q.pop_front();
-                        }
+                        // Same BDP-relative, keyframe-protected bound.
+                        self.enforce_paced_queue_bound(&mut q);
                     }
                 }
                 ControlBody::Pong(pong) => {
@@ -654,6 +771,13 @@ impl TransportLink {
                     // A receiver report is positive proof the path delivers,
                     // even if ACKs are sparse — refresh the blackhole timer.
                     *self.last_ack_or_report.lock().unwrap() = report_now;
+                    // F3: feed the receiver-measured relative-OWD gradient
+                    // into Biscay. This is the primary, path-relative
+                    // delay-pressure signal and demotes *this* link only.
+                    self.congestion
+                        .lock()
+                        .unwrap()
+                        .on_delay_gradient_us(report.delay_gradient_us);
                     let mut ewma = self.goodput_ewma_bps.lock().unwrap();
                     let goodput = report.goodput_bps as f64;
                     if *ewma == 0.0 {
@@ -694,6 +818,7 @@ impl TransportLink {
 
         let mut q = self.paced_queue.lock().unwrap();
         q.extend(outputs);
+        self.enforce_paced_queue_bound(&mut q);
         drop(q);
 
         self.flush_paced();
@@ -913,6 +1038,9 @@ impl LinkSender for TransportLink {
         // and phantom link-death WARNs even when the link is healthy.
         let total_wire = delta_sent.saturating_add(delta_retx).max(1);
         let loss_rate = (delta_retx as f64 / total_wire as f64).clamp(0.0, 1.0);
+        // Feed the loss EWMA used purely to classify the regime for metrics
+        // (loss already drives backoff through the CC itself).
+        cc.observe_loss_rate(loss_rate);
 
         // ── Continuous liveness model (no binary death) ─────────────────
         //
@@ -1015,6 +1143,20 @@ impl LinkSender for TransportLink {
             None
         };
 
+        // F6 observability: surface the inferred regime and the actual
+        // BDP-relative cap the link is enforcing so the system explains its
+        // own decisions in production.
+        let inferred_regime = Some(cc.inferred_regime().as_str().to_string());
+        let bdp_bytes = cc.bdp_bytes();
+        let inflight_cap_bytes = {
+            let bdp_cap = cc.inflight_cap_bytes(BDP_QUEUE_K);
+            if bdp_cap > 0.0 {
+                (bdp_cap as usize).max(GSO_SUPERPACKET_BYTES) as f64
+            } else {
+                PACED_QUEUE_BOOTSTRAP_BYTES as f64
+            }
+        };
+
         tracing::debug!(
             target: "strata::transport",
             link_id = self.id,
@@ -1066,6 +1208,7 @@ impl LinkSender for TransportLink {
                     jitter_buffer_ms: r.jitter_buffer_ms,
                     loss_after_fec: r.loss_after_fec_f32(),
                     late_rate: r.late_rate_f32(),
+                    delay_gradient_us: r.delay_gradient_us,
                 }
             }),
             probe_active: self
@@ -1073,6 +1216,9 @@ impl LinkSender for TransportLink {
                 .lock()
                 .unwrap()
                 .is_some_and(|t| Instant::now() < t),
+            inferred_regime,
+            bdp_bytes,
+            inflight_cap_bytes,
         }
     }
 
@@ -1146,6 +1292,18 @@ impl LinkSender for TransportLink {
         let r = ((FEC_BASE_K as f64) * ratio).round() as usize;
         let r = r.clamp(1, FEC_BASE_K);
         self.sender.lock().unwrap().set_fec_rate(FEC_BASE_K, r);
+    }
+
+    fn set_profile(&self, regime: Option<&str>) {
+        let parsed = regime.and_then(strata_transport::congestion::PathRegime::parse_override);
+        self.congestion.lock().unwrap().set_profile_override(parsed);
+    }
+
+    fn on_modem_flow_control(&self, slow_down: bool) {
+        self.congestion
+            .lock()
+            .unwrap()
+            .on_modem_flow_control(slow_down);
     }
 
     fn recv_feedback(&self) -> usize {
@@ -1310,6 +1468,85 @@ mod tests {
         let metrics = link.get_metrics();
         assert_eq!(metrics.observed_bytes, 0);
         assert_eq!(metrics.phase, LinkPhase::Probe);
+        // F6: regime is observable, unknown before any measurement.
+        assert_eq!(metrics.inferred_regime.as_deref(), Some("unknown"));
+        assert_eq!(metrics.bdp_bytes, 0.0);
+        // Before BDP converges the bound is the bootstrap budget.
+        assert_eq!(
+            metrics.inflight_cap_bytes,
+            PACED_QUEUE_BOOTSTRAP_BYTES as f64
+        );
+    }
+
+    #[test]
+    fn paced_queue_bound_drops_oldest_nonkeyframe_first() {
+        use strata_transport::sender::OutputPacket;
+        let link = make_loopback_link(11);
+
+        let mk = |seq: u64, prio: Priority| OutputPacket {
+            data: Bytes::from(vec![0u8; 1400]),
+            priority: prio,
+            sequence: seq,
+            is_retransmit: false,
+            is_fec_repair: false,
+        };
+
+        let mut q = std::collections::VecDeque::new();
+        // Oldest packet is a keyframe; then many standard packets that
+        // together blow past the bootstrap budget (140 KB ≈ 100 pkts).
+        q.push_back(mk(0, Priority::Reference));
+        for s in 1..400 {
+            q.push_back(mk(s, Priority::Standard));
+        }
+        let before = q.len();
+        link.enforce_paced_queue_bound(&mut q);
+
+        let total: usize = q.iter().map(|p| p.data.len()).sum();
+        assert!(
+            total <= PACED_QUEUE_BOOTSTRAP_BYTES,
+            "queue must be bounded to the BDP budget, got {total} bytes"
+        );
+        assert!(q.len() < before, "packets should have been dropped");
+        // The keyframe (oldest, priority ≥ Reference) must survive while
+        // standard packets are evicted.
+        assert!(
+            q.iter().any(|p| p.sequence == 0),
+            "keyframe must be protected from the oldest-drop"
+        );
+    }
+
+    #[test]
+    fn paced_queue_bound_noop_when_under_budget() {
+        use strata_transport::sender::OutputPacket;
+        let link = make_loopback_link(12);
+        let mut q = std::collections::VecDeque::new();
+        for s in 0..10 {
+            q.push_back(OutputPacket {
+                data: Bytes::from(vec![0u8; 1400]),
+                priority: Priority::Standard,
+                sequence: s,
+                is_retransmit: false,
+                is_fec_repair: false,
+            });
+        }
+        link.enforce_paced_queue_bound(&mut q);
+        assert_eq!(q.len(), 10, "small queue must be left intact");
+    }
+
+    #[test]
+    fn set_profile_overrides_inferred_regime() {
+        let link = make_loopback_link(13);
+        link.set_profile(Some("satellite"));
+        assert_eq!(
+            link.get_metrics().inferred_regime.as_deref(),
+            Some("satellite")
+        );
+        link.set_profile(Some("auto"));
+        assert_eq!(
+            link.get_metrics().inferred_regime.as_deref(),
+            Some("unknown"),
+            "auto restores measurement-based inference"
+        );
     }
 
     #[test]

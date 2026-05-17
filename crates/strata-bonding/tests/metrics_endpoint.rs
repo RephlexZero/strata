@@ -37,6 +37,7 @@ fn runtime_metrics_server_serves_prometheus() {
         id: 1,
         uri: format!("{}", rcv_addr),
         interface: None,
+        profile: None,
     })
     .unwrap();
     std::thread::sleep(Duration::from_millis(250));
@@ -91,6 +92,7 @@ fn runtime_metrics_reflect_link_changes() {
         id: 1,
         uri: format!("{}", rcv_addr),
         interface: None,
+        profile: None,
     })
     .unwrap();
     std::thread::sleep(Duration::from_millis(250));

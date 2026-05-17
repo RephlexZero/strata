@@ -248,6 +248,78 @@ impl Drop for TransportBondingReceiver {
     }
 }
 
+/// Per-link relative one-way-delay GRADIENT tracker (F3).
+///
+/// For each data packet we sample `rel = receiver_now_us − sender_send_ts_us`.
+/// The sender and receiver clocks have an arbitrary *constant* offset (no
+/// PTP). That offset cancels because we report only
+/// `ewma(rel) − windowed_min(rel)` — a gradient, never absolute OWD. The
+/// windowed minimum mirrors Biscay's `rt_prop` window so any residual
+/// clock-drift or a one-off bloated sample expires out of the baseline in
+/// ≈10 s exactly like BBR's min-RTT filter. A sustained positive gradient
+/// means the bottleneck queue is filling — strictly earlier than loss.
+struct DelayGradientTracker {
+    /// `(arrival_instant, rel_us)` within the baseline window.
+    window: std::collections::VecDeque<(std::time::Instant, i64)>,
+    /// EWMA of recent `rel_us` (the "current" relative delay).
+    ewma_rel: Option<f64>,
+    window_len: Duration,
+}
+
+impl DelayGradientTracker {
+    fn new() -> Self {
+        Self {
+            window: std::collections::VecDeque::with_capacity(256),
+            ewma_rel: None,
+            window_len: Duration::from_secs(10),
+        }
+    }
+
+    /// Feed one data-packet sample. `rel_us` may be negative (clock offset);
+    /// only its variation matters.
+    fn observe(&mut self, now: std::time::Instant, rel_us: i64) {
+        // Guard against a u32 µs clock wrap / reset: an impossibly large
+        // negative jump vs the current baseline is not real queue drain.
+        if let Some(&(_, min_rel)) = self
+            .window
+            .iter()
+            .min_by_key(|&&(_, r)| r)
+            && rel_us < min_rel - 2_000_000
+        {
+            self.window.clear();
+            self.ewma_rel = None;
+        }
+        self.window.push_back((now, rel_us));
+        while let Some(&(ts, _)) = self.window.front() {
+            if now.duration_since(ts) > self.window_len {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+        let r = rel_us as f64;
+        self.ewma_rel = Some(match self.ewma_rel {
+            Some(e) => 0.1 * r + 0.9 * e,
+            None => r,
+        });
+    }
+
+    /// Current queue-building magnitude in microseconds (≥ 0).
+    /// `max(0, ewma(rel) − windowed_min(rel))`.
+    fn gradient_us(&self) -> u32 {
+        let (Some(ewma), Some(&(_, _))) = (self.ewma_rel, self.window.front()) else {
+            return 0;
+        };
+        let min_rel = self
+            .window
+            .iter()
+            .map(|&(_, r)| r)
+            .min()
+            .unwrap_or(0) as f64;
+        (ewma - min_rel).max(0.0).min(u32::MAX as f64) as u32
+    }
+}
+
 /// Per-link reader loop (async, runs on a monoio event loop).
 ///
 /// Uses io_uring (or epoll fallback) for async UDP receives, feeding
@@ -291,6 +363,8 @@ async fn link_reader_async(
     let mut prev_reassembly_late: u64 = 0;
     // Most recently seen sender address on this socket.
     let mut sender_addr: Option<std::net::SocketAddr> = None;
+    // F3: per-link relative one-way-delay gradient (queue-build detector).
+    let mut grad_tracker = DelayGradientTracker::new();
 
     // ── Per-link RX diagnostics ─────────────────────────────────────────
     // A blackholed link receives nothing, so its receiver stats never
@@ -320,6 +394,22 @@ async fn link_reader_async(
                     );
                 }
                 let raw = Bytes::copy_from_slice(&returned_buf[..n]);
+
+                // F3: sample the relative one-way-delay gradient on DATA
+                // packets. Decode just the header; `timestamp_us` is the
+                // sender's send time. `rel = recv_now − send_ts` has a
+                // constant clock offset that cancels in the reported
+                // `ewma − windowed_min` gradient.
+                {
+                    let mut hdr_cur = &returned_buf[..n];
+                    if let Some(hdr) = PacketHeader::decode(&mut hdr_cur)
+                        && hdr.packet_type == strata_transport::wire::PacketType::Data
+                    {
+                        let rel_us =
+                            clock.now_us() as i64 - hdr.timestamp_us as i64;
+                        grad_tracker.observe(std::time::Instant::now(), rel_us);
+                    }
+                }
 
                 // Check for control packets (Ping) before handing to transport_rx.
                 // Respond with Pong immediately.
@@ -527,6 +617,10 @@ async fn link_reader_async(
                             // true throughput signal (independent of the modem
                             // TX queue, unlike sender-side observed_bytes).
                             bytes_delivered: cur_bytes,
+                            // F3: relative OWD gradient — queue-building
+                            // magnitude in µs, drives delay-bounded backoff
+                            // on the sender before loss appears.
+                            delay_gradient_us: grad_tracker.gradient_us(),
                         };
                         let pkt_bytes = encode_receiver_report(&report, &clock);
                         let _ = socket.send_to(pkt_bytes, addr).await;
@@ -700,6 +794,63 @@ mod tests {
         let stats = rcv.get_stats();
         assert_eq!(stats.lost_packets, 0);
         assert_eq!(stats.late_packets, 0);
+    }
+
+    #[test]
+    fn delay_gradient_is_clock_offset_immune() {
+        // A large CONSTANT clock offset (sender epoch ≠ receiver epoch)
+        // must cancel: only the variation of rel matters.
+        let mut t = DelayGradientTracker::new();
+        let base = std::time::Instant::now();
+        const OFFSET: i64 = 1_000_000_000; // huge constant skew
+        for i in 0u64..20 {
+            // Steady path: rel = OFFSET + small noise → gradient ≈ 0.
+            t.observe(
+                base + std::time::Duration::from_millis(i * 20),
+                OFFSET + (i % 2) as i64,
+            );
+        }
+        assert!(
+            t.gradient_us() < 50,
+            "constant offset must cancel; gradient ≈ 0, got {}",
+            t.gradient_us()
+        );
+    }
+
+    #[test]
+    fn delay_gradient_detects_queue_growth() {
+        let mut t = DelayGradientTracker::new();
+        let base = std::time::Instant::now();
+        // Establish a low baseline.
+        for i in 0u64..10 {
+            t.observe(base + std::time::Duration::from_millis(i * 20), 5_000);
+        }
+        // Queue builds: rel climbs by 40 ms above baseline.
+        for i in 10u64..30 {
+            t.observe(base + std::time::Duration::from_millis(i * 20), 45_000);
+        }
+        assert!(
+            t.gradient_us() > 20_000,
+            "rising relative delay must surface as a positive gradient, got {}",
+            t.gradient_us()
+        );
+    }
+
+    #[test]
+    fn delay_gradient_handles_clock_wrap() {
+        let mut t = DelayGradientTracker::new();
+        let base = std::time::Instant::now();
+        for i in 0u64..8 {
+            t.observe(base + std::time::Duration::from_millis(i * 20), 10_000);
+        }
+        // A u32 µs wrap makes rel jump hugely negative — must reset, not
+        // report a giant bogus negative-then-positive gradient.
+        t.observe(base + std::time::Duration::from_millis(200), -3_000_000);
+        assert_eq!(
+            t.gradient_us(),
+            0,
+            "a clock wrap must reset the baseline, not corrupt the gradient"
+        );
     }
 
     #[test]

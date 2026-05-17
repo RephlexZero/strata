@@ -1790,3 +1790,443 @@ fn capacity_estimation_converges() {
         avg_capacity_mbps
     );
 }
+
+// ─── Versatility doctrine §6: cross-regime profile matrix ───────────────────
+//
+// This is the ENFORCEMENT GATE for the burst-fix plan. Every F-item
+// (BDP-relative cap, delay-gradient signal fusion, delay-bounded ramp probe,
+// modem flow-control) must hold across ALL of these regimes. A change that
+// improves `cellular` but regresses `fiber`/`satellite`/`wifi`/`lossy` is an
+// over-fit and is rejected here. The pass criteria intentionally catch *gross*
+// regressions (collapse, oscillation, mis-flagged stalls) rather than being
+// tight enough to be flaky — the doctrine is "don't regress another regime",
+// not "hit an exact number".
+//
+// All are privilege-gated (skip without root/netns) like the rest of tier 3.
+
+/// Average total observed throughput (Mbps) over the post-warmup window.
+fn stable_avg_mbps(data: &[Value], warmup_frac: f64) -> f64 {
+    let samples: Vec<f64> = data
+        .iter()
+        .map(total_observed_bps)
+        .filter(|&b| b > 0.0)
+        .collect();
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let skip = ((samples.len() as f64) * warmup_frac) as usize;
+    let stable = &samples[skip.min(samples.len().saturating_sub(1))..];
+    stable.iter().sum::<f64>() / stable.len().max(1) as f64 / 1_000_000.0
+}
+
+/// Coefficient of variation of total throughput over the stable window.
+fn stable_cv(data: &[Value], warmup_frac: f64) -> f64 {
+    let samples: Vec<f64> = data
+        .iter()
+        .map(total_observed_bps)
+        .filter(|&b| b > 0.0)
+        .collect();
+    if samples.len() < 4 {
+        return 0.0;
+    }
+    let skip = ((samples.len() as f64) * warmup_frac) as usize;
+    let stable = &samples[skip.min(samples.len() - 1)..];
+    let n = stable.len() as f64;
+    let mean = stable.iter().sum::<f64>() / n;
+    if mean <= 0.0 {
+        return 1.0;
+    }
+    let var = stable.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    var.sqrt() / mean
+}
+
+/// Longest run of consecutive zero-throughput stat ticks ("konk-out").
+fn longest_zero_run(data: &[Value]) -> usize {
+    let mut worst = 0;
+    let mut cur = 0;
+    for v in data {
+        if total_observed_bps(v) > 0.0 {
+            cur = 0;
+        } else {
+            cur += 1;
+            worst = worst.max(cur);
+        }
+    }
+    worst
+}
+
+/// fiber: 1 Gbps, 1 ms, 0 loss → high utilization, no added latency, stable.
+#[test]
+#[ignore = "Versatility gate — run with --ignored (needs root/netns)"]
+fn profile_matrix_fiber() {
+    let bin = match require_privileged_env() {
+        Some(b) => b,
+        None => return,
+    };
+    let bin_str = bin.to_str().unwrap();
+    let ns_snd = Arc::new(Namespace::new("st_pf_fi_s").unwrap());
+    let ns_rcv = Arc::new(Namespace::new("st_pf_fi_r").unwrap());
+    ns_snd
+        .add_veth_link(&ns_rcv, "st_pf1_a", "st_pf1_b", "10.71.1.1/24", "10.71.1.2/24")
+        .unwrap();
+    setup_mgmt_link(
+        "st_mgmt_pf",
+        "st_mgmt_pg",
+        "st_pf_fi_s",
+        "192.168.210.1/24",
+        "192.168.210.2/24",
+    );
+    apply_bidirectional_impairment(
+        &ns_snd,
+        "st_pf1_a",
+        &ns_rcv,
+        "st_pf1_b",
+        ImpairmentConfig {
+            rate_kbit: Some(1_000_000),
+            delay_ms: Some(1),
+            loss_percent: Some(0.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut recv = spawn_in_ns(&ns_rcv.name, bin_str, &["receiver", "--bind", "0.0.0.0:7400"]);
+    let mut collector = StatsCollector::new("192.168.210.1:9810");
+    let mut sender = spawn_in_ns(
+        &ns_snd.name,
+        bin_str,
+        &[
+            "sender",
+            "--codec",
+            "h264",
+            "--dest",
+            "10.71.1.2:7400?rtt-min=10&buffer=1000",
+            "--stats-dest",
+            "192.168.210.1:9810",
+            "--bitrate",
+            "8000",
+        ],
+    );
+    thread::sleep(Duration::from_secs(18));
+    let _ = sender.kill();
+    let _ = sender.wait();
+    let _ = recv.kill();
+    let _ = recv.wait();
+    let data = collector.stop();
+    cleanup_mgmt_link("st_mgmt_pf");
+    assert!(!data.is_empty(), "fiber: no stats");
+    let avg = stable_avg_mbps(&data, 0.3);
+    eprintln!("[fiber] avg throughput {:.2} Mbps (offered 8 Mbps)", avg);
+    // Loss-free 1 Gbps pipe: must carry the offered video, not throttle it.
+    assert!(
+        avg > 4.0,
+        "fiber regressed: {avg:.2} Mbps on a loss-free 1 Gbps link — \
+         a delay/BDP mechanism is wrongly throttling a clean fat pipe"
+    );
+    assert_eq!(
+        longest_zero_run(&data),
+        0,
+        "fiber: unexpected throughput dropout on a perfect link"
+    );
+}
+
+/// cellular: variable BW + deep buffer + bursty loss → no konk-outs,
+/// standing queue bounded (this is the regime the plan is fixing).
+#[test]
+#[ignore = "Versatility gate — run with --ignored (needs root/netns)"]
+fn profile_matrix_cellular() {
+    let bin = match require_privileged_env() {
+        Some(b) => b,
+        None => return,
+    };
+    let bin_str = bin.to_str().unwrap();
+    let ns_snd = Arc::new(Namespace::new("st_pf_ce_s").unwrap());
+    let ns_rcv = Arc::new(Namespace::new("st_pf_ce_r").unwrap());
+    ns_snd
+        .add_veth_link(&ns_rcv, "st_pf2_a", "st_pf2_b", "10.72.1.1/24", "10.72.1.2/24")
+        .unwrap();
+    setup_mgmt_link(
+        "st_mgmt_pc",
+        "st_mgmt_pd",
+        "st_pf_ce_s",
+        "192.168.211.1/24",
+        "192.168.211.2/24",
+    );
+    // Deep-buffer bursty cellular (the konk-out regime).
+    apply_bidirectional_impairment(
+        &ns_snd,
+        "st_pf2_a",
+        &ns_rcv,
+        "st_pf2_b",
+        ImpairmentConfig::lte_poor(),
+    )
+    .unwrap();
+    let mut recv = spawn_in_ns(&ns_rcv.name, bin_str, &["receiver", "--bind", "0.0.0.0:7402"]);
+    let mut collector = StatsCollector::new("192.168.211.1:9811");
+    let mut sender = spawn_in_ns(
+        &ns_snd.name,
+        bin_str,
+        &[
+            "sender",
+            "--codec",
+            "h264",
+            "--dest",
+            "10.72.1.2:7402?rtt-min=60&buffer=2000",
+            "--stats-dest",
+            "192.168.211.1:9811",
+            "--bitrate",
+            "3000",
+        ],
+    );
+    thread::sleep(Duration::from_secs(25));
+    let _ = sender.kill();
+    let _ = sender.wait();
+    let _ = recv.kill();
+    let _ = recv.wait();
+    let data = collector.stop();
+    cleanup_mgmt_link("st_mgmt_pc");
+    assert!(!data.is_empty(), "cellular: no stats");
+    let avg = stable_avg_mbps(&data, 0.3);
+    let zero_run = longest_zero_run(&data);
+    eprintln!(
+        "[cellular] avg {:.2} Mbps, longest zero-throughput run = {} ticks",
+        avg, zero_run
+    );
+    // The whole point of the fix: the bonded feed must NOT konk out. A
+    // multi-tick (~several-second) total dropout is the failure mode.
+    assert!(
+        zero_run <= 3,
+        "cellular KONK-OUT: {zero_run} consecutive zero-throughput ticks — \
+         the sender is still inducing the loss it then fights"
+    );
+    assert!(
+        avg > 0.5,
+        "cellular: throughput collapsed to {avg:.2} Mbps"
+    );
+}
+
+/// satellite: 10 Mbps, 600 ms RTT, 0 loss → must fill the (huge) BDP and
+/// must NOT be mis-flagged as stalled by any delay/stall heuristic.
+#[test]
+#[ignore = "Versatility gate — run with --ignored (needs root/netns)"]
+fn profile_matrix_satellite() {
+    let bin = match require_privileged_env() {
+        Some(b) => b,
+        None => return,
+    };
+    let bin_str = bin.to_str().unwrap();
+    let ns_snd = Arc::new(Namespace::new("st_pf_sa_s").unwrap());
+    let ns_rcv = Arc::new(Namespace::new("st_pf_sa_r").unwrap());
+    ns_snd
+        .add_veth_link(&ns_rcv, "st_pf3_a", "st_pf3_b", "10.73.1.1/24", "10.73.1.2/24")
+        .unwrap();
+    setup_mgmt_link(
+        "st_mgmt_ps",
+        "st_mgmt_pt",
+        "st_pf_sa_s",
+        "192.168.212.1/24",
+        "192.168.212.2/24",
+    );
+    // 300 ms one-way → 600 ms RTT, generous buffer for the large BDP.
+    apply_bidirectional_impairment(
+        &ns_snd,
+        "st_pf3_a",
+        &ns_rcv,
+        "st_pf3_b",
+        ImpairmentConfig {
+            rate_kbit: Some(10_000),
+            delay_ms: Some(300),
+            loss_percent: Some(0.0),
+            limit: Some(4_000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut recv = spawn_in_ns(&ns_rcv.name, bin_str, &["receiver", "--bind", "0.0.0.0:7404"]);
+    let mut collector = StatsCollector::new("192.168.212.1:9812");
+    let mut sender = spawn_in_ns(
+        &ns_snd.name,
+        bin_str,
+        &[
+            "sender",
+            "--codec",
+            "h264",
+            "--dest",
+            // High rtt-min so the receiver buffer tolerates the 600ms RTT.
+            "10.73.1.2:7404?rtt-min=650&buffer=4000",
+            "--stats-dest",
+            "192.168.212.1:9812",
+            "--bitrate",
+            "5000",
+        ],
+    );
+    // Longer run: 600ms RTT needs several seconds just to fill the BDP.
+    thread::sleep(Duration::from_secs(30));
+    let _ = sender.kill();
+    let _ = sender.wait();
+    let _ = recv.kill();
+    let _ = recv.wait();
+    let data = collector.stop();
+    cleanup_mgmt_link("st_mgmt_ps");
+    assert!(!data.is_empty(), "satellite: no stats");
+    let avg = stable_avg_mbps(&data, 0.4);
+    eprintln!("[satellite] avg throughput {:.2} Mbps (10 Mbps, 600ms RTT)", avg);
+    // A stall/blackhole heuristic that mis-fires on 600ms-by-design would
+    // crush this link to the trickle floor → throughput near zero.
+    assert!(
+        avg > 1.0,
+        "satellite mis-flagged as stalled: {avg:.2} Mbps — a delay/stall \
+         detector is treating designed 600ms RTT as failure"
+    );
+}
+
+/// wifi: aggregation + contention + jitter → bursts absorbed, NO oscillation.
+#[test]
+#[ignore = "Versatility gate — run with --ignored (needs root/netns)"]
+fn profile_matrix_wifi() {
+    let bin = match require_privileged_env() {
+        Some(b) => b,
+        None => return,
+    };
+    let bin_str = bin.to_str().unwrap();
+    let ns_snd = Arc::new(Namespace::new("st_pf_wi_s").unwrap());
+    let ns_rcv = Arc::new(Namespace::new("st_pf_wi_r").unwrap());
+    ns_snd
+        .add_veth_link(&ns_rcv, "st_pf4_a", "st_pf4_b", "10.74.1.1/24", "10.74.1.2/24")
+        .unwrap();
+    setup_mgmt_link(
+        "st_mgmt_pw",
+        "st_mgmt_px",
+        "st_pf_wi_s",
+        "192.168.213.1/24",
+        "192.168.213.2/24",
+    );
+    // Aggregation bursts + contention jitter: low base delay, big jitter,
+    // slot scheduling to mimic 802.11 AMPDU bursts.
+    apply_bidirectional_impairment(
+        &ns_snd,
+        "st_pf4_a",
+        &ns_rcv,
+        "st_pf4_b",
+        ImpairmentConfig {
+            rate_kbit: Some(20_000),
+            delay_ms: Some(4),
+            jitter_ms: Some(12),
+            delay_distribution_normal: true,
+            loss_percent: Some(0.2),
+            slot_min_us: Some(500),
+            slot_max_us: Some(6_000),
+            slot_max_packets: Some(20),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut recv = spawn_in_ns(&ns_rcv.name, bin_str, &["receiver", "--bind", "0.0.0.0:7406"]);
+    let mut collector = StatsCollector::new("192.168.213.1:9813");
+    let mut sender = spawn_in_ns(
+        &ns_snd.name,
+        bin_str,
+        &[
+            "sender",
+            "--codec",
+            "h264",
+            "--dest",
+            "10.74.1.2:7406?rtt-min=40&buffer=2000",
+            "--stats-dest",
+            "192.168.213.1:9813",
+            "--bitrate",
+            "6000",
+        ],
+    );
+    thread::sleep(Duration::from_secs(22));
+    let _ = sender.kill();
+    let _ = sender.wait();
+    let _ = recv.kill();
+    let _ = recv.wait();
+    let data = collector.stop();
+    cleanup_mgmt_link("st_mgmt_pw");
+    assert!(!data.is_empty(), "wifi: no stats");
+    let cv = stable_cv(&data, 0.3);
+    let avg = stable_avg_mbps(&data, 0.3);
+    eprintln!("[wifi] avg {:.2} Mbps, throughput CV {:.3}", avg, cv);
+    // Aggregation bursts must be ABSORBED, not interpreted as bufferbloat
+    // that drives destructive oscillation.
+    assert!(
+        cv < 0.6,
+        "wifi OSCILLATION: throughput CV {cv:.3} — aggregation bursts are \
+         being mistaken for congestion and driving rate hunting"
+    );
+    assert!(avg > 1.0, "wifi: throughput collapsed to {avg:.2} Mbps");
+}
+
+/// lossy: shallow buffer, 1–2% random loss → loss-driven, high utilization.
+#[test]
+#[ignore = "Versatility gate — run with --ignored (needs root/netns)"]
+fn profile_matrix_lossy() {
+    let bin = match require_privileged_env() {
+        Some(b) => b,
+        None => return,
+    };
+    let bin_str = bin.to_str().unwrap();
+    let ns_snd = Arc::new(Namespace::new("st_pf_lo_s").unwrap());
+    let ns_rcv = Arc::new(Namespace::new("st_pf_lo_r").unwrap());
+    ns_snd
+        .add_veth_link(&ns_rcv, "st_pf5_a", "st_pf5_b", "10.75.1.1/24", "10.75.1.2/24")
+        .unwrap();
+    setup_mgmt_link(
+        "st_mgmt_pl",
+        "st_mgmt_pm",
+        "st_pf_lo_s",
+        "192.168.214.1/24",
+        "192.168.214.2/24",
+    );
+    // Shallow buffer + steady 1.5% random (independent) loss.
+    apply_bidirectional_impairment(
+        &ns_snd,
+        "st_pf5_a",
+        &ns_rcv,
+        "st_pf5_b",
+        ImpairmentConfig {
+            rate_kbit: Some(8_000),
+            delay_ms: Some(15),
+            loss_percent: Some(1.5),
+            limit: Some(40),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut recv = spawn_in_ns(&ns_rcv.name, bin_str, &["receiver", "--bind", "0.0.0.0:7408"]);
+    let mut collector = StatsCollector::new("192.168.214.1:9814");
+    let mut sender = spawn_in_ns(
+        &ns_snd.name,
+        bin_str,
+        &[
+            "sender",
+            "--codec",
+            "h264",
+            "--dest",
+            "10.75.1.2:7408?rtt-min=40&buffer=2000",
+            "--stats-dest",
+            "192.168.214.1:9814",
+            "--bitrate",
+            "5000",
+        ],
+    );
+    thread::sleep(Duration::from_secs(22));
+    let _ = sender.kill();
+    let _ = sender.wait();
+    let _ = recv.kill();
+    let _ = recv.wait();
+    let data = collector.stop();
+    cleanup_mgmt_link("st_mgmt_pl");
+    assert!(!data.is_empty(), "lossy: no stats");
+    let avg = stable_avg_mbps(&data, 0.3);
+    eprintln!("[lossy] avg throughput {:.2} Mbps (8 Mbps, 1.5% loss)", avg);
+    // With a delay-bounded controller, modest random loss on a shallow
+    // buffer must NOT collapse throughput — loss is the signal here and
+    // utilization should stay high (FEC/ARQ carry it).
+    assert!(
+        avg > 1.5,
+        "lossy regressed: {avg:.2} Mbps under 1.5% random loss — the \
+         controller is over-reacting to loss on a shallow-buffer link"
+    );
+}

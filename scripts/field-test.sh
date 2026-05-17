@@ -23,6 +23,14 @@
 #   STRATA_CRITICAL_BROADCAST   — Broadcast critical stream headers (default: false)
 #   STRATA_FAILOVER_ENABLED     — Sender scheduler failover flag (default: true)
 #   STRATA_FAILOVER_DURATION_MS — Sender failover hold (default: 800)
+#   STRATA_SAT_PROBE_INTERVAL_S — Saturation-probe interval per link, seconds
+#                                 (default: scheduler default; set to a huge
+#                                 value e.g. 1000000000 to disable the probe
+#                                 — Phase-0 §3.3 isolation sentinel)
+#   STRATA_SAT_PROBE_DURATION_S — Saturation-probe window, seconds (default:
+#                                 scheduler default)
+#   STRATA_PPD_PROBE_INTERVAL_S — PPD probe-pair interval per link, seconds
+#                                 (default: scheduler default; huge = disable)
 #   STRATA_MAX_LATENCY_MS  — Receiver jitter buffer ceiling (default: 2000)
 #   STRATA_DURATION_SECS   — How long to stream before stopping (default: 60)
 #   STRATA_NO_BUILD=1      — Skip building and installing the sender binary
@@ -87,6 +95,11 @@ REDUNDANCY_ENABLED="${STRATA_REDUNDANCY_ENABLED:-false}"
 CRITICAL_BROADCAST="${STRATA_CRITICAL_BROADCAST:-false}"
 FAILOVER_ENABLED="${STRATA_FAILOVER_ENABLED:-true}"
 FAILOVER_DURATION_MS="${STRATA_FAILOVER_DURATION_MS:-800}"
+# Probe-config toggles (Phase-0 §3.3). Empty → omit the key so the scheduler
+# default applies. A huge interval disables the probe with no code change.
+SAT_PROBE_INTERVAL_S="${STRATA_SAT_PROBE_INTERVAL_S:-}"
+SAT_PROBE_DURATION_S="${STRATA_SAT_PROBE_DURATION_S:-}"
+PPD_PROBE_INTERVAL_S="${STRATA_PPD_PROBE_INTERVAL_S:-}"
 MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-2000}"
 DURATION="${STRATA_DURATION_SECS:-60}"
 LOG_LEVEL="${STRATA_LOG_LEVEL:-debug,strata_bonding=debug,strata_transport=debug,strata::adapt=debug}"
@@ -327,6 +340,11 @@ RECEIVER_TOML=$(mktemp /tmp/strata-receiver-XXXXXX.toml)
     echo "critical_broadcast = $CRITICAL_BROADCAST"
     echo "failover_enabled = $FAILOVER_ENABLED"
     echo "failover_duration_ms = $FAILOVER_DURATION_MS"
+    # Probe toggles: only emit when the operator set them, otherwise the
+    # scheduler default applies. A huge interval is the §3.3 disable sentinel.
+    [[ -n "$SAT_PROBE_INTERVAL_S" ]] && echo "saturation_probe_interval_s = $SAT_PROBE_INTERVAL_S"
+    [[ -n "$SAT_PROBE_DURATION_S" ]] && echo "saturation_probe_duration_s = $SAT_PROBE_DURATION_S"
+    [[ -n "$PPD_PROBE_INTERVAL_S" ]] && echo "ppd_probe_interval_s = $PPD_PROBE_INTERVAL_S"
 } > "$SENDER_TOML"
 
 # Receiver TOML

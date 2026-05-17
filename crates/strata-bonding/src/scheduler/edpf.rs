@@ -562,6 +562,9 @@ mod tests {
                     owd_ms: 0.0,
                     receiver_report: None,
                     probe_active: false,
+                    inferred_regime: None,
+                    bdp_bytes: 0.0,
+                    inflight_cap_bytes: 0.0,
                 }),
             }
         }

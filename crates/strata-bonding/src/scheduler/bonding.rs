@@ -527,7 +527,47 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             // Re-read elapsed after potential snapshot reset
             let elapsed = self.saturation_probe_start.elapsed();
 
-            if self.saturation_probe_snapshot_taken && elapsed >= probe_duration {
+            // F1 — DELAY-BOUNDED RAMP. Pinning traffic to the probe link
+            // ramps the offered load; instead of dumping a fixed 0.4 s
+            // burst (which bloats the modem/RAN buffer — the very thing we
+            // are trying to stop), terminate the instant the F3 relative-
+            // OWD gradient knee says the queue has started to build. The
+            // delivery rate measured *up to* the knee is the true,
+            // non-bloating capacity ceiling. The configured
+            // `probe_duration` survives only as a safety cap, so the probe
+            // can only ever end EARLIER than before — never more bloat.
+            //
+            // Knee is path-relative: gradient exceeding half of *this
+            // link's own* windowed-min RTprop is a real standing queue, not
+            // jitter — correct on fiber, cellular and satellite alike.
+            let knee_reached = metrics
+                .iter()
+                .find(|(id, _)| *id == probe_id)
+                .and_then(|(_, m)| {
+                    let rtprop_us = m.rtprop_ms.filter(|v| *v > 0.0)? * 1000.0;
+                    let grad_us = m.receiver_report.as_ref()?.delay_gradient_us as f64;
+                    Some(grad_us > 0.5 * rtprop_us)
+                })
+                .unwrap_or(false);
+            // Require a usable measurement window before honoring the knee
+            // (expressed as a fraction of probe_duration — not a new
+            // constant): at least a quarter of the configured window.
+            let min_window = probe_duration.mul_f64(0.25);
+            let knee_terminate =
+                knee_reached && self.saturation_probe_snapshot_taken && elapsed >= min_window;
+            if knee_terminate {
+                tracing::info!(
+                    target: "strata::bonding",
+                    link_id = probe_id,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    max_ms = probe_duration.as_millis() as u64,
+                    "saturation probe hit delay-gradient knee — retreating early (delay-bounded ramp)"
+                );
+            }
+
+            if self.saturation_probe_snapshot_taken
+                && (elapsed >= probe_duration || knee_terminate)
+            {
                 // Sender-side measurement (raw send rate — includes any
                 // modem-internal bufferbloat). Used only as a diagnostic
                 // upper bound; the authoritative number comes from the
@@ -1098,6 +1138,9 @@ mod tests {
                     owd_ms: 0.0,
                     receiver_report: None,
                     probe_active: false,
+                    inferred_regime: None,
+                    bdp_bytes: 0.0,
+                    inflight_cap_bytes: 0.0,
                 }),
                 sent_packets: Mutex::new(Vec::new()),
                 ppd_probe_count: AtomicUsize::new(0),

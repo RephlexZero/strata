@@ -29,6 +29,13 @@ pub enum SupervisorEvent {
         total_capacity_kbps: f64,
         alive_links: usize,
     },
+    /// Opportunistic modem flow-control (F5): the modem's own transmit
+    /// path (QMAP DFC / vendor AT) reports backpressure (`slow_down =
+    /// true`) or grant restoration (`false`). Emitted only when a modem
+    /// backend feeds [`ModemSupervisor::update_flow_control`]; the runtime
+    /// forwards it to the link's congestion controller. Strictly additive
+    /// — absence of such a backend produces no events.
+    FlowControl { link_id: usize, slow_down: bool },
 }
 
 /// Configuration for the supervisor.
@@ -142,6 +149,20 @@ impl ModemSupervisor {
         self.check_capacity(&mut events);
 
         events
+    }
+
+    /// Opportunistic modem flow-control input (F5).
+    ///
+    /// A modem backend that exposes QMAP DFC (Qualcomm/rmnet) grant state
+    /// or vendor AT transmit-backpressure stats calls this; the returned
+    /// [`SupervisorEvent::FlowControl`] is forwarded by the runtime to the
+    /// link's congestion controller. Strictly additive — if no such
+    /// backend exists this is simply never called and nothing changes.
+    pub fn update_flow_control(&mut self, link_id: usize, slow_down: bool) -> Vec<SupervisorEvent> {
+        vec![SupervisorEvent::FlowControl {
+            link_id,
+            slow_down,
+        }]
     }
 
     /// Get the health score for a specific link.
@@ -272,6 +293,28 @@ mod tests {
             sinr_db: 20.0,
             cqi: 12,
         }
+    }
+
+    #[test]
+    fn flow_control_emits_event() {
+        let mut sup = ModemSupervisor::new(SupervisorConfig::default());
+        sup.register_link(0);
+        let ev = sup.update_flow_control(0, true);
+        assert_eq!(
+            ev,
+            vec![SupervisorEvent::FlowControl {
+                link_id: 0,
+                slow_down: true
+            }]
+        );
+        let ev = sup.update_flow_control(0, false);
+        assert_eq!(
+            ev,
+            vec![SupervisorEvent::FlowControl {
+                link_id: 0,
+                slow_down: false
+            }]
+        );
     }
 
     fn poor_rf() -> RfMetrics {

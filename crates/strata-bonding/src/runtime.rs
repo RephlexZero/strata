@@ -378,6 +378,9 @@ fn apply_link(
 
     match create_transport_link(&link) {
         Ok(tl) => {
+            // Apply the per-link path-regime override (F6). `None` keeps
+            // auto-inference; only metrics labelling is affected.
+            tl.set_profile(link.profile.as_deref());
             scheduler.add_link(Arc::new(tl) as Arc<dyn LinkSender>);
             current_links.insert(link.id, link);
         }
@@ -606,6 +609,7 @@ mod tests {
             id: 1,
             uri: "127.0.0.1:19100".to_string(),
             interface: None,
+            profile: None,
         };
         assert!(rt.add_link(link).is_ok());
         thread::sleep(Duration::from_millis(250));
@@ -620,6 +624,7 @@ mod tests {
             id: 1,
             uri: "127.0.0.1:19101".to_string(),
             interface: None,
+            profile: None,
         };
         rt.add_link(link).unwrap();
         thread::sleep(Duration::from_millis(250));
@@ -642,11 +647,13 @@ mod tests {
                     id: 1,
                     uri: "127.0.0.1:19102".to_string(),
                     interface: None,
+                    profile: None,
                 },
                 LinkConfig {
                     id: 2,
                     uri: "127.0.0.1:19103".to_string(),
                     interface: None,
+                    profile: None,
                 },
             ],
             ..BondingConfig::default()
@@ -662,6 +669,7 @@ mod tests {
                 id: 2,
                 uri: "127.0.0.1:19103".to_string(),
                 interface: None,
+                profile: None,
             }],
             ..BondingConfig::default()
         };
@@ -749,6 +757,7 @@ mod tests {
             id: 1,
             uri: "127.0.0.1:19200".to_string(),
             interface: None,
+            profile: None,
         };
         assert!(rt.add_link(link).is_ok());
         thread::sleep(Duration::from_millis(250));
@@ -771,6 +780,7 @@ mod tests {
             id: 1,
             uri: format!("{}", rcv_addr),
             interface: None,
+            profile: None,
         };
         rt.add_link(link).unwrap();
         thread::sleep(Duration::from_millis(200));
@@ -802,6 +812,7 @@ mod tests {
             id: 99,
             uri: "127.0.0.1:9999".to_string(),
             interface: Some("nonexistent_if_xyz".to_string()),
+            profile: None,
         };
         let result = create_transport_link(&link);
         assert!(

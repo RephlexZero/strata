@@ -42,6 +42,7 @@ fn runtime_to_receiver_single_link() {
         id: 1,
         uri: format!("{}", rcv_addr),
         interface: None,
+        profile: None,
     })
     .unwrap();
     std::thread::sleep(Duration::from_millis(200));
@@ -88,12 +89,14 @@ fn runtime_to_receiver_multi_link() {
         id: 1,
         uri: format!("{}", rcv_addr_1),
         interface: None,
+        profile: None,
     })
     .unwrap();
     rt.add_link(LinkConfig {
         id: 2,
         uri: format!("{}", rcv_addr_2),
         interface: None,
+        profile: None,
     })
     .unwrap();
     std::thread::sleep(Duration::from_millis(200));
@@ -187,12 +190,14 @@ fn critical_broadcast_deduplication() {
         id: 1,
         uri: format!("{}", rcv_addr_1),
         interface: None,
+        profile: None,
     })
     .unwrap();
     rt.add_link(LinkConfig {
         id: 2,
         uri: format!("{}", rcv_addr_2),
         interface: None,
+        profile: None,
     })
     .unwrap();
     std::thread::sleep(Duration::from_millis(200));
@@ -306,18 +311,21 @@ fn three_link_heterogeneous_all_delivered() {
         id: 1,
         uri: format!("{}", rcv_addr_1),
         interface: None,
+        profile: None,
     })
     .unwrap();
     rt.add_link(LinkConfig {
         id: 2,
         uri: format!("{}", rcv_addr_2),
         interface: None,
+        profile: None,
     })
     .unwrap();
     rt.add_link(LinkConfig {
         id: 3,
         uri: format!("{}", rcv_addr_3),
         interface: None,
+        profile: None,
     })
     .unwrap();
     std::thread::sleep(Duration::from_millis(200));
@@ -381,18 +389,21 @@ fn link_failure_mid_stream_failover() {
         id: 1,
         uri: format!("{}", rcv_addr_1),
         interface: None,
+        profile: None,
     })
     .unwrap();
     rt.add_link(LinkConfig {
         id: 2,
         uri: format!("{}", rcv_addr_2),
         interface: None,
+        profile: None,
     })
     .unwrap();
     rt.add_link(LinkConfig {
         id: 3,
         uri: format!("{}", rcv_addr_3),
         interface: None,
+        profile: None,
     })
     .unwrap();
     std::thread::sleep(Duration::from_millis(200));

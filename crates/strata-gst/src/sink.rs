@@ -98,6 +98,7 @@ mod imp {
                             id,
                             uri,
                             interface: iface,
+                            profile: None,
                         });
                     }
                     SinkMessage::RemoveLink { id } => {
@@ -113,6 +114,7 @@ mod imp {
                                 id,
                                 uri,
                                 interface: iface,
+                                profile: None,
                             },
                         );
                     }
