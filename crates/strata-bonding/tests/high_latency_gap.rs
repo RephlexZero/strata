@@ -32,6 +32,7 @@ fn test_transport_bonding_receiver_high_latency_gap() {
             payload_len: wrapped.len() as u16,
             sequence: VarInt::new(seq).unwrap(),
             timestamp_us: 0,
+            checksum: 0, // authoritative value written by WirePacket::encode
         };
         let wp = WirePacket {
             header: th,

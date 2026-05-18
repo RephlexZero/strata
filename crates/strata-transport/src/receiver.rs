@@ -477,6 +477,25 @@ impl Receiver {
             if rpkt.header.sequence.value() != seq {
                 continue;
             }
+            // Payload integrity: the header decoded and the seq matches,
+            // but RLNC/codec window length-alignment mismatches can leave
+            // the *payload tail* corrupt while the low-offset header is
+            // intact. That passes every header/seq guard yet delivers
+            // byte-garbage H.265 — invisible to loss/late/continuity
+            // stats. Treat a checksum failure as still-lost: drop it,
+            // count it, let the honest loss/NACK/keyframe path handle the
+            // gap instead of poisoning the decoder.
+            if !rpkt.verify_checksum() {
+                self.stats.fec_corrupt_dropped += 1;
+                tracing::debug!(
+                    "FEC recovery seq {} (generation {}) failed payload \
+                     checksum — dropping as loss (corrupt recovery, not \
+                     delivered)",
+                    seq,
+                    gen_id
+                );
+                continue;
+            }
 
             self.stats.fec_recoveries += 1;
             self.loss_detector.record_received(seq);

@@ -701,6 +701,8 @@ async fn link_reader_async(
                 rx_pkts_delta = d_pkts,
                 rx_kbps = (d_bytes as f64 * 8.0 / secs / 1000.0) as u64,
                 delivered_total = s.packets_delivered,
+                fec_recoveries = s.fec_recoveries,
+                fec_corrupt_dropped = s.fec_corrupt_dropped,
                 peer = sender_addr
                     .map(|a| a.to_string())
                     .unwrap_or_else(|| "<none>".into()),

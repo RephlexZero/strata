@@ -117,6 +117,7 @@ proptest! {
     fn packet_header_roundtrip(
         seq in varint_value(),
         timestamp in any::<u32>(),
+        checksum in any::<u32>(),
         payload_len in any::<u16>(),
         fragment in fragment_strategy(),
         is_keyframe in any::<bool>(),
@@ -133,6 +134,7 @@ proptest! {
             payload_len,
             sequence: VarInt::from_u64(seq),
             timestamp_us: timestamp,
+            checksum,
         };
 
         let mut buf = BytesMut::new();
@@ -148,6 +150,7 @@ proptest! {
         prop_assert_eq!(decoded.payload_len, payload_len);
         prop_assert_eq!(decoded.sequence.value(), seq);
         prop_assert_eq!(decoded.timestamp_us, timestamp);
+        prop_assert_eq!(decoded.checksum, checksum);
     }
 
     #[test]

@@ -74,6 +74,13 @@ pub struct ReceiverStats {
     pub late_packets: u64,
     /// Packets recovered via FEC.
     pub fec_recoveries: u64,
+    /// FEC recoveries discarded because the recovered payload failed its
+    /// checksum (codec window length-alignment mismatch). These are NOT
+    /// delivered — the seq stays missing and is handled as honest loss
+    /// rather than poisoning the decoder with byte-corrupt media. A
+    /// nonzero value here explains "stats look clean but the video is
+    /// full of grey/blocky artifacts".
+    pub fec_corrupt_dropped: u64,
     /// NACKs sent.
     pub nacks_sent: u64,
     /// Highest contiguous sequence delivered.

@@ -26,11 +26,31 @@ use std::fmt;
 /// Protocol version.
 pub const PROTOCOL_VERSION: u8 = 1;
 
-/// Minimum header size: 1 (flags) + 2 (payload len) + 1 (min varint) + 4 (timestamp) = 8.
-pub const MIN_HEADER_SIZE: usize = 8;
+/// Minimum header size: 1 (flags) + 2 (payload len) + 1 (min varint)
+/// + 4 (timestamp) + 4 (payload checksum) = 12.
+pub const MIN_HEADER_SIZE: usize = 12;
 
-/// Maximum header size: 1 + 2 + 8 + 4 = 15.
-pub const MAX_HEADER_SIZE: usize = 15;
+/// Maximum header size: 1 + 2 + 8 + 4 + 4 = 19.
+pub const MAX_HEADER_SIZE: usize = 19;
+
+/// FNV-1a 32-bit hash of a payload. Not cryptographic — a fast integrity
+/// check so an FEC-*recovered* packet (synthesized by GF(256) Gaussian
+/// elimination, never UDP-checksummed as that packet) cannot be delivered
+/// with a valid header/seq but byte-corrupt payload. RLNC/codec window
+/// length-alignment mismatches can produce exactly that: a correct
+/// low-offset header (decode + seq-match pass) over a corrupt payload
+/// tail, which every loss/late/continuity metric reports as healthy while
+/// the H.265 NAL is garbage. This checksum is the only thing that can
+/// catch it.
+#[inline]
+pub fn payload_checksum(payload: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in payload {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
 
 /// Maximum payload in a single packet (64 KiB - 1).
 pub const MAX_PAYLOAD_LEN: usize = u16::MAX as usize;
@@ -263,6 +283,10 @@ pub struct PacketHeader {
     pub sequence: VarInt,
     /// Microsecond timestamp (wraps every ~71 min).
     pub timestamp_us: u32,
+    /// FNV-1a checksum of the payload. Authoritative value is written by
+    /// [`Packet::encode`] from the actual payload; verified by
+    /// [`Packet::verify_checksum`] (used on the FEC-recovered path).
+    pub checksum: u32,
 }
 
 impl PacketHeader {
@@ -285,6 +309,9 @@ impl PacketHeader {
 
         // Timestamp (32-bit µs)
         buf.put_u32(self.timestamp_us);
+
+        // Payload checksum (32-bit FNV-1a)
+        buf.put_u32(self.checksum);
     }
 
     /// Decode a header from a buffer. Returns `None` if buffer is too short or invalid.
@@ -311,10 +338,11 @@ impl PacketHeader {
 
         let payload_len = buf.get_u16();
         let sequence = VarInt::decode(buf)?;
-        if buf.remaining() < 4 {
+        if buf.remaining() < 8 {
             return None;
         }
         let timestamp_us = buf.get_u32();
+        let checksum = buf.get_u32();
 
         Some(PacketHeader {
             version,
@@ -326,12 +354,13 @@ impl PacketHeader {
             payload_len,
             sequence,
             timestamp_us,
+            checksum,
         })
     }
 
     /// Total encoded size of this header.
     pub fn encoded_len(&self) -> usize {
-        1 + 2 + self.sequence.encoded_len() + 4
+        1 + 2 + self.sequence.encoded_len() + 4 + 4
     }
 
     /// Create a new data packet header.
@@ -346,6 +375,7 @@ impl PacketHeader {
             payload_len,
             sequence: VarInt::from_u64(sequence),
             timestamp_us,
+            checksum: 0,
         }
     }
 
@@ -361,6 +391,7 @@ impl PacketHeader {
             payload_len,
             sequence: VarInt::from_u64(sequence),
             timestamp_us,
+            checksum: 0,
         }
     }
 
@@ -908,11 +939,30 @@ pub struct Packet {
 
 impl Packet {
     /// Serialize the entire packet (header + payload) into a new `BytesMut`.
+    ///
+    /// The payload checksum is computed here and written authoritatively,
+    /// so every serialized packet carries a correct checksum regardless of
+    /// how its header was constructed.
     pub fn encode(&self) -> BytesMut {
         let mut buf = BytesMut::with_capacity(self.header.encoded_len() + self.payload.len());
-        self.header.encode(&mut buf);
+        let mut header = self.header.clone();
+        header.checksum = payload_checksum(&self.payload);
+        header.encode(&mut buf);
         buf.extend_from_slice(&self.payload);
         buf
+    }
+
+    /// Recompute the payload checksum and compare it to the header value.
+    ///
+    /// For UDP-received packets this is redundant (the kernel UDP checksum
+    /// already protects them). It is the *only* integrity guarantee for an
+    /// FEC-**recovered** packet, which is synthesized by GF(256) Gaussian
+    /// elimination and never traversed UDP as that packet — a window
+    /// length-alignment mismatch can yield a valid header + seq over a
+    /// corrupt payload that every loss/late/continuity metric calls healthy.
+    #[inline]
+    pub fn verify_checksum(&self) -> bool {
+        payload_checksum(&self.payload) == self.header.checksum
     }
 
     /// Decode a complete packet from raw bytes.
@@ -1105,6 +1155,39 @@ mod tests {
         let decoded = Packet::decode(&mut encoded.freeze()).unwrap();
         assert_eq!(decoded.header.sequence.value(), 100);
         assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn payload_checksum_roundtrips_and_detects_tampering() {
+        let payload = Bytes::from_static(b"hello strata video NAL bytes");
+        let pkt = Packet::new_data(7, 1234, payload.clone());
+        let encoded = pkt.encode();
+        let decoded = Packet::decode(&mut encoded.clone().freeze()).unwrap();
+
+        // A cleanly serialized packet always verifies.
+        assert!(
+            decoded.verify_checksum(),
+            "encoded packet must carry a correct payload checksum"
+        );
+        assert_eq!(decoded.header.checksum, payload_checksum(&payload));
+
+        // A recovered packet whose payload tail is corrupt (RLNC window
+        // length-alignment mismatch) keeps a valid header + seq but must
+        // fail verification — this is the only signal that catches it.
+        let mut corrupt = decoded.clone();
+        let mut bad = corrupt.payload.to_vec();
+        let n = bad.len();
+        bad[n - 1] ^= 0xFF;
+        corrupt.payload = Bytes::from(bad);
+        assert_eq!(
+            corrupt.header.sequence.value(),
+            7,
+            "header/seq still look valid — header guards alone cannot catch this"
+        );
+        assert!(
+            !corrupt.verify_checksum(),
+            "a single corrupt payload byte must fail the checksum"
+        );
     }
 
     #[test]

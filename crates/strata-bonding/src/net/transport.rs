@@ -1377,7 +1377,22 @@ impl LinkSender for TransportLink {
         // per the requirement) and never more repairs than sources.
         const FEC_BASE_K: usize = 32;
         let r = ((FEC_BASE_K as f64) * ratio).round() as usize;
-        let r = r.clamp(1, FEC_BASE_K);
+        let mut r = r.clamp(1, FEC_BASE_K);
+
+        // Diagnostic isolation lever (default OFF): `STRATA_FEC=off` forces
+        // zero repair symbols so a field run can prove whether FEC repair
+        // is the source of "clean stats, corrupt video". Not a normal mode
+        // — the default keeps FEC enabled (R ≥ 1).
+        static FEC_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let disabled = *FEC_DISABLED.get_or_init(|| {
+            std::env::var("STRATA_FEC")
+                .map(|v| v.eq_ignore_ascii_case("off") || v == "0")
+                .unwrap_or(false)
+        });
+        if disabled {
+            r = 0;
+        }
+
         self.sender.lock().unwrap().set_fec_rate(FEC_BASE_K, r);
     }
 

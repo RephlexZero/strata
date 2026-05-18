@@ -35,6 +35,8 @@
 #   STRATA_DURATION_SECS   — How long to stream before stopping (default: 60)
 #   STRATA_NO_BUILD=1      — Skip building and installing the sender binary
 #   STRATA_NO_DEPLOY=1     — Skip cross-compiling and deploying receiver binary
+#   STRATA_FEC=off         — Diagnostic: disable FEC repair (isolate whether
+#                            FEC recovery is the source of corrupt video)
 #   STRATA_DEPLOY_IFACE    — Network interface for SSH/SCP deploy (e.g. "wlan0" to avoid cellular)
 #   STRATA_LOG_LEVEL       — Rust log level (default: debug)
 #   YOUTUBE_API_KEY        — API key for fetching stream health
@@ -391,7 +393,7 @@ RECEIVER_SCRIPT=$(mktemp /tmp/strata-receiver-start-XXXXXX.sh)
 cat > "$RECEIVER_SCRIPT" << ENDSCRIPT
 #!/bin/bash
 export GST_PLUGIN_PATH=\$HOME/.local/share/gstreamer-1.0/plugins
-nohup env RUST_LOG="$LOG_LEVEL" GST_DEBUG="tsdemux:4,strata*:4" /usr/local/bin/strata-pipeline receiver \\
+nohup env RUST_LOG="$LOG_LEVEL" GST_DEBUG="tsdemux:4,strata*:4" STRATA_FEC="${STRATA_FEC:-}" /usr/local/bin/strata-pipeline receiver \\
   --bind "$BIND_STR" \\
   --relay-url "$STRATA_RELAY_URL" \\
   --codec "$CODEC" \\
@@ -454,6 +456,13 @@ fi
 
 # Enable adaptation debug logging unless user already set RUST_LOG
 export RUST_LOG="$LOG_LEVEL"
+
+# Diagnostic FEC isolation: STRATA_FEC=off forces zero repair symbols on
+# the sender so a run can prove whether FEC repair causes corrupt video.
+export STRATA_FEC="${STRATA_FEC:-}"
+if [[ "${STRATA_FEC,,}" == "off" || "$STRATA_FEC" == "0" ]]; then
+    warn "FEC DISABLED for this run (STRATA_FEC=$STRATA_FEC) — diagnostic isolation, expect raw loss to surface"
+fi
 
 strata-pipeline "${SENDER_ARGS[@]}" > /tmp/strata-sender.log 2>&1 &
 SENDER_PID=$!
