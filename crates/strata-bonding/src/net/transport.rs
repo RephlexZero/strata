@@ -1306,6 +1306,10 @@ impl LinkSender for TransportLink {
             .on_modem_flow_control(slow_down);
     }
 
+    fn queue_building(&self) -> bool {
+        self.congestion.lock().unwrap().queue_building()
+    }
+
     fn recv_feedback(&self) -> usize {
         let mut processed = 0;
         let mut buf = [0u8; 2048];

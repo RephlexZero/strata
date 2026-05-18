@@ -158,6 +158,15 @@ pub struct BiscayController {
     // ─── RTT tracking ───
     /// Recent RTT samples (µs) for RTprop estimation.
     rtt_samples: VecDeque<f64>,
+    /// Previous RTT sample (µs) for successive-difference jitter.
+    rtt_prev: Option<f64>,
+    /// EWMA of `|rtt_n − rtt_{n−1}|` — mean absolute successive difference.
+    /// The link's own short-term RTT volatility; the fast `queue_building`
+    /// knee trips when the excess above RTprop exceeds a σ-multiple of it.
+    /// A monotonic queue ramp has tiny per-step Δ (this stays low while
+    /// excess grows → fires); stationary jitter has large per-step Δ (this
+    /// rises → trip rises with it → does not fire).
+    rtt_masd: f64,
     /// Sliding window of `(timestamp, rtt_us)` whose minimum *is* RTprop.
     ///
     /// RTprop must be a windowed-min propagation delay, never a recent RTT:
@@ -257,6 +266,8 @@ impl BiscayController {
             bw_window: Duration::from_secs(10),
 
             rtt_samples: VecDeque::with_capacity(32),
+            rtt_prev: None,
+            rtt_masd: 0.0,
             rt_prop_window: VecDeque::with_capacity(64),
             rt_prop_stamp: now,
             rt_prop_expiry: Duration::from_secs(10),
@@ -520,6 +531,50 @@ impl BiscayController {
         if bdp > 0.0 { bdp * k.max(1.0) } else { 0.0 }
     }
 
+    /// Fast, path-relative "is the bottleneck queue filling RIGHT NOW?"
+    /// verdict, derived from the Pong-cadence RTT samples (≈100 ms apart)
+    /// against the windowed-min RTprop — NOT from the 1 s receiver-report
+    /// gradient.
+    ///
+    /// This exists so the F1 delay-bounded saturation probe can retreat
+    /// the instant it pushes the link past its knee. The receiver-report
+    /// gradient (F3) is the clean steady-state backoff signal but updates
+    /// only ~once per second — far too slow to bound a 0.4 s probe, so the
+    /// probe historically always ran its full destructive fixed pin. The
+    /// RTT-sample path delivers ≈4 fresh samples inside a 0.4 s probe.
+    ///
+    /// The discriminator is **mean absolute successive difference** of the
+    /// RTT samples (`rtt_masd`), not the dispersion over a window. A queue
+    /// build is a *sustained directional* rise: small per-sample Δ but
+    /// large cumulative excess above the propagation floor. Jitter is
+    /// *high-frequency bidirectional*: large per-sample Δ but bounded
+    /// cumulative excess. Window-MAD self-inflates exactly during the rise
+    /// we want to catch (the window straddles floor + rise); successive-Δ
+    /// does not (a ramp has tiny per-step Δ). MASD is the standard robust
+    /// scale-free noise estimator.
+    ///
+    /// Doctrine-compliant: the trip is the link's *own* RTT volatility
+    /// scaled by the same `GRAD_TRIP_SIGMA` used by the F3 gradient — no
+    /// new tuned constant, correct on fiber/cellular/satellite alike —
+    /// floored at 5 % of its own RTprop (the established path-relative
+    /// "meaningful standing queue" unit, also used by the F3 trip) so an
+    /// ultra-smooth link's near-zero MASD can't make it hair-trigger.
+    /// Fail-safe by design: a false positive merely retreats the probe
+    /// early (a conservative capacity sample the Oracle/PPD recover),
+    /// whereas a missed knee is the destructive full pin we are removing.
+    pub fn queue_building(&self) -> bool {
+        if self.rt_prop_us >= f64::MAX || self.rtt_samples.len() < 4 {
+            return false;
+        }
+        let latest = *self.rtt_samples.back().unwrap();
+        let excess = latest - self.rt_prop_us;
+        if excess <= 0.0 {
+            return false;
+        }
+        let trip = (Self::GRAD_TRIP_SIGMA * self.rtt_masd).max(0.05 * self.rt_prop_us);
+        excess > trip
+    }
+
     // ─── BBR feedback processing ────────────────────────────────────────
 
     /// Process a bandwidth sample (from ACK feedback).
@@ -612,6 +667,20 @@ impl BiscayController {
         if rtt_us <= 0.0 {
             return;
         }
+
+        // Mean absolute successive difference (the fast `queue_building`
+        // jitter scale). EWMA so it tracks the link's current volatility;
+        // a smooth queue ramp keeps per-step Δ tiny, stationary jitter
+        // keeps it high.
+        if let Some(prev) = self.rtt_prev {
+            let d = (rtt_us - prev).abs();
+            self.rtt_masd = if self.rtt_masd == 0.0 {
+                d
+            } else {
+                0.3 * d + 0.7 * self.rtt_masd
+            };
+        }
+        self.rtt_prev = Some(rtt_us);
 
         self.rtt_samples.push_back(rtt_us);
         if self.rtt_samples.len() > 32 {
@@ -1523,6 +1592,59 @@ mod tests {
                 "cycle {cycle}: should exit ProbeRtt"
             );
         }
+    }
+
+    // ─── F1 fast knee signal: queue_building() ──────────────────────────
+
+    #[test]
+    fn queue_building_needs_warmup_and_rtprop() {
+        let mut cc = BiscayController::new();
+        assert!(!cc.queue_building(), "no data → not building");
+        cc.on_rtt_sample(50_000.0);
+        cc.on_rtt_sample(50_000.0);
+        cc.on_rtt_sample(50_000.0);
+        // < 4 samples → still not enough to judge.
+        assert!(!cc.queue_building());
+    }
+
+    #[test]
+    fn queue_building_fires_on_sustained_delay_rise() {
+        let mut cc = BiscayController::new();
+        // Establish a low propagation floor (windowed-min RTprop).
+        for _ in 0..8 {
+            cc.on_rtt_sample(50_000.0);
+        }
+        assert!(
+            !cc.queue_building(),
+            "steady RTT at the floor must not look like queue build"
+        );
+        // Queue fills: srtt climbs well above the floor.
+        for _ in 0..6 {
+            cc.on_rtt_sample(140_000.0);
+        }
+        assert!(
+            cc.queue_building(),
+            "srtt sustained far above windowed-min RTprop must trip the knee"
+        );
+    }
+
+    #[test]
+    fn queue_building_is_jitter_immune() {
+        // Stationary RTT jitter around a stable floor must NOT trip the
+        // knee (the doctrine's Wi-Fi/aggregation landmine): the trip is a
+        // σ-multiple of the link's OWN jitter, so noise scales the
+        // threshold with it.
+        let mut cc = BiscayController::new();
+        let mut seed = 99u64;
+        for _ in 0..24 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let jitter = (seed >> 40) % 40_000; // 0–40 ms swing
+            cc.on_rtt_sample(50_000.0 + jitter as f64);
+        }
+        assert!(
+            !cc.queue_building(),
+            "heavy stationary jitter must not be mistaken for a standing queue"
+        );
     }
 
     // ─── Seed Bandwidth Tests ───────────────────────────────────────────

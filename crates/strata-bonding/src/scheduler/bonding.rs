@@ -530,24 +530,25 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             // F1 — DELAY-BOUNDED RAMP. Pinning traffic to the probe link
             // ramps the offered load; instead of dumping a fixed 0.4 s
             // burst (which bloats the modem/RAN buffer — the very thing we
-            // are trying to stop), terminate the instant the F3 relative-
-            // OWD gradient knee says the queue has started to build. The
-            // delivery rate measured *up to* the knee is the true,
-            // non-bloating capacity ceiling. The configured
+            // are trying to stop), terminate the instant the link's queue
+            // starts to build. The delivery rate measured *up to* the knee
+            // is the true, non-bloating capacity ceiling. The configured
             // `probe_duration` survives only as a safety cap, so the probe
             // can only ever end EARLIER than before — never more bloat.
             //
-            // Knee is path-relative: gradient exceeding half of *this
-            // link's own* windowed-min RTprop is a real standing queue, not
-            // jitter — correct on fiber, cellular and satellite alike.
-            let knee_reached = metrics
-                .iter()
-                .find(|(id, _)| *id == probe_id)
-                .and_then(|(_, m)| {
-                    let rtprop_us = m.rtprop_ms.filter(|v| *v > 0.0)? * 1000.0;
-                    let grad_us = m.receiver_report.as_ref()?.delay_gradient_us as f64;
-                    Some(grad_us > 0.5 * rtprop_us)
-                })
+            // The knee MUST come from the sender-side Pong-cadence RTT
+            // path (`queue_building()`, ≈100 ms updates → ~4 samples inside
+            // a 0.4 s probe), NOT the receiver-report delay gradient: that
+            // gradient only refreshes on the receiver's ~1 s report, so it
+            // can't be observed fresh inside a 0.4 s window and the probe
+            // historically always ran its full destructive fixed pin
+            // (35 probes / 0 knee retreats in the field). `queue_building()`
+            // is itself path-relative (σ-multiple of the link's own RTT
+            // jitter vs windowed-min RTprop) so this stays doctrine-clean.
+            let knee_reached = self
+                .scheduler
+                .get_link(probe_id)
+                .map(|l| l.queue_building())
                 .unwrap_or(false);
             // Require a usable measurement window before honoring the knee
             // (expressed as a fraction of probe_duration — not a new

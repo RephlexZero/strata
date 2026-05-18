@@ -268,6 +268,15 @@ pub trait LinkSender: Send + Sync {
     /// backing up, `false` when grants are restored. Strictly additive:
     /// the default no-op means absence of such a backend changes nothing.
     fn on_modem_flow_control(&self, _slow_down: bool) {}
+
+    /// Fast, path-relative "is this link's bottleneck queue filling right
+    /// now?" verdict from the sender-side Pong-cadence RTT path (≈100 ms),
+    /// NOT the 1 s receiver-report gradient. Used by the F1 delay-bounded
+    /// saturation probe to retreat at the knee within its own 0.4 s
+    /// window. Default `false` (mock/sim links never report queue build).
+    fn queue_building(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
