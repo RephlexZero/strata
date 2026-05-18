@@ -264,6 +264,13 @@ mod imp {
                 .spawn(move || {
                     let start = Instant::now();
                     let mut stats_seq: u64 = 0;
+                    // Previous per-link cumulative rx count, so `alive_links`
+                    // can mean "delivering in the last ~1 s" rather than the
+                    // hardcoded 0 it used to report (field runs showed
+                    // alive_links=0 for the whole stream while a link carried
+                    // 25k+ packets — the metric was untrustworthy).
+                    let mut prev_rx: std::collections::HashMap<usize, u64> =
+                        std::collections::HashMap::new();
                     while running.load(Ordering::Relaxed) {
                         if let Some(element) = element_weak.upgrade() {
                             let imp = element.imp();
@@ -271,6 +278,22 @@ mod imp {
                                 && let Some(receiver) = &*receiver_guard
                             {
                                 let stats = receiver.get_stats();
+                                // A link is "alive" at the receiver iff its
+                                // cumulative rx count advanced since the last
+                                // tick (actively delivering now) — a frozen or
+                                // never-delivering link is not counted.
+                                let alive_links = stats
+                                    .per_link
+                                    .iter()
+                                    .filter(|l| match prev_rx.get(&l.link_id) {
+                                        Some(&p) => l.packets_received > p,
+                                        None => l.packets_received > 0,
+                                    })
+                                    .count()
+                                    as u64;
+                                for l in &stats.per_link {
+                                    prev_rx.insert(l.link_id, l.packets_received);
+                                }
                                 let mono_time_ns = start.elapsed().as_nanos() as u64;
                                 let wall_time_ms = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
@@ -283,7 +306,7 @@ mod imp {
                                     .field("mono_time_ns", mono_time_ns)
                                     .field("wall_time_ms", wall_time_ms)
                                     .field("total_capacity", 0.0f64)
-                                    .field("alive_links", 0u64)
+                                    .field("alive_links", alive_links)
                                     .field("queue_depth", stats.queue_depth as u64)
                                     .field("next_seq", stats.next_seq)
                                     .field("lost_packets", stats.lost_packets)

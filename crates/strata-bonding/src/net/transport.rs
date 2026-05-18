@@ -12,7 +12,7 @@ use bytes::{Bytes, BytesMut};
 use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use std::net::UdpSocket;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
@@ -109,6 +109,13 @@ pub struct TransportLink {
     prev_pkts_acked: AtomicU64,
     /// Timestamp of previous per-link packets_acked snapshot.
     prev_pkts_acked_us: AtomicU64,
+    /// True once the per-link ACK-rate EWMA has decayed to zero during a
+    /// delivery stall. The first non-zero ACK interval after a stall is a
+    /// *stall-release burst* — thousands of cumulative ACKs flushed at once
+    /// (carrier NAT rebind) compressed into one ~500 ms window, which
+    /// over-states the true rate by 100×+. That single sample is discarded
+    /// for capacity purposes; the next clean interval seeds the rate.
+    ack_rate_was_zeroed: AtomicBool,
     /// Latest receiver report from the remote receiver (if any).
     receiver_report: Mutex<Option<ReceiverReportPacket>>,
     /// Most recent receiver-side cumulative `bytes_delivered` for this link.
@@ -176,6 +183,34 @@ const STARVED_STALE: std::time::Duration = std::time::Duration::from_secs(3);
 /// periodic saturation probes — the mechanism by which a recovered link
 /// re-admits itself. Roughly one 1300 B packet every ~150 ms.
 const STARVED_CAPACITY_FLOOR_BPS: f64 = 64_000.0;
+
+/// Capacity (bits/sec) a *hard-blackholed* link is pinned to — one that has
+/// sent meaningful traffic but had **zero** ACK progress ever (not a
+/// transient dip: `packets_acked == 0`). 64 kbps still earns a recovered
+/// link real EDPF share; a link that has *never once* delivered a packet
+/// must get effectively none while still keeping `alive=true` and its
+/// periodic saturation probe (the self-readmission path). ~4 kbps is one
+/// ~1300 B probe every ~2.6 s — enough to re-test the path, negligible
+/// scheduling weight so the bond never dumps media into a proven hole.
+const STARVED_HARD_BLACKHOLE_FLOOR_BPS: f64 = 4_000.0;
+
+/// Maximum factor by which the passive CapacityOracle estimate may exceed
+/// BBR's `btl_bw` before it is rejected as contaminated. `btl_bw` is the
+/// physically-grounded windowed-max-filter bottleneck estimate; a passive
+/// delivery-rate sample legitimately exceeds it only modestly (ACK
+/// batching, brief bursts). A 4×+ excess is a stall-release ACK burst or
+/// similar wrong-signal artifact (field: oracle 43.8 Mbps vs btl_bw
+/// 1.26 Mbps on a link that delivered ~0). Same doctrinal invariant as the
+/// probe-poisoning fix: a contaminated passive sample must never override
+/// the steady-state physical estimate.
+const ORACLE_SANE_BTLBW_MULT: f64 = 4.0;
+
+// Compile-time invariants: the hard-blackhole floor must be strictly below
+// the transient-starve trickle, and the oracle sanity multiple must stay in
+// a conservative band (reject stall-release bursts — 30×+ btl_bw in the
+// field — without clipping normal ACK-batching headroom).
+const _: () = assert!(STARVED_HARD_BLACKHOLE_FLOOR_BPS < STARVED_CAPACITY_FLOOR_BPS);
+const _: () = assert!(ORACLE_SANE_BTLBW_MULT >= 2.0 && ORACLE_SANE_BTLBW_MULT <= 8.0);
 
 /// Cooldown after a saturation probe's send window closes during which
 /// receiver feedback is still treated as contaminated. Receiver reports
@@ -352,6 +387,7 @@ impl TransportLink {
             per_link_ack_rate_bps: Mutex::new(0.0),
             prev_pkts_acked: AtomicU64::new(0),
             prev_pkts_acked_us: AtomicU64::new(0),
+            ack_rate_was_zeroed: AtomicBool::new(false),
             receiver_report: Mutex::new(None),
             last_recv_bytes_delivered: AtomicU64::new(0),
             last_recv_report_at: Mutex::new(Instant::now()),
@@ -965,7 +1001,22 @@ impl LinkSender for TransportLink {
             if delta > 0 {
                 let rate = (delta as f64 * 8.0) / (interval_us as f64 / 1_000_000.0);
                 if *ewma == 0.0 {
-                    *ewma = rate;
+                    // Re-acquiring delivery from a zeroed rate. If the rate
+                    // was zeroed by a *stall* (not a cold start), this first
+                    // non-zero interval is a stall-release ACK burst: the
+                    // cumulative ACKs for thousands of packets sent over the
+                    // whole stall are flushed at once and compressed into one
+                    // ~500 ms window, over-stating the true rate by 100×+
+                    // (field: link 0 → 43.8 Mbps vs btl_bw 1.26 Mbps). The
+                    // snapshot is already committed above, so discard this
+                    // one sample and let the *next* clean interval seed the
+                    // rate. A genuine cold start (no preceding stall) seeds
+                    // immediately as before.
+                    if self.ack_rate_was_zeroed.swap(false, Ordering::Relaxed) {
+                        // leave *ewma == 0.0 — burst sample dropped
+                    } else {
+                        *ewma = rate;
+                    }
                 } else {
                     *ewma = 0.2 * rate + 0.8 * *ewma;
                 }
@@ -976,6 +1027,10 @@ impl LinkSender for TransportLink {
                 *ewma *= 0.5;
                 if *ewma < 1000.0 {
                     *ewma = 0.0;
+                    // Mark that the rate was zeroed by a delivery stall so
+                    // the next non-zero interval is treated as a contaminated
+                    // stall-release burst, not a real capacity sample.
+                    self.ack_rate_was_zeroed.store(true, Ordering::Relaxed);
                 }
             }
             *ewma
@@ -1107,7 +1162,25 @@ impl LinkSender for TransportLink {
             0.0
         };
         let capacity_bps = if oracle_cap > 0.0 {
-            oracle_cap
+            // Defense-in-depth (same invariant as the probe-poisoning fix):
+            // BBR's `btl_bw` is the physically-grounded bottleneck estimate.
+            // A passive oracle estimate that exceeds it by ≥4× cannot be a
+            // real capacity ceiling — it is a contaminated passive sample
+            // (stall-release ACK burst, ACK batching artifact). Never let it
+            // override the physical estimate; fall back to btl_bw.
+            if btl_bw_capped > 0.0 && oracle_cap > btl_bw_capped * ORACLE_SANE_BTLBW_MULT {
+                tracing::warn!(
+                    link_id = self.id,
+                    oracle_cap_kbps = (oracle_cap / 1000.0) as u64,
+                    btl_bw_kbps = (btl_bw_capped / 1000.0) as u64,
+                    "oracle cap >{}× btl_bw — contaminated passive sample, \
+                     using btl_bw",
+                    ORACLE_SANE_BTLBW_MULT as u64,
+                );
+                btl_bw_capped
+            } else {
+                oracle_cap
+            }
         } else if btl_bw_capped > 0.0 {
             btl_bw_capped
         } else if per_link_ack_rate > 100_000.0 {
@@ -1121,12 +1194,26 @@ impl LinkSender for TransportLink {
         drop(oracle);
 
         // Continuous demotion (replaces binary death): a link that is
-        // currently delivering nothing is pinned to the trickle floor so
-        // EDPF deprioritises it instead of dumping the stream into a hole.
-        // It stays in the bond; the probe rotation re-tests it and the
-        // floor lifts automatically on the next tick after an ACK/report.
+        // currently delivering nothing is pinned to a trickle floor so EDPF
+        // deprioritises it instead of dumping the stream into a hole. It
+        // stays in the bond; the probe rotation re-tests it and the floor
+        // lifts automatically on the next tick after an ACK/report.
+        //
+        // Two tiers — a *transient* starve (had delivered before, currently
+        // stale) keeps the 64 kbps trickle so a recovering link earns share
+        // back quickly; a *hard blackhole* (sent ≥STARVED_MIN_SENT packets
+        // and **zero** acked, ever) is pinned far lower so EDPF gives it
+        // essentially no media while the periodic saturation probe still
+        // re-tests the path. This stops the bond repeatedly dealing the
+        // encoder onto a link that has never once delivered a packet
+        // (field run #5: link 0, 22k sent / 0 acked, still scheduled).
         let capacity_bps = if delivery_starved {
-            capacity_bps.min(STARVED_CAPACITY_FLOOR_BPS)
+            let floor = if acked == 0 {
+                STARVED_HARD_BLACKHOLE_FLOOR_BPS
+            } else {
+                STARVED_CAPACITY_FLOOR_BPS
+            };
+            capacity_bps.min(floor)
         } else {
             capacity_bps
         };
@@ -1462,6 +1549,31 @@ mod tests {
         assert!(
             m.capacity_bps == 0.0 || m.capacity_bps > STARVED_CAPACITY_FLOOR_BPS,
             "a barely-used link must not be crushed as starved, got {}",
+            m.capacity_bps
+        );
+    }
+
+    #[test]
+    fn hard_blackhole_link_demoted_below_transient_starve_floor() {
+        // Loopback ⇒ packets_acked stays 0 forever: a *hard* blackhole, not
+        // a transient dip. It must be pinned to the much lower
+        // hard-blackhole floor (≪ the 64 kbps transient-starve trickle) so
+        // EDPF gives it essentially no media, while still staying alive for
+        // the saturation-probe self-readmission path. Regression for field
+        // run #5: link 0 sent 22k packets / 0 acked yet kept real share.
+        let link = make_loopback_link(21);
+        for i in 0..60 {
+            link.send(format!("p{i}").as_bytes()).unwrap();
+        }
+        *link.last_ack_or_report.lock().unwrap() =
+            std::time::Instant::now() - (STARVED_STALE + std::time::Duration::from_secs(1));
+        let m = link.get_metrics();
+        assert!(m.alive, "hard-blackholed link must still be alive");
+        assert!(
+            m.capacity_bps <= STARVED_HARD_BLACKHOLE_FLOOR_BPS,
+            "a never-acked link must be pinned to the hard-blackhole floor \
+             ({STARVED_HARD_BLACKHOLE_FLOOR_BPS}), not the transient trickle \
+             ({STARVED_CAPACITY_FLOOR_BPS}); got {}",
             m.capacity_bps
         );
     }

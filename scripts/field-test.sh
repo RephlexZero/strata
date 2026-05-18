@@ -587,33 +587,44 @@ else
         fail "Sender exited during admission window — see /tmp/strata-sender.log"
     fi
 
-    RX_HB=$(ssh "${SSH_OPTS[@]}" "$HOST" "grep 'rx link heartbeat' /tmp/strata-receiver.log 2>/dev/null | tail -20" 2>/dev/null || echo "")
+    # Strip ANSI so field parsing is robust whether or not tracing emitted
+    # colour into the log files.
+    strip_ansi='s/\x1b\[[0-9;]*m//g'
+    RX_HB=$(ssh "${SSH_OPTS[@]}" "$HOST" "grep 'rx link heartbeat' /tmp/strata-receiver.log 2>/dev/null | tail -40" 2>/dev/null \
+            | sed -E "$strip_ansi" || echo "")
+    TX_STARVED=$(sed -E "$strip_ansi" /tmp/strata-sender.log 2>/dev/null \
+                 | grep -E "link delivery-starved" | tail -40 || echo "")
     ADMIT_BAD=()
     for ((li=0; li<NUM_LINKS; li++)); do
-        # Authoritative fail signal: the transport's blackhole detector.
-        bh=$(grep -E "ACK-starved blackhole" /tmp/strata-sender.log 2>/dev/null \
-             | grep -E "link_id=${li}\b" | tail -1 || echo "")
-        # Corroborating signal: latest per-link line still shows the
-        # never-measured-RTT + not-alive state.
-        ll=$(grep -E "\[link\] id=${li} " /tmp/strata-sender.log 2>/dev/null | tail -1 || echo "")
-        not_alive=$(echo "$ll" | grep -c "alive=false" || true)
-        # Receiver-side: did ANY bytes reach this link's listener?
-        rx_delta=$(echo "$RX_HB" | grep -E "link_id=${li}\b" | tail -1 \
-                   | grep -oE "rx_pkts_total=[0-9]+" | head -1 | cut -d= -f2 || echo "")
-        rx_delta=$(num "$rx_delta")
+        iface_str="${IFACES[$li]:-<routed>}"
+        port_str="${PORTS[$li]}"
 
-        if [[ -n "$bh" || "$not_alive" -ge 1 ]]; then
-            iface_str="${IFACES[$li]:-<routed>}"
-            port_str="${PORTS[$li]}"
-            if [[ "$rx_delta" -gt 0 ]]; then
-                diag="receiver RECEIVED ${rx_delta} pkts but sender got no ACKs ⇒ RETURN-PATH blackhole (carrier CGNAT on this SIM dropping VPS→modem, or receiver not replying on this link)"
-            else
-                diag="receiver received 0 pkts on this link ⇒ either sender failed to bind ${iface_str} (SO_BINDTODEVICE/cap_net_raw) or egress for this SIM is down"
-            fi
-            warn "Link $li ($iface_str → :${port_str}) FAILED admission: $diag"
+        # AUTHORITATIVE ground truth: did ANY datagram reach this link's
+        # receiver socket during the admission window? `rx_pkts_total` is
+        # cumulative; 0 ⇒ the link never delivered a single packet. (The
+        # old gate keyed off the sender's "ACK-starved blackhole" string
+        # and `alive=false`, both deleted by the continuous-demotion
+        # refactor — it could no longer fail any link. Read the receiver,
+        # not an obsolete sender diagnostic.)
+        rx_total=$(echo "$RX_HB" | grep -E "link_id=${li}( |\b)" | tail -1 \
+                   | grep -oE "rx_pkts_total=[0-9]+" | head -1 | cut -d= -f2 || echo "")
+        rx_total=$(num "$rx_total")
+
+        # CORROBORATING: sender currently reports this link delivery-starved
+        # with zero ACKs — a one-way blackhole even if a stray packet leaked
+        # through to the receiver.
+        starved0=$(echo "$TX_STARVED" \
+                   | grep -E "link_id=${li}( |\b)" \
+                   | grep -E "packets_acked=0( |\b)" | tail -1 || echo "")
+
+        if [[ "$rx_total" -le 0 ]]; then
+            warn "Link $li ($iface_str → :${port_str}) FAILED admission: receiver received 0 pkts on :${port_str} ⇒ egress for this SIM is down, sender failed to bind ${iface_str}, or the path is black-holed"
+            ADMIT_BAD+=("$li")
+        elif [[ -n "$starved0" ]]; then
+            warn "Link $li ($iface_str → :${port_str}) FAILED admission: receiver got ${rx_total} pkts but sender has 0 ACKs (delivery-starved) ⇒ RETURN-PATH blackhole (carrier CGNAT VPS→modem, or receiver not replying on this link)"
             ADMIT_BAD+=("$li")
         else
-            info "Link $li (${IFACES[$li]:-<routed>} → :${PORTS[$li]}) admitted (bidirectional liveness OK)"
+            info "Link $li (${iface_str} → :${port_str}) admitted (bidirectional liveness OK: rx_pkts_total=${rx_total})"
         fi
     done
 
