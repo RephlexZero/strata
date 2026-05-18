@@ -2040,14 +2040,27 @@ fn profile_matrix_cellular() {
         .map(stats_current_bitrate_bps)
         .filter(|&b| b > 0.0)
         .collect();
-    let m = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
+    let m = |v: &[f64]| {
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
+    };
     let traj: Vec<i64> = {
         let o: Vec<f64> = data.iter().map(total_observed_bps).collect();
-        o.iter().step_by(o.len().max(1) / 12 + 1).map(|b| (b / 1000.0) as i64).collect()
+        o.iter()
+            .step_by(o.len().max(1) / 12 + 1)
+            .map(|b| (b / 1000.0) as i64)
+            .collect()
     };
     eprintln!(
         "[cellular] avg {:.2} Mbps, zero_run = {} | mean est_cap {:.2} Mbps | mean enc_bitrate {:.2} Mbps | obs kbps traj {:?}",
-        avg, zero_run, m(&cap) / 1e6, m(&br) / 1e6, traj
+        avg,
+        zero_run,
+        m(&cap) / 1e6,
+        m(&br) / 1e6,
+        traj
     );
     // §6 cellular criterion is literally "no konk-outs; standing queue
     // bounded" — NOT a throughput number. The konk-out check is the real
@@ -2245,13 +2258,25 @@ fn profile_matrix_wifi() {
         .map(stats_current_bitrate_bps)
         .filter(|&b| b > 0.0)
         .collect();
-    let mean = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
-    let traj: Vec<i64> = obs.iter().step_by(obs.len().max(1) / 12 + 1)
-        .map(|b| (b / 1000.0) as i64).collect();
+    let mean = |v: &[f64]| {
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
+    };
+    let traj: Vec<i64> = obs
+        .iter()
+        .step_by(obs.len().max(1) / 12 + 1)
+        .map(|b| (b / 1000.0) as i64)
+        .collect();
     eprintln!(
         "[wifi] avg {:.2} Mbps CV {:.3} | mean est_cap {:.2} Mbps | mean enc_bitrate {:.2} Mbps | obs kbps traj {:?}",
-        avg, cv,
-        mean(&cap) / 1e6, mean(&br) / 1e6, traj
+        avg,
+        cv,
+        mean(&cap) / 1e6,
+        mean(&br) / 1e6,
+        traj
     );
     // Aggregation bursts must be ABSORBED, not interpreted as bufferbloat
     // that drives destructive oscillation.
