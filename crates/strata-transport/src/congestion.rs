@@ -167,10 +167,18 @@ pub struct BiscayController {
     /// than `rt_prop_expiry` expire out of the window exactly like BBR's
     /// windowed min_rtt, so any stale bloated sample self-heals.
     rt_prop_window: VecDeque<(Instant, f64)>,
-    /// When the current windowed-min RTprop sample was observed.
+    /// ProbeRtt **phase clock** — NOT the windowed-min sample time.
+    ///
+    /// Set only at construction, on the SlowStart→ProbeBw transition, and
+    /// on ProbeRtt exit. `tick()` keys the periodic forced-drain cadence
+    /// off this. It is deliberately decoupled from `on_rtt_sample`: if RTT
+    /// samples reset it, the ProbeRtt-exit timer can never elapse (the link
+    /// drains in ProbeRtt → RTT falls → stamp resets) and pacing locks at
+    /// 0.5×btl_bw forever. That deadlock killed a real two-modem field
+    /// stream; keep value (window) and phase (this) strictly separate.
     rt_prop_stamp: Instant,
-    /// RTprop expiry — also the sliding-window length. Probe RTT if the
-    /// current min is this old (forced drain keeps RTprop honest).
+    /// RTprop expiry — also the sliding-window length and the ProbeRtt
+    /// period (forced drain every ~this long keeps RTprop honest).
     rt_prop_expiry: Duration,
 
     // ─── Radio state ───
@@ -442,9 +450,12 @@ impl BiscayController {
         self.btl_bw = bw_bytes_sec;
 
         // If still in SlowStart, transition to ProbeBw since we now have
-        // a reliable capacity measurement.
+        // a reliable capacity measurement. Re-anchor the ProbeRtt phase
+        // clock so the first forced drain lands ~rt_prop_expiry into
+        // steady ProbeBw, not immediately at probe start.
         if self.bbr_phase == BbrPhase::SlowStart {
             self.bbr_phase = BbrPhase::ProbeBw;
+            self.rt_prop_stamp = Instant::now();
         }
 
         tracing::info!(
@@ -609,9 +620,17 @@ impl BiscayController {
 
         // RTprop = minimum over a sliding window (NOT a lifetime minimum).
         // Push the sample, expire anything older than the window, then take
-        // the min of what remains. `rt_prop_stamp` tracks when the *current
-        // minimum* was seen so ProbeRtt fires a forced drain right as the
-        // honest low sample is about to age out.
+        // the min of what remains.
+        //
+        // CRITICAL: this updates only the RTprop *value* (F2, for the BDP
+        // cap). It must NOT touch `rt_prop_stamp` — that field is the phase
+        // clock for the ProbeRtt state machine in `tick()`. Coupling them
+        // (an earlier bug) deadlocked the controller: in ProbeRtt the link
+        // drains, RTT falls, a fresh low sample resets the stamp to ~now,
+        // and the ProbeRtt-exit timer (`> rt_prop_expiry + 200ms`) could
+        // never be reached — pacing stuck forever at 0.5×btl_bw. The
+        // windowed minimum already handles staleness between the periodic
+        // forced drains, so the ProbeRtt cadence stays purely time-based.
         let prev_rt_prop = self.rt_prop_us;
         let now = Instant::now();
         self.rt_prop_window.push_back((now, rtt_us));
@@ -624,16 +643,13 @@ impl BiscayController {
             }
         }
         let mut min_rtt = f64::MAX;
-        let mut min_ts = now;
-        for &(ts, v) in &self.rt_prop_window {
+        for &(_, v) in &self.rt_prop_window {
             if v < min_rtt {
                 min_rtt = v;
-                min_ts = ts;
             }
         }
         if min_rtt < f64::MAX {
             self.rt_prop_us = min_rtt;
-            self.rt_prop_stamp = min_ts;
         }
 
         debug!(
@@ -803,6 +819,9 @@ impl BiscayController {
                 const MIN_CALIBRATION_SAMPLES: usize = 30;
                 if self.btl_bw > 0.0 && self.bw_samples.len() >= MIN_CALIBRATION_SAMPLES {
                     self.bbr_phase = BbrPhase::ProbeBw;
+                    // Re-anchor the ProbeRtt phase clock on the
+                    // SlowStart→ProbeBw transition (see seed_bandwidth).
+                    self.rt_prop_stamp = Instant::now();
                     self.btl_bw
                 } else if self.btl_bw > 0.0 {
                     // Have an estimate but still in calibration —
@@ -1423,6 +1442,87 @@ mod tests {
             cc.pacing_rate() <= rate_before,
             "bufferbloat should reduce pacing rate"
         );
+    }
+
+    // ─── ProbeRtt deadlock regression (real field-stream killer) ────────
+
+    #[test]
+    fn rtt_samples_do_not_touch_probe_rtt_phase_clock() {
+        // The field regression: `on_rtt_sample` updated `rt_prop_stamp`
+        // (the ProbeRtt phase clock) on every sample. In ProbeRtt the link
+        // drains → RTT falls → a fresh low sample reset the stamp → the
+        // exit timer (> rt_prop_expiry + 200ms) could never elapse →
+        // pacing locked at 0.5×btl_bw forever → encoder ring buffer
+        // overflowed → the receiver flat-lined and YouTube ended the
+        // stream. The phase clock MUST be decoupled from RTT samples.
+        let mut cc = BiscayController::new();
+        cc.seed_bandwidth(1_000_000.0); // → ProbeBw, btl_bw = 1 MB/s
+        assert_eq!(cc.bbr_phase, BbrPhase::ProbeBw);
+        cc.on_rtt_sample(60_000.0);
+
+        // Age the phase clock past the ProbeRtt period → enter ProbeRtt.
+        cc.rt_prop_stamp = Instant::now() - (cc.rt_prop_expiry + Duration::from_millis(50));
+        cc.tick();
+        assert_eq!(cc.bbr_phase, BbrPhase::ProbeRtt);
+
+        // Continuous RTT samples during the drain (fresh lows) must NOT
+        // move the phase clock, and the windowed-min VALUE must still track.
+        let anchor = cc.rt_prop_stamp;
+        for _ in 0..64 {
+            cc.on_rtt_sample(40_000.0);
+        }
+        assert_eq!(
+            cc.rt_prop_stamp, anchor,
+            "on_rtt_sample must not touch the ProbeRtt phase clock"
+        );
+        assert!(
+            cc.rt_prop_us() <= 40_000.0,
+            "windowed-min RTprop value must still update (F2 intact)"
+        );
+
+        // Age past the exit threshold → ProbeRtt MUST exit; pacing must
+        // leave the 0.5×btl_bw floor (the field symptom).
+        cc.rt_prop_stamp = Instant::now() - (cc.rt_prop_expiry + Duration::from_millis(300));
+        cc.tick();
+        assert_eq!(
+            cc.bbr_phase,
+            BbrPhase::ProbeBw,
+            "ProbeRtt must exit on its time-based cadence (no deadlock)"
+        );
+        cc.on_rtt_sample(40_000.0);
+        assert!(
+            cc.pacing_rate() > cc.btl_bw() * 0.5,
+            "pacing must recover above the ProbeRtt 0.5×btl_bw floor, got {} vs btl_bw {}",
+            cc.pacing_rate(),
+            cc.btl_bw()
+        );
+    }
+
+    #[test]
+    fn probe_rtt_cycles_repeatedly_not_once() {
+        // Beyond not deadlocking: the forced-drain cadence must keep
+        // working cycle after cycle so RTprop stays honest over a long
+        // stream.
+        let mut cc = BiscayController::new();
+        cc.seed_bandwidth(2_000_000.0);
+        cc.on_rtt_sample(50_000.0);
+        for cycle in 0..3 {
+            cc.rt_prop_stamp = Instant::now() - (cc.rt_prop_expiry + Duration::from_millis(50));
+            cc.tick();
+            assert_eq!(
+                cc.bbr_phase,
+                BbrPhase::ProbeRtt,
+                "cycle {cycle}: should re-enter ProbeRtt"
+            );
+            cc.on_rtt_sample(48_000.0);
+            cc.rt_prop_stamp = Instant::now() - (cc.rt_prop_expiry + Duration::from_millis(300));
+            cc.tick();
+            assert_eq!(
+                cc.bbr_phase,
+                BbrPhase::ProbeBw,
+                "cycle {cycle}: should exit ProbeRtt"
+            );
+        }
     }
 
     // ─── Seed Bandwidth Tests ───────────────────────────────────────────
