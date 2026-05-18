@@ -700,9 +700,7 @@ mod tests {
                 .abs()
                 < 1e-6
         );
-        assert!(
-            (cfg.scheduler.ppd_probe_interval_s - defaults.ppd_probe_interval_s).abs() < 1e-6
-        );
+        assert!((cfg.scheduler.ppd_probe_interval_s - defaults.ppd_probe_interval_s).abs() < 1e-6);
     }
 
     #[test]

@@ -338,8 +338,7 @@ impl BiscayController {
 
         // Trip point: max(kσ of this link's gradient jitter, 5% of its
         // own RTprop). Both terms are path-relative — no absolute constant.
-        let trip = (Self::GRAD_TRIP_SIGMA * self.delay_grad_jitter)
-            .max(0.05 * self.rt_prop_us);
+        let trip = (Self::GRAD_TRIP_SIGMA * self.delay_grad_jitter).max(0.05 * self.rt_prop_us);
         if self.delay_grad_ewma > trip {
             // Severity scales with how far past the trip point we are.
             let over = (self.delay_grad_ewma / trip).clamp(1.0, 8.0);

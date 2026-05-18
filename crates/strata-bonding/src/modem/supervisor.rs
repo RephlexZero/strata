@@ -159,10 +159,7 @@ impl ModemSupervisor {
     /// link's congestion controller. Strictly additive — if no such
     /// backend exists this is simply never called and nothing changes.
     pub fn update_flow_control(&mut self, link_id: usize, slow_down: bool) -> Vec<SupervisorEvent> {
-        vec![SupervisorEvent::FlowControl {
-            link_id,
-            slow_down,
-        }]
+        vec![SupervisorEvent::FlowControl { link_id, slow_down }]
     }
 
     /// Get the health score for a specific link.

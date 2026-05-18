@@ -565,8 +565,7 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
                 );
             }
 
-            if self.saturation_probe_snapshot_taken
-                && (elapsed >= probe_duration || knee_terminate)
+            if self.saturation_probe_snapshot_taken && (elapsed >= probe_duration || knee_terminate)
             {
                 // Sender-side measurement (raw send rate — includes any
                 // modem-internal bufferbloat). Used only as a diagnostic

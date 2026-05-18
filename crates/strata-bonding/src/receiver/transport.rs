@@ -251,27 +251,36 @@ impl Drop for TransportBondingReceiver {
 /// Per-link relative one-way-delay GRADIENT tracker (F3).
 ///
 /// For each data packet we sample `rel = receiver_now_us − sender_send_ts_us`.
-/// The sender and receiver clocks have an arbitrary *constant* offset (no
-/// PTP). That offset cancels because we report only
-/// `ewma(rel) − windowed_min(rel)` — a gradient, never absolute OWD. The
-/// windowed minimum mirrors Biscay's `rt_prop` window so any residual
-/// clock-drift or a one-off bloated sample expires out of the baseline in
-/// ≈10 s exactly like BBR's min-RTT filter. A sustained positive gradient
-/// means the bottleneck queue is filling — strictly earlier than loss.
+/// The sender/receiver clocks have an arbitrary *constant* offset (no PTP);
+/// it cancels because we only ever report a *difference of `rel` values*.
+///
+/// The signal is **short-window-min minus long-window-min** — NOT
+/// mean-minus-min. This is the LEDBAT/Copa insight and the key to
+/// jitter-immunity (the doctrine's explicit Wi-Fi landmine: "aggregation
+/// bursts look like bufferbloat"). Jitter only ever *adds* delay above the
+/// propagation floor, so on an uncongested-but-jittery link BOTH minima sit
+/// at that floor and the gradient is ≈0. A mean-vs-min signal, by contrast,
+/// reads a permanent false "standing queue" equal to the jitter spread and
+/// drains forever. The short min rises above the long min only when a
+/// genuine standing queue forms (the floor itself moves up).
 struct DelayGradientTracker {
-    /// `(arrival_instant, rel_us)` within the baseline window.
+    /// `(arrival_instant, rel_us)` within the long baseline window.
     window: std::collections::VecDeque<(std::time::Instant, i64)>,
-    /// EWMA of recent `rel_us` (the "current" relative delay).
-    ewma_rel: Option<f64>,
+    /// Long baseline length (true propagation floor, ~10 s — mirrors
+    /// Biscay's `rt_prop` window so drift/one-off bloat expires out).
     window_len: Duration,
+    /// Short window length whose *minimum* is the "current" delay floor.
+    /// Long enough to contain several packets so a momentary gap doesn't
+    /// empty it, short enough to track a rising queue promptly.
+    short_len: Duration,
 }
 
 impl DelayGradientTracker {
     fn new() -> Self {
         Self {
-            window: std::collections::VecDeque::with_capacity(256),
-            ewma_rel: None,
+            window: std::collections::VecDeque::with_capacity(512),
             window_len: Duration::from_secs(10),
+            short_len: Duration::from_millis(750),
         }
     }
 
@@ -280,14 +289,10 @@ impl DelayGradientTracker {
     fn observe(&mut self, now: std::time::Instant, rel_us: i64) {
         // Guard against a u32 µs clock wrap / reset: an impossibly large
         // negative jump vs the current baseline is not real queue drain.
-        if let Some(&(_, min_rel)) = self
-            .window
-            .iter()
-            .min_by_key(|&&(_, r)| r)
+        if let Some(&(_, min_rel)) = self.window.iter().min_by_key(|&&(_, r)| r)
             && rel_us < min_rel - 2_000_000
         {
             self.window.clear();
-            self.ewma_rel = None;
         }
         self.window.push_back((now, rel_us));
         while let Some(&(ts, _)) = self.window.front() {
@@ -297,26 +302,40 @@ impl DelayGradientTracker {
                 break;
             }
         }
-        let r = rel_us as f64;
-        self.ewma_rel = Some(match self.ewma_rel {
-            Some(e) => 0.1 * r + 0.9 * e,
-            None => r,
-        });
     }
 
-    /// Current queue-building magnitude in microseconds (≥ 0).
-    /// `max(0, ewma(rel) − windowed_min(rel))`.
+    /// Current queue-building magnitude in microseconds (≥ 0):
+    /// `min(rel over last short_len) − min(rel over full window)`.
+    ///
+    /// Jitter-immune (both terms are minima at the propagation floor when
+    /// uncongested); positive only when the delay floor itself rises.
     fn gradient_us(&self) -> u32 {
-        let (Some(ewma), Some(&(_, _))) = (self.ewma_rel, self.window.front()) else {
+        let Some(&(last_ts, _)) = self.window.back() else {
             return 0;
         };
-        let min_rel = self
-            .window
-            .iter()
-            .map(|&(_, r)| r)
-            .min()
-            .unwrap_or(0) as f64;
-        (ewma - min_rel).max(0.0).min(u32::MAX as f64) as u32
+        // Need a full short window of history before trusting the signal,
+        // otherwise the very first samples make short_min == long_min == the
+        // only sample (gradient 0) or a sparse short window over-reacts.
+        let Some(&(first_ts, _)) = self.window.front() else {
+            return 0;
+        };
+        if last_ts.duration_since(first_ts) < self.short_len {
+            return 0;
+        }
+        let mut long_min = i64::MAX;
+        let mut short_min = i64::MAX;
+        for &(ts, r) in &self.window {
+            if r < long_min {
+                long_min = r;
+            }
+            if last_ts.duration_since(ts) <= self.short_len && r < short_min {
+                short_min = r;
+            }
+        }
+        if long_min == i64::MAX || short_min == i64::MAX {
+            return 0;
+        }
+        (short_min - long_min).max(0).min(u32::MAX as i64) as u32
     }
 }
 
@@ -405,8 +424,7 @@ async fn link_reader_async(
                     if let Some(hdr) = PacketHeader::decode(&mut hdr_cur)
                         && hdr.packet_type == strata_transport::wire::PacketType::Data
                     {
-                        let rel_us =
-                            clock.now_us() as i64 - hdr.timestamp_us as i64;
+                        let rel_us = clock.now_us() as i64 - hdr.timestamp_us as i64;
                         grad_tracker.observe(std::time::Instant::now(), rel_us);
                     }
                 }
@@ -803,10 +821,10 @@ mod tests {
         let mut t = DelayGradientTracker::new();
         let base = std::time::Instant::now();
         const OFFSET: i64 = 1_000_000_000; // huge constant skew
-        for i in 0u64..20 {
-            // Steady path: rel = OFFSET + small noise → gradient ≈ 0.
+        // ~1.5 s of steady samples (must exceed the 750 ms short window).
+        for i in 0u64..60 {
             t.observe(
-                base + std::time::Duration::from_millis(i * 20),
+                base + std::time::Duration::from_millis(i * 25),
                 OFFSET + (i % 2) as i64,
             );
         }
@@ -818,20 +836,47 @@ mod tests {
     }
 
     #[test]
+    fn delay_gradient_is_jitter_immune() {
+        // The Wi-Fi landmine (doctrine §2): heavy STATIONARY jitter must
+        // NOT register as a standing queue. The old mean-vs-min signal
+        // reported ~½·jitter-spread of permanent false queue here and
+        // drained forever; short-min vs long-min must read ≈ 0 because the
+        // delay FLOOR never moves.
+        let mut t = DelayGradientTracker::new();
+        let base = std::time::Instant::now();
+        let mut seed = 12345u64;
+        for i in 0u64..120 {
+            // crude LCG jitter in [0, 30_000) µs above a fixed 8 ms floor.
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let jitter = (seed >> 33) % 30_000;
+            t.observe(
+                base + std::time::Duration::from_millis(i * 25),
+                8_000 + jitter as i64,
+            );
+        }
+        assert!(
+            t.gradient_us() < 4_000,
+            "stationary jitter must not look like a standing queue, got {} µs",
+            t.gradient_us()
+        );
+    }
+
+    #[test]
     fn delay_gradient_detects_queue_growth() {
         let mut t = DelayGradientTracker::new();
         let base = std::time::Instant::now();
-        // Establish a low baseline.
-        for i in 0u64..10 {
-            t.observe(base + std::time::Duration::from_millis(i * 20), 5_000);
+        // ~1.25 s low baseline (exceeds the short window).
+        for i in 0u64..50 {
+            t.observe(base + std::time::Duration::from_millis(i * 25), 5_000);
         }
-        // Queue builds: rel climbs by 40 ms above baseline.
-        for i in 10u64..30 {
-            t.observe(base + std::time::Duration::from_millis(i * 20), 45_000);
+        // The delay FLOOR itself rises by 40 ms (a real standing queue),
+        // sustained for ~1.25 s so it fills the short window.
+        for i in 50u64..100 {
+            t.observe(base + std::time::Duration::from_millis(i * 25), 45_000);
         }
         assert!(
-            t.gradient_us() > 20_000,
-            "rising relative delay must surface as a positive gradient, got {}",
+            t.gradient_us() > 30_000,
+            "a risen delay floor must surface as a positive gradient, got {}",
             t.gradient_us()
         );
     }
@@ -840,12 +885,12 @@ mod tests {
     fn delay_gradient_handles_clock_wrap() {
         let mut t = DelayGradientTracker::new();
         let base = std::time::Instant::now();
-        for i in 0u64..8 {
-            t.observe(base + std::time::Duration::from_millis(i * 20), 10_000);
+        for i in 0u64..40 {
+            t.observe(base + std::time::Duration::from_millis(i * 25), 10_000);
         }
         // A u32 µs wrap makes rel jump hugely negative — must reset, not
-        // report a giant bogus negative-then-positive gradient.
-        t.observe(base + std::time::Duration::from_millis(200), -3_000_000);
+        // report a giant bogus gradient.
+        t.observe(base + std::time::Duration::from_millis(1_100), -3_000_000);
         assert_eq!(
             t.gradient_us(),
             0,
