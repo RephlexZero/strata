@@ -28,7 +28,7 @@ pub async fn run(state: Arc<AgentState>) {
     }
 
     // Buffer for incoming stats JSON from strata-node
-    let mut last_real_stats: Option<Vec<LinkStats>> = None;
+    let mut last_real_stats: Option<(Vec<LinkStats>, Option<u64>)> = None;
     let mut recv_buf = [0u8; 8192];
 
     loop {
@@ -69,7 +69,7 @@ pub async fn run(state: Arc<AgentState>) {
             }
         }
 
-        let links = last_real_stats.clone().unwrap_or_default();
+        let (links, commanded_bitrate_bps) = last_real_stats.clone().unwrap_or_default();
 
         // Update shared link stats for Prometheus /metrics endpoint
         {
@@ -77,8 +77,16 @@ pub async fn run(state: Arc<AgentState>) {
             *latest = links.clone();
         }
 
-        // Use sum of observed_bps (actual throughput), NOT capacity
-        let encoder_kbps: u64 = links.iter().map(|l| l.observed_bps).sum::<u64>() / 1000;
+        // The encoder bitrate is the adapter's *commanded* target
+        // (top-level `current_bitrate_bps`), NOT summed on-the-wire
+        // `observed_bps` — those are different quantities and conflating
+        // them sends diagnosis to the wrong layer (the encoder can be
+        // commanding 2.6 Mbps while observed throughput reads 0.5 Mbps
+        // during a loss burst). Fall back to the observed sum only if the
+        // node didn't report a commanded target.
+        let encoder_kbps: u64 = commanded_bitrate_bps
+            .map(|b| b / 1000)
+            .unwrap_or_else(|| links.iter().map(|l| l.observed_bps).sum::<u64>() / 1000);
 
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -109,9 +117,17 @@ pub async fn run(state: Arc<AgentState>) {
 ///
 /// The JSON comes from the `strata-stats` GStreamer bus message
 /// and has the shape: `{"links": [{"id": 0, "rtt_us": ..., ...}, ...]}`.
-fn parse_bonding_stats(data: &[u8]) -> Result<Vec<LinkStats>, String> {
+/// Parsed bonding stats: the per-link array plus the adapter's *commanded*
+/// encoder target (top-level `current_bitrate_bps`). The latter is the
+/// real encoder bitrate; summed `observed_bps` is on-the-wire throughput
+/// (a different quantity) and must not masquerade as the encoder rate.
+fn parse_bonding_stats(data: &[u8]) -> Result<(Vec<LinkStats>, Option<u64>), String> {
     let v: serde_json::Value =
         serde_json::from_slice(data).map_err(|e| format!("JSON parse error: {e}"))?;
+    let current_bitrate_bps = v
+        .get("current_bitrate_bps")
+        .and_then(|x| x.as_u64())
+        .filter(|&b| b > 0);
     let links_arr = v
         .get("links")
         .and_then(|v| v.as_array())
@@ -193,5 +209,5 @@ fn parse_bonding_stats(data: &[u8]) -> Result<Vec<LinkStats>, String> {
             rtprop_ms,
         });
     }
-    Ok(stats)
+    Ok((stats, current_bitrate_bps))
 }

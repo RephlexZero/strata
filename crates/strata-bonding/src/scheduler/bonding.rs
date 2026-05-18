@@ -390,13 +390,30 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
         // more than we sent). If we timed out without a fresh report, fall
         // back to the sender-side rate but flag it in the log so the
         // diagnostic is unambiguous.
-        let final_rate_bps = if fresh_report_seen && recv_rate_bps > 0.0 {
+        let measured_rate_bps = if fresh_report_seen && recv_rate_bps > 0.0 {
             recv_rate_bps.min(sender_rate_bps.max(recv_rate_bps))
         } else {
             sender_rate_bps
         };
 
         let pre_goodput = self.saturation_probe_pre_recv_goodput_bps;
+
+        // Defense-in-depth #1c: a probe is an upper-bound discovery tool;
+        // it must NEVER report a "capacity" below what the link was
+        // already passively delivering just before the probe. An F1
+        // knee-terminated probe's receiver window straddles mostly
+        // un-pinned traffic and yields a garbage low number (field:
+        // 29 kbps vs 1.6 Mbps pre-probe goodput) which then poisons the
+        // oracle/Biscay. Flooring at the proven pre-probe goodput makes a
+        // knee-terminated probe inherently harmless: it can only ever
+        // raise the estimate, never crater it. (The oracle/seed guards
+        // are the other two layers; any one suffices, all three are
+        // cheap and independently correct.)
+        let final_rate_bps = if pre_goodput > 0.0 {
+            measured_rate_bps.max(pre_goodput)
+        } else {
+            measured_rate_bps
+        };
         let inflation_ratio = if recv_rate_bps > 0.0 {
             sender_rate_bps / recv_rate_bps
         } else {

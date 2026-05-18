@@ -201,6 +201,31 @@ impl CapacityOracle {
         }
 
         let raw_peak = peak_bps;
+
+        // A saturation probe is an UPPER-bound discovery tool. The
+        // `lower_bound` is the max *passively observed* delivery rate —
+        // throughput the link has already demonstrably achieved. A probe
+        // sample below that floor cannot be a real capacity ceiling: it is
+        // contaminated (e.g. an F1 knee-terminated probe whose receiver
+        // measurement window straddled mostly un-pinned traffic, or a probe
+        // that captured a transient queue-build moment). Accepting it would
+        // crush a healthy estimate and — via seed_bandwidth — Biscay's
+        // pacing, exactly the wrong-signal class of the ProbeRtt bug. A
+        // genuine capacity drop is the job of reset_on_downshift / the
+        // loss+delay drains, NOT of a contaminated probe sample. Ignore it.
+        if self.lower_bound > 0.0 && raw_peak < self.lower_bound {
+            tracing::info!(
+                target: "strata::oracle",
+                raw_peak_kbps = raw_peak / 1000.0,
+                lower_bound_kbps = self.lower_bound / 1000.0,
+                "complete_probe: sample below passive floor — contaminated, ignored"
+            );
+            // It is still evidence the link is alive; refresh the decay
+            // clock so confidence doesn't age out, but touch no bounds.
+            self.last_evidence = Instant::now();
+            return;
+        }
+
         let capped_peak = if self.upper_bound > 100_000.0 {
             peak_bps.min(self.upper_bound * Self::PROBE_GROWTH_CAP)
         } else {
@@ -216,14 +241,11 @@ impl CapacityOracle {
             "complete_probe"
         );
 
-        self.upper_bound = capped_peak;
-
-        // The lower bound should never exceed the probe result — cap it.
-        // This handles the case where a spurious delivery spike inflated
-        // the lower bound above the true capacity measured by saturation.
-        if self.lower_bound > capped_peak * 1.1 {
-            self.lower_bound = capped_peak;
-        }
+        // Upper bound only ever moves via probes; never pull the passive
+        // floor DOWN here (that inversion is the poisoning bug). The
+        // "spurious delivery spike inflated lower_bound" case is already
+        // handled by observe_delivery's 2×-cap and 40%-of-peak floor.
+        self.upper_bound = capped_peak.max(self.lower_bound);
 
         self.confidence = 1.0;
         self.last_probe = Instant::now();
@@ -447,15 +469,29 @@ mod tests {
     }
 
     #[test]
-    fn probe_caps_lower_bound_if_above_probe() {
+    fn probe_below_passive_floor_is_ignored_not_clamped() {
+        // A probe is an UPPER-bound discovery tool. A sample below the
+        // proven passive delivery floor is contaminated (e.g. an F1
+        // knee-terminated probe whose recv window was mostly un-pinned) —
+        // it must NOT crush the floor. The previous behaviour (clamp
+        // lower_bound DOWN to the probe) was the wrong-signal poisoning
+        // bug confirmed in the field (CC reseeded to 29 kbps).
         let mut oracle = CapacityOracle::new();
-        // Spurious high delivery (e.g. burst)
         oracle.observe_delivery(12_000_000.0);
         assert_eq!(oracle.lower_bound(), 12_000_000.0);
-        // Probe reveals true capacity is 8M
-        oracle.complete_probe(8_000_000.0);
-        // Lower bound should be capped to probe value
-        assert_eq!(oracle.lower_bound(), 8_000_000.0);
+        oracle.complete_probe(8_000_000.0); // below the 12M proven floor
+        assert_eq!(
+            oracle.lower_bound(),
+            12_000_000.0,
+            "a below-floor probe must be ignored, not allowed to crush the floor"
+        );
+        // And it must not have slammed confidence toward the low value.
+        assert!(oracle.estimated_cap() >= 12_000_000.0);
+
+        // A probe ABOVE the floor is a valid upper-bound discovery.
+        oracle.complete_probe(20_000_000.0);
+        assert_eq!(oracle.upper_bound(), 20_000_000.0);
+        assert_eq!(oracle.confidence(), 1.0);
     }
 
     #[test]

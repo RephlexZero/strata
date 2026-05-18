@@ -455,6 +455,25 @@ impl BiscayController {
         if bw_bytes_sec <= 0.0 {
             return;
         }
+        // A saturation probe exists ONLY to ratchet btl_bw UP past the
+        // self-limiting delivery rate the scheduler's own allocation
+        // produces. A probe sample BELOW the controller's current btl_bw
+        // carries no upward discovery — and is very likely contaminated
+        // (an F1 knee-terminated probe measured over a mostly-un-pinned
+        // recv window; field-observed at 29 kbps). Seeding btl_bw down
+        // from it would crater pacing — the exact wrong-signal class of
+        // the ProbeRtt bug. Genuine capacity drops are owned by the
+        // loss/delay-gradient drains, ProbeRtt and reset_on_downshift,
+        // never by overwriting btl_bw with a contaminated probe sample.
+        if self.btl_bw > 0.0 && bw_bytes_sec < self.btl_bw {
+            tracing::info!(
+                target: "strata::cc",
+                seed_kbps = bw_bytes_sec * 8.0 / 1000.0,
+                btl_bw_kbps = self.btl_bw * 8.0 / 1000.0,
+                "seed_bandwidth: below current btl_bw — ignored (probe ratchets up only)"
+            );
+            return;
+        }
         // Clear old feedback-dependent samples and seed with probe result
         self.bw_samples.clear();
         self.bw_samples.push_back((Instant::now(), bw_bytes_sec));
@@ -1699,5 +1718,28 @@ mod tests {
         let before = cc.btl_bw();
         cc.seed_bandwidth(0.0);
         assert_eq!(cc.btl_bw(), before);
+    }
+
+    #[test]
+    fn seed_bandwidth_ratchets_up_only() {
+        // A saturation probe must only ever raise btl_bw past the
+        // self-limiting delivery rate. A probe sample BELOW current
+        // btl_bw is contaminated (the field's 29 kbps knee-truncated
+        // probe) and must NOT crater Biscay pacing.
+        let mut cc = BiscayController::new();
+        cc.seed_bandwidth(1_000_000.0); // 1 MB/s established
+        assert!((cc.btl_bw() - 1_000_000.0).abs() < 1.0);
+
+        cc.seed_bandwidth(30_000.0 / 8.0); // ~30 kbps contaminated sample
+        assert!(
+            (cc.btl_bw() - 1_000_000.0).abs() < 1.0,
+            "a below-current probe sample must be ignored, not crater btl_bw"
+        );
+
+        cc.seed_bandwidth(2_000_000.0); // genuine higher discovery
+        assert!(
+            (cc.btl_bw() - 2_000_000.0).abs() < 1.0,
+            "a higher probe sample must still ratchet btl_bw up"
+        );
     }
 }
