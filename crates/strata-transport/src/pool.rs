@@ -260,6 +260,13 @@ impl Default for SequenceGenerator {
 
 // ─── TimestampClock ─────────────────────────────────────────────────────────
 
+/// Process-wide epoch shared by every `TimestampClock` instance. Per-instance
+/// epochs would put each per-link `Sender` in its own clock domain, so packets
+/// from different links would carry timestamps that differ by the inter-link
+/// construction gap (50–2000 ms during startup) — masquerading as huge inter-
+/// link delay spread on the receiver and destabilising playout sizing.
+static PROCESS_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
 /// Microsecond wall clock for packet timestamps.
 /// Wraps every ~71 minutes (u32::MAX µs).
 pub struct TimestampClock {
@@ -269,7 +276,7 @@ pub struct TimestampClock {
 impl TimestampClock {
     pub fn new() -> Self {
         TimestampClock {
-            epoch: Instant::now(),
+            epoch: *PROCESS_EPOCH.get_or_init(Instant::now),
         }
     }
 
