@@ -357,6 +357,28 @@ impl BitrateAdapter {
         }
     }
 
+    /// Per-tick slew-rate limit applied only to bitrate *increases*.
+    ///
+    /// Caps the per-tick step up so the encoder is never asked to climb more
+    /// than +15 % from `current_target_kbps`. Decreases pass through
+    /// unchanged: a real capacity drop must reach the encoder immediately so
+    /// it doesn't drown a fading link. Without the up-side cap, noisy
+    /// per-tick goodput / capacity estimates whipsaw the encoder (field run
+    /// #10 saw 1039 ↔ 2742 kbps swings every 5 s); CBR-HEVC produces visible
+    /// VBV transients on every jump — the "moments of clear, then grey
+    /// noise, then back" pattern. The 15 % step deliberately exceeds the
+    /// 10 % `target_changed` commit threshold so legitimate ramp-up ticks
+    /// still propagate. `LinkFailure` bypasses the limit entirely.
+    fn slew_clamp(&self, proposed: u32, reason: AdaptationReason) -> u32 {
+        if matches!(reason, AdaptationReason::LinkFailure) {
+            return proposed;
+        }
+        const MAX_STEP_UP_PCT: f64 = 0.15;
+        let anchor = self.current_target_kbps.max(self.config.min_bitrate_kbps) as f64;
+        let up_cap = (anchor * (1.0 + MAX_STEP_UP_PCT)) as u32;
+        proposed.min(up_cap)
+    }
+
     /// Update with new link capacity information and optionally produce
     /// a bitrate command if the encoder target should change.
     pub fn update(&mut self, links: &[LinkCapacity]) -> Option<BitrateCommand> {
@@ -505,6 +527,9 @@ impl BitrateAdapter {
         let new_target = new_target
             .min(effective_max)
             .max(self.config.min_bitrate_kbps);
+        // Slew-rate limit so the encoder is not whipsawed by per-tick
+        // capacity-estimate noise (see `slew_clamp` doc).
+        let new_target = self.slew_clamp(new_target, reason);
 
         // Track spare bandwidth
         self.spare_bw_kbps = if usable_kbps > new_target as f64 {
