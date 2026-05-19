@@ -105,10 +105,20 @@ impl TransportBondingReceiver {
                     // waiting on a full input channel.
                     match input_rx.recv_timeout(tick_interval) {
                         Ok(packet) => {
-                            buffer.push(packet.seq_id, packet.payload, packet.arrival_time);
+                            buffer.push_with_ts(
+                                packet.seq_id,
+                                packet.payload,
+                                packet.arrival_time,
+                                packet.send_ts_us,
+                            );
                             // Drain any additional queued packets without blocking.
                             while let Ok(p) = input_rx.try_recv() {
-                                buffer.push(p.seq_id, p.payload, p.arrival_time);
+                                buffer.push_with_ts(
+                                    p.seq_id,
+                                    p.payload,
+                                    p.arrival_time,
+                                    p.send_ts_us,
+                                );
                             }
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -449,6 +459,7 @@ async fn link_reader_async(
                                     seq_id: header.seq_id,
                                     payload: original_payload,
                                     arrival_time: quanta::Instant::now(),
+                                    send_ts_us: delivered.timestamp_us,
                                 };
                                 // Non-blocking: drop packet rather than stall
                                 // the async reader (and ACK/NACK generation).
@@ -503,6 +514,7 @@ async fn link_reader_async(
                                 seq_id: header.seq_id,
                                 payload: original_payload,
                                 arrival_time: quanta::Instant::now(),
+                                send_ts_us: delivered.timestamp_us,
                             };
                             let _ = input_tx.try_send(packet);
                         }
@@ -673,6 +685,7 @@ async fn link_reader_async(
                                     seq_id: header.seq_id,
                                     payload: original_payload,
                                     arrival_time: quanta::Instant::now(),
+                                    send_ts_us: delivered.timestamp_us,
                                 };
                                 let _ = input_tx.try_send(packet);
                             }

@@ -8,6 +8,14 @@ pub struct Packet {
     pub seq_id: u64,
     pub payload: Bytes,
     pub arrival_time: Instant,
+    /// Sender wire send-time (µs, sender clock, wraps ~71 min). Used only
+    /// for the *relative* per-packet delay `arrival − send_ts`: the
+    /// constant clock offset cancels when we take the spread (max − min)
+    /// over a short window, which is exactly the bonded inter-link arrival
+    /// skew the playout buffer must absorb. Inter-arrival jitter (the old
+    /// sole input) is blind to this — it reads ~19 ms while the real
+    /// cross-link spread during a one-modem fade is 250–400 ms.
+    pub send_ts_us: u32,
 }
 
 /// Jitter buffer that reorders and releases packets in sequence order.
@@ -37,6 +45,16 @@ pub struct ReassemblyBuffer {
     avg_iat: f64,
     jitter_smoothed: f64,
     jitter_samples: VecDeque<f64>,
+
+    // Adaptive latency — bonded inter-link delay-spread tracking.
+    // `rel = arrival_since_epoch_us − send_ts_us`; the constant offset
+    // cancels in the windowed (max − min) spread, which is the true
+    // cross-link arrival skew the buffer must cover. Monotonic deques give
+    // O(1) amortised sliding-window min & max over `DELAY_SPREAD_WINDOW`.
+    epoch: Instant,
+    rel_min_deque: VecDeque<(Instant, i64)>,
+    rel_max_deque: VecDeque<(Instant, i64)>,
+    delay_spread_us: i64,
 
     // Adaptive latency — bidirectional smoothing
     target_latency: Duration,
@@ -182,6 +200,10 @@ impl ReassemblyBuffer {
             avg_iat: 0.0,
             jitter_smoothed: 0.0,
             jitter_samples: VecDeque::with_capacity(128),
+            epoch: Instant::now(),
+            rel_min_deque: VecDeque::new(),
+            rel_max_deque: VecDeque::new(),
+            delay_spread_us: 0,
             target_latency: config.start_latency,
             ramp_up_alpha: config.ramp_up_alpha,
             ramp_down_alpha: config.ramp_down_alpha,
@@ -213,7 +235,55 @@ impl ReassemblyBuffer {
         }
     }
 
+    /// Test-only / legacy entry point. Synthesises a `send_ts_us` that
+    /// tracks the arrival clock so `rel = arrival − send_ts` stays
+    /// constant across pushes — the delay-spread component collapses to
+    /// zero and the dynamic component falls back to inter-arrival jitter,
+    /// preserving pre-`push_with_ts` behaviour for unit tests.
     pub fn push(&mut self, seq_id: u64, payload: Bytes, now: Instant) {
+        let synthetic_ts = now.saturating_duration_since(self.epoch).as_micros() as u32;
+        self.push_with_ts(seq_id, payload, now, synthetic_ts);
+    }
+
+    /// Production entry point. `send_ts_us` is the sender's wire send-time;
+    /// used to size the playout window from the bonded inter-link delay
+    /// spread (the signal that actually governs lateness on heterogeneous
+    /// bonded links, unlike naive inter-arrival jitter).
+    pub fn push_with_ts(&mut self, seq_id: u64, payload: Bytes, now: Instant, send_ts_us: u32) {
+        // Bonded inter-link delay spread. `rel` = arrival (local µs since
+        // epoch) − sender send-time. The absolute value is meaningless
+        // (two unsynced clocks) but its spread over a short sliding window
+        // IS the cross-link arrival skew the buffer must absorb: a packet
+        // striped on the momentarily-slow modem has a large `rel`, one on
+        // the fast modem a small `rel`, and (max − min) is the skew. u32
+        // send-ts wraps ~71 min; the windowed diff bounds any wrap blip
+        // and max_latency clamps the final window regardless.
+        let arrival_us = now.saturating_duration_since(self.epoch).as_micros() as i64;
+        let rel = arrival_us - send_ts_us as i64;
+        const DELAY_SPREAD_WINDOW: Duration = Duration::from_secs(4);
+        let cutoff = now.checked_sub(DELAY_SPREAD_WINDOW);
+        // Sliding-window MIN via monotonic-increasing deque.
+        while self.rel_min_deque.back().is_some_and(|&(_, v)| v >= rel) {
+            self.rel_min_deque.pop_back();
+        }
+        self.rel_min_deque.push_back((now, rel));
+        // Sliding-window MAX via monotonic-decreasing deque.
+        while self.rel_max_deque.back().is_some_and(|&(_, v)| v <= rel) {
+            self.rel_max_deque.pop_back();
+        }
+        self.rel_max_deque.push_back((now, rel));
+        if let Some(cut) = cutoff {
+            while self.rel_min_deque.front().is_some_and(|&(t, _)| t < cut) {
+                self.rel_min_deque.pop_front();
+            }
+            while self.rel_max_deque.front().is_some_and(|&(t, _)| t < cut) {
+                self.rel_max_deque.pop_front();
+            }
+        }
+        let rel_min = self.rel_min_deque.front().map(|&(_, v)| v).unwrap_or(rel);
+        let rel_max = self.rel_max_deque.front().map(|&(_, v)| v).unwrap_or(rel);
+        self.delay_spread_us = (rel_max - rel_min).max(0);
+
         // Calculate Jitter
         if let Some(last) = self.last_arrival {
             let iat = now.duration_since(last).as_secs_f64();
@@ -243,14 +313,28 @@ impl ReassemblyBuffer {
             let jitter_ms = jitter_est * 1000.0;
             let jitter_component = self.jitter_latency_multiplier * jitter_ms;
 
+            // Bonded inter-link delay-spread component. This is the signal
+            // that actually governs lateness on heterogeneous bonded links:
+            // the buffer must hold ≥ the cross-link arrival skew or a
+            // slow-modem packet is declared "late" and dropped before it
+            // can physically arrive (field: spread 250–400 ms during a
+            // one-modem fade while inter-arrival jitter read ~19 ms — the
+            // old sole input was structurally blind to this). 1.15× covers
+            // sampling lag in the windowed max.
+            let spread_component = (self.delay_spread_us as f64 / 1000.0) * 1.15;
+
             // Loss-aware component: more buffer when losing packets
             let loss_component = self.loss_rate_smoothed * self.loss_penalty_ms;
 
-            // Closed-loop drain: every STABLE_DRAIN_MS without a late arrival,
-            // shed 10ms of pressure.  This matches AIMD's multiplicative-decrease
-            // intent (slow) vs additive-increase (fast, on each miss).
+            // Closed-loop late-pressure is now a *secondary trim* on top of
+            // the spread floor, so the drain must be genuinely slow:
+            // fast-open (≈6 ms per late hit) / slow-close (≈8 ms per 500 ms
+            // stable) is real AIMD. The old 40 ms/500 ms drain collapsed
+            // the window faster than skew bursts recurred → the observed
+            // 312↔933 ms oscillation that re-created the very lateness it
+            // was reacting to.
             const STABLE_DRAIN_MS: u128 = 500;
-            const DRAIN_STEP_MS: f64 = 40.0;
+            const DRAIN_STEP_MS: f64 = 8.0;
             if let Some(last_late) = self.last_late_arrival
                 && now.duration_since(last_late).as_millis() >= STABLE_DRAIN_MS
                 && self.late_pressure_ms > 0.0
@@ -261,10 +345,16 @@ impl ReassemblyBuffer {
                 self.last_late_arrival = Some(now);
             }
 
+            // The dynamic component is the MAX of inter-arrival jitter and
+            // the bonded delay spread — never let the window sit below the
+            // measured cross-link skew (the floor), while still honouring
+            // single-link jitter when it is the larger effect.
+            let dynamic_component = jitter_component.max(spread_component);
+
             // Compute target latency: formula gives the floor, late-pressure
-            // (closed-loop) widens when retransmits are landing past deadline.
+            // (closed-loop) trims around it.
             let target_ms = self.start_latency.as_millis() as f64
-                + jitter_component
+                + dynamic_component
                 + loss_component
                 + self.late_pressure_ms;
             self.target_latency = Duration::from_millis(target_ms as u64)
@@ -340,7 +430,7 @@ impl ReassemblyBuffer {
                 if resync_target < emit_watermark {
                     self.consecutive_late = 0;
                     self.max_late_seq = 0;
-                    const LATE_HIT_MS: f64 = 3.0;
+                    const LATE_HIT_MS: f64 = 6.0;
                     let base_headroom_ms = self
                         .max_latency
                         .as_millis()
@@ -426,6 +516,7 @@ impl ReassemblyBuffer {
             seq_id,
             payload,
             arrival_time: now,
+            send_ts_us,
         });
     }
 
@@ -1516,6 +1607,58 @@ mod tests {
         assert_eq!(
             buf.next_seq, 10,
             "next_seq should not reset with intermittent normal arrivals"
+        );
+    }
+
+    #[test]
+    fn bonded_inter_link_skew_widens_playout_window() {
+        // Field run: inter-arrival jitter ~19 ms while bonded inter-link
+        // arrival skew hit 250–400 ms during a one-modem fade, causing the
+        // playout window to sit below the skew → ~4 % of delivered packets
+        // dropped as "late". Regression: the new delay-spread component
+        // must lift `target_latency` to cover the skew so spread-induced
+        // lateness never fires.
+        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(50));
+        let start = Instant::now();
+
+        // Phase 1: warm with steady inter-arrival to seed jitter EWMA.
+        for i in 0u64..20 {
+            let t = start + Duration::from_millis(i * 10);
+            let ts = (i as u32) * 10_000; // synthetic sender ts, 10 ms cadence
+            buf.push_with_ts(i, Bytes::from(vec![0u8; 100]), t, ts);
+        }
+        let baseline_latency_ms = buf.target_latency.as_millis() as u64;
+
+        // Phase 2: simulate two bonded links with a 300 ms inter-link skew —
+        // odd seqs ride a slow link (large send-vs-arrival lag), even seqs
+        // a fast link (small lag). Inter-arrival cadence stays steady.
+        for i in 20u64..80 {
+            let t = start + Duration::from_millis(200 + (i - 20) * 10);
+            // Fast link: send_ts ≈ arrival − 50 ms. Slow link: send_ts ≈
+            // arrival − 350 ms (300 ms more delay).
+            let arrival_us = ((200 + (i - 20) * 10) * 1000) as u32;
+            let ts = if i % 2 == 0 {
+                arrival_us.saturating_sub(50_000)
+            } else {
+                arrival_us.saturating_sub(350_000)
+            };
+            buf.push_with_ts(i, Bytes::from(vec![0u8; 100]), t, ts);
+        }
+
+        let skewed_target_ms = buf.target_latency.as_millis() as u64;
+        assert!(
+            skewed_target_ms >= 300,
+            "playout window must cover the 300 ms inter-link skew \
+             (target_latency={} ms, baseline={} ms)",
+            skewed_target_ms,
+            baseline_latency_ms,
+        );
+        assert!(
+            skewed_target_ms > baseline_latency_ms,
+            "inter-link skew must widen the window beyond a no-skew \
+             baseline (was {} ms, now {} ms)",
+            baseline_latency_ms,
+            skewed_target_ms,
         );
     }
 

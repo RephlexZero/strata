@@ -295,9 +295,16 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     //
     // The initial source (--source flag) determines which branch is active.
     // Additional branches are added dynamically via the control socket.
-    // YouTube Live requires a 2-second IDR (keyframe) interval.
-    // key-int-max is in frames, so multiply by 2 to get the correct interval.
-    let key_int = framerate * 2;
+    // IDR (keyframe) interval. Was 2 s (framerate × 2) to match the 2 s
+    // HLS segment duration. On lossy bonded cellular that makes one lost
+    // packet corrupt up to ~2 s of video (every P-frame references the
+    // damaged frame until the next IDR — the "clear for a moment then
+    // grey/blocky" symptom). A 1 s IDR halves that error-propagation
+    // window while still keeping every 2 s segment keyframe-aligned
+    // (hlssink2 closes a segment at the first keyframe past
+    // target-duration), so YouTube ingest stays happy. key-int-max is in
+    // frames, so `framerate` == 1 s.
+    let key_int = framerate;
 
     // Parse codec type
     let codec_type = gststrata::codec::CodecType::from_str_loose(codec_str).unwrap_or_else(|| {

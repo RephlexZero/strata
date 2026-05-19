@@ -415,8 +415,9 @@ impl FecEncoder {
     }
 
     /// Update FEC parameters (for TAROT adaptive rate).
+    /// `r = 0` is valid and disables repair symbol generation (diagnostic mode).
     pub fn set_rate(&mut self, k: usize, r: usize) {
-        assert!(k > 0 && r > 0);
+        assert!(k > 0);
         self.window_size = k;
         self.repair_count = r;
     }
