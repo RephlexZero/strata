@@ -31,7 +31,7 @@
 #                                 scheduler default)
 #   STRATA_PPD_PROBE_INTERVAL_S — PPD probe-pair interval per link, seconds
 #                                 (default: scheduler default; huge = disable)
-#   STRATA_MAX_LATENCY_MS  — Receiver jitter buffer ceiling (default: 2000)
+#   STRATA_MAX_LATENCY_MS  — Receiver jitter buffer ceiling (default: 3000)
 #   STRATA_DURATION_SECS   — How long to stream before stopping (default: 60)
 #   STRATA_NO_BUILD=1      — Skip building and installing the sender binary
 #   STRATA_NO_DEPLOY=1     — Skip cross-compiling and deploying receiver binary
@@ -102,7 +102,7 @@ FAILOVER_DURATION_MS="${STRATA_FAILOVER_DURATION_MS:-800}"
 SAT_PROBE_INTERVAL_S="${STRATA_SAT_PROBE_INTERVAL_S:-}"
 SAT_PROBE_DURATION_S="${STRATA_SAT_PROBE_DURATION_S:-}"
 PPD_PROBE_INTERVAL_S="${STRATA_PPD_PROBE_INTERVAL_S:-}"
-MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-2000}"
+MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-3000}"
 DURATION="${STRATA_DURATION_SECS:-60}"
 LOG_LEVEL="${STRATA_LOG_LEVEL:-debug,strata_bonding=debug,strata_transport=debug,strata::adapt=debug}"
 HOST="${STRATA_RECEIVER_HOST}"

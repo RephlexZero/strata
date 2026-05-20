@@ -155,12 +155,16 @@ pub struct LinkLifecycleConfig {
 impl Default for ReceiverConfig {
     fn default() -> Self {
         Self {
-            // 300ms baseline: covers ~1.5 RTT of NACK-retransmit budget on
-            // typical 4G links (RTT 60-100ms).  The closed-loop late-pressure
-            // feedback in ReassemblyBuffer auto-widens further when needed,
-            // up to scheduler.max_latency_ms.  HLS consumers tolerate this
-            // easily — segment duration dominates end-to-end latency anyway.
-            start_latency: Duration::from_millis(300),
+            // 1500 ms baseline: sits above the bonded-cellular tail OWD
+            // (HARQ retries + per-link saturation probe pinning, which
+            // routinely reaches 600-1500 ms). At 300 ms the receiver was
+            // dropping ~3 packets/sec as late and blowing H.265 reference
+            // chains. The closed-loop late-pressure feedback in
+            // ReassemblyBuffer auto-widens further when needed, up to
+            // ReassemblyConfig::max_latency_ms (3000 ms by default).
+            // HLS consumers tolerate this easily — segment duration
+            // dominates end-to-end latency anyway.
+            start_latency: Duration::from_millis(1500),
             buffer_capacity: 2048,
             skip_after: None,
         }

@@ -22,6 +22,9 @@ fn adaptive_latency_spike_and_recovery() {
         skip_after: Some(Duration::from_millis(300)),
         jitter_latency_multiplier: 4.0,
         max_latency_ms: 200,
+        // Permissive floor (production default is 1000 ms, which would
+        // clamp this low-latency test to the same value in both phases).
+        min_latency_ms: 10,
         // Allow ramp-down after 500ms of stable jitter (shorter than default 2s
         // so the 200-packet recovery phase is sufficient to demonstrate decrease).
         stability_threshold_ms: 500,
@@ -81,6 +84,7 @@ fn latency_ceiling_under_extreme_jitter() {
         skip_after: None,
         jitter_latency_multiplier: 10.0, // Aggressive multiplier
         max_latency_ms: 150,
+        min_latency_ms: 5,
         ..Default::default()
     };
     let mut buf = ReassemblyBuffer::with_config(0, config);
@@ -112,6 +116,7 @@ fn handles_burst_reordering_pattern() {
         skip_after: Some(Duration::from_millis(100)),
         jitter_latency_multiplier: 4.0,
         max_latency_ms: 300,
+        min_latency_ms: 10,
         ..Default::default()
     };
     let mut buf = ReassemblyBuffer::with_config(0, config);
@@ -148,6 +153,7 @@ fn skip_after_prevents_hol_blocking() {
         skip_after: Some(Duration::from_millis(30)),
         jitter_latency_multiplier: 4.0,
         max_latency_ms: 500,
+        min_latency_ms: 10,
         ..Default::default()
     };
     let mut buf = ReassemblyBuffer::with_config(0, config);
@@ -180,6 +186,7 @@ fn latency_never_drops_below_start() {
         skip_after: None,
         jitter_latency_multiplier: 4.0,
         max_latency_ms: 500,
+        min_latency_ms: 10,
         ..Default::default()
     };
     let mut buf = ReassemblyBuffer::with_config(0, config);

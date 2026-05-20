@@ -97,9 +97,11 @@ pub struct ReassemblyConfig {
     pub skip_after: Option<Duration>,
     /// Multiplier for p95 jitter in adaptive latency (default: 4.0)
     pub jitter_latency_multiplier: f64,
-    /// Hard ceiling on adaptive reassembly latency (default: 500ms)
+    /// Hard ceiling on adaptive reassembly latency (default: 3000 ms).
     pub max_latency_ms: u64,
-    /// Floor for adaptive latency in ms (default: 10). Can be below start_latency.
+    /// Floor for adaptive latency in ms (default: 1000 ms). Defense-in-depth
+    /// clamp: late-pressure drain and downward smoothing must never let the
+    /// buffer dip below this even if the formula transiently goes lower.
     pub min_latency_ms: u64,
     /// Smoothing factor for upward adaptation (default: 0.3 = fast ramp-up).
     pub ramp_up_alpha: f64,
@@ -111,15 +113,38 @@ pub struct ReassemblyConfig {
     pub loss_penalty_ms: f64,
 }
 
+#[cfg(test)]
+impl ReassemblyConfig {
+    /// Permissive defaults for unit tests: 10 ms start, 10 ms floor, 2000 ms
+    /// ceiling. Lets tests exercise sub-second playout behaviour without the
+    /// production 1000 ms floor clamping every assertion. Production code
+    /// must use [`ReassemblyConfig::default`].
+    pub(crate) fn test_defaults() -> Self {
+        Self {
+            start_latency: Duration::from_millis(10),
+            min_latency_ms: 10,
+            max_latency_ms: 2000,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ReassemblyConfig {
     fn default() -> Self {
         Self {
-            start_latency: Duration::from_millis(300),
+            // Bonded-cellular tail OWD (HARQ retries + per-link saturation
+            // probe pinning) reaches 600-1500 ms. Adaptive playout used to
+            // chase calm-period averages back down to ~500-700 ms and then
+            // discard ~3 packets/sec as late, blowing H.265 reference-frame
+            // chains. For HLS ingest use cases (YouTube etc.) latency is
+            // free — segment duration dominates glass-to-glass anyway —
+            // so we pin the baseline well above the tail.
+            start_latency: Duration::from_millis(1500),
             buffer_capacity: 2048,
             skip_after: None,
             jitter_latency_multiplier: 4.0,
-            max_latency_ms: 2000,
-            min_latency_ms: 10,
+            max_latency_ms: 3000,
+            min_latency_ms: 1000,
             ramp_up_alpha: 0.3,
             ramp_down_alpha: 0.05,
             stability_threshold_ms: 2000,
@@ -175,6 +200,20 @@ impl ReassemblyBuffer {
             ReassemblyConfig {
                 start_latency: latency,
                 ..ReassemblyConfig::default()
+            },
+        )
+    }
+
+    /// Test-only convenience constructor that uses permissive defaults
+    /// (10 ms floor, 2 s ceiling) so tests can exercise sub-second playout
+    /// behaviour without the production 1000 ms floor clamping assertions.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(start_seq: u64, latency: Duration) -> Self {
+        Self::with_config(
+            start_seq,
+            ReassemblyConfig {
+                start_latency: latency,
+                ..ReassemblyConfig::test_defaults()
             },
         )
     }
@@ -629,7 +668,7 @@ mod tests {
 
     #[test]
     fn test_in_order_delivery() {
-        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(100));
+        let mut buf = ReassemblyBuffer::new_for_test(0, Duration::from_millis(100));
         let start = Instant::now();
         let p1 = Bytes::from_static(b"P1");
 
@@ -647,7 +686,7 @@ mod tests {
 
     #[test]
     fn test_reordering() {
-        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(50));
+        let mut buf = ReassemblyBuffer::new_for_test(0, Duration::from_millis(50));
         let start = Instant::now();
 
         // Arrives: Seq 2, then Seq 0, then Seq 1
@@ -667,7 +706,7 @@ mod tests {
 
     #[test]
     fn test_gap_skipping() {
-        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(50));
+        let mut buf = ReassemblyBuffer::new_for_test(0, Duration::from_millis(50));
         let start = Instant::now();
 
         // P0 missing
@@ -686,7 +725,7 @@ mod tests {
     #[test]
     fn test_adaptive_latency() {
         // Base latency 10ms
-        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(10));
+        let mut buf = ReassemblyBuffer::new_for_test(0, Duration::from_millis(10));
         let start = Instant::now();
 
         // Push packets with jitter
@@ -750,7 +789,7 @@ mod tests {
             start_latency: Duration::from_millis(100),
             buffer_capacity: 64,
             skip_after: Some(Duration::from_millis(30)),
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -769,7 +808,7 @@ mod tests {
         let config = ReassemblyConfig {
             start_latency: Duration::from_millis(10),
             buffer_capacity: 8,
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -784,7 +823,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_packet_counting() {
-        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(100));
+        let mut buf = ReassemblyBuffer::new_for_test(0, Duration::from_millis(100));
         let start = Instant::now();
 
         // Push packet with seq_id 0
@@ -810,7 +849,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_vs_late_packets() {
-        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(100));
+        let mut buf = ReassemblyBuffer::new_for_test(0, Duration::from_millis(100));
         let start = Instant::now();
 
         // Push packet 0 and 1
@@ -839,7 +878,7 @@ mod tests {
             start_latency: Duration::from_millis(10),
             jitter_latency_multiplier: 100.0,
             max_latency_ms: 200,
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -878,7 +917,7 @@ mod tests {
         let config = ReassemblyConfig {
             start_latency: Duration::from_millis(10),
             buffer_capacity: 16,
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -894,7 +933,7 @@ mod tests {
 
     #[test]
     fn test_stats_during_operation() {
-        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(50));
+        let mut buf = ReassemblyBuffer::new_for_test(0, Duration::from_millis(50));
         let start = Instant::now();
 
         buf.push(0, Bytes::from_static(b"P0"), start);
@@ -927,7 +966,7 @@ mod tests {
 
     #[test]
     fn test_many_packets_in_order() {
-        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(10));
+        let mut buf = ReassemblyBuffer::new_for_test(0, Duration::from_millis(10));
         let start = Instant::now();
 
         for i in 0..1000u64 {
@@ -949,7 +988,7 @@ mod tests {
             stability_threshold_ms: 0, // Immediate ramp-down for testing
             ramp_down_alpha: 0.5,
             ramp_up_alpha: 1.0, // Instant ramp-up
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -1027,7 +1066,7 @@ mod tests {
             ramp_down_alpha: 0.02, // very slow — without the fast path we'd stay high
             loss_penalty_ms: 500.0,
             stability_threshold_ms: 0, // no stability wait
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -1081,7 +1120,7 @@ mod tests {
             skip_after: Some(Duration::from_millis(5)),
             ramp_up_alpha: 1.0, // Instant ramp-up
             loss_penalty_ms: 1000.0,
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -1136,7 +1175,7 @@ mod tests {
             start_latency: Duration::from_millis(5),
             min_latency_ms: 20,
             ramp_up_alpha: 1.0,
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -1159,7 +1198,7 @@ mod tests {
 
     #[test]
     fn test_stats_target_and_jitter() {
-        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(10));
+        let mut buf = ReassemblyBuffer::new_for_test(0, Duration::from_millis(10));
         let start = Instant::now();
 
         buf.push(0, Bytes::from_static(b"P0"), start);
@@ -1181,7 +1220,7 @@ mod tests {
 
     #[test]
     fn test_delivered_packets_counted() {
-        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(10));
+        let mut buf = ReassemblyBuffer::new_for_test(0, Duration::from_millis(10));
         let start = Instant::now();
 
         for i in 0..5u64 {
@@ -1206,7 +1245,7 @@ mod tests {
         let config = ReassemblyConfig {
             start_latency: Duration::from_millis(50),
             max_latency_ms: 3000,
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let buf = ReassemblyBuffer::with_config(0, config);
         assert_eq!(
@@ -1226,7 +1265,7 @@ mod tests {
             // Fast ramp-up so latency reaches ceiling quickly
             ramp_up_alpha: 1.0,
             jitter_latency_multiplier: 4.0,
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -1254,16 +1293,17 @@ mod tests {
         );
     }
 
-    /// With the default max_latency (500ms), the same high-jitter pattern
-    /// causes significantly more late packets — proving the ceiling matters.
+    /// Regression guard pinning the current default ceiling. If someone
+    /// lowers `max_latency_ms` below the bonded-cellular tail OWD again,
+    /// this test will fail loudly.
     #[test]
-    fn test_default_max_latency_drops_slow_packets() {
+    fn test_default_max_latency_is_3000ms() {
         let config = ReassemblyConfig {
             start_latency: Duration::from_millis(50),
             // max_latency_ms: 500 (default)
             ramp_up_alpha: 1.0,
             jitter_latency_multiplier: 4.0,
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -1281,14 +1321,14 @@ mod tests {
         let _ = buf.tick(start + Duration::from_millis(5000));
         let _stats = buf.get_stats();
 
-        // Confirm the default ceiling is 2000ms (regression guard).
-        // Raised from 500ms when the jitter buffer moved to closed-loop
-        // self-tuning — HLS tolerates generous headroom, and tight ceilings
-        // were forcing packet drops during retransmit-driven recovery.
+        // Confirm the default ceiling is 3000ms (regression guard).
+        // Raised from 500 → 2000 → 3000 ms across iterations: HLS tolerates
+        // generous headroom, and tight ceilings forced packet drops during
+        // retransmit-driven recovery and bonded-cellular tail-OWD events.
         assert_eq!(
             ReassemblyConfig::default().max_latency_ms,
-            2000,
-            "Default max_latency_ms should be 2000"
+            3000,
+            "Default max_latency_ms should be 3000"
         );
     }
 
@@ -1312,7 +1352,7 @@ mod tests {
             ramp_up_alpha: 1.0,
             loss_penalty_ms: 500.0,
             max_latency_ms: 500,
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -1397,7 +1437,7 @@ mod tests {
             start_latency: Duration::from_millis(20),
             buffer_capacity: 64,
             skip_after: Some(Duration::from_millis(5)),
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -1455,7 +1495,7 @@ mod tests {
             start_latency: Duration::from_millis(10),
             buffer_capacity: 128,
             skip_after: Some(Duration::from_millis(5)),
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -1500,7 +1540,7 @@ mod tests {
             start_latency: Duration::from_millis(10),
             buffer_capacity: 64,
             skip_after: Some(Duration::from_millis(5)),
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -1566,7 +1606,7 @@ mod tests {
             start_latency: Duration::from_millis(10),
             buffer_capacity: 64,
             skip_after: Some(Duration::from_millis(5)),
-            ..Default::default()
+            ..ReassemblyConfig::test_defaults()
         };
         let mut buf = ReassemblyBuffer::with_config(0, config);
         let start = Instant::now();
@@ -1618,7 +1658,7 @@ mod tests {
         // dropped as "late". Regression: the new delay-spread component
         // must lift `target_latency` to cover the skew so spread-induced
         // lateness never fires.
-        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(50));
+        let mut buf = ReassemblyBuffer::new_for_test(0, Duration::from_millis(50));
         let start = Instant::now();
 
         // Phase 1: warm with steady inter-arrival to seed jitter EWMA.
@@ -1664,7 +1704,7 @@ mod tests {
 
     #[test]
     fn tick_sets_discont_after_gap_skip() {
-        let mut buf = ReassemblyBuffer::new(0, Duration::from_millis(50));
+        let mut buf = ReassemblyBuffer::new_for_test(0, Duration::from_millis(50));
         let start = Instant::now();
 
         // Push seq 0 and seq 2 (gap at seq 1)
@@ -1680,5 +1720,96 @@ mod tests {
         // Second packet was preceded by a gap (seq 1 skipped)
         assert_eq!(out[1].0, Bytes::from_static(b"P2"));
         assert!(out[1].1, "P2 should have discont flag after gap skip");
+    }
+
+    // ── Phase 1 (HLS floor): production defaults absorb bonded-cellular tail OWD ──
+
+    /// With the production defaults (start=1500, min=1000, max=3000), a
+    /// 1.2 s tail spike — representative of cellular HARQ retries plus
+    /// saturation-probe pinning — must not produce any late drops. This
+    /// is the artifact-stopping regression guard from the field saga.
+    #[test]
+    fn production_defaults_absorb_1200ms_owd_spike() {
+        let mut buf = ReassemblyBuffer::with_config(0, ReassemblyConfig::default());
+        let start = Instant::now();
+
+        // 100 packets, in-order seq, 10 ms apart on average. Every 10th
+        // arrives 1200 ms later than its neighbours (simulating a probe-
+        // induced tail event). With a 1500 ms baseline buffer those late
+        // arrivals are still within the playout window.
+        for i in 0..100u64 {
+            let extra = if i % 10 == 0 { 1200 } else { 0 };
+            buf.push(
+                i,
+                Bytes::from(vec![0; 100]),
+                start + Duration::from_millis(i * 10 + extra),
+            );
+        }
+        let _ = buf.tick(start + Duration::from_millis(5000));
+
+        let stats = buf.get_stats();
+        assert_eq!(
+            stats.late_packets, 0,
+            "1.2 s OWD spike must not cause late drops with a 1500 ms baseline (got {} late)",
+            stats.late_packets
+        );
+    }
+
+    /// Steady-state with low jitter and zero loss must settle the target
+    /// near the configured baseline, not above. Guards against the
+    /// adaptive controller bloating the window when nothing is wrong.
+    #[test]
+    fn production_defaults_steady_state_settles_near_baseline() {
+        let mut buf = ReassemblyBuffer::with_config(0, ReassemblyConfig::default());
+        let start = Instant::now();
+
+        // 200 packets, in-order, 5 ms apart, ±2 ms jitter.
+        for i in 0..200u64 {
+            let jitter = i % 5; // 0..4 ms
+            buf.push(
+                i,
+                Bytes::from(vec![0; 100]),
+                start + Duration::from_millis(i * 5 + jitter),
+            );
+        }
+        let _ = buf.tick(start + Duration::from_millis(2000));
+
+        let stats = buf.get_stats();
+        assert!(
+            stats.target_latency_ms >= 1500 && stats.target_latency_ms <= 1700,
+            "target should settle near 1500 ms baseline under low jitter (got {} ms)",
+            stats.target_latency_ms
+        );
+        assert_eq!(
+            stats.late_packets, 0,
+            "no late drops under steady low-jitter traffic"
+        );
+    }
+
+    /// The downward smoothing path must never let `latency` dip below the
+    /// configured `min_latency_ms`, even when the AIMD drain has fully
+    /// emptied `late_pressure_ms` and the dynamic component is tiny.
+    #[test]
+    fn production_defaults_latency_never_below_min_floor() {
+        let mut buf = ReassemblyBuffer::with_config(0, ReassemblyConfig::default());
+        let start = Instant::now();
+
+        // Long, calm traffic: 2 minutes of in-order packets 20 ms apart.
+        // Ample time for downward smoothing and any drain to act.
+        for i in 0..6000u64 {
+            buf.push(
+                i,
+                Bytes::from(vec![0; 100]),
+                start + Duration::from_millis(i * 20),
+            );
+        }
+        let _ = buf.tick(start + Duration::from_millis(125_000));
+
+        let stats = buf.get_stats();
+        assert!(
+            stats.current_latency_ms >= 1000,
+            "latency must never dip below min_latency_ms=1000 (got {} ms)",
+            stats.current_latency_ms
+        );
     }
 }

@@ -91,6 +91,9 @@ fn jitter_buffer_adapts_to_high_jitter_then_recovers() {
         skip_after: Some(Duration::from_millis(200)),
         jitter_latency_multiplier: 4.0,
         max_latency_ms: 300,
+        // Permissive floor for this low-latency test (production default is
+        // 1000 ms, which would clamp both phases to the same value).
+        min_latency_ms: 10,
         ..Default::default()
     };
     let mut buf = ReassemblyBuffer::with_config(0, config);
@@ -143,6 +146,9 @@ fn receiver_stats_reflect_impairments() {
         skip_after: Some(Duration::from_millis(50)),
         jitter_latency_multiplier: 4.0,
         max_latency_ms: 500,
+        // Permissive floor for this low-latency test (production default is
+        // 1000 ms, which would block the 60 ms tick from releasing anything).
+        min_latency_ms: 10,
         ..Default::default()
     };
     let mut buf = ReassemblyBuffer::with_config(0, config);
@@ -263,7 +269,14 @@ fn cloud_receiver_with_metrics_endpoint() {
 
 #[test]
 fn receiver_graceful_shutdown_drains_pending() {
-    let mut rcv = TransportBondingReceiver::new(Duration::from_millis(10));
+    // Use a permissive 10 ms floor — production default is 1000 ms, which
+    // would block the 100 ms drain window below from delivering anything.
+    let mut rcv = TransportBondingReceiver::new_with_config(ReassemblyConfig {
+        start_latency: Duration::from_millis(10),
+        min_latency_ms: 10,
+        max_latency_ms: 2000,
+        ..Default::default()
+    });
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = sock.local_addr().unwrap();
     rcv.add_link_socket(sock).unwrap();
