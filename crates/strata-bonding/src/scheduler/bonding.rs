@@ -645,6 +645,19 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             // each link once. After the first full cycle, switch to the
             // normal steady-state stagger. Use the minimum of the startup
             // stagger and the configured stagger so tests with tiny intervals work.
+            //
+            // EXCEPTION: when the configured stagger is the existing
+            // "huge interval" disable sentinel (≥1e9 s), respect that
+            // and skip the initial cycle too — otherwise the operator's
+            // explicit "no saturation probes" choice (now the default for
+            // bonded-cellular HLS) still bursts 1 probe per link at
+            // startup. In field tests on 2× LTE those 3 startup probes
+            // dumped ~110 lost packets into the first 5 s and were the
+            // only visible probe-induced damage left after `3b1ef62`.
+            let probes_disabled = config.saturation_probe_interval_s >= 1e9;
+            if probes_disabled {
+                return;
+            }
             let effective_stagger = if !self.initial_probe_cycle_done {
                 Duration::from_secs_f64(1.0).min(stagger_interval)
             } else {
@@ -2058,6 +2071,44 @@ mod tests {
         assert!(
             scheduler.saturation_probe_link().is_none(),
             "no probe during Probe phase"
+        );
+    }
+
+    /// When `saturation_probe_interval_s` is set to the disabled sentinel
+    /// (≥1e9 s, e.g. the new production default after `3b1ef62`), the
+    /// scheduler must not fire any saturation probe — including the
+    /// "rapid initial cycle" that used to burst one probe per link at
+    /// startup regardless of the configured interval. Field tests on
+    /// 2× LTE showed those 3 startup probes were the only remaining
+    /// source of saturation-probe-induced loss after the steady-state
+    /// path was disabled.
+    #[test]
+    fn test_no_probe_when_interval_is_disable_sentinel() {
+        let config = crate::config::SchedulerConfig {
+            saturation_probe_interval_s: 1e10, // disable sentinel
+            saturation_probe_duration_s: 0.4,
+            ..Default::default()
+        };
+
+        let mut scheduler = BondingScheduler::with_config(config);
+        let l1 = Arc::new(MockLink::new(1, 5_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 5_000_000.0, 10.0));
+        l1.set_phase(LinkPhase::Live); // would normally probe in startup cycle
+        l2.set_phase(LinkPhase::Live);
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+
+        // Refresh many times; the steady-state interval is huge so no
+        // probe should be triggered no matter how long we wait.
+        for _ in 0..50 {
+            scheduler.refresh_metrics();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        assert!(
+            scheduler.saturation_probe_link().is_none(),
+            "no saturation probe must fire when interval is the disable sentinel — \
+             not even the rapid initial-cycle probe"
         );
     }
 
