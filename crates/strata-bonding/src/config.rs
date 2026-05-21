@@ -252,8 +252,21 @@ impl Default for SchedulerConfig {
             max_latency_ms: 500,
             stats_interval_ms: 1000,
             channel_capacity: 1000,
-            saturation_probe_interval_s: 10.0,
+            // Saturation probes default OFF: in field A/B testing on bonded
+            // cellular (runs A vs C, 2026-05-20), enabling saturation probes
+            // caused ~3.2 late drops/s and inflated peak_gp to 5+ Mbps on
+            // 2× LTE (physically impossible), which the up-only bitrate
+            // slew cap then locked onto → radio overdrive → loss bursts.
+            // Run C (probes off) had 4 late / 92 lost in 120 s vs Run A's
+            // 370 late / 57 lost.  Passive BBR + ack-rate measurement is
+            // sufficient for HLS use cases where the segment boundary
+            // absorbs any conservatism. Opt in via STRATA_SAT_PROBE_INTERVAL_S
+            // or by lowering this default.
+            saturation_probe_interval_s: 1e10,
             saturation_probe_duration_s: 0.4,
+            // PPD probes are 2-packet bursts every 2 s per link — too small
+            // to disrupt the radio, kept enabled for continuous capacity
+            // signal between any (now-opt-in) saturation probes.
             ppd_probe_interval_s: 2.0,
         }
     }
