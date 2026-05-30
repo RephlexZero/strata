@@ -514,7 +514,7 @@ pub fn StreamTab(
             </div>
 
             // Transport Tuning controls
-            <TransportTuningCard sender_id=sender_id stream_state=stream_state sender_metrics=sender_metrics live_links=live_links />
+            <TransportTuningCard sender_id=sender_id stream_state=stream_state sender_metrics=sender_metrics />
 
             // Multi-Destination Routing
             <MultiDestRoutingCard sender_id=sender_id stream_state=stream_state />

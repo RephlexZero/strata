@@ -2,17 +2,12 @@
 //!
 //! 1. Biscay full state cycle: Normal → Cautious → PreHandover → Normal
 //! 2. BitrateCmd wire format round-trip
-//! 3. Supervisor → Adapter → BitrateCmd wire encoding pipeline
 
 use quanta::Instant;
 use std::time::Duration;
 
 use strata_transport::congestion::{BiscayController, BiscayState, RadioMetrics};
 use strata_transport::wire::{BitrateCmd, BitrateReason};
-
-use strata_bonding::adaptation::{AdaptationConfig, AdaptationReason, BitrateAdapter};
-use strata_bonding::modem::health::RfMetrics;
-use strata_bonding::modem::supervisor::{ModemSupervisor, SupervisorConfig, SupervisorEvent};
 
 // ─── Biscay Full State Cycle ────────────────────────────────────────────
 
@@ -191,118 +186,4 @@ fn bitrate_cmd_decode_rejects_truncated_input() {
         BitrateCmd::decode(&mut reader).is_none(),
         "should reject truncated input"
     );
-}
-
-// ─── Supervisor → Adapter → BitrateCmd Wire Encoding Pipeline ──────────
-
-/// Tests the full intelligence pipeline: modem supervisor detects degradation,
-/// adapter produces a BitrateCommand, which is then encoded to the wire format
-/// BitrateCmd and decoded back.
-#[test]
-fn supervisor_adapter_to_wire_bitrate_cmd_pipeline() {
-    // Setup supervisor
-    let mut supervisor = ModemSupervisor::new(SupervisorConfig {
-        degraded_threshold: 40.0,
-        recovery_threshold: 55.0,
-        ..Default::default()
-    });
-
-    // Setup adapter
-    let mut adapter = BitrateAdapter::new(AdaptationConfig {
-        max_bitrate_kbps: 10_000,
-        min_interval: Duration::ZERO,
-        ramp_down_factor: 0.7,
-        // Set quality_cap equal to max so MaxReliability mode doesn't reduce
-        // bitrate below target — this test exercises the degradation/recovery
-        // pipeline, not the quality-cap feature.
-        quality_cap_kbps: 10_000,
-        ..Default::default()
-    });
-
-    // Register links with good RF
-    let good_rf = RfMetrics {
-        rsrp_dbm: -75.0,
-        rsrq_db: -6.0,
-        sinr_db: 20.0,
-        cqi: 12,
-    };
-    for _ in 0..10 {
-        supervisor.update_rf(0, &good_rf);
-        supervisor.update_rf(1, &good_rf);
-    }
-
-    // Normal state: adapter stays at max
-    let caps = supervisor.link_capacities();
-    adapter.update(&caps);
-    assert_eq!(adapter.current_target_kbps(), 10_000);
-
-    // Degrade link 0 severely
-    let bad_rf = RfMetrics {
-        rsrp_dbm: -130.0,
-        rsrq_db: -18.0,
-        sinr_db: -10.0,
-        cqi: 1,
-    };
-    let mut saw_degraded = false;
-    for _ in 0..40 {
-        let events = supervisor.update_rf(0, &bad_rf);
-        supervisor.update_transport(
-            0,
-            &strata_bonding::modem::health::TransportMetrics {
-                loss_rate: 0.30,
-                jitter_ms: 80.0,
-                rtt_ms: 200.0,
-            },
-        );
-        if events
-            .iter()
-            .any(|e| matches!(e, SupervisorEvent::LinkDegraded { .. }))
-        {
-            saw_degraded = true;
-        }
-    }
-    assert!(saw_degraded, "supervisor should detect link degradation");
-
-    // Feed degraded capacities to adapter → should produce a command
-    let caps = supervisor.link_capacities();
-    let cmd = adapter.update(&caps);
-    // update() always returns Some for stage freshness; if the surviving
-    // link still covers the target, force a reduction explicitly to
-    // exercise the wire-format round-trip below.
-    let bitrate_command = match cmd {
-        Some(c) if c.target_kbps < 10_000 => c,
-        _ => adapter.force_reduce(AdaptationReason::LinkFailure),
-    };
-
-    assert!(
-        bitrate_command.target_kbps < 10_000,
-        "target should be reduced"
-    );
-
-    // Convert adaptation::AdaptationReason → wire::BitrateReason
-    let wire_reason = match bitrate_command.reason {
-        AdaptationReason::Capacity => BitrateReason::Capacity,
-        AdaptationReason::Congestion => BitrateReason::Congestion,
-        AdaptationReason::LinkFailure => BitrateReason::LinkFailure,
-        AdaptationReason::Recovery => BitrateReason::Recovery,
-    };
-
-    // Encode to wire format
-    let wire_cmd = BitrateCmd {
-        target_kbps: bitrate_command.target_kbps,
-        reason: wire_reason,
-    };
-
-    let mut buf = bytes::BytesMut::with_capacity(64);
-    wire_cmd.encode(&mut buf);
-
-    // Decode from wire
-    use bytes::Buf;
-    let mut reader = buf.freeze();
-    let _ctrl_type = reader.get_u8(); // skip control type byte
-    let decoded = BitrateCmd::decode(&mut reader).expect("should decode wire BitrateCmd");
-
-    // Verify round-trip
-    assert_eq!(decoded.target_kbps, bitrate_command.target_kbps);
-    assert_eq!(decoded.reason, wire_reason);
 }

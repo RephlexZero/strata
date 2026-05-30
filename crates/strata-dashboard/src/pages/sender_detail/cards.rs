@@ -867,7 +867,6 @@ pub fn TransportTuningCard(
     sender_id: Memo<String>,
     stream_state: ReadSignal<String>,
     sender_metrics: ReadSignal<Option<crate::types::TransportSenderMetrics>>,
-    live_links: ReadSignal<Vec<LinkStats>>,
 ) -> impl IntoView {
     let auth = expect_context::<AuthState>();
 
@@ -876,7 +875,6 @@ pub fn TransportTuningCard(
     let (fec_overhead, set_fec_overhead) = signal(20u32); // %
     let (fec_layer, set_fec_layer) = signal(String::from("rlnc"));
     let (blest_threshold, set_blest_threshold) = signal(50u32); // ms
-    let (sbd_enabled, set_sbd_enabled) = signal(false);
     let (applying, set_applying) = signal(false);
     let (apply_msg, set_apply_msg) = signal(Option::<(String, &'static str)>::None);
 
@@ -897,7 +895,6 @@ pub fn TransportTuningCard(
             fec: Some(crate::types::FecConfigUpdate {
                 layer: Some(fec_layer.get_untracked()),
                 blest_threshold_ms: Some(blest_threshold.get_untracked()),
-                shared_bottleneck_detection: Some(sbd_enabled.get_untracked()),
             }),
         };
 
@@ -1073,52 +1070,7 @@ pub fn TransportTuningCard(
                             "BLEST Head-of-Line blocking threshold. Prevents scheduling to slow links."
                         </p>
                     </fieldset>
-
-                    // Shared Bottleneck Detection
-                    <fieldset class="fieldset">
-                        <label class="fieldset-label">"Shared Bottleneck Detection (RFC 8382)"</label>
-                        <label class="flex items-center gap-2 cursor-pointer mt-1">
-                            <input
-                                type="checkbox"
-                                class="toggle toggle-sm toggle-primary"
-                                prop:checked=move || sbd_enabled.get()
-                                on:change=move |_| set_sbd_enabled.set(!sbd_enabled.get_untracked())
-                            />
-                            <span class="text-sm">{move || if sbd_enabled.get() { "Enabled" } else { "Disabled" }}</span>
-                        </label>
-                        <p class="text-xs text-base-content/40 mt-1">
-                            "Groups links sharing the same tower backhaul to avoid congestion."
-                        </p>
-                    </fieldset>
                 </div>
-
-                // ── Thompson Sampling Scores ──
-                {move || {
-                    let links = live_links.get();
-                    let has_scores = links.iter().any(|l| l.thompson_score.is_some());
-                    has_scores.then(|| {
-                        view! {
-                            <div class="mt-4">
-                                <h4 class="text-sm font-semibold mb-2">"Thompson Sampling Scores"</h4>
-                                <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
-                                    {links.iter().filter_map(|l| {
-                                        l.thompson_score.map(|score| {
-                                            let iface = l.interface.clone();
-                                            let pct = (score * 100.0).min(100.0);
-                                            view! {
-                                                <div class="bg-base-300 rounded-lg p-2">
-                                                    <div class="text-xs text-base-content/40 truncate">{iface}</div>
-                                                    <div class="font-mono text-sm font-semibold">{format!("{:.1}%", pct)}</div>
-                                                    <progress class="progress progress-primary w-full h-1" value=format!("{}", pct as u32) max="100"></progress>
-                                                </div>
-                                            }
-                                        })
-                                    }).collect::<Vec<_>>()}
-                                </div>
-                            </div>
-                        }
-                    })
-                }}
 
                 <div class="card-actions justify-end mt-3">
                     <button

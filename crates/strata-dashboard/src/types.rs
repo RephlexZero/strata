@@ -314,9 +314,6 @@ pub struct TransportSenderMetrics {
     /// BLEST Head-of-Line blocking threshold in ms.
     #[serde(default)]
     pub blest_threshold_ms: Option<u32>,
-    /// Whether Shared Bottleneck Detection (RFC 8382) is enabled.
-    #[serde(default)]
-    pub shared_bottleneck_detection: Option<bool>,
     /// NAL unit counters for media awareness.
     #[serde(default)]
     pub nal_critical_sent: Option<u64>,
@@ -401,9 +398,6 @@ pub struct LinkStats {
     pub link_kind: Option<String>,
     pub btlbw_bps: Option<u64>,
     pub rtprop_ms: Option<f64>,
-    /// Thompson Sampling scheduler preference score for this link.
-    #[serde(default)]
-    pub thompson_score: Option<f64>,
 }
 
 // ── Stream Config Update (Hot Reconfig) ─────────────────────────────
@@ -428,9 +422,6 @@ pub struct FecConfigUpdate {
     /// BLEST Head-of-Line blocking threshold in ms.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blest_threshold_ms: Option<u32>,
-    /// Toggle Shared Bottleneck Detection (RFC 8382).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shared_bottleneck_detection: Option<bool>,
 }
 
 /// Partial encoder update — only set fields are applied.

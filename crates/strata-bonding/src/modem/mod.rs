@@ -1,10 +1,11 @@
-//! # Modem Intelligence Layer
+//! # Modem RF Metrics Seam
 //!
-//! Link health scoring from RF metrics (RSRP, RSRQ, SINR, CQI) and
-//! transport-level feedback (loss rate, jitter). Uses Kalman-smoothed
-//! metrics for stable scoring. Includes band locking automation for
-//! frequency diversity across multiple modems.
+//! Defines [`health::RfMetrics`], the raw radio readings forwarded to each
+//! link's Biscay congestion controller. The radio feed-forward logic itself
+//! (SINR ceiling, CQI-derivative, RSRP-slope handover detection) lives in
+//! `strata-transport`'s `BiscayController::on_radio_metrics`; this module only
+//! carries the metric type across the crate boundary.
+//!
+//! No field producer exists yet — see [`health`] for why.
 
-pub mod band;
 pub mod health;
-pub mod supervisor;

@@ -1,7 +1,7 @@
 //! Integration tests for the bonding intelligence pipeline.
 //!
-//! These tests exercise the full stack: BondingScheduler with IoDS/BLEST/Thompson,
-//! BitrateAdapter, ModemSupervisor, and simulated link failure scenarios.
+//! These tests exercise the stack: BondingScheduler with IoDS/BLEST/EDPF,
+//! BitrateAdapter, and simulated link failure scenarios.
 
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
@@ -10,8 +10,6 @@ use std::time::Duration;
 use strata_bonding::adaptation::{AdaptationConfig, BitrateAdapter, LinkCapacity};
 use strata_bonding::config::SchedulerConfig;
 use strata_bonding::media::priority::DegradationStage;
-use strata_bonding::modem::health::RfMetrics;
-use strata_bonding::modem::supervisor::{ModemSupervisor, SupervisorConfig, SupervisorEvent};
 use strata_bonding::net::interface::{LinkMetrics, LinkPhase, LinkSender};
 use strata_bonding::scheduler::PacketProfile;
 use strata_bonding::scheduler::bonding::BondingScheduler;
@@ -133,11 +131,6 @@ fn full_pipeline_link_failure_and_recovery() {
         ..Default::default()
     });
 
-    let mut supervisor = ModemSupervisor::default();
-    supervisor.register_link(1);
-    supervisor.register_link(2);
-    supervisor.register_link(3);
-
     // Phase 1: Normal operation — send 50 packets
     for _ in 0..50 {
         let payload = Bytes::from(vec![0u8; 1000]);
@@ -152,17 +145,6 @@ fn full_pipeline_link_failure_and_recovery() {
     // Phase 2: Kill link 3
     l3.kill();
     scheduler.refresh_metrics();
-
-    // Feed supervisor degraded RF for link 3
-    let bad_rf = RfMetrics {
-        rsrp_dbm: -140.0,
-        rsrq_db: -20.0,
-        sinr_db: -15.0,
-        cqi: 0,
-    };
-    for _ in 0..10 {
-        supervisor.update_rf(3, &bad_rf);
-    }
 
     // Adaptation should detect reduced capacity
     let caps = vec![
@@ -213,13 +195,26 @@ fn full_pipeline_link_failure_and_recovery() {
         "some packets should succeed on alive links"
     );
 
-    // Phase 3: Revive link 3
+    // Phase 3: Revive link 3. The kill drove loss to 100%, which now trips
+    // EDPF's collapse-avoidance hysteresis (a link is shed for ~1500ms after a
+    // collapse even once its metrics recover — see SEVERE_LOSS_THRESHOLD and
+    // `collapse_avoid_window_persists_across_immediate_recovery_tick`). Wait
+    // past that window so this test exercises genuine recovery, not the
+    // anti-flap hold.
     l3.revive();
+    std::thread::sleep(Duration::from_millis(1600));
     scheduler.refresh_metrics();
 
+    // Send enough (with periodic refresh) that EDPF spills past the two faster
+    // links to the slower revived one — robust to in-flight drain over the
+    // wait above, unlike a tight 30-packet burst.
     for _ in 0..30 {
-        let payload = Bytes::from(vec![0u8; 1000]);
-        let _ = scheduler.send(payload, default_profile(1000));
+        std::thread::sleep(Duration::from_millis(1));
+        scheduler.refresh_metrics();
+        for _ in 0..10 {
+            let payload = Bytes::from(vec![0u8; 1000]);
+            let _ = scheduler.send(payload, default_profile(1000));
+        }
     }
 
     assert!(
@@ -283,77 +278,6 @@ fn adaptation_reduces_bitrate_on_capacity_drop() {
     let cmd = adapter.update(&bad_caps);
     assert!(cmd.is_some(), "should produce bitrate reduction command");
     assert!(adapter.current_target_kbps() < 15_000);
-}
-
-// ─── Test: Supervisor Detects Degradation ───────────────────────────────
-
-#[test]
-fn supervisor_to_adapter_pipeline() {
-    let mut supervisor = ModemSupervisor::new(SupervisorConfig {
-        degraded_threshold: 40.0,
-        recovery_threshold: 55.0,
-        ..Default::default()
-    });
-
-    let mut adapter = BitrateAdapter::new(AdaptationConfig {
-        max_bitrate_kbps: 10_000,
-        min_interval: Duration::ZERO,
-        ..Default::default()
-    });
-
-    // Register links and give good RF
-    let good_rf = RfMetrics {
-        rsrp_dbm: -75.0,
-        rsrq_db: -6.0,
-        sinr_db: 20.0,
-        cqi: 12,
-    };
-    for _ in 0..10 {
-        supervisor.update_rf(0, &good_rf);
-        supervisor.update_rf(1, &good_rf);
-    }
-
-    // Get capacities and feed to adapter
-    let caps = supervisor.link_capacities();
-    assert_eq!(caps.len(), 2);
-    adapter.update(&caps);
-
-    // Now degrade link 0
-    let bad_rf = RfMetrics {
-        rsrp_dbm: -130.0,
-        rsrq_db: -18.0,
-        sinr_db: -10.0,
-        cqi: 1,
-    };
-    let mut saw_degraded = false;
-    for _ in 0..40 {
-        let events = supervisor.update_rf(0, &bad_rf);
-        supervisor.update_transport(
-            0,
-            &strata_bonding::modem::health::TransportMetrics {
-                loss_rate: 0.30,
-                jitter_ms: 80.0,
-                rtt_ms: 200.0,
-            },
-        );
-        if events
-            .iter()
-            .any(|e| matches!(e, SupervisorEvent::LinkDegraded { .. }))
-        {
-            saw_degraded = true;
-        }
-    }
-    assert!(saw_degraded, "supervisor should detect degradation");
-
-    // Feed updated capacities to adapter
-    let caps = supervisor.link_capacities();
-    adapter.update(&caps);
-
-    // Adapter should be aware of reduced capacity
-    assert!(
-        adapter.current_target_kbps() <= 10_000,
-        "adapter should reflect capacity constraints"
-    );
 }
 
 // ─── Test: Critical Packets Broadcast Even During Degradation ───────────

@@ -19,7 +19,6 @@ pub mod fec;
 pub mod iods;
 pub mod kalman;
 pub mod oracle;
-pub mod sbd;
 
 /// Describes the importance and characteristics of a packet for scheduling decisions.
 ///
