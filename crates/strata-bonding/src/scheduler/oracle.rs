@@ -47,6 +47,15 @@ pub struct CapacityOracle {
     /// delivery observations are suppressed (the inflated traffic would
     /// corrupt the lower bound).
     probe_active: bool,
+    /// Whether the bonding scheduler is currently broadcasting the same
+    /// payload across multiple links (fast-failover). When true, this
+    /// link's per-link ACK rate and receiver-reported goodput include
+    /// duplicates of traffic that other links are also carrying — feeding
+    /// it to `observe_delivery` ratchets `lower_bound` to the bonded
+    /// aggregate, inflating per-link capacity well past the physical
+    /// rate. The scheduler then over-allocates the link, the encoder
+    /// overshoots, and wire loss bursts. Mirror of `probe_active`.
+    broadcast_active: bool,
     /// Slow-decaying high-water mark of `estimated_cap`. Used as a stable
     /// reference for pacing floors so that transient delivery drops don't
     /// create a death spiral.
@@ -73,6 +82,7 @@ impl CapacityOracle {
             baseline_rtt_ms: 0.0,
             last_reset: now,
             probe_active: false,
+            broadcast_active: false,
             peak_estimate: 0.0,
             last_tick: now,
             lower_bound_peak: 0.0,
@@ -123,7 +133,7 @@ impl CapacityOracle {
     /// delivery rates. This allows the lower bound to decrease when traffic
     /// shifts away, while still reflecting genuine throughput capacity.
     pub fn observe_delivery(&mut self, delivery_bps: f64) {
-        if delivery_bps <= 0.0 || self.probe_active {
+        if delivery_bps <= 0.0 || self.probe_active || self.broadcast_active {
             return;
         }
 
@@ -388,6 +398,16 @@ impl CapacityOracle {
     /// from corrupting the lower bound.
     pub fn set_probe_active(&mut self, active: bool) {
         self.probe_active = active;
+    }
+
+    /// Set failover-broadcast active state. When active, delivery
+    /// observations are suppressed: during broadcast every payload is
+    /// duplicated to every link, so each link's per-link ACK/goodput rate
+    /// reflects bonded aggregate traffic rather than its own physical
+    /// capacity. Without suppression the `lower_bound` ratchets to the
+    /// bonded rate and the 40 %-of-peak floor pins it there for ~30 s.
+    pub fn set_broadcast_active(&mut self, active: bool) {
+        self.broadcast_active = active;
     }
 }
 
@@ -682,6 +702,36 @@ mod tests {
             "PPD should be capped at 3× lower_bound, got {}",
             oracle.upper_bound()
         );
+    }
+
+    #[test]
+    fn broadcast_active_suppresses_delivery_observations() {
+        // Failover-broadcast inflates per-link delivery to the bonded
+        // aggregate. While suppression is on, the lower bound must NOT
+        // ratchet against contaminated samples.
+        let mut oracle = CapacityOracle::new();
+        oracle.observe_delivery(3_000_000.0);
+        assert_eq!(oracle.lower_bound(), 3_000_000.0);
+
+        oracle.set_broadcast_active(true);
+        // 10× the real per-link rate (simulating both copies attributed here)
+        oracle.observe_delivery(30_000_000.0);
+        assert_eq!(
+            oracle.lower_bound(),
+            3_000_000.0,
+            "broadcast-contaminated sample must be ignored"
+        );
+        assert_eq!(
+            oracle.estimated_cap(),
+            3_000_000.0,
+            "estimated_cap stays at the pre-broadcast floor"
+        );
+
+        // After broadcast ends, normal observations resume.
+        oracle.set_broadcast_active(false);
+        oracle.observe_delivery(3_200_000.0);
+        // Fast-rise EWMA (α=0.3): 0.7*3M + 0.3*3.2M = 3.06M
+        assert!((oracle.lower_bound() - 3_060_000.0).abs() < 1.0);
     }
 
     #[test]

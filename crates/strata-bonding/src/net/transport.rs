@@ -1361,6 +1361,10 @@ impl LinkSender for TransportLink {
         }
     }
 
+    fn set_failover_broadcast_active(&self, active: bool) {
+        self.oracle.lock().unwrap().set_broadcast_active(active);
+    }
+
     fn recv_bytes_delivered(&self) -> u64 {
         self.last_recv_bytes_delivered.load(Ordering::Relaxed)
     }

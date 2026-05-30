@@ -235,6 +235,14 @@ pub trait LinkSender: Send + Sync {
     /// inflated traffic rates from corrupting the lower bound estimate.
     fn set_saturation_probe_active(&self, _active: bool) {}
 
+    /// Notify the link that fast-failover broadcasting is active across
+    /// the bond. While true, every payload is duplicated to every link,
+    /// so this link's per-link ACK rate and receiver-reported goodput
+    /// reflect bonded aggregate traffic rather than its own capacity.
+    /// The oracle suppresses delivery observations to keep `lower_bound`
+    /// (and its 40 %-of-peak floor) from ratcheting to the bonded rate.
+    fn set_failover_broadcast_active(&self, _active: bool) {}
+
     /// Cumulative bytes the remote receiver reports as delivered on this link
     /// (from the most recent `ReceiverReport`). Returns `0` if no report has
     /// been received yet. The probe driver uses this to compute true

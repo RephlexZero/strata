@@ -14,6 +14,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, warn};
 
+/// Extra suppression window past `failover_until` during which per-link
+/// capacity oracles still ignore delivery observations. The transport's
+/// per-link ACK-rate EWMA uses a ~500 ms commit interval (see
+/// `crates/strata-bonding/src/net/transport.rs` `prev_pkts_acked_us`); a
+/// matching cooldown gives that EWMA at least one clean window to wash
+/// out broadcast-doubled samples before the oracle starts ratcheting
+/// against fresh evidence.
+const FAILOVER_BROADCAST_COOLDOWN: Duration = Duration::from_millis(500);
+
 /// Top-level bonding packet scheduler.
 ///
 /// Uses an **Earliest Delivery Path First (EDPF)** scheduler with
@@ -51,6 +60,15 @@ pub struct BondingScheduler<L: LinkSender + ?Sized + 'static> {
 
     // ─── Fast-failover state ────────────────────────────────────────
     failover_until: Option<Instant>,
+    /// Deadline past which per-link oracles may resume capturing delivery
+    /// observations. Equals `failover_until + FAILOVER_BROADCAST_COOLDOWN`
+    /// so the 500 ms ACK-rate EWMA window has time to wash out the
+    /// broadcast-doubled samples before the lower bound starts ratcheting
+    /// again. `None` when no broadcast suppression is active.
+    broadcast_suppress_until: Option<Instant>,
+    /// Last propagated broadcast-suppression state. Used to edge-trigger
+    /// `LinkSender::set_failover_broadcast_active` only on transitions.
+    prev_broadcast_active: bool,
     prev_phases: HashMap<usize, crate::net::interface::LinkPhase>,
     prev_rtts: HashMap<usize, f64>,
 
@@ -144,6 +162,8 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             kalman_rtt: HashMap::new(),
             degradation_stage: DegradationStage::Normal,
             failover_until: None,
+            broadcast_suppress_until: None,
+            prev_broadcast_active: false,
             prev_phases: HashMap::new(),
             prev_rtts: HashMap::new(),
             consecutive_dead_count: 0,
@@ -797,7 +817,49 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
         if trigger_failover {
             let failover_duration =
                 Duration::from_millis(self.scheduler.config().failover_duration_ms);
-            self.failover_until = Some(Instant::now() + failover_duration);
+            let now = Instant::now();
+            self.failover_until = Some(now + failover_duration);
+            // Suppress per-link oracle delivery observations for the full
+            // broadcast window plus a short cooldown. Without this, every
+            // link's ACK-rate EWMA captures the bonded-aggregate rate, the
+            // oracle's `lower_bound` ratchets up, the 40 %-of-peak floor
+            // traps it, and `cap_kbps` reports a phantom 2–4× the real
+            // physical capacity. The encoder then targets that phantom
+            // rate and overshoots into wire loss.
+            self.broadcast_suppress_until =
+                Some(now + failover_duration + FAILOVER_BROADCAST_COOLDOWN);
+        }
+
+        self.propagate_broadcast_suppression();
+    }
+
+    /// Edge-trigger `set_failover_broadcast_active(true/false)` on every
+    /// link whenever the suppression state actually changes. Called from
+    /// `check_failover_conditions`, which itself is called every
+    /// `refresh_metrics` tick — so transitions are caught at the natural
+    /// scheduler cadence without polling per-packet.
+    fn propagate_broadcast_suppression(&mut self) {
+        let active = self.is_broadcast_suppression_active();
+        if active == self.prev_broadcast_active {
+            return;
+        }
+        for id in self.scheduler.link_ids() {
+            if let Some(link) = self.scheduler.get_link(id) {
+                link.set_failover_broadcast_active(active);
+            }
+        }
+        self.prev_broadcast_active = active;
+        // Clear the suppression deadline once it has expired so we don't
+        // keep checking a stale Instant.
+        if !active {
+            self.broadcast_suppress_until = None;
+        }
+    }
+
+    fn is_broadcast_suppression_active(&self) -> bool {
+        match self.broadcast_suppress_until {
+            Some(until) => Instant::now() < until,
+            None => false,
         }
     }
 
@@ -1139,6 +1201,7 @@ mod tests {
         metrics: Mutex<LinkMetrics>,
         sent_packets: Mutex<Vec<Vec<u8>>>,
         ppd_probe_count: AtomicUsize,
+        broadcast_active_calls: Mutex<Vec<bool>>,
     }
 
     impl MockLink {
@@ -1174,6 +1237,7 @@ mod tests {
                 }),
                 sent_packets: Mutex::new(Vec::new()),
                 ppd_probe_count: AtomicUsize::new(0),
+                broadcast_active_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -1203,6 +1267,9 @@ mod tests {
         }
         fn inject_ppd_pair(&self) {
             self.ppd_probe_count.fetch_add(1, Ordering::Relaxed);
+        }
+        fn set_failover_broadcast_active(&self, active: bool) {
+            self.broadcast_active_calls.lock().unwrap().push(active);
         }
     }
 
@@ -1343,6 +1410,67 @@ mod tests {
 
         // Should trigger failover
         assert!(scheduler.in_failover_mode());
+    }
+
+    #[test]
+    fn failover_propagates_broadcast_suppression_to_oracle() {
+        // Regression for the oracle-inflation pathway: during failover
+        // every payload is broadcast to every link, so each link's per-link
+        // ACK rate captures bonded-aggregate traffic. The oracle must be
+        // told to suppress delivery observations for the broadcast window
+        // (plus a short cooldown for the ACK-rate EWMA to wash out).
+        let mut scheduler = BondingScheduler::with_config(SchedulerConfig {
+            failover_duration_ms: 100,
+            ..SchedulerConfig::default()
+        });
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        let l2 = Arc::new(MockLink::new(2, 10_000_000.0, 10.0));
+        scheduler.add_link(l1.clone());
+        scheduler.add_link(l2.clone());
+
+        // Baseline refresh: nothing happening yet → no calls.
+        scheduler.refresh_metrics();
+        assert!(l1.broadcast_active_calls.lock().unwrap().is_empty());
+        assert!(l2.broadcast_active_calls.lock().unwrap().is_empty());
+
+        // Trigger failover via phase degradation.
+        l1.set_phase(LinkPhase::Degrade);
+        scheduler.refresh_metrics();
+        assert!(scheduler.in_failover_mode());
+
+        // Both links must have received exactly one true call.
+        assert_eq!(
+            *l1.broadcast_active_calls.lock().unwrap(),
+            vec![true],
+            "link 1 must receive broadcast=true on the failover edge"
+        );
+        assert_eq!(
+            *l2.broadcast_active_calls.lock().unwrap(),
+            vec![true],
+            "link 2 must receive broadcast=true on the failover edge"
+        );
+
+        // Repeated refreshes inside the broadcast window must NOT spam the
+        // trait method — only edges propagate.
+        scheduler.refresh_metrics();
+        scheduler.refresh_metrics();
+        assert_eq!(l1.broadcast_active_calls.lock().unwrap().len(), 1);
+        assert_eq!(l2.broadcast_active_calls.lock().unwrap().len(), 1);
+
+        // Wait past failover_duration (100 ms) + cooldown (500 ms).
+        std::thread::sleep(Duration::from_millis(700));
+        scheduler.refresh_metrics();
+
+        // Suppression must clear with a single false call per link.
+        assert_eq!(
+            *l1.broadcast_active_calls.lock().unwrap(),
+            vec![true, false],
+            "link 1 must receive broadcast=false once the cooldown expires"
+        );
+        assert_eq!(
+            *l2.broadcast_active_calls.lock().unwrap(),
+            vec![true, false]
+        );
     }
 
     #[test]
