@@ -5,6 +5,116 @@ use serde::Deserialize;
 
 pub const CONFIG_VERSION: u32 = 1;
 
+/// Operating profile, keyed to the egress target's latency budget.
+///
+/// The latency a bonded stream can afford is a property of *where it is going*,
+/// not of Strata itself. Rather than tuning ~8 feedback loops by hand for every
+/// run, a profile selects a coherent operating point: how the receiver playout
+/// behaves (fixed vs adaptive, and its floor), whether the sender probes and
+/// fast-fails-over, and how aggressively the encoder bitrate tracks capacity.
+///
+/// Explicit config/env knobs still override individual fields — the profile
+/// only sets the baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StreamProfile {
+    /// YouTube HLS (H.265) and similar store-and-forward ingest with a large
+    /// (10–30 s) downstream buffer. Fixed, generous playout (no downward
+    /// adaptation), saturation probes OFF, fast-failover OFF, slow/conservative
+    /// bitrate. The "boring and reliable" mode — survival over latency.
+    #[default]
+    Broadcast,
+    /// RTMP/H.264 to YouTube, or RTMP/SRT to a direct endpoint. Adaptive but
+    /// damped playout with a moderate floor, conservative bitrate, fast-failover
+    /// ON, probes OFF. Targets "better than YouTube's own latency" without
+    /// chasing the absolute bleeding edge. The sensible default for most uses.
+    LowLatency,
+    /// Genuinely low-latency direct use (preview monitors, interactive). The
+    /// full aggressive adaptive stack: tight playout, probes and failover on.
+    Realtime,
+}
+
+/// Receiver playout-window operating point selected by a [`StreamProfile`].
+#[derive(Debug, Clone, Copy)]
+pub struct PlayoutProfile {
+    pub start_ms: u64,
+    pub min_ms: u64,
+    pub max_ms: u64,
+    /// When true the playout window is pinned at `start_ms` — no jitter/spread
+    /// adaptation. Correct when a large downstream buffer makes a stable,
+    /// generous window strictly better than one that chases the mean.
+    pub fixed: bool,
+}
+
+impl StreamProfile {
+    /// Parse from a config/env string. Accepts `broadcast`/`hls`,
+    /// `low-latency`/`low_latency`/`rtmp`, `realtime`/`live`. Unknown → None.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "broadcast" | "hls" => Some(Self::Broadcast),
+            "low_latency" | "lowlatency" | "rtmp" | "srt" => Some(Self::LowLatency),
+            "realtime" | "live" | "direct" => Some(Self::Realtime),
+            _ => None,
+        }
+    }
+
+    /// Playout-window baseline for this profile.
+    pub fn playout(self) -> PlayoutProfile {
+        match self {
+            // Pinned above the bonded-cellular tail OWD; downstream buffer
+            // absorbs the latency, so a stable window beats a chasing one.
+            Self::Broadcast => PlayoutProfile {
+                start_ms: 1500,
+                min_ms: 1500,
+                max_ms: 3000,
+                fixed: true,
+            },
+            // Adaptive but with a real floor so it can't chase the mean below
+            // the HARQ-retry tail. Grows on fades, drains slowly.
+            Self::LowLatency => PlayoutProfile {
+                start_ms: 600,
+                min_ms: 400,
+                max_ms: 1500,
+                fixed: false,
+            },
+            // Tight, fully adaptive — for paths that genuinely need it.
+            Self::Realtime => PlayoutProfile {
+                start_ms: 200,
+                min_ms: 50,
+                max_ms: 800,
+                fixed: false,
+            },
+        }
+    }
+
+    /// Scheduler baseline for this profile. Starts from [`SchedulerConfig::default`]
+    /// (which is itself the broadcast operating point) and adjusts probing and
+    /// failover per the latency budget.
+    pub fn scheduler_config(self) -> SchedulerConfig {
+        let mut c = SchedulerConfig::default();
+        match self {
+            Self::Broadcast => {
+                // Probes off (already the default sentinel), failover off:
+                // the downstream buffer hides any reconverge, and broadcasting
+                // all traffic on instability just doubles offered load.
+                c.failover_enabled = false;
+            }
+            Self::LowLatency => {
+                // Probes off (PPD still supplies passive capacity samples), but
+                // keep fast-failover: at sub-second playout a dead link must be
+                // shed quickly or it stalls the buffer.
+                c.failover_enabled = true;
+            }
+            Self::Realtime => {
+                // Full adaptive: periodic saturation probes for fresh capacity,
+                // fast-failover on.
+                c.failover_enabled = true;
+                c.saturation_probe_interval_s = 20.0;
+            }
+        }
+        c
+    }
+}
+
 /// Raw deserialized TOML configuration (pre-resolution).
 ///
 /// All fields use `Option` to support partial overrides; defaults are
@@ -13,6 +123,10 @@ pub const CONFIG_VERSION: u32 = 1;
 #[serde(default)]
 pub struct BondingConfigInput {
     pub version: u32,
+    /// Operating profile: `broadcast` (default), `low-latency`, or `realtime`.
+    /// Selects coherent baselines for playout, probing, failover and bitrate;
+    /// explicit fields below still override.
+    pub profile: Option<String>,
     pub links: Vec<LinkConfigInput>,
     pub receiver: ReceiverConfigInput,
     pub lifecycle: LinkLifecycleConfigInput,
@@ -130,6 +244,13 @@ pub struct ReceiverConfig {
     pub start_latency: Duration,
     pub buffer_capacity: usize,
     pub skip_after: Option<Duration>,
+    /// Floor for the adaptive playout window (ignored when `fixed_playout`).
+    pub min_latency: Duration,
+    /// Ceiling for the adaptive playout window.
+    pub max_latency: Duration,
+    /// Pin the playout window at `start_latency` — no jitter/spread adaptation.
+    /// Set by the [`StreamProfile`] (true for broadcast).
+    pub fixed_playout: bool,
 }
 
 /// Resolved link lifecycle state-machine thresholds.
@@ -167,6 +288,9 @@ impl Default for ReceiverConfig {
             start_latency: Duration::from_millis(1500),
             buffer_capacity: 2048,
             skip_after: None,
+            min_latency: Duration::from_millis(1000),
+            max_latency: Duration::from_millis(3000),
+            fixed_playout: false,
         }
     }
 }
@@ -276,6 +400,7 @@ impl Default for SchedulerConfig {
 #[derive(Debug, Clone)]
 pub struct BondingConfig {
     pub version: u32,
+    pub profile: StreamProfile,
     pub links: Vec<LinkConfig>,
     pub receiver: ReceiverConfig,
     pub lifecycle: LinkLifecycleConfig,
@@ -286,6 +411,7 @@ impl Default for BondingConfig {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
+            profile: StreamProfile::default(),
             links: Vec::new(),
             receiver: ReceiverConfig::default(),
             lifecycle: LinkLifecycleConfig::default(),
@@ -329,8 +455,8 @@ impl LinkLifecycleConfigInput {
 }
 
 impl SchedulerConfigInput {
-    pub fn resolve(self) -> SchedulerConfig {
-        let defaults = SchedulerConfig::default();
+    pub fn resolve(self, profile: StreamProfile) -> SchedulerConfig {
+        let defaults = profile.scheduler_config();
         SchedulerConfig {
             redundancy_enabled: self
                 .redundancy_enabled
@@ -421,11 +547,22 @@ impl BondingConfigInput {
             return Err(format!("Unsupported config version {}", version));
         }
 
+        // Resolve the operating profile first — it provides the baseline for
+        // playout and scheduler tuning that explicit fields then override.
+        let profile = match &self.profile {
+            Some(p) => StreamProfile::parse(p).ok_or_else(|| {
+                format!(
+                    "unknown profile '{}' (expected broadcast|low-latency|realtime)",
+                    p
+                )
+            })?,
+            None => StreamProfile::default(),
+        };
+        let playout = profile.playout();
+
         let receiver = ReceiverConfig {
             start_latency: Duration::from_millis(
-                self.receiver
-                    .start_latency_ms
-                    .unwrap_or(ReceiverConfig::default().start_latency.as_millis() as u64),
+                self.receiver.start_latency_ms.unwrap_or(playout.start_ms),
             ),
             buffer_capacity: self
                 .receiver
@@ -433,10 +570,15 @@ impl BondingConfigInput {
                 .unwrap_or(ReceiverConfig::default().buffer_capacity)
                 .max(16),
             skip_after: self.receiver.skip_after_ms.map(Duration::from_millis),
+            min_latency: Duration::from_millis(playout.min_ms),
+            max_latency: Duration::from_millis(
+                self.scheduler.max_latency_ms.unwrap_or(playout.max_ms),
+            ),
+            fixed_playout: playout.fixed,
         };
 
         let lifecycle = self.lifecycle.resolve();
-        let scheduler = self.scheduler.resolve();
+        let scheduler = self.scheduler.resolve(profile);
 
         let mut out = Vec::new();
         let mut seen_ids = HashSet::new();
@@ -472,6 +614,7 @@ impl BondingConfigInput {
 
         Ok(BondingConfig {
             version,
+            profile,
             links: out,
             receiver,
             lifecycle,
@@ -729,14 +872,55 @@ mod tests {
         "#;
 
         let cfg = BondingConfig::from_toml_str(toml).unwrap();
-        let defaults = SchedulerConfig::default();
+        // With no explicit profile the default is Broadcast, whose scheduler
+        // baseline differs from the raw SchedulerConfig::default (failover off).
+        let defaults = StreamProfile::default().scheduler_config();
+        assert_eq!(cfg.profile, StreamProfile::Broadcast);
         assert_eq!(
             cfg.scheduler.redundancy_enabled,
             defaults.redundancy_enabled
         );
         assert_eq!(cfg.scheduler.failover_enabled, defaults.failover_enabled);
+        assert!(
+            !cfg.scheduler.failover_enabled,
+            "broadcast disables failover"
+        );
         assert_eq!(cfg.scheduler.channel_capacity, defaults.channel_capacity);
         assert!((cfg.scheduler.ewma_alpha - defaults.ewma_alpha).abs() < 1e-6);
+    }
+
+    #[test]
+    fn profile_selects_playout_and_failover() {
+        let mk = |p: &str| {
+            BondingConfig::from_toml_str(&format!(
+                "version = 1\nprofile = \"{p}\"\n[[links]]\nuri = \"strata://10.0.0.1:5000\"\n"
+            ))
+            .unwrap()
+        };
+        let bc = mk("broadcast");
+        assert!(bc.receiver.fixed_playout);
+        assert_eq!(bc.receiver.start_latency.as_millis(), 1500);
+        assert!(!bc.scheduler.failover_enabled);
+
+        let ll = mk("low-latency");
+        assert!(!ll.receiver.fixed_playout);
+        assert_eq!(ll.receiver.start_latency.as_millis(), 600);
+        assert!(ll.scheduler.failover_enabled);
+
+        let rt = mk("realtime");
+        assert!(!rt.receiver.fixed_playout);
+        assert_eq!(rt.receiver.start_latency.as_millis(), 200);
+        assert!(rt.scheduler.saturation_probe_interval_s < 1e9);
+
+        // Unknown profile is an error.
+        assert!(BondingConfig::from_toml_str("version = 1\nprofile = \"bogus\"\n").is_err());
+
+        // Explicit start_latency_ms overrides the profile baseline.
+        let override_cfg = BondingConfig::from_toml_str(
+            "version = 1\nprofile = \"broadcast\"\n[receiver]\nstart_latency_ms = 2500\n",
+        )
+        .unwrap();
+        assert_eq!(override_cfg.receiver.start_latency.as_millis(), 2500);
     }
 
     #[test]

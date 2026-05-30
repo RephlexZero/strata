@@ -15,6 +15,7 @@
 #   STRATA_RESOLUTION      — WxH (default: 640x360)
 #   STRATA_FRAMERATE       — FPS (default: 30)
 #   STRATA_CODEC           — h264 or h265 (default: h265)
+#   STRATA_AUDIO_ENABLED   — Enable sender audio path (default: 1)
 #   STRATA_BITRATE         — Target kbps (default: 500)
 #   STRATA_MIN_BITRATE     — Min kbps (default: 200)
 #   STRATA_MAX_BITRATE     — Max kbps (default: 1500)
@@ -32,13 +33,18 @@
 #   STRATA_PPD_PROBE_INTERVAL_S — PPD probe-pair interval per link, seconds
 #                                 (default: scheduler default; huge = disable)
 #   STRATA_MAX_LATENCY_MS  — Receiver jitter buffer ceiling (default: 3000)
+#   STRATA_RECEIVER_BUFFER_CAPACITY — Receiver reorder buffer slots (default: 4096)
 #   STRATA_DURATION_SECS   — How long to stream before stopping (default: 60)
+#   STRATA_MONITOR_INTERVAL_S — Monitor loop cadence in seconds (default: 5)
+#   STRATA_SKIP_ADMISSION=1 — Skip the bidirectional admission gate
+#   STRATA_ADMISSION_WAIT_S — Admission gate warm-up before checking links (default: 12)
 #   STRATA_NO_BUILD=1      — Skip building and installing the sender binary
 #   STRATA_NO_DEPLOY=1     — Skip cross-compiling and deploying receiver binary
 #   STRATA_FEC=off         — Diagnostic: disable FEC repair (isolate whether
 #                            FEC recovery is the source of corrupt video)
 #   STRATA_DEPLOY_IFACE    — Network interface for SSH/SCP deploy (e.g. "wlan0" to avoid cellular)
 #   STRATA_LOG_LEVEL       — Rust log level (default: debug)
+#   STRATA_GST_DEBUG       — GStreamer debug categories for receiver (default: tsdemux:4,strata*:4)
 #   YOUTUBE_API_KEY        — API key for fetching stream health
 #   YOUTUBE_STREAM_ID      — ID of the YouTube live stream to monitor
 #
@@ -90,6 +96,13 @@ VIDEO_SOURCE="${STRATA_VIDEO_SOURCE:-test}"
 RESOLUTION="${STRATA_RESOLUTION:-640x360}"
 FRAMERATE="${STRATA_FRAMERATE:-30}"
 CODEC="${STRATA_CODEC:-h265}"
+# Operating profile, keyed to the egress target's latency budget:
+#   broadcast    — YouTube HLS / store-and-forward (fixed playout, probes/failover off)
+#   low-latency  — RTMP/SRT to YouTube or a direct endpoint (adaptive, damped)
+#   realtime     — direct low-latency (full adaptive stack)
+# Explicit STRATA_* knobs below still override individual fields.
+PROFILE="${STRATA_PROFILE:-broadcast}"
+AUDIO_ENABLED="${STRATA_AUDIO_ENABLED:-1}"
 BITRATE="${STRATA_BITRATE:-500}"
 MIN_BITRATE="${STRATA_MIN_BITRATE:-200}"
 MAX_BITRATE="${STRATA_MAX_BITRATE:-1500}"
@@ -102,10 +115,20 @@ FAILOVER_DURATION_MS="${STRATA_FAILOVER_DURATION_MS:-800}"
 SAT_PROBE_INTERVAL_S="${STRATA_SAT_PROBE_INTERVAL_S:-}"
 SAT_PROBE_DURATION_S="${STRATA_SAT_PROBE_DURATION_S:-}"
 PPD_PROBE_INTERVAL_S="${STRATA_PPD_PROBE_INTERVAL_S:-}"
-MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-3000}"
+# Empty → the selected profile's playout ceiling applies. Set to override it.
+MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-}"
+RECEIVER_BUFFER_CAPACITY="${STRATA_RECEIVER_BUFFER_CAPACITY:-4096}"
 DURATION="${STRATA_DURATION_SECS:-60}"
+MONITOR_INTERVAL="${STRATA_MONITOR_INTERVAL_S:-5}"
+SKIP_ADMISSION="${STRATA_SKIP_ADMISSION:-0}"
+ADMISSION_WAIT="${STRATA_ADMISSION_WAIT_S:-12}"
 LOG_LEVEL="${STRATA_LOG_LEVEL:-debug,strata_bonding=debug,strata_transport=debug,strata::adapt=debug}"
+GST_DEBUG_LEVEL="${STRATA_GST_DEBUG:-tsdemux:4,strata*:4}"
 HOST="${STRATA_RECEIVER_HOST}"
+
+[[ "$RECEIVER_BUFFER_CAPACITY" =~ ^[1-9][0-9]*$ ]] || fail "STRATA_RECEIVER_BUFFER_CAPACITY must be a positive integer"
+[[ "$MONITOR_INTERVAL" =~ ^[1-9][0-9]*$ ]] || fail "STRATA_MONITOR_INTERVAL_S must be a positive integer"
+[[ "$ADMISSION_WAIT" =~ ^[0-9]+$ ]] || fail "STRATA_ADMISSION_WAIT_S must be a non-negative integer"
 
 # SSH/SCP options — bind to a specific interface (e.g. WiFi) so deploys
 # don't go through the cellular links you're about to bond.
@@ -317,6 +340,8 @@ RECEIVER_TOML=$(mktemp /tmp/strata-receiver-XXXXXX.toml)
 
 # Sender TOML
 {
+    echo "profile = \"$PROFILE\""
+    echo ""
     for ((i=0; i<NUM_LINKS; i++)); do
         echo "[[links]]"
         echo "id = $i"
@@ -351,14 +376,19 @@ RECEIVER_TOML=$(mktemp /tmp/strata-receiver-XXXXXX.toml)
 
 # Receiver TOML
 {
-    echo "[receiver]"
-    echo "buffer_capacity = 4096"
+    echo "profile = \"$PROFILE\""
     echo ""
-    echo "[scheduler]"
-    # Only the hard ceiling is user-set (from STRATA_MAX_LATENCY_MS).  The
-    # buffer self-tunes within this ceiling via closed-loop late-arrival
-    # feedback — no jitter/start-latency knobs to misconfigure.
-    echo "max_latency_ms = $MAX_LATENCY_MS"
+    echo "[receiver]"
+    echo "buffer_capacity = $RECEIVER_BUFFER_CAPACITY"
+    echo ""
+    # Playout is driven by the profile (fixed floor for broadcast, adaptive
+    # within the profile ceiling otherwise). Only emit an explicit ceiling
+    # when the operator set STRATA_MAX_LATENCY_MS.
+    if [[ -n "$MAX_LATENCY_MS" ]]; then
+        echo ""
+        echo "[scheduler]"
+        echo "max_latency_ms = $MAX_LATENCY_MS"
+    fi
 } > "$RECEIVER_TOML"
 
 info "Sender config: $SENDER_TOML"
@@ -393,7 +423,7 @@ RECEIVER_SCRIPT=$(mktemp /tmp/strata-receiver-start-XXXXXX.sh)
 cat > "$RECEIVER_SCRIPT" << ENDSCRIPT
 #!/bin/bash
 export GST_PLUGIN_PATH=\$HOME/.local/share/gstreamer-1.0/plugins
-nohup env RUST_LOG="$LOG_LEVEL" GST_DEBUG="tsdemux:4,strata*:4" STRATA_FEC="${STRATA_FEC:-}" /usr/local/bin/strata-pipeline receiver \\
+nohup env RUST_LOG="$LOG_LEVEL" GST_DEBUG="$GST_DEBUG_LEVEL" STRATA_FEC="${STRATA_FEC:-}" /usr/local/bin/strata-pipeline receiver \\
   --bind "$BIND_STR" \\
   --relay-url "$STRATA_RELAY_URL" \\
   --codec "$CODEC" \\
@@ -446,9 +476,19 @@ SENDER_ARGS=(
     --bitrate "$BITRATE"
     --min-bitrate "$MIN_BITRATE"
     --max-bitrate "$MAX_BITRATE"
-    --audio
     --config "$SENDER_TOML"
 )
+
+case "${AUDIO_ENABLED,,}" in
+    1|true|yes|on)
+        SENDER_ARGS+=(--audio)
+        ;;
+    0|false|no|off)
+        ;;
+    *)
+        fail "STRATA_AUDIO_ENABLED must be one of 0/1/false/true/no/yes/off/on"
+        ;;
+esac
 
 if [[ "$VIDEO_SOURCE" == "v4l2" ]]; then
     SENDER_ARGS+=(--device "$VIDEO_DEVICE")
@@ -470,7 +510,7 @@ info "Sender started (PID $SENDER_PID)"
 
 # ── Monitor ─────────────────────────────────────────────────────────
 echo ""
-echo "── Streaming for ${DURATION}s — monitoring every 5s ──"
+echo "── Streaming for ${DURATION}s — monitoring every ${MONITOR_INTERVAL}s ──"
 
 ELAPSED=0
 SEGMENT_COUNT=0
@@ -480,7 +520,41 @@ WORST_FB_LOSS_FEC="0.000"
 MAX_WINDOW_LOSS_BP=0
 MAX_DELTA_LATE=0
 UNHEALTHY_WINDOWS=0
+ARTIFACT_DIR="./runs/field-test-${SENDER_PID}"
+REMOTE_DAMAGE_TAR="/tmp/strata-hls-damage-${SENDER_PID}.tgz"
+DAMAGE_CAPTURED=0
+DAMAGE_REASON=""
 CLEANUP_DONE=0
+
+capture_damage_artifacts() {
+    local reason="$1"
+    local hls_base
+    local hls_name
+
+    if [[ $DAMAGE_CAPTURED -eq 1 ]]; then
+        return
+    fi
+
+    DAMAGE_CAPTURED=1
+    DAMAGE_REASON="$reason"
+    mkdir -p "$ARTIFACT_DIR"
+    printf '%s\n' "$reason" > "$ARTIFACT_DIR/damage-reason.txt"
+    printf 'elapsed=%ss\nsender_pid=%s\nreceiver_pid=%s\n' "$ELAPSED" "$SENDER_PID" "$RECEIVER_PID" \
+        > "$ARTIFACT_DIR/damage-context.txt"
+
+    info "Capturing damage artifacts (${reason}) → ${ARTIFACT_DIR}"
+
+    hls_base=$(dirname "$HLS_DIR")
+    hls_name=$(basename "$HLS_DIR")
+    ssh "${SSH_OPTS[@]}" "$HOST" "tar -C '$hls_base' -czf '$REMOTE_DAMAGE_TAR' '$hls_name' 2>/dev/null || true" \
+        2>/dev/null || warn "Failed to snapshot remote HLS directory"
+    scp "${SSH_OPTS[@]}" -q "$HOST:$REMOTE_DAMAGE_TAR" "$ARTIFACT_DIR/hls-damage-snapshot.tgz" \
+        || warn "Failed to fetch HLS damage snapshot"
+    scp "${SSH_OPTS[@]}" -q "$HOST:/tmp/strata-receiver.log" "$ARTIFACT_DIR/strata-receiver-damage.log" \
+        || warn "Failed to fetch receiver damage log"
+    cp /tmp/strata-sender.log "$ARTIFACT_DIR/strata-sender-damage.log" \
+        || warn "Failed to copy sender damage log"
+}
 
 cleanup() {
     if [[ $CLEANUP_DONE -eq 1 ]]; then
@@ -510,15 +584,31 @@ cleanup() {
     scp "${SSH_OPTS[@]}" -q "$HOST:/tmp/strata-receiver.log" "./strata-receiver-${SENDER_PID}.log" || warn "Failed to fetch receiver log"
     cp /tmp/strata-sender.log "./strata-sender-${SENDER_PID}.log" || warn "Failed to copy sender log"
     info "Saved full logs to ./strata-sender-${SENDER_PID}.log and ./strata-receiver-${SENDER_PID}.log"
+    if [[ $DAMAGE_CAPTURED -eq 1 ]]; then
+        mkdir -p "$ARTIFACT_DIR"
+        if [[ ! -f "$ARTIFACT_DIR/hls-damage-snapshot.tgz" ]]; then
+            scp "${SSH_OPTS[@]}" -q "$HOST:$REMOTE_DAMAGE_TAR" "$ARTIFACT_DIR/hls-damage-snapshot.tgz" \
+                || warn "Failed to fetch deferred HLS damage snapshot"
+        fi
+        info "Damage artifacts saved under ${ARTIFACT_DIR}"
+    fi
 
     rm -f "$SENDER_TOML" "$RECEIVER_TOML" "$RECEIVER_SCRIPT" "/tmp/start-receiver.sh"
     echo ""
 
     MAX_WINDOW_LOSS_PCT=$(awk "BEGIN { printf \"%.1f\", $MAX_WINDOW_LOSS_BP / 100.0 }")
     HEALTH_SUMMARY="worst_loss_fec=${WORST_FB_LOSS_FEC} max_window_loss=${MAX_WINDOW_LOSS_PCT}% max_delta_late=${MAX_DELTA_LATE} unhealthy_windows=${UNHEALTHY_WINDOWS}"
+    FATAL_RX_ERROR=0
+    if [[ -f "./strata-receiver-${SENDER_PID}.log" ]] && grep -q 'Timestamping error on input streams' "./strata-receiver-${SENDER_PID}.log"; then
+        FATAL_RX_ERROR=1
+        HEALTH_SUMMARY+=" fatal_rx=timestamping"
+    fi
 
     severe_health_failure=0
     degraded_health=0
+    if [[ $FATAL_RX_ERROR -eq 1 ]]; then
+        severe_health_failure=1
+    fi
     if awk "BEGIN { exit !($WORST_FB_LOSS_FEC >= 0.55) }"; then
         severe_health_failure=1
     fi
@@ -584,10 +674,9 @@ set +e
 # print the receiver-side per-link RX heartbeat so the failure mode
 # (no bytes at receiver = CGNAT/sender-bind, vs bytes-but-no-ACK =
 # return path) is unambiguous.
-if [[ "${STRATA_SKIP_ADMISSION:-0}" == "1" ]]; then
+if [[ "$SKIP_ADMISSION" == "1" ]]; then
     warn "Link admission gate skipped (STRATA_SKIP_ADMISSION=1)"
 else
-    ADMISSION_WAIT="${STRATA_ADMISSION_WAIT_S:-12}"
     echo ""
     echo "── Link admission gate (${ADMISSION_WAIT}s bidirectional check) ──"
     sleep "$ADMISSION_WAIT"
@@ -647,8 +736,8 @@ else
 fi
 
 while [[ $ELAPSED -lt $DURATION ]]; do
-    sleep 5
-    ELAPSED=$((ELAPSED + 5))
+    sleep "$MONITOR_INTERVAL"
+    ELAPSED=$((ELAPSED + MONITOR_INTERVAL))
 
     # Sender status
     if ! kill -0 "$SENDER_PID" 2>/dev/null; then
@@ -657,15 +746,30 @@ while [[ $ELAPSED -lt $DURATION ]]; do
     fi
 
     # Receiver stats (last lines — include enough history for per-link fields)
-    RX_RAW=$(ssh "${SSH_OPTS[@]}" "$HOST" "tail -30 /tmp/strata-receiver.log 2>/dev/null" 2>/dev/null || echo "")
+    RX_RAW=$(ssh "${SSH_OPTS[@]}" "$HOST" "tail -80 /tmp/strata-receiver.log 2>/dev/null" 2>/dev/null || echo "")
     RX_STATS_LINE=$(echo "$RX_RAW" | grep 'strata-stats' | tail -1 || echo "")
-    STATS=$(echo "$RX_STATS_LINE" | grep -oE 'next_seq=[^,;]+|lost_packets=[^,;]+|late_packets=[^,;]+|current_latency_ms=[^,;]+|target_latency_ms=[^,;]+|jitter_estimate_ms=[^,;]+|loss_rate=[^,;]+|packets_delivered=[^,;]+|queue_depth=[^,;]+' | head -9 | tr '\n' ' ')
     RX_LINK_STATS=$(echo "$RX_STATS_LINE" | grep -oE 'packets_received_link_[0-9]+=[^,;]+|packets_delivered_link_[0-9]+=[^,;]+|loss_link_[0-9]+=[^,;]+' | tr '\n' ' ')
+    RX_HB_WINDOW=$(echo "$RX_RAW" | grep 'rx link heartbeat' || echo "")
 
     # Extract numbers for delta calculation (handle GStreamer type annotations like =(guint64)123)
-    CUR_LOST=$(num "$(echo "$STATS" | grep -oP 'lost_packets=\([^)]*\)\K[0-9]+' | head -1)")
-    CUR_LATE=$(num "$(echo "$STATS" | grep -oP 'late_packets=\([^)]*\)\K[0-9]+' | head -1)")
-    CUR_DELIVERED=$(num "$(echo "$STATS" | grep -oP 'packets_delivered=\([^)]*\)\K[0-9]+' | head -1)")
+    CUR_LOST=$(num "$(echo "$RX_STATS_LINE" | grep -oP 'lost_packets=\([^)]*\)\K[0-9]+' | head -1)")
+    CUR_LATE=$(num "$(echo "$RX_STATS_LINE" | grep -oP 'late_packets=\([^)]*\)\K[0-9]+' | head -1)")
+    CUR_DELIVERED=$(num "$(echo "$RX_STATS_LINE" | grep -oP 'packets_delivered=\([^)]*\)\K[0-9]+' | head -1)")
+    CUR_QUEUE=$(num "$(echo "$RX_STATS_LINE" | grep -oP 'queue_depth=\([^)]*\)\K[0-9]+' | head -1)")
+    CUR_NEXT_SEQ=$(num "$(echo "$RX_STATS_LINE" | grep -oP 'next_seq=\([^)]*\)\K[0-9]+' | head -1)")
+    CUR_LATENCY=$(num "$(echo "$RX_STATS_LINE" | grep -oP 'current_latency_ms=\([^)]*\)\K[0-9]+' | head -1)")
+    CUR_TARGET_LATENCY=$(num "$(echo "$RX_STATS_LINE" | grep -oP 'target_latency_ms=\([^)]*\)\K[0-9]+' | head -1)")
+    CUR_DISCONT=$(num "$(echo "$RX_STATS_LINE" | grep -oP 'discontinuities=\([^)]*\)\K[0-9]+' | head -1)")
+    CUR_JITTER=$(echo "$RX_STATS_LINE" | grep -oP 'jitter_estimate_ms=\([^)]*\)\K[-0-9.eE+]+' | head -1 || true)
+    CUR_SMOOTHED_LOSS=$(echo "$RX_STATS_LINE" | grep -oP 'smoothed_loss_rate=\([^)]*\)\K[-0-9.eE+]+' | head -1 || true)
+    if [[ -z "$CUR_SMOOTHED_LOSS" ]]; then
+        CUR_SMOOTHED_LOSS=$(echo "$RX_STATS_LINE" | grep -oP 'loss_rate=\([^)]*\)\K[-0-9.eE+]+' | head -1 || true)
+    fi
+    [[ -z "$CUR_JITTER" ]] && CUR_JITTER="0"
+    [[ -z "$CUR_SMOOTHED_LOSS" ]] && CUR_SMOOTHED_LOSS="0"
+    CUR_JITTER_FMT=$(awk "BEGIN { printf \"%.1f\", ${CUR_JITTER:-0} }")
+    CUR_SMOOTHED_LOSS_FMT=$(awk "BEGIN { printf \"%.3f\", ${CUR_SMOOTHED_LOSS:-0} }")
+
     # A counter reset (receiver restart) would produce a negative delta.
     # Clamp to 0 so the health math remains sane.
     DELTA_LOST=$(( CUR_LOST >= PREV_LOST ? CUR_LOST - PREV_LOST : 0 ))
@@ -707,6 +811,7 @@ while [[ $ELAPSED -lt $DURATION ]]; do
     LINK_LINES=$(grep '\[link\]' /tmp/strata-sender.log 2>/dev/null | tail -"$NUM_LINKS" | sed 's/.*\[link\]/  [link]/' || echo "")
 
     CUR_FB_LOSS=$(echo "$FB_LINE" | grep -oP 'loss_fec=\K[0-9]+(\.[0-9]+)?' | head -1 || true)
+    [[ -z "$CUR_FB_LOSS" ]] && CUR_FB_LOSS="0.000"
     if [[ -n "$CUR_FB_LOSS" ]]; then
         if awk "BEGIN { exit !($CUR_FB_LOSS > $WORST_FB_LOSS_FEC) }"; then
             WORST_FB_LOSS_FEC="$CUR_FB_LOSS"
@@ -717,6 +822,40 @@ while [[ $ELAPSED -lt $DURATION ]]; do
     fi
 
     WINDOW_LOSS_PCT=$(awk "BEGIN { printf \"%.1f\", $WINDOW_LOSS_BP / 100.0 }")
+    CONTINUITY_MISMATCHES=$(num "$(ssh "${SSH_OPTS[@]}" "$HOST" "grep -c 'CONTINUITY: Mismatch' /tmp/strata-receiver.log 2>/dev/null" 2>/dev/null || echo "0")")
+
+    RX_LINK_SUMMARY=""
+    for ((li=0; li<NUM_LINKS; li++)); do
+        LINK_RX=$(num "$(echo "$RX_LINK_STATS" | grep -oP "packets_received_link_${li}=\([^)]*\)\K[0-9]+" | head -1)")
+        LINK_OK=$(num "$(echo "$RX_LINK_STATS" | grep -oP "packets_delivered_link_${li}=\([^)]*\)\K[0-9]+" | head -1)")
+        LINK_LOSS=$(echo "$RX_LINK_STATS" | grep -oP "loss_link_${li}=\([^)]*\)\K[-0-9.eE+]+" | head -1 || true)
+        [[ -z "$LINK_LOSS" ]] && LINK_LOSS="0"
+        LINK_LOSS_FMT=$(awk "BEGIN { printf \"%.3f\", ${LINK_LOSS:-0} }")
+        HB_LINE=$(echo "$RX_HB_WINDOW" | grep -E "link_id=${li}( |$)" | tail -1 || echo "")
+        LINK_FEC=$(num "$(echo "$HB_LINE" | grep -oP 'fec_recoveries=\K[0-9]+' | head -1)")
+        LINK_CORR=$(num "$(echo "$HB_LINE" | grep -oP 'fec_corrupt_dropped=\K[0-9]+' | head -1)")
+        RX_LINK_SUMMARY="${RX_LINK_SUMMARY}${RX_LINK_SUMMARY:+ }l${li}:rx=${LINK_RX}/ok=${LINK_OK}/loss=${LINK_LOSS_FMT}/fec=${LINK_FEC}/corr=${LINK_CORR}"
+    done
+
+    DAMAGE_FLAGS=""
+    if [[ $CONTINUITY_MISMATCHES -gt 0 ]]; then
+        DAMAGE_FLAGS="${DAMAGE_FLAGS}${DAMAGE_FLAGS:+ }continuity=${CONTINUITY_MISMATCHES}"
+    fi
+    if [[ $CUR_DISCONT -gt 0 ]]; then
+        DAMAGE_FLAGS="${DAMAGE_FLAGS}${DAMAGE_FLAGS:+ }discont=${CUR_DISCONT}"
+    fi
+    if awk "BEGIN { exit !($CUR_FB_LOSS >= 0.05) }"; then
+        DAMAGE_FLAGS="${DAMAGE_FLAGS}${DAMAGE_FLAGS:+ }loss_fec=${CUR_FB_LOSS}"
+    fi
+    if [[ $WINDOW_LOSS_BP -ge 100 ]]; then
+        DAMAGE_FLAGS="${DAMAGE_FLAGS}${DAMAGE_FLAGS:+ }win_loss=${WINDOW_LOSS_PCT}%"
+    fi
+    if [[ $DELTA_LATE -gt 0 ]]; then
+        DAMAGE_FLAGS="${DAMAGE_FLAGS}${DAMAGE_FLAGS:+ }delta_late=${DELTA_LATE}"
+    fi
+    if [[ -n "$DAMAGE_FLAGS" && $DAMAGE_CAPTURED -eq 0 ]]; then
+        capture_damage_artifacts "$DAMAGE_FLAGS"
+    fi
 
     # YouTube Health Polling
     YT_HEALTH_STR=""
@@ -726,11 +865,17 @@ while [[ $ELAPSED -lt $DURATION ]]; do
         [[ -n "$YT_STATUS" ]] && YT_HEALTH_STR=" YT_Health=$YT_STATUS"
     fi
 
+    # Cumulative media damage = lost + late. The honest run-health number: it
+    # never decays (unlike smoothed_loss) and counts "late" drops (silent
+    # reference-frame holes) that no loss metric otherwise surfaces.
+    CUR_DAMAGED=$(( ${CUR_LOST:-0} + ${CUR_LATE:-0} ))
+
     echo ""
     echo "╌╌╌ [${ELAPSED}s] segments=$SEGMENT_COUNT (max=$MAX_SEGMENT_COUNT)$YT_HEALTH_STR ╌╌╌"
-    echo "  RX: $STATS"
-    [[ -n "$RX_LINK_STATS" ]] && echo "  RX links: $RX_LINK_STATS"
-    echo "  Δ5s: delivered=$DELTA_DELIVERED lost=$DELTA_LOST late=$DELTA_LATE win_loss=${WINDOW_LOSS_PCT}%"
+    [[ -n "$DAMAGE_FLAGS" ]] && echo "  DAMAGE: $DAMAGE_FLAGS"
+    echo "  RX: delivered=$CUR_DELIVERED damaged=$CUR_DAMAGED (lost=$CUR_LOST late=$CUR_LATE) discont=$CUR_DISCONT queue=$CUR_QUEUE next_seq=$CUR_NEXT_SEQ latency=${CUR_LATENCY}/${CUR_TARGET_LATENCY}ms jitter=${CUR_JITTER_FMT}ms smoothed_loss=${CUR_SMOOTHED_LOSS_FMT}"
+    [[ -n "$RX_LINK_SUMMARY" ]] && echo "  RX links: $RX_LINK_SUMMARY"
+    echo "  Δ${MONITOR_INTERVAL}s: delivered=$DELTA_DELIVERED lost=$DELTA_LOST late=$DELTA_LATE win_loss=${WINDOW_LOSS_PCT}%"
     [[ -n "$ADAPT_LINE" ]] && echo "  $ADAPT_LINE"
     [[ -n "$FB_LINE" ]]    && echo "  $FB_LINE"
     [[ -n "$CMD_LINE" ]]   && echo "  $CMD_LINE"
