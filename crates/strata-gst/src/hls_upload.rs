@@ -1,6 +1,6 @@
 //! HLS segment uploader for YouTube HLS ingest.
 //!
-//! Watches a local directory where `hlssink2` writes `.ts` segments and
+//! Watches a local directory where the HLS sink writes `.ts` segments and
 //! `.m3u8` playlists, then uploads each new file to the YouTube HLS HTTP
 //! endpoint via HTTPS PUT.
 //!
@@ -31,7 +31,7 @@ const RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 
 /// Configuration for the HLS uploader.
 pub struct HlsUploaderConfig {
-    /// Local directory where hlssink2 writes segments + playlist.
+    /// Local directory where the HLS sink writes segments + playlist.
     pub segment_dir: PathBuf,
     /// Base URL for uploads (everything up to and including `file=`).
     pub base_url: String,
@@ -251,12 +251,12 @@ pub(crate) fn content_type_for_hls(filename: &str) -> &'static str {
 /// Scan `dir` for `.ts` segment files not yet in `uploaded`, returning them
 /// sorted by name.
 ///
-/// Only non-empty files are considered — `hlssink2` creates the segment file
+/// Only non-empty files are considered — the HLS sink creates the segment file
 /// before writing any data, so a zero-byte file is still open for writing.
 ///
 /// When `include_latest` is `false` (live polling mode), the segment with the
 /// highest name is also excluded because it may still be open for writing.
-/// `hlssink2` always finalises segment N before creating segment N+1, so a
+/// The HLS sink always finalises segment N before creating segment N+1, so a
 /// segment is guaranteed complete as soon as a successor exists.
 ///
 /// Set `include_latest = true` only during final shutdown cleanup, when the

@@ -155,6 +155,75 @@ fn configure_mpegtsmux(pipeline: &gst::Pipeline) {
     }
 }
 
+/// Install the DeliveredStream gate (A2) on a parsed-video src pad.
+///
+/// The bonding transport delivers in-order but, under loss, gap-skips leave the
+/// MPEG-TS multiplex holed: the next decoded access unit can be partial or carry
+/// a backwards/NONE DTS. A plain re-mux's `mpegtsmux` treats that as fatal
+/// ("Timestamping error on input streams"). This probe makes the stream the
+/// muxer sees *clean* so the re-mux can't be poisoned and still segments:
+///   1. emit nothing until the first keyframe (IDR);
+///   2. after any DISCONT, drop the rest of the damaged GOP — resume at the
+///      next keyframe (the standard "decode from next IDR after loss");
+///   3. drop any buffer whose DTS regresses below the last emitted (the actual
+///      crash trigger), so the muxer only ever sees monotonic DTS.
+fn install_delivered_stream_gate(pad: &gst::Pad) {
+    use std::sync::Mutex;
+    struct GateState {
+        waiting_for_keyframe: bool,
+        last_dts: Option<u64>,
+        dropped: u64,
+    }
+    let state = Mutex::new(GateState {
+        // Start by waiting: never hand the muxer a mid-GOP opening run.
+        waiting_for_keyframe: true,
+        last_dts: None,
+        dropped: 0,
+    });
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+        let Some(gst::PadProbeData::Buffer(buf)) = &info.data else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let flags = buf.flags();
+        let is_keyframe = !flags.contains(gst::BufferFlags::DELTA_UNIT);
+        let is_discont = flags.contains(gst::BufferFlags::DISCONT);
+        let dts = buf.dts().map(|t| t.nseconds());
+
+        let mut st = state.lock().unwrap();
+        if is_discont {
+            st.waiting_for_keyframe = true;
+        }
+        if st.waiting_for_keyframe {
+            if is_keyframe {
+                st.waiting_for_keyframe = false;
+                // Reset the DTS baseline to this IDR: the forward jump across
+                // the skipped gap is expected and must not look like a regression.
+                st.last_dts = dts;
+                return gst::PadProbeReturn::Ok;
+            }
+            st.dropped += 1;
+            if st.dropped.is_power_of_two() {
+                eprintln!(
+                    "DeliveredStream gate: dropped {} non-keyframe buffer(s) awaiting IDR after loss",
+                    st.dropped
+                );
+            }
+            return gst::PadProbeReturn::Drop;
+        }
+        // Monotonic-DTS guard: a backwards DTS is what kills mpegtsmux.
+        if let (Some(d), Some(last)) = (dts, st.last_dts)
+            && d < last
+        {
+            st.dropped += 1;
+            return gst::PadProbeReturn::Drop;
+        }
+        if dts.is_some() {
+            st.last_dts = dts;
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
 fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut dest_str = "";
     let mut stats_dest = "";
@@ -301,7 +370,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // damaged frame until the next IDR — the "clear for a moment then
     // grey/blocky" symptom). A 1 s IDR halves that error-propagation
     // window while still keeping every 2 s segment keyframe-aligned
-    // (hlssink2 closes a segment at the first keyframe past
+    // (the receiver's hlssink closes a segment at the first keyframe past
     // target-duration), so YouTube ingest stays happy. key-int-max is in
     // frames, so `framerate` == 1 s.
     let key_int = framerate;
@@ -1500,17 +1569,36 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let hls_dir = hls_tmp_dir.as_ref().unwrap();
         let seg_location = hls_dir.join("segment%05d.ts");
         let pl_location = hls_dir.join("playlist.m3u8");
+        // HLS via the DeliveredStream contract (A2). Two earlier approaches
+        // each failed one half of the problem:
+        //   * Re-mux (tsdemux → h265parse → hlssink2) SEGMENTS correctly but
+        //     mpegtsmux dies on the first backwards/NONE DTS from a gap-skip
+        //     ("Timestamping error on input streams") — fatal under loss.
+        //   * TS-passthrough (tsparse split-on-rai → hlssink) SURVIVES loss but
+        //     cannot segment a network TS: hlssink only cuts when a live encoder
+        //     upstream answers its force-key-unit requests, which never happens
+        //     across the network → one ever-growing segment, no playlist.
+        // The fix is to make the stream the egress sees *clean* — monotonic DTS,
+        // discontinuities only at keyframe (IDR) boundaries — so a plain re-mux
+        // both segments AND cannot be poisoned. The cleaning happens in a pad
+        // probe on the parsed video (`install_delivered_stream_gate`), because
+        // the keyframe signal is only reliable post-demux (mpegtsmux strips
+        // DELTA_UNIT, so the bonding transport can't see keyframes — see
+        // sink.rs). Video-only on purpose: the cross-stream audio/video DTS
+        // interleave at startup was a second crash trigger (run 5032). Audio
+        // can be re-added behind its own gate once this is field-proven.
         format!(
             "stratasrc links=\"{bind}\" name=src latency=200 ! \
              queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 \
              leaky=downstream ! \
-             tsdemux name=d \
-             d. ! queue max-size-buffers=600 max-size-bytes=0 max-size-time=2000000000 \
-                   leaky=downstream ! {parser} ! hls.video \
-             d. ! queue max-size-buffers=200 max-size-bytes=0 max-size-time=2000000000 \
-                   leaky=downstream ! aacparse ! hls.audio \
-             hlssink2 name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
-             target-duration=2 max-files=10 send-keyframe-requests=true",
+             tsparse set-timestamps=true alignment=7 ! \
+             tsdemux name=d d. ! \
+             queue max-size-buffers=600 max-size-bytes=0 max-size-time=2000000000 \
+             leaky=downstream ! \
+             {parser} name=vparse ! \
+             mpegtsmux name=mux alignment=7 pat-interval=1 pmt-interval=1 ! \
+             hlssink name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
+             target-duration=2 max-files=10 playlist-length=6",
             bind = bind_str,
             parser = relay_parser,
             seg = seg_location.display(),
@@ -1568,6 +1656,18 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("Failed to read config file '{}': {}", config_path, e))?;
         src_elem.set_property("config", &config_toml);
         eprintln!("Applied config from {}", config_path);
+    }
+
+    // HLS re-mux egress: install the DeliveredStream gate on the parsed video
+    // and disable mpegtsmux skew correction so it preserves our timestamps.
+    if use_hls_relay {
+        if let Some(vparse) = pipeline.by_name("vparse")
+            && let Some(src) = vparse.static_pad("src")
+        {
+            install_delivered_stream_gate(&src);
+            eprintln!("DeliveredStream gate installed on vparse src pad");
+        }
+        configure_mpegtsmux(&pipeline);
     }
 
     // Setup AppSink (only used for non-relay monitor/record modes)
