@@ -9,6 +9,7 @@ target/
 *.log
 .DS_Store
 Thumbs.db
+runs/
 
 # IDE settings (optional, but good to ignore user-specifics)
 .idea/
