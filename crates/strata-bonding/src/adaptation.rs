@@ -437,8 +437,17 @@ impl BitrateAdapter {
             );
         }
 
-        // Compute usable capacity (with headroom)
-        let usable_kbps = aggregate_kbps * (1.0 - self.config.headroom);
+        // Compute usable capacity for *video*, with FEC decoupled from the
+        // video budget (B5). FEC repair symbols and video bytes draw from the
+        // same aggregate pipe; when FEC overhead ramps up under loss, the video
+        // target must give way by the same amount or the two loops fight for
+        // capacity — raising one starves the other, and both feed the loss
+        // signal that drives both. Reserve the LARGER of the fixed control
+        // headroom or the current recommended FEC overhead. `recommended_fec_
+        // overhead()` reads `ewma_loss_fec` (loss-driven, no circularity) and
+        // last tick's `spare_bw_kbps` (lagged, not circular within this call).
+        let fec_reserve = self.recommended_fec_overhead().max(self.config.headroom);
+        let usable_kbps = aggregate_kbps * (1.0 - fec_reserve);
 
         // Compute pressure ratio (target / capacity; >1 = over-pressure)
         let pressure = if usable_kbps > 0.0 {
@@ -883,7 +892,18 @@ impl BitrateAdapter {
                 self.config.ramp_down_factor
             };
             let new_target = (self.current_target_kbps as f64 * reduction_factor) as u32;
-            let new_target = new_target.max(self.effective_floor_kbps());
+            // The dynamic floor is intentionally optimistic during healthy
+            // burst recovery, but once receiver-visible loss/late pressure is
+            // real it can pin the encoder above the working envelope. In that
+            // state, let congestion cuts fall back to the static floor so the
+            // encoder can actually retreat instead of staying stuck near its
+            // pre-collapse target.
+            let floor_kbps = if loss_pressure || burst_loss || severe_burst || late_pressure {
+                self.config.min_bitrate_kbps
+            } else {
+                self.effective_floor_kbps()
+            };
+            let new_target = new_target.max(floor_kbps);
 
             if new_target < self.current_target_kbps {
                 self.current_target_kbps = new_target;
@@ -2178,6 +2198,53 @@ mod tests {
             after_increase,
             adapter.current_target_kbps()
         );
+    }
+
+    #[test]
+    fn loss_congestion_can_bypass_dynamic_floor() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 5_000,
+            min_bitrate_kbps: 200,
+            min_interval: Duration::ZERO,
+            initial_bitrate_kbps: 2_000,
+            congestion_sustain: Duration::ZERO,
+            ..Default::default()
+        });
+
+        adapter.current_target_kbps = 2_000;
+        adapter.prev_capacity_kbps = 3_000.0;
+        adapter.ever_had_capacity = true;
+        adapter.goodput_peak_bps = 6_000_000.0;
+        adapter.ewma_goodput_bps = 5_000_000.0;
+        adapter.ewma_loss_fec = 0.25;
+
+        let links = vec![LinkCapacity {
+            link_id: 0,
+            capacity_kbps: 3_000.0,
+            alive: true,
+            loss_rate: 0.70,
+            rtt_ms: 120.0,
+            queue_depth: Some(120),
+        }];
+
+        let feedback = ReceiverFeedback {
+            goodput_bps: 2_500_000,
+            fec_repair_rate: 0.0,
+            jitter_buffer_ms: 2_500,
+            loss_after_fec: 0.20,
+            late_rate: 0.06,
+        };
+
+        let cmd = adapter
+            .update_with_feedback(&links, &feedback)
+            .expect("congestion update should emit a command");
+
+        assert!(
+            cmd.target_kbps < 2_000,
+            "loss-driven congestion should cut below the sticky dynamic floor: {}",
+            cmd.target_kbps
+        );
+        assert_eq!(cmd.reason, AdaptationReason::Congestion);
     }
 
     // ── Regression: EWMA loss decay during stall ─────────────────────

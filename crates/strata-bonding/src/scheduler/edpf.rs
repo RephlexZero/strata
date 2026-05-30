@@ -20,6 +20,22 @@ use crate::net::interface::{LinkMetrics, LinkPhase, LinkSender};
 use quanta::Instant;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+
+const COLLAPSE_AVOID_WINDOW: Duration = Duration::from_millis(1500);
+const COLLAPSE_LOSS_THRESHOLD: f64 = 0.45;
+const COLLAPSE_QUEUE_THRESHOLD: usize = 48;
+/// Pure-loss shedding bar (B6). The combined collapse heuristics above require
+/// BOTH high loss AND deep queue, which misses a link melting via *radio* loss
+/// (HARQ failures, fades) — high loss with no local queue buildup. Above this
+/// loss a link is toxic regardless of queue: routing the worst of both signals
+/// (a global bitrate cut) is not enough; EDPF must also shed the link itself.
+/// Set higher than the combined threshold so a transiently-lossy-but-useful
+/// link is not shed on a brief spike. The `|| !any_alive` fallback in
+/// `select_from_links` still keeps the stream alive if every link is this bad.
+const SEVERE_LOSS_THRESHOLD: f64 = 0.60;
+const COLLAPSE_GRADIENT_THRESHOLD_US: u32 = 20_000;
+const COLLAPSE_GRADIENT_QUEUE_THRESHOLD: usize = 24;
 
 /// Per-link state tracked by the EDPF scheduler.
 pub(crate) struct LinkState<L: ?Sized> {
@@ -46,6 +62,10 @@ pub(crate) struct LinkState<L: ?Sized> {
     pub penalty_factor: f64,
     /// Previous link phase (for detecting transitions).
     pub prev_phase: LinkPhase,
+    /// Short-lived suppression window after a collapse signal so EDPF does
+    /// not immediately snap traffic back onto a link that only briefly looked
+    /// healthy between refresh ticks.
+    pub avoid_until: Option<Instant>,
     /// Stop signal for the feedback thread.
     pub stop_tx: Option<crossbeam_channel::Sender<()>>,
 }
@@ -75,6 +95,11 @@ impl<L: ?Sized> LinkState<L> {
         // Clamp to 0.99 so a link never appears to have exactly 0 capacity;
         // the fallback routing path can still use it as a last resort.
         let loss = self.metrics.loss_rate.clamp(0.0, 0.99);
+        // Sender-side queue depth is the earliest direct signal that the
+        // transport is collapsing locally. RTT-based queueing lags when the
+        // paced queue is already clipped or the path has only just started to
+        // melt, so penalize deep local queues directly in the routing score.
+        let queue_depth = self.metrics.queue_depth as f64;
         let base_rtt_ms = self
             .metrics
             .rtprop_ms
@@ -104,7 +129,33 @@ impl<L: ?Sized> LinkState<L> {
             })
             .unwrap_or(1.0);
 
-        (self.metrics.capacity_bps / 8.0 * (1.0 - loss) * queue_penalty * jitter_penalty).max(1.0)
+        let local_queue_penalty = if queue_depth <= 24.0 {
+            1.0
+        } else {
+            (1.0 - ((queue_depth - 24.0) / 216.0)).clamp(0.20, 1.0)
+        };
+
+        // Match the adapter's per-link collapse heuristic: once a link shows
+        // both deep local queueing and very high sender-side retransmission
+        // pressure, treat it as temporarily toxic for EDPF rather than merely
+        // "a bit worse". Also shed a link drowning in pure radio loss even with
+        // a shallow queue (B6) — `(1 - loss)` alone only scales capacity
+        // linearly, leaving a 70%-loss link still attractive on RTT.
+        let collapse_penalty = if (self.metrics.loss_rate >= 0.55 && self.metrics.queue_depth >= 60)
+            || self.metrics.loss_rate >= SEVERE_LOSS_THRESHOLD
+        {
+            0.05
+        } else {
+            1.0
+        };
+
+        (self.metrics.capacity_bps / 8.0
+            * (1.0 - loss)
+            * queue_penalty
+            * jitter_penalty
+            * local_queue_penalty
+            * collapse_penalty)
+            .max(1.0)
     }
 
     /// Predicted arrival time (seconds from now) for a packet of `size_bytes`.
@@ -114,6 +165,23 @@ impl<L: ?Sized> LinkState<L> {
         let queue_drain =
             (self.in_flight_bytes as f64 + size_bytes as f64) / self.capacity_bytes_per_sec();
         queue_drain + self.base_rtt_secs()
+    }
+
+    fn should_avoid_temporarily(&self) -> bool {
+        let sender_collapse = (self.metrics.loss_rate >= COLLAPSE_LOSS_THRESHOLD
+            && self.metrics.queue_depth >= COLLAPSE_QUEUE_THRESHOLD)
+            // Pure radio-loss collapse: high loss with no queue buildup (B6).
+            || self.metrics.loss_rate >= SEVERE_LOSS_THRESHOLD;
+        let receiver_queue_build = self.metrics.receiver_report.as_ref().is_some_and(|report| {
+            report.delay_gradient_us >= COLLAPSE_GRADIENT_THRESHOLD_US
+                && self.metrics.queue_depth >= COLLAPSE_GRADIENT_QUEUE_THRESHOLD
+        });
+
+        sender_collapse || receiver_queue_build
+    }
+
+    fn is_temporarily_avoided(&self, now: Instant) -> bool {
+        self.avoid_until.as_ref().is_some_and(|until| now < *until)
     }
 }
 
@@ -202,6 +270,7 @@ impl<L: LinkSender + ?Sized + 'static> Edpf<L> {
                 prev_capacity_bps: metrics.capacity_bps,
                 penalty_factor: 1.0,
                 prev_phase: LinkPhase::Init,
+                avoid_until: None,
                 stop_tx: Some(stop_tx),
             },
         );
@@ -322,6 +391,16 @@ impl<L: LinkSender + ?Sized + 'static> Edpf<L> {
             }
 
             state.prev_capacity_bps = curr_capacity;
+
+            if state.should_avoid_temporarily() {
+                state.avoid_until = Some(now + COLLAPSE_AVOID_WINDOW);
+            } else if state
+                .avoid_until
+                .as_ref()
+                .is_some_and(|until| now >= *until)
+            {
+                state.avoid_until = None;
+            }
         }
     }
 
@@ -467,8 +546,12 @@ impl<L: LinkSender + ?Sized + 'static> Edpf<L> {
         }
 
         let any_alive = self.links.values().any(|state| state.metrics.alive);
-        // Collect (link_id, predicted_arrival) for alive candidates
-        let mut scored: Vec<(usize, f64)> = Vec::new();
+        let now = Instant::now();
+        // Collect (link_id, predicted_arrival) for alive candidates, keeping
+        // temporarily avoided links separate so they are only used when every
+        // candidate is degraded.
+        let mut preferred: Vec<(usize, f64)> = Vec::new();
+        let mut avoided: Vec<(usize, f64)> = Vec::new();
         for &id in candidates {
             if let Some(state) = self.links.get(&id)
                 && (state.metrics.alive || !any_alive)
@@ -478,10 +561,20 @@ impl<L: LinkSender + ?Sized + 'static> Edpf<L> {
                 let os_ok = !matches!(state.metrics.os_up, Some(false));
                 if phase_ok && os_ok {
                     let arrival = state.predicted_arrival(packet_len);
-                    scored.push((id, arrival));
+                    if state.is_temporarily_avoided(now) {
+                        avoided.push((id, arrival));
+                    } else {
+                        preferred.push((id, arrival));
+                    }
                 }
             }
         }
+
+        let scored = if preferred.is_empty() {
+            &avoided
+        } else {
+            &preferred
+        };
 
         if scored.is_empty() {
             // Last resort: any alive link
@@ -526,7 +619,7 @@ impl<L: LinkSender + ?Sized> Default for Edpf<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::interface::{LinkMetrics, TransportMetrics};
+    use crate::net::interface::{LinkMetrics, ReceiverReportMetrics, TransportMetrics};
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -790,6 +883,160 @@ mod tests {
             "refresh should reset in_flight to queue_depth ({} vs {})",
             actual,
             50 * 1400
+        );
+    }
+
+    #[test]
+    fn transport_collapse_penalty_routes_away_from_melting_link() {
+        let mut edpf = Edpf::new();
+        let l1 = Arc::new(MockLink::with_transport(
+            1,
+            10_000_000.0,
+            40.0,
+            LinkPhase::Live,
+        ));
+        let l2 = Arc::new(MockLink::with_transport(
+            2,
+            10_000_000.0,
+            40.0,
+            LinkPhase::Live,
+        ));
+
+        edpf.add_link(l1.clone());
+        edpf.add_link(l2.clone());
+
+        {
+            let mut metrics = l1.metrics.lock().unwrap();
+            metrics.loss_rate = 0.80;
+            metrics.queue_depth = 120;
+        }
+
+        edpf.refresh_metrics();
+
+        let selected = edpf.select_link(1400).unwrap();
+        assert_eq!(
+            selected.id(),
+            2,
+            "collapsed transport link should be avoided"
+        );
+    }
+
+    #[test]
+    fn pure_radio_loss_link_is_shed_without_deep_queue() {
+        // B6: a link melting via radio loss (high loss, shallow queue — HARQ
+        // failures / fades) was previously NOT shed because the collapse
+        // heuristics required BOTH high loss AND a deep queue. Now severe loss
+        // alone (>= SEVERE_LOSS_THRESHOLD) sheds the link.
+        let mut edpf = Edpf::new();
+        let l1 = Arc::new(MockLink::with_transport(
+            1,
+            12_000_000.0,
+            20.0,
+            LinkPhase::Live,
+        ));
+        let l2 = Arc::new(MockLink::with_transport(
+            2,
+            10_000_000.0,
+            40.0,
+            LinkPhase::Live,
+        ));
+        edpf.add_link(l1.clone());
+        edpf.add_link(l2.clone());
+        edpf.refresh_metrics();
+        // Both healthy: faster link 1 wins.
+        assert_eq!(edpf.select_link(1400).unwrap().id(), 1);
+
+        // Link 1 drowns in radio loss but its sender queue stays shallow.
+        {
+            let mut m = l1.metrics.lock().unwrap();
+            m.loss_rate = 0.70;
+            m.queue_depth = 4;
+        }
+        edpf.refresh_metrics();
+        assert_eq!(
+            edpf.select_link(1400).unwrap().id(),
+            2,
+            "pure-radio-loss link should be shed even with a shallow queue"
+        );
+    }
+
+    #[test]
+    fn collapse_avoid_window_persists_across_immediate_recovery_tick() {
+        let mut edpf = Edpf::new();
+        let l1 = Arc::new(MockLink::with_transport(
+            1,
+            14_000_000.0,
+            20.0,
+            LinkPhase::Live,
+        ));
+        let l2 = Arc::new(MockLink::with_transport(
+            2,
+            6_000_000.0,
+            50.0,
+            LinkPhase::Live,
+        ));
+
+        edpf.add_link(l1.clone());
+        edpf.add_link(l2.clone());
+        edpf.refresh_metrics();
+        assert_eq!(edpf.select_link(1400).unwrap().id(), 1);
+
+        {
+            let mut metrics = l1.metrics.lock().unwrap();
+            metrics.loss_rate = 0.78;
+            metrics.queue_depth = 96;
+        }
+        edpf.refresh_metrics();
+        assert_eq!(edpf.select_link(1400).unwrap().id(), 2);
+
+        {
+            let mut metrics = l1.metrics.lock().unwrap();
+            metrics.loss_rate = 0.0;
+            metrics.queue_depth = 0;
+        }
+        edpf.refresh_metrics();
+
+        assert_eq!(
+            edpf.select_link(1400).unwrap().id(),
+            2,
+            "avoid window should survive one clean refresh tick"
+        );
+    }
+
+    #[test]
+    fn receiver_delay_gradient_routes_away_before_loss_spike() {
+        let mut edpf = Edpf::new();
+        let l1 = Arc::new(MockLink::with_transport(
+            1,
+            12_000_000.0,
+            25.0,
+            LinkPhase::Live,
+        ));
+        let l2 = Arc::new(MockLink::with_transport(
+            2,
+            8_000_000.0,
+            40.0,
+            LinkPhase::Live,
+        ));
+
+        edpf.add_link(l1.clone());
+        edpf.add_link(l2.clone());
+
+        {
+            let mut metrics = l1.metrics.lock().unwrap();
+            metrics.queue_depth = 32;
+            metrics.receiver_report = Some(ReceiverReportMetrics {
+                delay_gradient_us: 28_000,
+                ..ReceiverReportMetrics::default()
+            });
+        }
+
+        edpf.refresh_metrics();
+
+        assert_eq!(
+            edpf.select_link(1400).unwrap().id(),
+            2,
+            "per-link delay gradient should suppress queue-building links before hard loss"
         );
     }
 }
