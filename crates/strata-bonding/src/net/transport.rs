@@ -883,6 +883,10 @@ impl LinkSender for TransportLink {
         self.transport_send(packet, Priority::Standard)
     }
 
+    fn send_prioritized(&self, packet: &[u8], priority: Priority) -> Result<usize> {
+        self.transport_send(packet, priority)
+    }
+
     fn get_metrics(&self) -> LinkMetrics {
         // ── Snapshot sender state and release lock immediately ──────────
         // Holding the sender lock during oracle/CC computations blocks

@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use strata_transport::pool::Priority;
 use tracing::{debug, error, warn};
 
 /// Extra suppression window past `failover_until` during which per-link
@@ -965,6 +966,17 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             Treatment::Normal
         };
 
+        // Map the packet profile to a transport priority so keyframe/critical
+        // data (IDR slices, VPS/SPS/PPS headers — flagged by the sink) actually
+        // gets keyframe-protected paced-queue drop and the wire keyframe bits.
+        // Previously every bonded packet was hardcoded Priority::Standard at the
+        // link sender, which made the entire keyframe-protection path dead code.
+        let wire_priority = if profile.is_critical {
+            Priority::Critical
+        } else {
+            Priority::Standard
+        };
+
         // Periodic send path tracing (every 500 packets by drain count)
         static SEND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = SEND_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1006,7 +1018,7 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             let wrapped = header.wrap(payload);
 
             for link in links {
-                match link.send(&wrapped) {
+                match link.send_prioritized(&wrapped, wire_priority) {
                     Ok(_) => {
                         self.scheduler.record_send(link.id(), packet_len as u64);
                     }
@@ -1060,7 +1072,7 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
                     let wrapped = header.wrap(payload);
 
                     for link in links {
-                        match link.send(&wrapped) {
+                        match link.send_prioritized(&wrapped, wire_priority) {
                             Ok(_) => {
                                 self.scheduler.record_send(link.id(), packet_len as u64);
                             }
@@ -1089,7 +1101,7 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             let wrapped = header.wrap(payload.clone());
 
             let link_id = link.id();
-            match link.send(&wrapped) {
+            match link.send_prioritized(&wrapped, wire_priority) {
                 Ok(_) => {
                     self.scheduler.record_send(link_id, packet_len as u64);
                     self.consecutive_dead_count = 0;
@@ -1200,6 +1212,7 @@ mod tests {
         id: usize,
         metrics: Mutex<LinkMetrics>,
         sent_packets: Mutex<Vec<Vec<u8>>>,
+        sent_priorities: Mutex<Vec<Priority>>,
         ppd_probe_count: AtomicUsize,
         broadcast_active_calls: Mutex<Vec<bool>>,
     }
@@ -1236,6 +1249,7 @@ mod tests {
                     inflight_cap_bytes: 0.0,
                 }),
                 sent_packets: Mutex::new(Vec::new()),
+                sent_priorities: Mutex::new(Vec::new()),
                 ppd_probe_count: AtomicUsize::new(0),
                 broadcast_active_calls: Mutex::new(Vec::new()),
             }
@@ -1262,6 +1276,10 @@ mod tests {
             self.sent_packets.lock().unwrap().push(packet.to_vec());
             Ok(packet.len())
         }
+        fn send_prioritized(&self, packet: &[u8], priority: Priority) -> Result<usize> {
+            self.sent_priorities.lock().unwrap().push(priority);
+            self.send(packet)
+        }
         fn get_metrics(&self) -> LinkMetrics {
             self.metrics.lock().unwrap().clone()
         }
@@ -1271,6 +1289,52 @@ mod tests {
         fn set_failover_broadcast_active(&self, active: bool) {
             self.broadcast_active_calls.lock().unwrap().push(active);
         }
+    }
+
+    #[test]
+    fn critical_profile_routes_critical_priority() {
+        // A critical packet (keyframe/headers) must reach the link sender as
+        // Priority::Critical so keyframe-protected scheduling/FEC applies; a
+        // plain packet stays Standard. Regression guard for the previously
+        // hardcoded Priority::Standard at the link sender.
+        let mut scheduler = BondingScheduler::new();
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        scheduler.add_link(l1.clone());
+        scheduler.refresh_metrics();
+
+        let payload = Bytes::from_static(b"IDR-slice");
+        scheduler
+            .send(
+                payload.clone(),
+                crate::scheduler::PacketProfile {
+                    is_critical: true,
+                    can_drop: false,
+                    size_bytes: payload.len(),
+                },
+            )
+            .unwrap();
+        scheduler
+            .send(
+                payload.clone(),
+                crate::scheduler::PacketProfile {
+                    is_critical: false,
+                    can_drop: false,
+                    size_bytes: payload.len(),
+                },
+            )
+            .unwrap();
+
+        let prios = l1.sent_priorities.lock().unwrap();
+        assert!(
+            prios.contains(&Priority::Critical),
+            "critical profile must send Priority::Critical, got {:?}",
+            *prios
+        );
+        assert!(
+            prios.contains(&Priority::Standard),
+            "standard profile must send Priority::Standard, got {:?}",
+            *prios
+        );
     }
 
     #[test]

@@ -187,6 +187,24 @@ pub trait LinkSender: Send + Sync {
     fn id(&self) -> usize;
     /// Sends raw bytes over this link. Returns the number of bytes written.
     fn send(&self, packet: &[u8]) -> Result<usize>;
+
+    /// Sends raw bytes with an explicit transport [`Priority`].
+    ///
+    /// Keyframe / critical packets (`Priority::Reference`/`Critical`) get
+    /// keyframe-protected paced-queue drop and the wire keyframe/config bits
+    /// set, so they survive transient queue pressure that would otherwise drop
+    /// the IDR as readily as a B-frame. The default delegates to [`Self::send`]
+    /// (i.e. `Priority::Standard`) for links that don't distinguish priority
+    /// (e.g. test mocks).
+    fn send_prioritized(
+        &self,
+        packet: &[u8],
+        priority: strata_transport::pool::Priority,
+    ) -> Result<usize> {
+        let _ = priority;
+        self.send(packet)
+    }
+
     /// Returns a snapshot of the link's current metrics.
     fn get_metrics(&self) -> LinkMetrics;
     /// Read and process any pending feedback (ACKs, NACKs, Pongs) from the
