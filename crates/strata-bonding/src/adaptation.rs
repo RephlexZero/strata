@@ -61,6 +61,23 @@ pub struct AdaptationConfig {
     /// true before the adapter is allowed to issue a `Congestion`
     /// reduction. See [`CONGESTION_SUSTAIN_DEFAULT`].
     pub congestion_sustain: Duration,
+    /// Duration over which the encoder bitrate ramps gently from
+    /// [`AdaptationConfig::startup_floor_kbps`] up to `initial_bitrate_kbps`
+    /// at stream start.
+    ///
+    /// A freshly-attached cellular link has not yet warmed its bandwidth
+    /// grant or congestion window. Blasting the full target bitrate (plus FEC
+    /// overhead) into a cold link overflows the modem buffer and produces a
+    /// heavy startup loss burst (~14 % over the first ~10 s in field tests)
+    /// that decodes as grey/noisy frames until the next clean keyframe lands.
+    /// Ramping the encoder up gently lets the link warm before it has to
+    /// carry full rate. `Duration::ZERO` disables the ramp (the default,
+    /// which preserves legacy/unit-test behaviour). Only active when
+    /// `initial_bitrate_kbps > 0`.
+    pub startup_ramp: Duration,
+    /// Bitrate (kbps) the startup ramp begins at. Clamped at runtime to
+    /// `>= min_bitrate_kbps` and `<= initial_bitrate_kbps`.
+    pub startup_floor_kbps: u32,
 }
 
 /// Default sustain duration for non-severe congestion signals.
@@ -90,6 +107,8 @@ impl Default for AdaptationConfig {
             reliability_spare_threshold_kbps: 3_000,
             initial_bitrate_kbps: 0,
             congestion_sustain: CONGESTION_SUSTAIN_DEFAULT,
+            startup_ramp: Duration::ZERO,
+            startup_floor_kbps: 500,
         }
     }
 }
@@ -202,6 +221,12 @@ pub struct BitrateAdapter {
     /// Number of consecutive capacity decreases.
     consecutive_decreases: u32,
     over_pressure_ticks: u32,
+    /// Consecutive ticks with zero usable capacity while links are still alive.
+    /// A single transient zero is a feedback/ACK gap on an otherwise-healthy
+    /// link (the next tick reports full capacity), NOT a collapse — slamming to
+    /// min on it produces a ~5s bitrate sawtooth that shows as grey/blocky
+    /// frames. Only a sustained run is treated as a real LinkFailure.
+    zero_capacity_ticks: u32,
     /// When the last rate *increase* was committed — used to suppress
     /// feedback-driven reductions for a grace period so stale receiver
     /// metrics don't immediately revert the increase.
@@ -242,6 +267,17 @@ pub struct BitrateAdapter {
     /// `severe_burst` bypasses this gate so genuine collapses still
     /// react immediately.
     congestion_started: Option<Instant>,
+    /// Bitrate (kbps) the startup ramp climbs toward — the resolved initial
+    /// target. `0` means the ramp is inactive (disabled, or already complete,
+    /// or no explicit initial bitrate). See [`AdaptationConfig::startup_ramp`].
+    startup_ramp_target_kbps: u32,
+    /// Floor (kbps) the startup ramp begins at. Only meaningful while
+    /// `startup_ramp_target_kbps > 0`.
+    startup_ramp_floor_kbps: u32,
+    /// When the startup-ramp clock started — set lazily on the first
+    /// `update()` tick so SSH/pipeline spin-up latency doesn't eat into the
+    /// ramp window. `None` until the first tick.
+    startup_ramp_started: Option<Instant>,
 }
 
 impl BitrateAdapter {
@@ -253,9 +289,24 @@ impl BitrateAdapter {
         } else {
             config.max_bitrate_kbps
         };
+        // Gentle startup ramp: when an explicit initial bitrate is set and a
+        // ramp window is configured, start at a low floor and climb to
+        // `initial` over the window (see `apply_startup_ramp`). Legacy/unit
+        // tests leave `initial_bitrate_kbps == 0` and/or `startup_ramp == 0`,
+        // so they keep starting at the full initial with no ramp.
+        let ramp_active = !config.startup_ramp.is_zero() && config.initial_bitrate_kbps > 0;
+        let (start_target, ramp_target, ramp_floor) = if ramp_active {
+            let floor = config
+                .startup_floor_kbps
+                .max(config.min_bitrate_kbps)
+                .min(initial);
+            (floor, initial, floor)
+        } else {
+            (initial, 0, 0)
+        };
         BitrateAdapter {
             config,
-            current_target_kbps: initial,
+            current_target_kbps: start_target,
             stage: DegradationStage::Normal,
             mode: ReliabilityMode::MaxQuality,
             spare_bw_kbps: 0,
@@ -265,6 +316,7 @@ impl BitrateAdapter {
             consecutive_increases: 0,
             consecutive_decreases: 0,
             over_pressure_ticks: 0,
+            zero_capacity_ticks: 0,
             last_increase_time: None,
             ewma_loss_fec: 0.0,
             ewma_goodput_bps: 0.0,
@@ -274,6 +326,9 @@ impl BitrateAdapter {
             goodput_peak_bps: 0.0,
             prev_jitter_buffer_ms: 0,
             congestion_started: None,
+            startup_ramp_target_kbps: ramp_target,
+            startup_ramp_floor_kbps: ramp_floor,
+            startup_ramp_started: None,
         }
     }
 
@@ -379,6 +434,36 @@ impl BitrateAdapter {
         proposed.min(up_cap)
     }
 
+    /// Time-based ceiling enforcing the gentle startup ramp.
+    ///
+    /// During the [`AdaptationConfig::startup_ramp`] window the encoder target
+    /// is capped to a ceiling that climbs linearly from
+    /// `startup_ramp_floor_kbps` to the resolved initial bitrate, so a cold
+    /// cellular link is not blasted with full rate before its bandwidth grant
+    /// warms up (the dominant source of the ~14 % startup loss burst seen in
+    /// field tests). The clock starts on the first call (the first `update()`
+    /// tick), not at construction. Once the window elapses the ceiling is
+    /// released permanently and this becomes a no-op. Also a no-op when the
+    /// ramp is inactive (`startup_ramp_target_kbps == 0`).
+    fn apply_startup_ramp(&mut self, proposed: u32) -> u32 {
+        if self.startup_ramp_target_kbps == 0 {
+            return proposed;
+        }
+        let started = *self.startup_ramp_started.get_or_insert_with(Instant::now);
+        let window = self.config.startup_ramp;
+        let elapsed = started.elapsed();
+        if elapsed >= window {
+            // Ramp complete — release the ceiling for the rest of the stream.
+            self.startup_ramp_target_kbps = 0;
+            return proposed;
+        }
+        let floor = self.startup_ramp_floor_kbps as f64;
+        let target = self.startup_ramp_target_kbps as f64;
+        let frac = elapsed.as_secs_f64() / window.as_secs_f64();
+        let ceiling = (floor + (target - floor) * frac) as u32;
+        proposed.min(ceiling.max(self.startup_ramp_floor_kbps))
+    }
+
     /// Update with new link capacity information and optionally produce
     /// a bitrate command if the encoder target should change.
     pub fn update(&mut self, links: &[LinkCapacity]) -> Option<BitrateCommand> {
@@ -437,17 +522,8 @@ impl BitrateAdapter {
             );
         }
 
-        // Compute usable capacity for *video*, with FEC decoupled from the
-        // video budget (B5). FEC repair symbols and video bytes draw from the
-        // same aggregate pipe; when FEC overhead ramps up under loss, the video
-        // target must give way by the same amount or the two loops fight for
-        // capacity — raising one starves the other, and both feed the loss
-        // signal that drives both. Reserve the LARGER of the fixed control
-        // headroom or the current recommended FEC overhead. `recommended_fec_
-        // overhead()` reads `ewma_loss_fec` (loss-driven, no circularity) and
-        // last tick's `spare_bw_kbps` (lagged, not circular within this call).
-        let fec_reserve = self.recommended_fec_overhead().max(self.config.headroom);
-        let usable_kbps = aggregate_kbps * (1.0 - fec_reserve);
+        // Compute usable capacity (with headroom)
+        let usable_kbps = aggregate_kbps * (1.0 - self.config.headroom);
 
         // Compute pressure ratio (target / capacity; >1 = over-pressure)
         let pressure = if usable_kbps > 0.0 {
@@ -530,6 +606,15 @@ impl BitrateAdapter {
             self.over_pressure_ticks = 0;
         }
 
+        // Track transient vs sustained zero-capacity (see `zero_capacity_ticks`).
+        // A single alive-but-zero tick is a feedback gap; only a sustained run is
+        // a genuine mid-stream collapse.
+        if usable_kbps == 0.0 && alive_count > 0 {
+            self.zero_capacity_ticks += 1;
+        } else {
+            self.zero_capacity_ticks = 0;
+        }
+
         // Determine if we need a bitrate change
         let (new_target, reason) =
             self.compute_target(usable_kbps, pressure, alive_count, self.ever_had_capacity);
@@ -539,6 +624,10 @@ impl BitrateAdapter {
         // Slew-rate limit so the encoder is not whipsawed by per-tick
         // capacity-estimate noise (see `slew_clamp` doc).
         let new_target = self.slew_clamp(new_target, reason);
+        // Gentle startup ramp: cap the target to a climbing ceiling for the
+        // first few seconds so a cold link isn't blasted with full rate
+        // (see `apply_startup_ramp` doc). No-op once warmed / when disabled.
+        let new_target = self.apply_startup_ramp(new_target);
 
         // Track spare bandwidth
         self.spare_bw_kbps = if usable_kbps > new_target as f64 {
@@ -975,9 +1064,20 @@ impl BitrateAdapter {
         // Cold-start (never had capacity): hold current bitrate.
         // Mid-stream (had capacity before): this is a collapse, drop to min.
         if usable_kbps == 0.0 {
-            if had_capacity {
-                debug!(target: "strata::adapt", "decision: zero usable (mid-stream collapse) → min");
+            // Sustained zero capacity is a genuine mid-stream collapse → min.
+            // A transient single-tick zero on an otherwise-healthy link is just a
+            // feedback/ACK gap; collapsing on it produces a ~5s bitrate sawtooth
+            // (grey/blocky frames) on a perfectly good link, so hold instead and
+            // wait for confirmation. ZERO_CAP_COLLAPSE_TICKS at ~1s/tick ≈ 2s:
+            // a single transient zero holds; two consecutive zeros confirm collapse.
+            const ZERO_CAP_COLLAPSE_TICKS: u32 = 2;
+            if had_capacity && self.zero_capacity_ticks >= ZERO_CAP_COLLAPSE_TICKS {
+                debug!(target: "strata::adapt", "decision: zero usable (sustained {} ticks → collapse) → min", self.zero_capacity_ticks);
                 return (self.config.min_bitrate_kbps, AdaptationReason::LinkFailure);
+            }
+            if had_capacity {
+                debug!(target: "strata::adapt", "decision: zero usable (transient {} tick → hold)", self.zero_capacity_ticks);
+                return (self.current_target_kbps, AdaptationReason::Capacity);
             }
             debug!(target: "strata::adapt", "decision: zero usable (cold-start) → hold");
             return (self.current_target_kbps, AdaptationReason::Capacity);
@@ -1776,6 +1876,96 @@ mod tests {
             adapter.current_target_kbps(),
             adapter.config.min_bitrate_kbps,
             "zero usable after prior capacity should cut to min"
+        );
+    }
+
+    #[test]
+    fn single_transient_zero_tick_holds_not_collapses() {
+        // Regression: a single alive-but-zero-capacity tick (a feedback/ACK gap
+        // on a healthy link) must NOT slam bitrate to min. Collapsing on isolated
+        // zero ticks produced a ~5s bitrate sawtooth (grey/blocky frames) on a
+        // single clean link. The bitrate must hold until the zero is sustained.
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            min_bitrate_kbps: 500,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+
+        let links_ok = make_links(&[(8_000.0, true)]);
+        let links_zero = vec![LinkCapacity {
+            link_id: 0,
+            capacity_kbps: 8_000.0,
+            alive: true,
+            loss_rate: 1.0, // feedback gap: 100% loss for one tick → usable 0
+            rtt_ms: 80.0,
+            queue_depth: Some(0),
+        }];
+
+        // Establish capacity, then ramp the target up off the floor.
+        for _ in 0..6 {
+            adapter.update(&links_ok);
+        }
+        let healthy = adapter.current_target_kbps();
+        assert!(healthy > 500, "expected ramp above min, got {healthy}");
+
+        // One transient zero tick → hold (NOT a collapse to min).
+        adapter.update(&links_zero);
+        assert_eq!(
+            adapter.current_target_kbps(),
+            healthy,
+            "a single transient zero tick must hold the bitrate, not collapse"
+        );
+
+        // Capacity returns next tick → still healthy, no sawtooth.
+        adapter.update(&links_ok);
+        assert!(adapter.current_target_kbps() >= healthy);
+    }
+
+    #[test]
+    fn startup_ramp_holds_encoder_low_then_releases() {
+        // Gentle startup ramp: even with abundant capacity, the encoder must
+        // start at the floor and climb toward the initial bitrate over the
+        // ramp window — NOT blast full rate into a cold link (the dominant
+        // source of the ~14% startup loss burst that decodes as grey).
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            min_bitrate_kbps: 500,
+            max_bitrate_kbps: 8_000,
+            initial_bitrate_kbps: 4_000,
+            startup_ramp: Duration::from_millis(60),
+            startup_floor_kbps: 600,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+
+        // Starts at the ramp floor, not the full initial.
+        assert_eq!(
+            adapter.current_target_kbps(),
+            600,
+            "ramp-enabled adapter must start at the floor, not the initial bitrate"
+        );
+
+        // Capacity is abundant from the very first tick.
+        let links = make_links(&[(8_000.0, true)]);
+
+        // First tick (t≈0): the ramp ceiling pins the target near the floor
+        // even though usable capacity (~6.8 Mbps) would otherwise allow more.
+        adapter.update(&links);
+        assert!(
+            adapter.current_target_kbps() <= 900,
+            "ramp must hold the target near the floor at t≈0, got {}",
+            adapter.current_target_kbps()
+        );
+
+        // After the ramp window elapses the ceiling is released and the
+        // target is free to climb toward capacity (slew-limited per tick).
+        std::thread::sleep(Duration::from_millis(80));
+        for _ in 0..20 {
+            adapter.update(&links);
+        }
+        assert!(
+            adapter.current_target_kbps() > 1_500,
+            "after the ramp window the target must climb toward capacity, got {}",
+            adapter.current_target_kbps()
         );
     }
 
