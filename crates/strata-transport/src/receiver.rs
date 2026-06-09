@@ -391,12 +391,9 @@ impl Receiver {
         let pending_gen = self.fec_generations.iter().find_map(|(g, info)| {
             let stride = info.stride.max(1) as u64;
             // base_seq is wire data; saturate so a corrupt header can't overflow.
-            let end = info
-                .base_seq
-                .saturating_add(info.k as u64 * stride);
-            let in_range = seq >= info.base_seq
-                && seq < end
-                && (seq - info.base_seq).is_multiple_of(stride);
+            let end = info.base_seq.saturating_add(info.k as u64 * stride);
+            let in_range =
+                seq >= info.base_seq && seq < end && (seq - info.base_seq).is_multiple_of(stride);
             in_range.then_some(*g)
         });
         if let Some(gen_id) = pending_gen {

@@ -106,8 +106,8 @@ pub struct Sender {
 impl Sender {
     /// Create a new sender with the given configuration.
     pub fn new(config: SenderConfig) -> Self {
-        let fec_encoder =
-            FecEncoder::new(config.fec_k, config.fec_r).with_interleave(config.fec_interleave_depth);
+        let fec_encoder = FecEncoder::new(config.fec_k, config.fec_r)
+            .with_interleave(config.fec_interleave_depth);
         let retransmit = RetransmitTracker::new(config.max_retries);
         let pool = PacketPool::new(config.pool_capacity);
 
