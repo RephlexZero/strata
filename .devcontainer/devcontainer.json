@@ -43,7 +43,8 @@
     ],
     // Tell the container where the forwarded agent socket lives.
     "containerEnv": {
-        "SSH_AUTH_SOCK": "/ssh-agent.sock"
+        "SSH_AUTH_SOCK": "/ssh-agent.sock",
+        "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}"
     },
     // GPU passthrough for hardware video encoding (VA-API: AMD / Intel).
     // /dev/dri is already covered by the /dev bind mount above; kept as an

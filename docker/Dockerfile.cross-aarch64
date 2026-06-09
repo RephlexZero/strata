@@ -1,10 +1,28 @@
 # ── Stage 1: Build Strata for aarch64 ────────────────────────
-FROM debian:sid AS builder
+# Base = ubuntu:jammy to match the deploy target (Orange Pi 5 / cloud receiver,
+# both Ubuntu 22.04): GLIBC 2.35 + GStreamer 1.20. Building against an OLDER or
+# EQUAL GLIBC keeps the binary loadable on the Pi. debian:sid shipped GLIBC 2.39,
+# so the Pi's 2.35 dynamic loader rejected the binary with
+# "version `GLIBC_2.39' not found" and the sender refused to start.
+FROM ubuntu:jammy AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install cross-compilation toolchain + GStreamer dev for arm64
+# Install cross-compilation toolchain + GStreamer dev for arm64.
+# Ubuntu's default mirrors (archive/security.ubuntu.com) only carry amd64/i386;
+# arm64 (a "port" arch) lives on ports.ubuntu.com. Pin each arch to its mirror
+# so `:arm64` packages resolve — otherwise apt 404s on the arm64 Packages index.
 RUN dpkg --add-architecture arm64 && \
+    printf '%s\n' \
+      'deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse' \
+      'deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse' \
+      'deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse' \
+      'deb [arch=amd64] http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse' \
+      'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse' \
+      'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse' \
+      'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-backports main restricted universe multiverse' \
+      'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse' \
+      > /etc/apt/sources.list && \
     apt-get update && apt-get install -y --no-install-recommends \
     # Native build tools
     build-essential \

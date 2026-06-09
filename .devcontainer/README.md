@@ -40,6 +40,11 @@ It does **not** install any software - that's all baked into the image.
 
 ## Rebuilding
 
+The devcontainer forwards selected host environment variables, including
+`ANTHROPIC_API_KEY`, through `devcontainer.json`. After setting or changing one
+of those values on the host, rebuild the container so the new value is present
+in the container environment.
+
 When you update the Dockerfile:
 
 ```bash
