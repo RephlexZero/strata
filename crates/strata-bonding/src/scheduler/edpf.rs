@@ -25,15 +25,6 @@ use std::time::Duration;
 const COLLAPSE_AVOID_WINDOW: Duration = Duration::from_millis(1500);
 const COLLAPSE_LOSS_THRESHOLD: f64 = 0.45;
 const COLLAPSE_QUEUE_THRESHOLD: usize = 48;
-/// Pure-loss shedding bar (B6). The combined collapse heuristics above require
-/// BOTH high loss AND deep queue, which misses a link melting via *radio* loss
-/// (HARQ failures, fades) — high loss with no local queue buildup. Above this
-/// loss a link is toxic regardless of queue: routing the worst of both signals
-/// (a global bitrate cut) is not enough; EDPF must also shed the link itself.
-/// Set higher than the combined threshold so a transiently-lossy-but-useful
-/// link is not shed on a brief spike. The `|| !any_alive` fallback in
-/// `select_from_links` still keeps the stream alive if every link is this bad.
-const SEVERE_LOSS_THRESHOLD: f64 = 0.60;
 const COLLAPSE_GRADIENT_THRESHOLD_US: u32 = 20_000;
 const COLLAPSE_GRADIENT_QUEUE_THRESHOLD: usize = 24;
 
@@ -138,12 +129,8 @@ impl<L: ?Sized> LinkState<L> {
         // Match the adapter's per-link collapse heuristic: once a link shows
         // both deep local queueing and very high sender-side retransmission
         // pressure, treat it as temporarily toxic for EDPF rather than merely
-        // "a bit worse". Also shed a link drowning in pure radio loss even with
-        // a shallow queue (B6) — `(1 - loss)` alone only scales capacity
-        // linearly, leaving a 70%-loss link still attractive on RTT.
-        let collapse_penalty = if (self.metrics.loss_rate >= 0.55 && self.metrics.queue_depth >= 60)
-            || self.metrics.loss_rate >= SEVERE_LOSS_THRESHOLD
-        {
+        // "a bit worse".
+        let collapse_penalty = if self.metrics.loss_rate >= 0.55 && self.metrics.queue_depth >= 60 {
             0.05
         } else {
             1.0
@@ -168,10 +155,8 @@ impl<L: ?Sized> LinkState<L> {
     }
 
     fn should_avoid_temporarily(&self) -> bool {
-        let sender_collapse = (self.metrics.loss_rate >= COLLAPSE_LOSS_THRESHOLD
-            && self.metrics.queue_depth >= COLLAPSE_QUEUE_THRESHOLD)
-            // Pure radio-loss collapse: high loss with no queue buildup (B6).
-            || self.metrics.loss_rate >= SEVERE_LOSS_THRESHOLD;
+        let sender_collapse = self.metrics.loss_rate >= COLLAPSE_LOSS_THRESHOLD
+            && self.metrics.queue_depth >= COLLAPSE_QUEUE_THRESHOLD;
         let receiver_queue_build = self.metrics.receiver_report.as_ref().is_some_and(|report| {
             report.delay_gradient_us >= COLLAPSE_GRADIENT_THRESHOLD_US
                 && self.metrics.queue_depth >= COLLAPSE_GRADIENT_QUEUE_THRESHOLD
@@ -918,45 +903,6 @@ mod tests {
             selected.id(),
             2,
             "collapsed transport link should be avoided"
-        );
-    }
-
-    #[test]
-    fn pure_radio_loss_link_is_shed_without_deep_queue() {
-        // B6: a link melting via radio loss (high loss, shallow queue — HARQ
-        // failures / fades) was previously NOT shed because the collapse
-        // heuristics required BOTH high loss AND a deep queue. Now severe loss
-        // alone (>= SEVERE_LOSS_THRESHOLD) sheds the link.
-        let mut edpf = Edpf::new();
-        let l1 = Arc::new(MockLink::with_transport(
-            1,
-            12_000_000.0,
-            20.0,
-            LinkPhase::Live,
-        ));
-        let l2 = Arc::new(MockLink::with_transport(
-            2,
-            10_000_000.0,
-            40.0,
-            LinkPhase::Live,
-        ));
-        edpf.add_link(l1.clone());
-        edpf.add_link(l2.clone());
-        edpf.refresh_metrics();
-        // Both healthy: faster link 1 wins.
-        assert_eq!(edpf.select_link(1400).unwrap().id(), 1);
-
-        // Link 1 drowns in radio loss but its sender queue stays shallow.
-        {
-            let mut m = l1.metrics.lock().unwrap();
-            m.loss_rate = 0.70;
-            m.queue_depth = 4;
-        }
-        edpf.refresh_metrics();
-        assert_eq!(
-            edpf.select_link(1400).unwrap().id(),
-            2,
-            "pure-radio-loss link should be shed even with a shallow queue"
         );
     }
 

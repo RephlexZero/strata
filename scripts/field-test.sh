@@ -96,12 +96,6 @@ VIDEO_SOURCE="${STRATA_VIDEO_SOURCE:-test}"
 RESOLUTION="${STRATA_RESOLUTION:-640x360}"
 FRAMERATE="${STRATA_FRAMERATE:-30}"
 CODEC="${STRATA_CODEC:-h265}"
-# Operating profile, keyed to the egress target's latency budget:
-#   broadcast    — YouTube HLS / store-and-forward (fixed playout, probes/failover off)
-#   low-latency  — RTMP/SRT to YouTube or a direct endpoint (adaptive, damped)
-#   realtime     — direct low-latency (full adaptive stack)
-# Explicit STRATA_* knobs below still override individual fields.
-PROFILE="${STRATA_PROFILE:-broadcast}"
 AUDIO_ENABLED="${STRATA_AUDIO_ENABLED:-1}"
 BITRATE="${STRATA_BITRATE:-500}"
 MIN_BITRATE="${STRATA_MIN_BITRATE:-200}"
@@ -115,8 +109,7 @@ FAILOVER_DURATION_MS="${STRATA_FAILOVER_DURATION_MS:-800}"
 SAT_PROBE_INTERVAL_S="${STRATA_SAT_PROBE_INTERVAL_S:-}"
 SAT_PROBE_DURATION_S="${STRATA_SAT_PROBE_DURATION_S:-}"
 PPD_PROBE_INTERVAL_S="${STRATA_PPD_PROBE_INTERVAL_S:-}"
-# Empty → the selected profile's playout ceiling applies. Set to override it.
-MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-}"
+MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-3000}"
 RECEIVER_BUFFER_CAPACITY="${STRATA_RECEIVER_BUFFER_CAPACITY:-4096}"
 DURATION="${STRATA_DURATION_SECS:-60}"
 MONITOR_INTERVAL="${STRATA_MONITOR_INTERVAL_S:-5}"
@@ -340,8 +333,6 @@ RECEIVER_TOML=$(mktemp /tmp/strata-receiver-XXXXXX.toml)
 
 # Sender TOML
 {
-    echo "profile = \"$PROFILE\""
-    echo ""
     for ((i=0; i<NUM_LINKS; i++)); do
         echo "[[links]]"
         echo "id = $i"
@@ -376,19 +367,14 @@ RECEIVER_TOML=$(mktemp /tmp/strata-receiver-XXXXXX.toml)
 
 # Receiver TOML
 {
-    echo "profile = \"$PROFILE\""
-    echo ""
     echo "[receiver]"
     echo "buffer_capacity = $RECEIVER_BUFFER_CAPACITY"
     echo ""
-    # Playout is driven by the profile (fixed floor for broadcast, adaptive
-    # within the profile ceiling otherwise). Only emit an explicit ceiling
-    # when the operator set STRATA_MAX_LATENCY_MS.
-    if [[ -n "$MAX_LATENCY_MS" ]]; then
-        echo ""
-        echo "[scheduler]"
-        echo "max_latency_ms = $MAX_LATENCY_MS"
-    fi
+    echo "[scheduler]"
+    # Only the hard ceiling is user-set (from STRATA_MAX_LATENCY_MS).  The
+    # buffer self-tunes within this ceiling via closed-loop late-arrival
+    # feedback — no jitter/start-latency knobs to misconfigure.
+    echo "max_latency_ms = $MAX_LATENCY_MS"
 } > "$RECEIVER_TOML"
 
 info "Sender config: $SENDER_TOML"
@@ -865,15 +851,10 @@ while [[ $ELAPSED -lt $DURATION ]]; do
         [[ -n "$YT_STATUS" ]] && YT_HEALTH_STR=" YT_Health=$YT_STATUS"
     fi
 
-    # Cumulative media damage = lost + late. The honest run-health number: it
-    # never decays (unlike smoothed_loss) and counts "late" drops (silent
-    # reference-frame holes) that no loss metric otherwise surfaces.
-    CUR_DAMAGED=$(( ${CUR_LOST:-0} + ${CUR_LATE:-0} ))
-
     echo ""
     echo "╌╌╌ [${ELAPSED}s] segments=$SEGMENT_COUNT (max=$MAX_SEGMENT_COUNT)$YT_HEALTH_STR ╌╌╌"
     [[ -n "$DAMAGE_FLAGS" ]] && echo "  DAMAGE: $DAMAGE_FLAGS"
-    echo "  RX: delivered=$CUR_DELIVERED damaged=$CUR_DAMAGED (lost=$CUR_LOST late=$CUR_LATE) discont=$CUR_DISCONT queue=$CUR_QUEUE next_seq=$CUR_NEXT_SEQ latency=${CUR_LATENCY}/${CUR_TARGET_LATENCY}ms jitter=${CUR_JITTER_FMT}ms smoothed_loss=${CUR_SMOOTHED_LOSS_FMT}"
+    echo "  RX: delivered=$CUR_DELIVERED lost=$CUR_LOST late=$CUR_LATE discont=$CUR_DISCONT queue=$CUR_QUEUE next_seq=$CUR_NEXT_SEQ latency=${CUR_LATENCY}/${CUR_TARGET_LATENCY}ms jitter=${CUR_JITTER_FMT}ms smoothed_loss=${CUR_SMOOTHED_LOSS_FMT}"
     [[ -n "$RX_LINK_SUMMARY" ]] && echo "  RX links: $RX_LINK_SUMMARY"
     echo "  Δ${MONITOR_INTERVAL}s: delivered=$DELTA_DELIVERED lost=$DELTA_LOST late=$DELTA_LATE win_loss=${WINDOW_LOSS_PCT}%"
     [[ -n "$ADAPT_LINE" ]] && echo "  $ADAPT_LINE"

@@ -88,10 +88,6 @@ pub struct ReassemblyBuffer {
     /// the downstream MPEG-TS demuxer see a PTS/continuity regression and
     /// post a fatal "Timestamping error on input streams".
     last_emitted_seq: Option<u64>,
-
-    /// When true, the playout window is pinned at `start_latency` and all
-    /// adaptive sizing (jitter, spread, loss, late-pressure) is skipped.
-    fixed_playout: bool,
 }
 
 /// Configuration for the reassembly jitter buffer.
@@ -116,11 +112,6 @@ pub struct ReassemblyConfig {
     pub stability_threshold_ms: u64,
     /// Extra latency (ms) added at 100% loss rate (default: 500). Scaled linearly.
     pub loss_penalty_ms: f64,
-    /// When true, pin the playout window at `start_latency` and disable all
-    /// jitter/spread/late-pressure adaptation. Set by the broadcast
-    /// [`StreamProfile`](crate::config::StreamProfile), where a large downstream
-    /// buffer makes a stable, generous window strictly better than a chasing one.
-    pub fixed_playout: bool,
 }
 
 #[cfg(test)]
@@ -159,9 +150,6 @@ impl Default for ReassemblyConfig {
             ramp_down_alpha: 0.05,
             stability_threshold_ms: 2000,
             loss_penalty_ms: 200.0,
-            // Default false so existing adaptive behaviour (and all unit tests)
-            // is unchanged; the broadcast profile opts in via config.
-            fixed_playout: false,
         }
     }
 }
@@ -189,19 +177,10 @@ pub struct ReassemblyStats {
     pub target_latency_ms: u64,
     /// Current smoothed jitter estimate in milliseconds.
     pub jitter_estimate_ms: f64,
-    /// **Smoothed** loss rate (0.0–1.0), EWMA — decays after a burst, so it is
-    /// a control-loop signal, NOT a run-health metric. For "how much media was
-    /// actually lost" read [`Self::damaged_packets`] (cumulative). Reading this
-    /// as instantaneous loss is the trap documented in `findings-report.md`.
+    /// Recent smoothed loss rate (0.0–1.0).
     pub loss_rate: f64,
     /// Packets successfully delivered.
     pub packets_delivered: u64,
-    /// **Cumulative media damage** = lost + late packets. The single honest
-    /// run-health number: unlike `loss_rate` it never decays, and unlike
-    /// `lost_packets` alone it counts "late" drops (silent reference-frame
-    /// holes) which are otherwise invisible to every loss metric. Corruption
-    /// dropped by FEC is counted at the transport layer, not here.
-    pub damaged_packets: u64,
     /// Per-link receive/delivery stats from transport readers.
     pub per_link: Vec<ReassemblyLinkStats>,
 }
@@ -279,7 +258,6 @@ impl ReassemblyBuffer {
             consecutive_late: 0,
             max_late_seq: 0,
             last_emitted_seq: None,
-            fixed_playout: config.fixed_playout,
         }
     }
 
@@ -296,7 +274,6 @@ impl ReassemblyBuffer {
             jitter_estimate_ms: self.jitter_smoothed * 1000.0,
             loss_rate: self.loss_rate_smoothed,
             packets_delivered: self.packets_delivered,
-            damaged_packets: self.lost_packets + self.late_packets,
             per_link: Vec::new(),
         }
     }
@@ -350,11 +327,8 @@ impl ReassemblyBuffer {
         let rel_max = self.rel_max_deque.front().map(|&(_, v)| v).unwrap_or(rel);
         self.delay_spread_us = (rel_max - rel_min).max(0);
 
-        // Calculate Jitter — skipped entirely under fixed playout, where the
-        // window is pinned at start_latency (broadcast profile).
-        if let Some(last) = self.last_arrival
-            && !self.fixed_playout
-        {
+        // Calculate Jitter
+        if let Some(last) = self.last_arrival {
             let iat = now.duration_since(last).as_secs_f64();
 
             // EWMA alpha

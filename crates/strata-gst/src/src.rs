@@ -16,9 +16,7 @@ mod imp {
     struct Settings {
         links: String,
         latency: u32,
-        min_latency_ms: u64,
         max_latency_ms: u64,
-        fixed_playout: bool,
         config_toml: String,
     }
 
@@ -27,9 +25,7 @@ mod imp {
             Self {
                 links: String::new(),
                 latency: 50,
-                min_latency_ms: 50,
                 max_latency_ms: 800,
-                fixed_playout: false,
                 config_toml: String::new(),
             }
         }
@@ -56,9 +52,7 @@ mod imp {
                     let mut settings = lock_or_recover(&self.settings);
                     settings.config_toml = toml_str.to_string();
                     settings.latency = cfg.receiver.start_latency.as_millis() as u32;
-                    settings.min_latency_ms = cfg.receiver.min_latency.as_millis() as u64;
-                    settings.max_latency_ms = cfg.receiver.max_latency.as_millis() as u64;
-                    settings.fixed_playout = cfg.receiver.fixed_playout;
+                    settings.max_latency_ms = cfg.scheduler.max_latency_ms;
                     if !cfg.links.is_empty() {
                         settings.links = cfg
                             .links
@@ -242,9 +236,7 @@ mod imp {
             let max_latency_ms = settings.max_latency_ms;
             let receiver = ReceiverBackend::new_with_config(ReassemblyConfig {
                 start_latency: latency_duration,
-                min_latency_ms: settings.min_latency_ms,
                 max_latency_ms,
-                fixed_playout: settings.fixed_playout,
                 ..ReassemblyConfig::default()
             });
 
@@ -319,16 +311,10 @@ mod imp {
                                     .field("next_seq", stats.next_seq)
                                     .field("lost_packets", stats.lost_packets)
                                     .field("late_packets", stats.late_packets)
-                                    // Cumulative media damage (lost+late) — the
-                                    // honest run-health number that never decays,
-                                    // unlike the smoothed loss rate below.
-                                    .field("damaged_packets", stats.damaged_packets)
                                     .field("discontinuities", stats.discontinuities)
                                     .field("current_latency_ms", stats.current_latency_ms)
                                     .field("target_latency_ms", stats.target_latency_ms)
                                     .field("packets_delivered", stats.packets_delivered)
-                                    // EWMA, decays after a burst — control-loop
-                                    // signal only, NOT run health. See damaged_packets.
                                     .field("smoothed_loss_rate", stats.loss_rate)
                                     .field("loss_rate", stats.loss_rate)
                                     .field("jitter_estimate_ms", stats.jitter_estimate_ms);
