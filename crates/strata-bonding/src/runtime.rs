@@ -511,10 +511,19 @@ fn create_transport_link(link: &LinkConfig) -> anyhow::Result<TransportLink> {
 
     socket.connect(addr)?;
     set_busy_poll(&socket);
+    // FEC interleave depth: defaults to SenderConfig's production value but is
+    // field-tunable via STRATA_FEC_INTERLEAVE (1 = off, disables the ~1 s
+    // recovery-latency cost; higher = recover longer bursts).
+    let mut sender_cfg = SenderConfig::default();
+    if let Ok(d) = std::env::var("STRATA_FEC_INTERLEAVE")
+        && let Ok(d) = d.parse::<usize>()
+    {
+        sender_cfg.fec_interleave_depth = d.clamp(1, u8::MAX as usize);
+    }
     Ok(TransportLink::new(
         link.id,
         socket,
-        SenderConfig::default(),
+        sender_cfg,
         link.interface.clone(),
     ))
 }

@@ -210,6 +210,7 @@ fn bench_sender_send(c: &mut Criterion) {
                 pool_capacity: 8192,
                 fec_k: 32,
                 fec_r: 4,
+                fec_interleave_depth: 1,
                 packet_ttl: Duration::from_secs(5),
                 max_retries: 3,
             };

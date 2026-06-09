@@ -42,6 +42,11 @@ pub struct SenderConfig {
     pub fec_k: usize,
     /// FEC repair symbols per generation (R).
     pub fec_r: usize,
+    /// FEC temporal interleave depth (D): consecutive source symbols are
+    /// striped across `D` generations so a burst of up to `R*D` consecutive
+    /// losses stays recoverable. `1` disables interleaving. Adds up to `D*K`
+    /// packet-times of recovery latency (~1 s at D=4, K=32, ~1.2 Mbps).
+    pub fec_interleave_depth: usize,
     /// Maximum time to keep unacked packets before expiry.
     pub packet_ttl: Duration,
     /// Maximum retransmit attempts per packet.
@@ -55,6 +60,10 @@ impl Default for SenderConfig {
             pool_capacity: 4096,
             fec_k: 32,
             fec_r: 4,
+            // Interleave across 4 generations: recovers bursts up to R*D=16
+            // consecutive losses (vs 4 without), at ~1 s added recovery latency
+            // — well within the receiver's 1–3 s playout buffer.
+            fec_interleave_depth: 4,
             packet_ttl: Duration::from_secs(2),
             max_retries: 3,
         }
@@ -97,7 +106,8 @@ pub struct Sender {
 impl Sender {
     /// Create a new sender with the given configuration.
     pub fn new(config: SenderConfig) -> Self {
-        let fec_encoder = FecEncoder::new(config.fec_k, config.fec_r);
+        let fec_encoder =
+            FecEncoder::new(config.fec_k, config.fec_r).with_interleave(config.fec_interleave_depth);
         let retransmit = RetransmitTracker::new(config.max_retries);
         let pool = PacketPool::new(config.pool_capacity);
 
@@ -477,6 +487,7 @@ mod tests {
             pool_capacity: 256,
             fec_k: 4,
             fec_r: 1,
+            fec_interleave_depth: 1,
             packet_ttl: Duration::from_secs(5),
             max_retries: 3,
         }

@@ -217,6 +217,9 @@ struct FecGenInfo {
     base_seq: u64,
     k: u8,
     r: u8,
+    /// Seq spacing between consecutive source symbols (FEC interleave depth).
+    /// Symbol index `i` maps to global seq `base_seq + i * stride`.
+    stride: u8,
 }
 
 /// How many sequence numbers of received source wire-bytes to retain for
@@ -386,8 +389,15 @@ impl Receiver {
         // generation whose repair already arrived, a fresh source symbol
         // may now make the linear system solvable.
         let pending_gen = self.fec_generations.iter().find_map(|(g, info)| {
-            let end = info.base_seq + info.k as u64;
-            (seq >= info.base_seq && seq < end).then_some(*g)
+            let stride = info.stride.max(1) as u64;
+            // base_seq is wire data; saturate so a corrupt header can't overflow.
+            let end = info
+                .base_seq
+                .saturating_add(info.k as u64 * stride);
+            let in_range = seq >= info.base_seq
+                && seq < end
+                && (seq - info.base_seq).is_multiple_of(stride);
+            in_range.then_some(*g)
         });
         if let Some(gen_id) = pending_gen {
             self.attempt_fec_recovery(gen_id);
@@ -406,6 +416,7 @@ impl Receiver {
                     base_seq: fec_hdr.base_seq,
                     k: fec_hdr.k,
                     r: fec_hdr.r,
+                    stride: fec_hdr.stride.max(1),
                 },
             );
 
@@ -434,8 +445,9 @@ impl Receiver {
         // so the decoder can reduce the linear system. `add_source` is
         // idempotent per index, so re-feeding across repair/source arrivals
         // is safe.
+        let stride = info.stride.max(1) as u64;
         for idx in 0..k {
-            let seq = info.base_seq + idx as u64;
+            let seq = info.base_seq.saturating_add(idx as u64 * stride);
             if let Some(raw) = self.fec_source_cache.get(&seq) {
                 self.fec_decoder
                     .add_source_symbol(gen_id, idx, k, info.r as usize, raw.clone());
@@ -449,7 +461,7 @@ impl Receiver {
 
         let mut reinserted = false;
         for (idx, data) in recovered {
-            let seq = info.base_seq + idx as u64;
+            let seq = info.base_seq.saturating_add(idx as u64 * stride);
 
             // Already delivered, buffered, or directly received — nothing
             // to do. (try_recover re-reports the same symbols on every
@@ -1368,6 +1380,7 @@ mod tests {
         let mut tx = Sender::new(SenderConfig {
             fec_k: 8,
             fec_r: 4,
+            fec_interleave_depth: 1,
             ..SenderConfig::default()
         });
 
@@ -1435,6 +1448,7 @@ mod tests {
         let mut tx = Sender::new(SenderConfig {
             fec_k: 6,
             fec_r: 3,
+            fec_interleave_depth: 1,
             ..SenderConfig::default()
         });
         for i in 0..6u64 {

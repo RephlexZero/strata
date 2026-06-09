@@ -41,6 +41,7 @@ fn test_sender() -> Sender {
         pool_capacity: 512,
         fec_k: 8,
         fec_r: 2,
+        fec_interleave_depth: 1,
         packet_ttl: Duration::from_secs(5),
         max_retries: 3,
     })
@@ -297,6 +298,7 @@ fn fragmented_packet_reassembled() {
         pool_capacity: 256,
         fec_k: 16,
         fec_r: 2,
+        fec_interleave_depth: 1,
         packet_ttl: Duration::from_secs(5),
         max_retries: 3,
     });
@@ -469,6 +471,7 @@ fn simulation_10k_packets_perfect_delivery() {
         pool_capacity: 16384,
         fec_k: 32,
         fec_r: 4,
+        fec_interleave_depth: 1,
         packet_ttl: Duration::from_secs(30),
         max_retries: 5,
     });
@@ -513,6 +516,7 @@ fn run_loss_recovery_test(loss_rate: f64, seed: u64) {
         pool_capacity: 4096,
         fec_k: 16,
         fec_r: 4,
+        fec_interleave_depth: 1,
         packet_ttl: Duration::from_secs(30),
         max_retries: 50,
     });
@@ -639,6 +643,7 @@ fn simulation_burst_loss_gilbert_elliott_recovery() {
         pool_capacity: 4096,
         fec_k: 16,
         fec_r: 4,
+        fec_interleave_depth: 1,
         packet_ttl: Duration::from_secs(30),
         max_retries: 10,
     });

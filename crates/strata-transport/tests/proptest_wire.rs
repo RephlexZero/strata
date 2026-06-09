@@ -397,6 +397,7 @@ proptest! {
         k in 1u8..=255,
         r in 1u8..=255,
         base_seq in any::<u64>(),
+        stride in 1u8..=255,
     ) {
         let header = FecRepairHeader {
             generation_id,
@@ -404,6 +405,7 @@ proptest! {
             k,
             r,
             base_seq,
+            stride,
         };
 
         let mut buf = BytesMut::new();
@@ -416,5 +418,6 @@ proptest! {
         prop_assert_eq!(decoded.k, k);
         prop_assert_eq!(decoded.r, r);
         prop_assert_eq!(decoded.base_seq, base_seq);
+        prop_assert_eq!(decoded.stride, stride);
     }
 }

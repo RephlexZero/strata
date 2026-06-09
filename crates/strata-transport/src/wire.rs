@@ -526,16 +526,22 @@ pub struct FecRepairHeader {
     /// Total repair symbols generated.
     pub r: u8,
     /// Global sequence number of source symbol index 0 in this generation.
-    /// Source seqs within a generation are contiguous (the sender assigns
-    /// them from a monotonic counter), so the receiver maps a recovered
-    /// generation index `i` back to its global seq via `base_seq + i`.
-    /// Without this, recovered symbols cannot be reinserted into the
-    /// in-order delivery stream.
+    /// The receiver maps a recovered generation index `i` back to its global
+    /// seq via `base_seq + i * stride` (see `stride`). Without this, recovered
+    /// symbols cannot be reinserted into the in-order delivery stream.
     pub base_seq: u64,
+    /// Seq spacing between consecutive source symbols of this generation
+    /// (= the FEC interleave depth). `1` means a contiguous generation (no
+    /// interleaving): symbol `i` is `base_seq + i`. With interleaving depth `D`
+    /// the encoder round-robins consecutive source seqs across `D` generations,
+    /// so this generation's symbols are `base_seq, base_seq+D, base_seq+2D, …`
+    /// — a localized burst of up to `R*D` consecutive losses then lands at most
+    /// `R` per generation and stays recoverable.
+    pub stride: u8,
 }
 
 impl FecRepairHeader {
-    pub const ENCODED_LEN: usize = 13;
+    pub const ENCODED_LEN: usize = 14;
 
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(ControlType::FecRepair as u8);
@@ -544,6 +550,7 @@ impl FecRepairHeader {
         buf.put_u8(self.k);
         buf.put_u8(self.r);
         buf.put_u64(self.base_seq);
+        buf.put_u8(self.stride);
     }
 
     pub fn decode(buf: &mut impl Buf) -> Option<Self> {
@@ -556,6 +563,7 @@ impl FecRepairHeader {
             k: buf.get_u8(),
             r: buf.get_u8(),
             base_seq: buf.get_u64(),
+            stride: buf.get_u8(),
         })
     }
 }

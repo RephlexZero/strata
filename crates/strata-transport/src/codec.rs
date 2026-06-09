@@ -295,77 +295,106 @@ unsafe fn gf_mul_acc_neon(dst: &mut [u8], coeff: u8, src: &[u8]) {
 /// reaches the target size. Repair symbols are random linear combinations
 /// over GF(2^8) of all source symbols in the current window.
 pub struct FecEncoder {
-    /// Maximum source symbols in the window (K).
+    /// Maximum source symbols per generation (K).
     window_size: usize,
-    /// Number of repair symbols to emit per window (R).
+    /// Number of repair symbols to emit per generation (R).
     repair_count: usize,
-    /// Current window generation ID (incremented on each window slide).
+    /// Temporal interleave depth (D). Consecutive source symbols are
+    /// round-robined across `D` independent generations, so a burst of up to
+    /// `R*D` consecutive losses lands ≤R per generation and stays recoverable.
+    /// `1` == no interleaving (contiguous generations, the original behaviour).
+    interleave_depth: usize,
+    /// Current generation ID (incremented on every generation emitted).
     current_gen_id: u16,
-    /// Source symbols in the current window: (seq, data).
-    window: Vec<(u64, Bytes)>,
+    /// One in-progress window per interleave lane; `windows[n % D]` collects
+    /// source symbol `n`. Each lane's seqs are spaced `D` apart.
+    windows: Vec<Vec<(u64, Bytes)>>,
+    /// Monotonic count of source symbols added (selects the round-robin lane).
+    added: u64,
 }
 
 impl FecEncoder {
-    /// Create a new sliding-window RLNC encoder.
+    /// Create a new sliding-window RLNC encoder (no interleaving).
     ///
-    /// - `k`: window size (number of source symbols per window)
-    /// - `r`: repair symbols generated per window
+    /// - `k`: window size (number of source symbols per generation)
+    /// - `r`: repair symbols generated per generation
     pub fn new(k: usize, r: usize) -> Self {
         assert!(k > 0, "FEC K must be > 0");
         assert!(r > 0, "FEC R must be > 0");
         FecEncoder {
             window_size: k,
             repair_count: r,
+            interleave_depth: 1,
             current_gen_id: 0,
-            window: Vec::with_capacity(k),
+            windows: vec![Vec::with_capacity(k)],
+            added: 0,
         }
+    }
+
+    /// Set the temporal interleave depth `D` (clamped to ≥1). Consecutive
+    /// source symbols are striped across `D` generations so a burst of up to
+    /// `R*D` consecutive losses is recoverable, at the cost of up to `D*K`
+    /// packet-times of added recovery latency. Only meaningful before symbols
+    /// are added; resets the in-progress lanes.
+    pub fn with_interleave(mut self, depth: usize) -> Self {
+        // Clamp to [1, 255]: the depth is the per-generation seq stride, carried
+        // on the wire as a single byte (FecRepairHeader::stride). A larger depth
+        // would truncate to u8 and desync the decoder's index→seq mapping.
+        let d = depth.clamp(1, u8::MAX as usize);
+        self.interleave_depth = d;
+        self.windows = (0..d)
+            .map(|_| Vec::with_capacity(self.window_size))
+            .collect();
+        self.added = 0;
+        self
     }
 
     /// Feed a source symbol into the encoder.
     ///
-    /// When the window reaches `window_size` symbols, generates `repair_count`
-    /// RLNC repair packets and slides the window. Returns repair packets
-    /// (empty vec if window not yet full).
+    /// When a lane reaches `window_size` symbols, generates `repair_count` RLNC
+    /// repair packets and resets that lane. Returns repair packets (empty vec
+    /// if no lane completed this call).
     pub fn add_source_symbol(&mut self, seq: u64, data: Bytes) -> Vec<Bytes> {
-        self.window.push((seq, data));
+        let lane = (self.added % self.interleave_depth as u64) as usize;
+        self.added = self.added.wrapping_add(1);
+        self.windows[lane].push((seq, data));
 
-        if self.window.len() >= self.window_size {
-            let repairs = self.emit_repair();
+        if self.windows[lane].len() >= self.window_size {
+            let win = std::mem::take(&mut self.windows[lane]);
+            let repairs = self.emit_repair(&win);
             self.current_gen_id = self.current_gen_id.wrapping_add(1);
-            self.window.clear();
             repairs
         } else {
             Vec::new()
         }
     }
 
-    /// Generate RLNC repair symbols from the current window.
+    /// Generate RLNC repair symbols from a completed generation `window`.
     ///
     /// Each repair symbol is a random linear combination in GF(2^8):
     ///   repair[j] = Σ (c_i · source[i])  for all i in window
     ///
     /// Coefficients are deterministically derived from (gen_id, repair_index, i)
-    /// so the decoder can reconstruct them without out-of-band signalling.
-    fn emit_repair(&self) -> Vec<Bytes> {
+    /// so the decoder can reconstruct them without out-of-band signalling. The
+    /// generation's source seqs are spaced `interleave_depth` apart, so the
+    /// decoder maps recovered index `i` → `base_seq + i * stride`.
+    fn emit_repair(&self, window: &[(u64, Bytes)]) -> Vec<Bytes> {
         let gen_id = self.current_gen_id;
-        let k = self.window.len();
+        let k = window.len();
 
-        let max_len = self.window.iter().map(|(_, d)| d.len()).max().unwrap_or(0);
+        let max_len = window.iter().map(|(_, d)| d.len()).max().unwrap_or(0);
         if max_len == 0 {
             return Vec::new();
         }
 
-        // Source seqs in a generation are contiguous (sender assigns from a
-        // monotonic counter), so the seq of index 0 anchors the whole
-        // generation: the decoder maps recovered index `i` → `base_seq + i`.
-        let base_seq = self.window.first().map(|(s, _)| *s).unwrap_or(0);
+        let base_seq = window.first().map(|(s, _)| *s).unwrap_or(0);
 
         let mut repairs = Vec::with_capacity(self.repair_count);
 
         for repair_idx in 0..self.repair_count {
             let mut repair_data = vec![0u8; max_len];
 
-            for (i, (_, symbol)) in self.window.iter().enumerate() {
+            for (i, (_, symbol)) in window.iter().enumerate() {
                 let coeff = coding_coefficient(gen_id, repair_idx as u8, i);
                 gf_mul_acc(&mut repair_data, coeff, symbol);
             }
@@ -377,6 +406,7 @@ impl FecEncoder {
                 k: k as u8,
                 r: self.repair_count as u8,
                 base_seq,
+                stride: self.interleave_depth.min(u8::MAX as usize) as u8,
             };
 
             let payload_len = 1 + FecRepairHeader::ENCODED_LEN + repair_data.len();
@@ -398,20 +428,25 @@ impl FecEncoder {
         self.current_gen_id
     }
 
-    /// Number of source symbols buffered in the current window.
+    /// Number of source symbols buffered across all in-progress lanes.
     pub fn buffered_count(&self) -> usize {
-        self.window.len()
+        self.windows.iter().map(|w| w.len()).sum()
     }
 
-    /// Flush the current partial window — emit repair even if < K symbols.
+    /// Flush every partial lane — emit repair even if < K symbols. Used to
+    /// protect the trailing partial generation(s) on a deadline so a loss in
+    /// the tail isn't left unrecoverable until enough fresh symbols arrive.
     pub fn flush(&mut self) -> Vec<Bytes> {
-        if self.window.is_empty() {
-            return Vec::new();
+        let mut out = Vec::new();
+        for lane in 0..self.windows.len() {
+            if self.windows[lane].is_empty() {
+                continue;
+            }
+            let win = std::mem::take(&mut self.windows[lane]);
+            out.extend(self.emit_repair(&win));
+            self.current_gen_id = self.current_gen_id.wrapping_add(1);
         }
-        let repairs = self.emit_repair();
-        self.current_gen_id = self.current_gen_id.wrapping_add(1);
-        self.window.clear();
-        repairs
+        out
     }
 
     /// Update FEC parameters (for TAROT adaptive rate).
@@ -1102,6 +1137,119 @@ mod tests {
         use crate::wire::Packet;
         let decoded = Packet::decode(&mut repairs[0].clone()).unwrap();
         assert_eq!(decoded.header.packet_type, crate::wire::PacketType::Control);
+    }
+
+    // ─── Interleaving (burst recovery) ──────────────────────────────────
+
+    /// Encode `n = depth*k` symbols, drop a burst of `burst_len` consecutive
+    /// seqs, and decode every generation independently (mapping index→seq via
+    /// the header's base_seq + stride, exactly as the receiver does). Returns
+    /// (dropped, recovered).
+    fn run_burst(
+        k: usize,
+        r: usize,
+        depth: usize,
+        n: usize,
+        burst_start: u64,
+        burst_len: u64,
+    ) -> (usize, usize) {
+        use std::collections::{HashMap, HashSet};
+        let symbols: Vec<Bytes> = (0..n)
+            .map(|i| Bytes::from(vec![(i % 251 + 1) as u8; 16]))
+            .collect();
+
+        let mut enc = FecEncoder::new(k, r).with_interleave(depth);
+        // gen_id -> (base_seq, stride, repairs[(symbol_index, data)])
+        type GenInfo = (u64, u8, Vec<(u8, Vec<u8>)>);
+        let mut gens: HashMap<u16, GenInfo> = HashMap::new();
+        for (i, sym) in symbols.iter().enumerate() {
+            for rp in enc.add_source_symbol(i as u64, sym.clone()) {
+                let mut buf = rp.clone();
+                let pkt = crate::wire::Packet::decode(&mut buf).unwrap();
+                let mut payload = pkt.payload;
+                let _sub = payload.split_to(1);
+                let hdr = FecRepairHeader::decode(&mut payload).unwrap();
+                let e =
+                    gens.entry(hdr.generation_id)
+                        .or_insert((hdr.base_seq, hdr.stride, Vec::new()));
+                e.2.push((hdr.symbol_index, payload.to_vec()));
+            }
+        }
+
+        let dropped: HashSet<u64> = (burst_start..burst_start + burst_len).collect();
+        let mut total_dropped = 0;
+        let mut total_recovered = 0;
+        for (gen_id, (base_seq, stride, repairs)) in &gens {
+            let mut dec = FecDecoder::new(64);
+            for idx in 0..k {
+                let seq = base_seq + idx as u64 * *stride as u64;
+                if dropped.contains(&seq) {
+                    total_dropped += 1;
+                } else {
+                    dec.add_source_symbol(*gen_id, idx, k, r, symbols[seq as usize].clone());
+                }
+            }
+            for (sym_idx, data) in repairs {
+                let hdr = FecRepairHeader {
+                    generation_id: *gen_id,
+                    symbol_index: *sym_idx,
+                    k: k as u8,
+                    r: r as u8,
+                    base_seq: *base_seq,
+                    stride: *stride,
+                };
+                dec.add_repair_symbol(&hdr, data.clone());
+            }
+            for (idx, data) in dec.try_recover(*gen_id) {
+                let seq = base_seq + idx as u64 * *stride as u64;
+                let orig = &symbols[seq as usize];
+                assert_eq!(
+                    &data[..orig.len()],
+                    &orig[..],
+                    "recovered data must match original"
+                );
+                total_recovered += 1;
+            }
+        }
+        (total_dropped, total_recovered)
+    }
+
+    #[test]
+    fn interleave_depth_clamped_to_u8_on_the_wire() {
+        // Depth > 255 would truncate the single-byte wire stride and desync the
+        // decoder's index→seq mapping; with_interleave must clamp it.
+        let mut enc = FecEncoder::new(1, 1).with_interleave(260);
+        let repairs = enc.add_source_symbol(0, Bytes::from_static(b"x"));
+        assert_eq!(repairs.len(), 1);
+        let mut buf = repairs[0].clone();
+        let pkt = crate::wire::Packet::decode(&mut buf).unwrap();
+        let mut payload = pkt.payload;
+        let _sub = payload.split_to(1);
+        let hdr = FecRepairHeader::decode(&mut payload).unwrap();
+        assert_eq!(hdr.stride, 255, "stride must be clamped to u8::MAX");
+    }
+
+    #[test]
+    fn interleaving_recovers_burst_of_r_times_depth() {
+        // K=8, R=2, D=4, 32 symbols (4 generations) → a burst of R*D=8
+        // consecutive losses spreads to exactly R=2 per generation, so every
+        // generation recovers fully.
+        let (dropped, recovered) = run_burst(8, 2, 4, 32, 12, 8);
+        assert_eq!(dropped, 8, "burst drops R*D = 8 symbols");
+        assert_eq!(recovered, 8, "interleaving recovers the entire R*D burst");
+    }
+
+    #[test]
+    fn without_interleaving_same_burst_is_unrecoverable() {
+        // Same 32 symbols / same 8-symbol burst but NO interleaving (depth=1)
+        // concentrates >R losses into the contiguous generations it covers →
+        // unrecoverable.
+        let (dropped, recovered) = run_burst(8, 2, 1, 32, 12, 8);
+        assert_eq!(dropped, 8);
+        assert!(
+            recovered < dropped,
+            "without interleaving the burst exceeds R per generation (recovered {recovered}/{dropped})"
+        );
     }
 
     // ─── Multi-loss recovery (deterministic) ────────────────────────────
