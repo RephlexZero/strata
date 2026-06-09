@@ -90,6 +90,10 @@ pub enum EncoderBackend {
     Vulkan,
     /// SVT-HEVC: fast software H.265 encoder (multi-threaded, much faster than x265enc).
     SvtHevc,
+    /// Rockchip MPP hardware encoder (RK3588 / RK35xx SoCs — e.g. Orange Pi 5).
+    /// Covers both the mainline `rkmpph26xenc` (gst-plugins-bad ≥1.24) and the
+    /// Rockchip BSP `mpph26xenc` (gstreamer-rockchip).
+    Rockchip,
 }
 
 impl std::fmt::Display for EncoderBackend {
@@ -101,6 +105,7 @@ impl std::fmt::Display for EncoderBackend {
             EncoderBackend::Qsv => write!(f, "QSV"),
             EncoderBackend::Vulkan => write!(f, "Vulkan"),
             EncoderBackend::SvtHevc => write!(f, "SVT-HEVC"),
+            EncoderBackend::Rockchip => write!(f, "Rockchip-MPP"),
         }
     }
 }
@@ -119,6 +124,8 @@ fn resolve_encoder(codec: CodecType) -> (&'static str, EncoderBackend) {
             ("vaapih264enc", EncoderBackend::Vaapi), // old gstreamer-vaapi plugin
             ("qsvh264enc", EncoderBackend::Qsv),
             ("vulkanh264enc", EncoderBackend::Vulkan), // AMD RADV / any Vulkan 1.3 GPU
+            ("rkmpph264enc", EncoderBackend::Rockchip), // RK3588 mainline rkmpp
+            ("mpph264enc", EncoderBackend::Rockchip),  // RK3588 Rockchip BSP
             ("x264enc", EncoderBackend::Software),
         ],
         CodecType::H265 => &[
@@ -126,6 +133,8 @@ fn resolve_encoder(codec: CodecType) -> (&'static str, EncoderBackend) {
             ("vah265enc", EncoderBackend::Vaapi), // new va plugin
             ("vaapih265enc", EncoderBackend::Vaapi), // old gstreamer-vaapi plugin
             ("qsvh265enc", EncoderBackend::Qsv),
+            ("rkmpph265enc", EncoderBackend::Rockchip), // RK3588 mainline rkmpp
+            ("mpph265enc", EncoderBackend::Rockchip),   // RK3588 Rockchip BSP
             ("svthevcenc", EncoderBackend::SvtHevc), // fast multi-threaded SW (much faster than x265)
             ("x265enc", EncoderBackend::Software),
         ],
@@ -138,6 +147,30 @@ fn resolve_encoder(codec: CodecType) -> (&'static str, EncoderBackend) {
     }
     // Last-resort fallback (may fail at pipeline creation if not installed).
     (codec.encoder_factory(), EncoderBackend::Software)
+}
+
+/// Set an integer rate property (`bitrate`/`bps`) using the property's actual
+/// value type, so we never panic setting a u32 into an i32 property (or vice
+/// versa) on an unfamiliar HW encoder.
+fn set_rate_prop(enc: &gst::Element, name: &str, spec: &gst::glib::ParamSpec, value: u32) {
+    match spec.value_type() {
+        gst::glib::Type::U32 => enc.set_property(name, value),
+        gst::glib::Type::I32 => enc.set_property(name, value as i32),
+        gst::glib::Type::U64 => enc.set_property(name, value as u64),
+        gst::glib::Type::I64 => enc.set_property(name, value as i64),
+        _ => {}
+    }
+}
+
+/// Read an integer rate property (`bitrate`/`bps`) regardless of its int type.
+fn get_rate_prop(enc: &gst::Element, name: &str, spec: &gst::glib::ParamSpec) -> u32 {
+    match spec.value_type() {
+        gst::glib::Type::U32 => enc.property::<u32>(name),
+        gst::glib::Type::I32 => enc.property::<i32>(name).max(0) as u32,
+        gst::glib::Type::U64 => enc.property::<u64>(name).min(u32::MAX as u64) as u32,
+        gst::glib::Type::I64 => enc.property::<i64>(name).clamp(0, u32::MAX as i64) as u32,
+        _ => 0,
+    }
 }
 
 /// Uniform codec controller for encoder runtime operations.
@@ -186,18 +219,86 @@ impl CodecController {
     }
 
     /// Set the encoder bitrate in kbps.
-    /// All supported backends (software + HW) expose `bitrate` in kbps.
+    ///
+    /// Most backends expose `bitrate` in kbps. The Rockchip BSP `mpph26xenc`
+    /// instead exposes `bps` (bits/sec). Pick whichever the element actually
+    /// has, matching the property's value type so we never panic on a
+    /// type/property mismatch on an unfamiliar HW encoder.
     pub fn set_bitrate_kbps(&self, enc: &gst::Element, kbps: u32) {
-        if self.codec != CodecType::Fake {
-            enc.set_property("bitrate", kbps);
+        if self.codec == CodecType::Fake {
+            return;
+        }
+        // Rockchip BSP/BELABOX `mpph26xenc` names its property `bitrate` but
+        // interprets it as BPS (bits/sec); everything else (incl. mainline
+        // `rkmpph26xenc`) uses kbps.
+        let rockchip_bps =
+            self.backend == EncoderBackend::Rockchip && self.encoder_factory.starts_with("mpp");
+        if let Some(spec) = enc.find_property("bitrate") {
+            let v = if rockchip_bps {
+                kbps.saturating_mul(1000)
+            } else {
+                kbps
+            };
+            set_rate_prop(enc, "bitrate", &spec, v);
+        } else if let Some(spec) = enc.find_property("bps") {
+            set_rate_prop(enc, "bps", &spec, kbps.saturating_mul(1000));
         }
     }
 
     /// Get the current encoder bitrate in kbps.
     pub fn get_bitrate_kbps(&self, enc: &gst::Element) -> u32 {
-        match self.codec {
-            CodecType::Fake => 0,
-            _ => enc.property::<u32>("bitrate"),
+        if self.codec == CodecType::Fake {
+            return 0;
+        }
+        let rockchip_bps =
+            self.backend == EncoderBackend::Rockchip && self.encoder_factory.starts_with("mpp");
+        if let Some(spec) = enc.find_property("bitrate") {
+            let raw = get_rate_prop(enc, "bitrate", &spec);
+            if rockchip_bps { raw / 1000 } else { raw }
+        } else if let Some(spec) = enc.find_property("bps") {
+            get_rate_prop(enc, "bps", &spec) / 1000
+        } else {
+            0
+        }
+    }
+
+    /// Apply static encoder properties that [`Self::pipeline_fragment`]
+    /// intentionally omits from the launch string for the Rockchip HW encoder.
+    ///
+    /// The Rockchip `mpph26xenc` fragment sets only `bitrate` so that
+    /// `gst::parse::launch` can never fail on an unknown property — which left
+    /// the GOP / IDR interval at the encoder default. That default *is* the
+    /// framerate (~1 s IDR) on the BELABOX/rockchip-linux BSP, but it was never
+    /// pinned, so the IDR cadence was an unverified assumption. This sets the
+    /// GOP explicitly *after* launch, guarded by `find_property`, so an encoder
+    /// lacking a property is simply skipped — keeping the launch robust while
+    /// making the IDR cadence deterministic.
+    ///
+    /// - **GOP / IDR interval**: BSP `mpph26xenc` exposes `gop` (in frames);
+    ///   mainline `rkmpph26xenc` and the SW/other HW encoders use `key-int-max`.
+    ///   Whichever exists is pinned to `key_int_max` frames. (For the SW/NVENC/
+    ///   VA-API paths the launch string already set this; re-setting the same
+    ///   value is idempotent.)
+    /// - **`header-mode=each-idr`** (Rockchip only): the BSP default is
+    ///   "first-frame" — VPS/SPS/PPS are emitted only in the very first access
+    ///   unit. Pinning each-idr makes every IDR independently decodable in the
+    ///   elementary stream itself, instead of relying solely on downstream
+    ///   `h265parse config-interval=-1` re-injection (a single point of failure
+    ///   for mid-stream HLS segment joins and YouTube ingest).
+    pub fn configure_static_props(&self, enc: &gst::Element, key_int_max: u32) {
+        if self.codec == CodecType::Fake {
+            return;
+        }
+        for name in ["gop", "key-int-max"] {
+            if let Some(spec) = enc.find_property(name) {
+                set_rate_prop(enc, name, &spec, key_int_max);
+            }
+        }
+        // The "each-idr" nick is specific to GstMppEncHeaderMode, and
+        // set_property_from_str panics on an unknown nick, so guard to the
+        // Rockchip backend where the property and nick are known to exist.
+        if self.backend == EncoderBackend::Rockchip && enc.find_property("header-mode").is_some() {
+            enc.set_property_from_str("header-mode", "each-idr");
         }
     }
 
@@ -311,6 +412,32 @@ impl CodecController {
                     name = name,
                     bps = bitrate_kbps,
                     ki = key_int_max,
+                )
+            }
+            // ── Rockchip MPP (RK3588 etc.) ───────────────────────────────
+            (EncoderBackend::Rockchip, _) => {
+                // BSP/BELABOX `mpph26xenc`: the `bitrate` property is "Target
+                // BPS" (bits/sec, NOT kbps); the mainline gst-plugins-bad
+                // `rkmpph26xenc` follows the GstVideoEncoder convention
+                // (`bitrate` in kbps). Branch on the factory name. The GOP/IDR
+                // interval (BSP default `gop` == FPS, ~1 s IDR; verified in the
+                // rockchip-linux gstmppenc.c source, DEFAULT_PROP_GOP=-1 ->
+                // FPS) is NOT set here on purpose: keep the launch fragment to
+                // just the bitrate knob so `parse::launch` can't fail on an
+                // unknown property. It is pinned explicitly post-launch by
+                // `configure_static_props()` (gop + header-mode), so the IDR
+                // cadence is deterministic rather than an unverified default.
+                // The adapter retunes the rate via set_bitrate_kbps.
+                let bitrate_val = if factory.starts_with("mpp") {
+                    bitrate_kbps.saturating_mul(1000) // BSP/BELABOX: BPS
+                } else {
+                    bitrate_kbps // mainline rkmpp: kbps
+                };
+                format!(
+                    "{factory} name={name} bitrate={v}",
+                    factory = factory,
+                    name = name,
+                    v = bitrate_val
                 )
             }
         }

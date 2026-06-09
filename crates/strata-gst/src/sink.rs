@@ -67,6 +67,20 @@ mod imp {
         pub(crate) adaptation_max_kbps: AtomicU32,
         /// Starting bitrate for BitrateAdapter — should match encoder --bitrate.
         pub(crate) adaptation_initial_kbps: AtomicU32,
+        /// Gentle startup-ramp duration in ms (0 = disabled). The encoder
+        /// climbs from a low floor to `adaptation_initial_kbps` over this
+        /// window so a cold link isn't blasted with full rate at startup.
+        pub(crate) adaptation_startup_ramp_ms: AtomicU32,
+        /// Bitrate (kbps) the startup ramp begins at. Clamped at runtime to
+        /// `>= min_bitrate` and `<= initial`. 0 = use the adapter default.
+        pub(crate) adaptation_startup_floor_kbps: AtomicU32,
+
+        /// Scans the muxed MPEG-TS to flag keyframe (IDR) access-unit packets so
+        /// they can be marked critical for keyframe-protected scheduling. The
+        /// bonding sink is downstream of mpegtsmux, so the only in-band keyframe
+        /// signal left is the TS random-access-indicator bit. See
+        /// [`crate::ts_keyframe`].
+        pub(crate) ts_keyframe: Mutex<crate::ts_keyframe::TsKeyframeScanner>,
     }
 
     impl Default for StrataSink {
@@ -84,6 +98,9 @@ mod imp {
                 adaptation_min_kbps: AtomicU32::new(500),
                 adaptation_max_kbps: AtomicU32::new(25_000),
                 adaptation_initial_kbps: AtomicU32::new(0),
+                adaptation_startup_ramp_ms: AtomicU32::new(0),
+                adaptation_startup_floor_kbps: AtomicU32::new(0),
+                ts_keyframe: Mutex::new(crate::ts_keyframe::TsKeyframeScanner::new()),
             }
         }
     }
@@ -458,6 +475,8 @@ mod imp {
             let adapt_min = self.adaptation_min_kbps.load(Ordering::Relaxed);
             let adapt_max = self.adaptation_max_kbps.load(Ordering::Relaxed);
             let adapt_initial = self.adaptation_initial_kbps.load(Ordering::Relaxed);
+            let adapt_startup_ramp_ms = self.adaptation_startup_ramp_ms.load(Ordering::Relaxed);
+            let adapt_startup_floor = self.adaptation_startup_floor_kbps.load(Ordering::Relaxed);
 
             let handle = std::thread::Builder::new()
                 .name("strata-stats".into())
@@ -467,11 +486,18 @@ mod imp {
                     let start = Instant::now();
                     let mut stats_seq: u64 = 0;
 
+                    let default_cfg = AdaptationConfig::default();
                     let mut adapter = BitrateAdapter::new(AdaptationConfig {
                         max_bitrate_kbps: adapt_max,
                         min_bitrate_kbps: adapt_min,
                         initial_bitrate_kbps: adapt_initial,
-                        ..AdaptationConfig::default()
+                        startup_ramp: Duration::from_millis(adapt_startup_ramp_ms as u64),
+                        startup_floor_kbps: if adapt_startup_floor > 0 {
+                            adapt_startup_floor
+                        } else {
+                            default_cfg.startup_floor_kbps
+                        },
+                        ..default_cfg
                     });
 
                     while running.load(Ordering::Relaxed) {
@@ -634,12 +660,19 @@ mod imp {
             let data = bytes::Bytes::copy_from_slice(&map);
 
             let flags = buffer.flags();
-            // Only stream headers (SPS/PPS/VPS, PAT/PMT) are truly critical
-            // and worth broadcasting to all links.  The DELTA_UNIT flag is
-            // unreliable for muxed streams — mpegtsmux never sets it, so
-            // `!DELTA_UNIT` was true for every buffer, causing ALL data to
-            // be broadcast to every link (nullifying EDPF differentiation).
-            let is_critical = flags.contains(gst::BufferFlags::HEADER);
+            // The DELTA_UNIT flag is unreliable for muxed streams — mpegtsmux
+            // never sets it, so `!DELTA_UNIT` was true for every buffer. To mark
+            // the loss-critical data we instead use two in-band TS signals that
+            // survive the mux: the HEADER flag (SPS/PPS/VPS, PAT/PMT) and the
+            // random-access-indicator bit on the video PID, which marks IDR
+            // (keyframe) access units. Both are raised to Priority::Critical by
+            // the scheduler so the reference frames the decoder cannot live
+            // without get keyframe-protected drop + (when enabled) cross-link
+            // redundancy/broadcast — instead of the flat treatment that let a
+            // single lost IDR packet grey out a whole GOP.
+            let is_header = flags.contains(gst::BufferFlags::HEADER);
+            let is_keyframe_au = lock_or_recover(&self.ts_keyframe).scan(&map);
+            let is_critical = is_header || is_keyframe_au;
             let can_drop = flags.contains(gst::BufferFlags::DROPPABLE);
 
             let profile = PacketProfile {
@@ -815,7 +848,17 @@ impl StrataSink {
     /// Set the bitrate adaptation envelope (must be called before PLAYING).
     /// `initial_kbps` should match the encoder's starting `--bitrate` so the
     /// adapter and encoder start in sync and avoid a cold-start ramp-down.
-    pub fn set_adaptation_envelope(&self, min_kbps: u32, max_kbps: u32, initial_kbps: u32) {
+    /// `startup_ramp_ms` enables the gentle startup ramp (0 = disabled): the
+    /// encoder climbs from a low floor to `initial_kbps` over that window so a
+    /// cold cellular link isn't blasted with full rate at stream start.
+    pub fn set_adaptation_envelope(
+        &self,
+        min_kbps: u32,
+        max_kbps: u32,
+        initial_kbps: u32,
+        startup_ramp_ms: u32,
+        startup_floor_kbps: u32,
+    ) {
         self.imp()
             .adaptation_min_kbps
             .store(min_kbps, Ordering::Relaxed);
@@ -825,6 +868,12 @@ impl StrataSink {
         self.imp()
             .adaptation_initial_kbps
             .store(initial_kbps, Ordering::Relaxed);
+        self.imp()
+            .adaptation_startup_ramp_ms
+            .store(startup_ramp_ms, Ordering::Relaxed);
+        self.imp()
+            .adaptation_startup_floor_kbps
+            .store(startup_floor_kbps, Ordering::Relaxed);
     }
 }
 

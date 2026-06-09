@@ -23,6 +23,11 @@ OPTIONS:
   --codec <codec>      Video codec: h265 (default) or h264
   --min-bitrate <kbps> Minimum bitrate for adaptation (default: from profile)
   --max-bitrate <kbps> Maximum bitrate for adaptation (default: from profile)
+  --startup-ramp-ms <ms> Gently ramp the encoder from a low floor up to
+                      --bitrate over this window so a cold link isn't blasted
+                      with full rate at startup (0 = disabled, default: 0)
+  --startup-floor-kbps <kbps> Bitrate the startup ramp begins at
+                      (clamped to >= --min-bitrate; 0 = adapter default)
   --framerate <fps>   Video framerate (default: 30)
   --audio             Add silent AAC audio track (required for relay targets)
   --config <path>     Path to TOML config file (see Configuration Reference)
@@ -224,6 +229,34 @@ fn install_delivered_stream_gate(pad: &gst::Pad) {
     });
 }
 
+/// Monotonic-DTS guard for streams without keyframes (audio).
+///
+/// A subset of [`install_delivered_stream_gate`]: it only drops buffers whose
+/// DTS regresses below the last emitted one — the exact condition that makes
+/// `mpegtsmux` abort with "Timestamping error on input streams". Audio frames
+/// are all independent, so there is no keyframe to resync to after loss; we
+/// simply never hand the muxer a backwards DTS.
+fn install_monotonic_dts_gate(pad: &gst::Pad) {
+    use std::sync::Mutex;
+    let last_dts = Mutex::new(None::<u64>);
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+        let Some(gst::PadProbeData::Buffer(buf)) = &info.data else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let dts = buf.dts().map(|t| t.nseconds());
+        let mut last = last_dts.lock().unwrap();
+        if let (Some(d), Some(prev)) = (dts, *last)
+            && d < prev
+        {
+            return gst::PadProbeReturn::Drop;
+        }
+        if dts.is_some() {
+            *last = dts;
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
 fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut dest_str = "";
     let mut stats_dest = "";
@@ -241,6 +274,8 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut codec_str = "h265";
     let mut min_bitrate_kbps: Option<u32> = None;
     let mut max_bitrate_kbps: Option<u32> = None;
+    let mut startup_ramp_ms: u32 = 0;
+    let mut startup_floor_kbps: u32 = 0;
 
     let mut i = 0;
     while i < args.len() {
@@ -271,6 +306,14 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--max-bitrate" if i + 1 < args.len() => {
                 max_bitrate_kbps = Some(args[i + 1].parse().unwrap_or(25000));
+                i += 1;
+            }
+            "--startup-ramp-ms" if i + 1 < args.len() => {
+                startup_ramp_ms = args[i + 1].parse().unwrap_or(0);
+                i += 1;
+            }
+            "--startup-floor-kbps" if i + 1 < args.len() => {
+                startup_floor_kbps = args[i + 1].parse().unwrap_or(0);
                 i += 1;
             }
             "--framerate" if i + 1 < args.len() => {
@@ -413,8 +456,13 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let min_bitrate_kbps_val = min_bitrate_kbps.unwrap_or(profile.min_kbps);
     let max_bitrate_kbps_val = max_bitrate_kbps.unwrap_or(profile.max_kbps);
 
-    // Probe for available AAC encoder (preference: fdkaacenc > faac > avenc_aac)
-    let aac_enc_element = ["fdkaacenc", "faac", "avenc_aac"]
+    // Probe for available AAC encoder. Preference is quality-first
+    // (fdkaacenc > avenc_aac) then broadly-available fallbacks. voaacenc ships
+    // in stock gstreamer1.0-plugins-bad (present on the Orange Pi 5 / Ubuntu
+    // 22.04 default install), so it's the realistic fallback when the
+    // libav/fdk packages aren't installed. All of these expose a `bitrate`
+    // property in bits/sec, so the element name is a drop-in substitution.
+    let aac_enc_element = ["fdkaacenc", "avenc_aac", "voaacenc", "faac"]
         .iter()
         .find(|&&name| gst::ElementFactory::find(name).is_some())
         .copied()
@@ -460,7 +508,10 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let hw_fmt_conv = match codec_ctrl.backend() {
         gststrata::codec::EncoderBackend::Vaapi
         | gststrata::codec::EncoderBackend::Vulkan
-        | gststrata::codec::EncoderBackend::Nvenc => "! videoconvert ! video/x-raw,format=NV12 ",
+        | gststrata::codec::EncoderBackend::Nvenc
+        // Rockchip rkmpp encoders take NV12 (8-bit 4:2:0); convert so a YUYV
+        // USB camera or 10-bit source negotiates cleanly.
+        | gststrata::codec::EncoderBackend::Rockchip => "! videoconvert ! video/x-raw,format=NV12 ",
         _ => "",
     };
 
@@ -491,6 +542,26 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "Failed to cast to pipeline")?;
 
     configure_mpegtsmux(&pipeline);
+
+    // Pin the GOP / IDR interval (and per-IDR parameter sets on Rockchip) that
+    // the launch string deliberately omitted for the HW encoder so a
+    // parse::launch could not fail on an unknown property. Done post-launch and
+    // guarded by find_property, so the IDR cadence is deterministic (~1 s)
+    // instead of an unverified encoder default — a known under-investigated
+    // variable in the grey/ref-loss artifact.
+    if let Some(enc) = pipeline.by_name("enc") {
+        codec_ctrl.configure_static_props(&enc, key_int);
+        eprintln!(
+            "Encoder static props applied: GOP/key-int={} frames (~{:.0} ms IDR){}",
+            key_int,
+            (key_int as f64 / framerate.max(1) as f64) * 1000.0,
+            if codec_ctrl.backend() == gststrata::codec::EncoderBackend::Rockchip {
+                ", header-mode=each-idr (if supported)"
+            } else {
+                ""
+            }
+        );
+    }
 
     // Keep a handle to the input-selector and its test-source pad
     let selector = pipeline
@@ -594,10 +665,12 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             min_bitrate_kbps_val,
             max_bitrate_kbps_val,
             bitrate_kbps,
+            startup_ramp_ms,
+            startup_floor_kbps,
         );
         eprintln!(
-            "Adaptation envelope: {}–{} kbps",
-            min_bitrate_kbps_val, max_bitrate_kbps_val
+            "Adaptation envelope: {}–{} kbps (startup ramp {} ms, floor {} kbps)",
+            min_bitrate_kbps_val, max_bitrate_kbps_val, startup_ramp_ms, startup_floor_kbps
         );
     }
 
@@ -1132,20 +1205,46 @@ fn add_source_branch(
                 // expose is-live as a settable GObject property.  The
                 // clocksync element downstream handles hot-swap timestamps.
                 .build()?;
+            // Many USB cameras only reach the target framerate in MJPG (this
+            // FHD cam does 30fps only as MJPG; YUYV caps at ~10-15fps).
+            // decodebin auto-plugs jpegdec for MJPG and passes raw through, so
+            // we negotiate whatever format the camera actually offers at the
+            // requested resolution/fps instead of forcing video/x-raw.
+            let dbin = gst::ElementFactory::make("decodebin").build()?;
             // clocksync re-stamps buffers against the pipeline clock so that
             // switching from testsrc (already clock-stamped) to v4l2 does not
             // produce a backwards or large-forward jump at input-selector.
             let csync = gst::ElementFactory::make("clocksync").build()?;
             let conv = gst::ElementFactory::make("videoconvert").build()?;
             let scale = gst::ElementFactory::make("videoscale").build()?;
+            // videorate reconciles the camera's delivered framerate with the
+            // requested one. Critical for UVC cams whose only mode at a given
+            // resolution is low-fps raw (this FHD cam offers 1080p only as
+            // YUY2 @ 5fps); without it the downstream framerate=N/1 capsfilter
+            // cannot negotiate and the branch dies with a not-linked error.
+            // It's a passthrough when the rates already match.
+            let rate = gst::ElementFactory::make("videorate").build()?;
             let filter = gst::ElementFactory::make("capsfilter")
                 .property("caps", &caps)
                 .build()?;
             let queue = gst::ElementFactory::make("queue")
                 .property("max-size-buffers", 3u32)
                 .build()?;
+            // decodebin has dynamic src pads — link to clocksync when it appears.
+            let csync_weak = csync.downgrade();
+            dbin.connect_pad_added(move |_, pad| {
+                if let Some(csync) = csync_weak.upgrade()
+                    && let Some(sink_pad) = csync.static_pad("sink")
+                    && !sink_pad.is_linked()
+                {
+                    let _ = pad.link(&sink_pad);
+                }
+            });
             let name = src.name().to_string();
-            (vec![src, csync, conv, scale, filter, queue], name)
+            (
+                vec![src, dbin, csync, conv, scale, rate, filter, queue],
+                name,
+            )
         }
         "uri" => {
             if uri.is_empty() {
@@ -1156,6 +1255,9 @@ fn add_source_branch(
                 .build()?;
             let conv = gst::ElementFactory::make("videoconvert").build()?;
             let scale = gst::ElementFactory::make("videoscale").build()?;
+            // See the v4l2 branch: videorate reconciles source fps with the
+            // requested framerate so the downstream capsfilter can negotiate.
+            let rate = gst::ElementFactory::make("videorate").build()?;
             let filter = gst::ElementFactory::make("capsfilter")
                 .property("caps", &caps)
                 .build()?;
@@ -1173,8 +1275,8 @@ fn add_source_branch(
                     let _ = pad.link(&sink_pad);
                 }
             });
-            // Link conv→scale→filter→queue (src→conv linked via pad-added)
-            (vec![src, conv, scale, filter, queue], name)
+            // Link conv→scale→rate→filter→queue (src→conv linked via pad-added)
+            (vec![src, conv, scale, rate, filter, queue], name)
         }
         other => {
             return Err(format!("Unknown source mode: {other}").into());
@@ -1187,10 +1289,13 @@ fn add_source_branch(
     }
 
     // Link chain: elements[0] → elements[1] → ... → elements[N-1]
-    // For v4l2: src → conv → scale → filter → queue
-    // For uri: conv → scale → filter → queue (src→conv via pad-added)
+    // For v4l2: src → conv → scale → rate → filter → queue
+    // For uri: conv → scale → rate → filter → queue (src→conv via pad-added)
     if mode == "v4l2" {
-        gst::Element::link_many(&elements)?;
+        // v4l2src ! decodebin (static); decodebin →(dynamic, via pad-added)
+        // clocksync; then clocksync ! videoconvert ! videoscale ! videorate ! capsfilter ! queue.
+        elements[0].link(&elements[1])?;
+        gst::Element::link_many(&elements[2..])?;
     } else {
         // Skip the first element (uridecodebin) — linked via pad-added
         gst::Element::link_many(&elements[1..])?;
@@ -1584,18 +1689,26 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // probe on the parsed video (`install_delivered_stream_gate`), because
         // the keyframe signal is only reliable post-demux (mpegtsmux strips
         // DELTA_UNIT, so the bonding transport can't see keyframes — see
-        // sink.rs). Video-only on purpose: the cross-stream audio/video DTS
-        // interleave at startup was a second crash trigger (run 5032). Audio
-        // can be re-added behind its own gate once this is field-proven.
+        // sink.rs). The cross-stream audio/video DTS interleave at startup was
+        // a second crash trigger (run 5032), so audio rides its own gate: the
+        // monotonic-DTS half of the video gate (AAC has no keyframes, so there
+        // is nothing to wait for — only backwards DTS must be dropped). YouTube
+        // Live will not display a video-only HLS, so the silent AAC track the
+        // sender muxes has to survive the re-mux.
         format!(
             "stratasrc links=\"{bind}\" name=src latency=200 ! \
              queue max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 \
              leaky=downstream ! \
              tsparse set-timestamps=true alignment=7 ! \
-             tsdemux name=d d. ! \
+             tsdemux name=d \
+             d. ! \
              queue max-size-buffers=600 max-size-bytes=0 max-size-time=2000000000 \
              leaky=downstream ! \
-             {parser} name=vparse ! \
+             {parser} name=vparse ! mux. \
+             d. ! \
+             queue max-size-buffers=200 max-size-bytes=0 max-size-time=2000000000 \
+             leaky=downstream ! \
+             aacparse name=aparse ! mux. \
              mpegtsmux name=mux alignment=7 pat-interval=1 pmt-interval=1 ! \
              hlssink name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
              target-duration=2 max-files=10 playlist-length=6",
@@ -1666,6 +1779,15 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         {
             install_delivered_stream_gate(&src);
             eprintln!("DeliveredStream gate installed on vparse src pad");
+        }
+        // Audio rides a monotonic-DTS-only gate (see pipeline comment): mpegtsmux
+        // dies on a backwards DTS, and the audio PID can regress after a gap-skip
+        // just like video. No keyframe logic — every AAC frame is independent.
+        if let Some(aparse) = pipeline.by_name("aparse")
+            && let Some(src) = aparse.static_pad("src")
+        {
+            install_monotonic_dts_gate(&src);
+            eprintln!("Monotonic-DTS gate installed on aparse src pad");
         }
         configure_mpegtsmux(&pipeline);
     }

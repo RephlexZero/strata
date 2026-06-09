@@ -10,6 +10,7 @@ pub mod hls_upload;
 pub mod pad;
 pub mod sink;
 pub mod src;
+pub mod ts_keyframe;
 mod util;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
