@@ -256,39 +256,42 @@ const GSO_SUPERPACKET_BYTES: usize = 65_536;
 const PACED_QUEUE_SOJOURN_BUDGET_SECS: f64 = 0.5;
 
 impl TransportLink {
-    /// Enforce the BDP-relative byte bound on the paced queue with
-    /// keyframe-protected oldest-drop.
+    /// The paced-queue byte budget shared by the AQM
+    /// (`enforce_paced_queue_bound`) and retransmit admission control:
+    /// `max(k×BDP, pacing_rate × sojourn budget, one GSO superpacket)`.
     ///
-    /// The cap is `k·(btl_bw × RTprop)` — scale-free: satellite → huge
-    /// (never drops), fiber → huge, cellular → modest. This is the F2/F4
-    /// AQM: the only queue strata actually owns is this userspace one, so
-    /// we bound *it* instead of poking `tc`. Oldest low-priority packets
-    /// are dropped first; keyframes/config (priority ≥ Reference) are
-    /// preserved until nothing else remains.
+    /// The drain-time term (Little's law: the queue empties at pacing_rate,
+    /// so `rate × budget` bounds the oldest packet's sojourn directly)
+    /// exists because the BDP cap alone collapses to the GSO floor on
+    /// short-RTT paths (loopback BDP ≈ 30 B) and modest-RTT cellular
+    /// (BDP ≈ 30 KB), where a single keyframe burst is larger than the
+    /// floor — measured 2.3% SELF-inflicted loss on loopback with zero
+    /// network loss, every drop a mid-GOP hole. A burst that drains within
+    /// the sojourn budget must never be cut; a queue standing past it is
+    /// genuine overload (the adapter's job) and still gets bounded.
+    fn paced_queue_cap_bytes(&self) -> usize {
+        let cc = self.congestion.lock().unwrap();
+        let bdp_cap = cc.inflight_cap_bytes(BDP_QUEUE_K);
+        let drain_cap = cc.pacing_rate() * PACED_QUEUE_SOJOURN_BUDGET_SECS;
+        if bdp_cap > 0.0 {
+            (bdp_cap.max(drain_cap) as usize).max(GSO_SUPERPACKET_BYTES)
+        } else {
+            PACED_QUEUE_BOOTSTRAP_BYTES
+        }
+    }
+
+    /// Enforce the byte bound on the paced queue with keyframe-protected
+    /// oldest-drop (see `paced_queue_cap_bytes` for the bound itself).
+    ///
+    /// This is the F2/F4 AQM: the only queue strata actually owns is this
+    /// userspace one, so we bound *it* instead of poking `tc`. Oldest
+    /// low-priority packets are dropped first; keyframes/config
+    /// (priority ≥ Reference) are preserved until nothing else remains.
     fn enforce_paced_queue_bound(
         &self,
         q: &mut std::collections::VecDeque<strata_transport::sender::OutputPacket>,
     ) {
-        let cap_bytes = {
-            let cc = self.congestion.lock().unwrap();
-            let bdp_cap = cc.inflight_cap_bytes(BDP_QUEUE_K);
-            // Drain-time bound (Little's law): the queue empties at
-            // pacing_rate, so `rate × budget` bounds the oldest packet's
-            // sojourn directly. The BDP cap alone collapses to the GSO floor
-            // on short-RTT paths (loopback BDP ≈ 30 B) and modest-RTT
-            // cellular (BDP ≈ 30 KB), where a single keyframe burst is
-            // larger than the floor — measured 2.3% SELF-inflicted loss on
-            // loopback with zero network loss, every drop a mid-GOP hole. A
-            // burst that drains within the sojourn budget must never be cut;
-            // a queue standing past it is genuine overload (the adapter's
-            // job) and still gets bounded.
-            let drain_cap = cc.pacing_rate() * PACED_QUEUE_SOJOURN_BUDGET_SECS;
-            if bdp_cap > 0.0 {
-                (bdp_cap.max(drain_cap) as usize).max(GSO_SUPERPACKET_BYTES)
-            } else {
-                PACED_QUEUE_BOOTSTRAP_BYTES
-            }
-        };
+        let cap_bytes = self.paced_queue_cap_bytes();
 
         let mut total: usize = q.iter().map(|p| p.data.len()).sum();
         if total <= cap_bytes {
@@ -323,12 +326,16 @@ impl TransportLink {
             }
         }
         if dropped_pkts > 0 {
-            let pkts_total = self.aqm_dropped_pkts.fetch_add(dropped_pkts, Ordering::Relaxed)
+            let pkts_total = self
+                .aqm_dropped_pkts
+                .fetch_add(dropped_pkts, Ordering::Relaxed)
                 + dropped_pkts;
             self.aqm_dropped_bytes
                 .fetch_add(dropped_bytes, Ordering::Relaxed);
-            let retx_total =
-                self.aqm_dropped_retx.fetch_add(dropped_retx, Ordering::Relaxed) + dropped_retx;
+            let retx_total = self
+                .aqm_dropped_retx
+                .fetch_add(dropped_retx, Ordering::Relaxed)
+                + dropped_retx;
             let mut last = self.aqm_last_log.lock().unwrap();
             if last.elapsed() >= std::time::Duration::from_secs(1) {
                 *last = Instant::now();
@@ -837,17 +844,39 @@ impl TransportLink {
                     }
                 }
                 ControlBody::Nack(nack) => {
-                    sender.process_nack(nack);
-                    // Drain retransmits into paced queue so they actually get
-                    // sent. Without this, retransmits pile up in the sender's
-                    // internal output_queue and inflate queue_depth, keeping
-                    // the BDP cap permanently blocked.
-                    let outputs: Vec<_> = sender.drain_output().collect();
-                    if !outputs.is_empty() {
-                        let mut q = self.paced_queue.lock().unwrap();
-                        q.extend(outputs);
-                        // Same BDP-relative, keyframe-protected bound.
-                        self.enforce_paced_queue_bound(&mut q);
+                    // Retransmit admission control: when the paced queue is
+                    // already past half its budget, requeueing repairs only
+                    // multiplies the offered load — the AQM trims them, the
+                    // receiver re-NACKs, and the loop amplifies a radio
+                    // stall into a sustained storm (field run 12: 273k of
+                    // 396k AQM drops were retransmissions, ~5× the fresh
+                    // traffic). Skipping here does NOT consume the sender
+                    // retry budget; the receiver re-asks after its rearm
+                    // interval, by which time the queue has drained if the
+                    // stall has passed.
+                    let q_bytes: usize = {
+                        let q = self.paced_queue.lock().unwrap();
+                        q.iter().map(|p| p.data.len()).sum()
+                    };
+                    if q_bytes * 2 > self.paced_queue_cap_bytes() {
+                        tracing::debug!(
+                            link_id = self.id,
+                            q_bytes,
+                            "NACK deferred: paced queue above half budget"
+                        );
+                    } else {
+                        sender.process_nack(nack);
+                        // Drain retransmits into paced queue so they actually
+                        // get sent. Without this, retransmits pile up in the
+                        // sender's internal output_queue and inflate
+                        // queue_depth, keeping the BDP cap permanently blocked.
+                        let outputs: Vec<_> = sender.drain_output().collect();
+                        if !outputs.is_empty() {
+                            let mut q = self.paced_queue.lock().unwrap();
+                            q.extend(outputs);
+                            // Same BDP-relative, keyframe-protected bound.
+                            self.enforce_paced_queue_bound(&mut q);
+                        }
                     }
                 }
                 ControlBody::Pong(pong) => {
@@ -1376,6 +1405,8 @@ impl LinkSender for TransportLink {
             inferred_regime,
             bdp_bytes,
             inflight_cap_bytes,
+            pacing_rate_bps: cc.pacing_rate() * 8.0,
+            aqm_dropped_total: self.aqm_dropped_pkts.load(Ordering::Relaxed),
         }
     }
 

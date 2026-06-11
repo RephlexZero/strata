@@ -172,6 +172,15 @@ pub struct LinkCapacity {
     /// ARQ send-queue depth in packets. `None` when unavailable (e.g. from
     /// the modem supervisor which lacks transport-layer visibility).
     pub queue_depth: Option<usize>,
+    /// Pacing (drain) rate in kbps — the rate this link actually empties
+    /// its paced queue at. `None` when unavailable. Capacity estimates
+    /// above this are undeliverable (the oracle over-reads lossy LTE), so
+    /// the adapter clamps per-link capacity to it.
+    pub drain_rate_kbps: Option<f64>,
+    /// Cumulative packets deleted by the link's paced-queue AQM. `None`
+    /// when unavailable. A rising count means offered > drained for longer
+    /// than the queue's sojourn budget — self-congestion.
+    pub aqm_dropped_total: Option<u64>,
 }
 
 /// Receiver-side telemetry feedback for the BitrateAdapter.
@@ -221,6 +230,18 @@ pub struct BitrateAdapter {
     /// Number of consecutive capacity decreases.
     consecutive_decreases: u32,
     over_pressure_ticks: u32,
+    /// Previous sum of per-link AQM drop counters (for per-tick deltas).
+    prev_aqm_dropped: u64,
+    /// Consecutive ticks on which the paced-queue AQM deleted packets.
+    /// One dropping tick can be a single over-size burst; a sustained run
+    /// means the queue is standing past its sojourn budget — the offered
+    /// rate (video + FEC + retransmits) durably exceeds the drain rate.
+    aqm_dropping_ticks: u32,
+    /// Latched while AQM drops are sustained. Forces the over-pressure
+    /// reduce path regardless of the (optimistic) capacity estimate, and
+    /// pins FEC overhead to baseline — congestive loss must not inflate
+    /// parity, that's the 50%-overhead-at-zero-spare death spiral.
+    self_congested: bool,
     /// Consecutive ticks with zero usable capacity while links are still alive.
     /// A single transient zero is a feedback/ACK gap on an otherwise-healthy
     /// link (the next tick reports full capacity), NOT a collapse — slamming to
@@ -316,6 +337,9 @@ impl BitrateAdapter {
             consecutive_increases: 0,
             consecutive_decreases: 0,
             over_pressure_ticks: 0,
+            prev_aqm_dropped: 0,
+            aqm_dropping_ticks: 0,
+            self_congested: false,
             zero_capacity_ticks: 0,
             last_increase_time: None,
             ewma_loss_fec: 0.0,
@@ -390,10 +414,24 @@ impl BitrateAdapter {
 
         // Loss-driven scaling independent of mode avoids being stuck at 10%
         // overhead when links are lossy but mode hysteresis has not latched.
-        let loss_scaled = (BASE_OVERHEAD + self.ewma_loss_fec as f64 * 0.50).min(MAX_OVERHEAD);
+        //
+        // EXCEPT under self-congestion: when the paced-queue AQM is cutting
+        // our own standing queue, the loss is congestive (offered exceeds
+        // drained), and parity packets ADD to the offer — scaling FEC with
+        // that loss is a positive-feedback death spiral. Field runs sat at
+        // "overhead_pct=50.0 spare_kbps=0" with ~80% measured loss on a
+        // link whose only real problem was being offered 1.5× its drain
+        // rate. FEC inflation is for RANDOM channel loss only; congestive
+        // loss is the bitrate adapter's job (which `self_congested` is
+        // simultaneously forcing down via the over-pressure path).
+        let loss_scaled = if self.self_congested {
+            BASE_OVERHEAD
+        } else {
+            (BASE_OVERHEAD + self.ewma_loss_fec as f64 * 0.50).min(MAX_OVERHEAD)
+        };
 
         let mut overhead = spare_scaled.max(loss_scaled);
-        if self.ewma_loss_fec as f64 >= 0.25 {
+        if self.ewma_loss_fec as f64 >= 0.25 && !self.self_congested {
             overhead = overhead.max(MIN_LOSSY_OVERHEAD);
         }
 
@@ -480,7 +518,17 @@ impl BitrateAdapter {
             .iter()
             .filter(|l| l.alive)
             .map(|l| {
-                let raw = l.capacity_kbps;
+                // Drain-honesty clamp: the pacer is the rate the link
+                // ACTUALLY sends at; capacity claims above it (the oracle
+                // over-reads lossy LTE) budget the encoder past what the
+                // link can deliver, and the surplus becomes paced-queue AQM
+                // drops — self-inflicted mid-GOP holes. BBR's startup gain
+                // keeps pacing above the delivered rate, so ramp-up probing
+                // still works under the clamp.
+                let raw = match l.drain_rate_kbps {
+                    Some(drain) if drain > 0.0 => l.capacity_kbps.min(drain),
+                    _ => l.capacity_kbps,
+                };
                 let smoothed = if raw > 0.0 {
                     let entry = self.capacity_ewma.entry(l.link_id).or_insert(raw);
                     let alpha = if raw < *entry {
@@ -526,13 +574,43 @@ impl BitrateAdapter {
         let usable_kbps = aggregate_kbps * (1.0 - self.config.headroom);
 
         // Compute pressure ratio (target / capacity; >1 = over-pressure)
-        let pressure = if usable_kbps > 0.0 {
+        let mut pressure = if usable_kbps > 0.0 {
             self.current_target_kbps as f64 / usable_kbps
         } else if alive_count > 0 {
             2.0 // Over-pressure: have links but zero capacity
         } else {
             5.0 // Extreme: no links alive
         };
+
+        // ── Self-congestion detector: paced-queue AQM drops ──────────────
+        // The AQM only deletes packets once the queue has stood past its
+        // sojourn budget — direct, unambiguous evidence that the offered
+        // rate (video + FEC + retransmits) exceeds the drain rate, no
+        // matter how optimistic the capacity estimate reads. A single
+        // dropping tick can be one oversized burst; a sustained run forces
+        // the over-pressure reduce path and latches `self_congested` (which
+        // also pins FEC overhead to baseline — see
+        // `recommended_fec_overhead`).
+        const AQM_DROPS_PER_TICK_THRESHOLD: u64 = 5;
+        const AQM_SUSTAINED_TICKS: u32 = 2;
+        let aqm_total: u64 = links.iter().filter_map(|l| l.aqm_dropped_total).sum();
+        let aqm_delta = aqm_total.saturating_sub(self.prev_aqm_dropped);
+        self.prev_aqm_dropped = aqm_total;
+        if aqm_delta >= AQM_DROPS_PER_TICK_THRESHOLD {
+            self.aqm_dropping_ticks += 1;
+        } else {
+            self.aqm_dropping_ticks = 0;
+        }
+        self.self_congested = self.aqm_dropping_ticks >= AQM_SUSTAINED_TICKS;
+        if self.self_congested {
+            pressure = pressure.max(self.config.pressure_threshold + 0.05);
+            info!(
+                target: "strata::adapt",
+                "[adapt] self-congestion: AQM dropped {aqm_delta} pkts this tick \
+                 ({} sustained ticks) — forcing over-pressure",
+                self.aqm_dropping_ticks
+            );
+        }
 
         // DegradationStage::from_pressure expects capacity/required ratio
         let capacity_ratio = if pressure > 0.0 { 1.0 / pressure } else { 1.0 };
@@ -574,7 +652,10 @@ impl BitrateAdapter {
         let per_link_collapse = links
             .iter()
             .any(|l| l.alive && l.loss_rate >= 0.55 && l.queue_depth.unwrap_or(0) >= 60);
-        if per_link_collapse {
+        if per_link_collapse || self.self_congested {
+            // Self-congestion likewise must not race a concurrent ramp-up:
+            // the AQM is already cutting packets, so adding rate is the
+            // exact wrong direction even if the capacity trend looks up.
             self.consecutive_increases = 0;
         }
 
@@ -1256,8 +1337,102 @@ mod tests {
                 loss_rate: 0.0,
                 rtt_ms: 20.0,
                 queue_depth: None,
+                drain_rate_kbps: None,
+                aqm_dropped_total: None,
             })
             .collect()
+    }
+
+    // ─── Drain-honesty: capacity clamp + AQM self-congestion ────────────
+
+    /// The oracle over-reads lossy LTE; the pacer is the rate the link
+    /// actually sends at. Capacity above the drain rate must not budget the
+    /// encoder (it would just become paced-queue AQM drops).
+    #[test]
+    fn capacity_clamped_to_drain_rate() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+        let mut links = make_links(&[(8_000.0, true)]);
+        links[0].drain_rate_kbps = Some(2_000.0);
+        // Repeat so the capacity EWMA converges to the clamped value.
+        let mut cmd = None;
+        for _ in 0..20 {
+            cmd = adapter.update(&links);
+        }
+        let cmd = cmd.unwrap();
+        // usable = 2000 × (1 - headroom 0.15) = 1700 — the target must be
+        // governed by the drain rate, not the 8000 kbps capacity claim.
+        assert!(
+            cmd.target_kbps <= 1_700,
+            "target {} must be bounded by the drain rate, not the capacity claim",
+            cmd.target_kbps
+        );
+    }
+
+    /// Sustained AQM drops are direct evidence of offered > drained and must
+    /// force the over-pressure reduce path even when the capacity estimate
+    /// claims there is headroom.
+    #[test]
+    fn sustained_aqm_drops_force_reduce() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_bitrate_kbps: 500,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+        let mut links = make_links(&[(8_000.0, true)]);
+        // Converge: capacity ample, target climbs toward usable.
+        for _ in 0..30 {
+            adapter.update(&links);
+        }
+        let before = adapter.current_target_kbps();
+        assert!(before > 2_000, "precondition: target climbed ({before})");
+        // AQM starts deleting ~50 packets per tick — counter rises each tick.
+        let mut total = 0u64;
+        for _ in 0..6 {
+            total += 50;
+            links[0].aqm_dropped_total = Some(total);
+            adapter.update(&links);
+        }
+        assert!(adapter.self_congested, "sustained AQM drops must latch");
+        assert!(
+            adapter.current_target_kbps() < before,
+            "target must reduce under self-congestion ({} → {})",
+            before,
+            adapter.current_target_kbps()
+        );
+        // Counter stops rising → latch releases.
+        for _ in 0..3 {
+            links[0].aqm_dropped_total = Some(total);
+            adapter.update(&links);
+        }
+        assert!(
+            !adapter.self_congested,
+            "latch must release when drops stop"
+        );
+    }
+
+    /// Congestive loss must not inflate FEC overhead: parity adds to the
+    /// very offer that is overflowing the queue (the 50%-overhead-at-zero-
+    /// spare death spiral). Under self-congestion the loss-driven scaling
+    /// is pinned to baseline.
+    #[test]
+    fn fec_overhead_pinned_under_self_congestion() {
+        let mut adapter = BitrateAdapter {
+            ewma_loss_fec: 0.8, // would normally drive overhead to 50%
+            ..Default::default()
+        };
+        adapter.self_congested = false;
+        assert!(adapter.recommended_fec_overhead() >= 0.49);
+        adapter.self_congested = true;
+        assert!(
+            adapter.recommended_fec_overhead() <= 0.11,
+            "self-congestion must pin FEC to baseline, got {}",
+            adapter.recommended_fec_overhead()
+        );
     }
 
     // ─── Basic Operation ────────────────────────────────────────────────
@@ -1400,6 +1575,8 @@ mod tests {
             loss_rate: 0.20,
             rtt_ms: 30.0,
             queue_depth: None,
+            drain_rate_kbps: None,
+            aqm_dropped_total: None,
         }];
 
         adapter.update(&links);
@@ -1859,6 +2036,8 @@ mod tests {
             loss_rate: 1.0,
             rtt_ms: 80.0,
             queue_depth: Some(95),
+            drain_rate_kbps: None,
+            aqm_dropped_total: None,
         }];
 
         adapter.update(&links_ok);
@@ -1899,6 +2078,8 @@ mod tests {
             loss_rate: 1.0, // feedback gap: 100% loss for one tick → usable 0
             rtt_ms: 80.0,
             queue_depth: Some(0),
+            drain_rate_kbps: None,
+            aqm_dropped_total: None,
         }];
 
         // Establish capacity, then ramp the target up off the floor.
@@ -1989,6 +2170,8 @@ mod tests {
                 loss_rate: 0.0,
                 rtt_ms: 70.0,
                 queue_depth: Some(5),
+                drain_rate_kbps: None,
+                aqm_dropped_total: None,
             },
             LinkCapacity {
                 link_id: 1,
@@ -1997,6 +2180,8 @@ mod tests {
                 loss_rate: 0.85,
                 rtt_ms: 95.0,
                 queue_depth: Some(96),
+                drain_rate_kbps: None,
+                aqm_dropped_total: None,
             },
         ];
 
@@ -2415,6 +2600,8 @@ mod tests {
             loss_rate: 0.70,
             rtt_ms: 120.0,
             queue_depth: Some(120),
+            drain_rate_kbps: None,
+            aqm_dropped_total: None,
         }];
 
         let feedback = ReceiverFeedback {

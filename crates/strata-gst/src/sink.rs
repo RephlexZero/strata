@@ -521,6 +521,12 @@ mod imp {
                                         loss_rate: m.loss_rate,
                                         rtt_ms: m.rtt_ms,
                                         queue_depth: m.transport.as_ref().map(|_| m.queue_depth),
+                                        drain_rate_kbps: (m.pacing_rate_bps > 0.0)
+                                            .then_some(m.pacing_rate_bps / 1000.0),
+                                        aqm_dropped_total: m
+                                            .transport
+                                            .as_ref()
+                                            .map(|_| m.aqm_dropped_total),
                                     });
                                     if m.alive {
                                         total_capacity += m.capacity_bps;

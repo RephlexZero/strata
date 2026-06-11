@@ -52,6 +52,8 @@ impl MockLink {
                 inferred_regime: None,
                 bdp_bytes: 0.0,
                 inflight_cap_bytes: 0.0,
+                pacing_rate_bps: 0.0,
+                aqm_dropped_total: 0,
             }),
             sent_packets: Mutex::new(Vec::new()),
         }
@@ -155,6 +157,8 @@ fn full_pipeline_link_failure_and_recovery() {
             loss_rate: 0.0,
             rtt_ms: 10.0,
             queue_depth: None,
+            drain_rate_kbps: None,
+            aqm_dropped_total: None,
         },
         LinkCapacity {
             link_id: 2,
@@ -163,6 +167,8 @@ fn full_pipeline_link_failure_and_recovery() {
             loss_rate: 0.0,
             rtt_ms: 15.0,
             queue_depth: None,
+            drain_rate_kbps: None,
+            aqm_dropped_total: None,
         },
         LinkCapacity {
             link_id: 3,
@@ -171,6 +177,8 @@ fn full_pipeline_link_failure_and_recovery() {
             loss_rate: 1.0,
             rtt_ms: 0.0,
             queue_depth: None,
+            drain_rate_kbps: None,
+            aqm_dropped_total: None,
         },
     ];
     adapter.update(&caps);
@@ -242,6 +250,8 @@ fn adaptation_reduces_bitrate_on_capacity_drop() {
             loss_rate: 0.0,
             rtt_ms: 10.0,
             queue_depth: None,
+            drain_rate_kbps: None,
+            aqm_dropped_total: None,
         },
         LinkCapacity {
             link_id: 1,
@@ -250,6 +260,8 @@ fn adaptation_reduces_bitrate_on_capacity_drop() {
             loss_rate: 0.0,
             rtt_ms: 15.0,
             queue_depth: None,
+            drain_rate_kbps: None,
+            aqm_dropped_total: None,
         },
     ];
     adapter.update(&good_caps);
@@ -264,6 +276,8 @@ fn adaptation_reduces_bitrate_on_capacity_drop() {
             loss_rate: 0.05,
             rtt_ms: 50.0,
             queue_depth: None,
+            drain_rate_kbps: None,
+            aqm_dropped_total: None,
         },
         LinkCapacity {
             link_id: 1,
@@ -272,6 +286,8 @@ fn adaptation_reduces_bitrate_on_capacity_drop() {
             loss_rate: 1.0,
             rtt_ms: 0.0,
             queue_depth: None,
+            drain_rate_kbps: None,
+            aqm_dropped_total: None,
         },
     ];
     adapter.update(&bad_caps);

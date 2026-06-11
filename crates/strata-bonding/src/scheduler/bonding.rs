@@ -1247,6 +1247,8 @@ mod tests {
                     inferred_regime: None,
                     bdp_bytes: 0.0,
                     inflight_cap_bytes: 0.0,
+                    pacing_rate_bps: 0.0,
+                    aqm_dropped_total: 0,
                 }),
                 sent_packets: Mutex::new(Vec::new()),
                 sent_priorities: Mutex::new(Vec::new()),

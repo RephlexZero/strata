@@ -140,6 +140,16 @@ pub struct LinkMetrics {
     /// The inflight / paced-queue cap in bytes the link is enforcing
     /// (`k × BDP`, or the bootstrap budget before BDP converges).
     pub inflight_cap_bytes: f64,
+    /// Pacing (drain) rate in bits/sec — the rate the paced queue actually
+    /// empties at. Capacity claims above this are undeliverable; the
+    /// adapter clamps to it so the encoder is never budgeted past what the
+    /// link drains. `0.0` when unknown.
+    pub pacing_rate_bps: f64,
+    /// Cumulative packets deleted by the paced-queue AQM. A growing value
+    /// means the queue is standing past its sojourn budget — offered rate
+    /// durably exceeds the drain rate (self-congestion), and every drop is
+    /// a self-inflicted hole in the stream.
+    pub aqm_dropped_total: u64,
 }
 
 /// Receiver report metrics forwarded from the remote receiver.
