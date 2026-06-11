@@ -87,6 +87,19 @@ pub struct TransportLink {
     bytes_sent: AtomicU64,
     /// Total packets sent.
     packets_sent: AtomicU64,
+    /// Packets silently deleted by the paced-queue AQM
+    /// (`enforce_paced_queue_bound`). Every one of these is a hole the
+    /// receiver must FEC/NACK its way around — loopback measurement showed
+    /// this self-inflicted loss (~2.3%) dominating real link loss, so it
+    /// must never again be invisible.
+    aqm_dropped_pkts: AtomicU64,
+    /// Bytes deleted by the paced-queue AQM.
+    aqm_dropped_bytes: AtomicU64,
+    /// AQM-deleted packets that were NACK retransmissions — each one is a
+    /// repair the receiver asked for and silently never got.
+    aqm_dropped_retx: AtomicU64,
+    /// Rate limiter for the AQM drop warning log.
+    aqm_last_log: Mutex<Instant>,
     /// Snapshot of `bytes_sent` at the last rate computation.
     prev_rate_bytes: AtomicU64,
     /// Microsecond timestamp of the last rate computation.
@@ -233,6 +246,15 @@ const PACED_QUEUE_BOOTSTRAP_BYTES: usize = 140_000;
 /// or a GSO flush would be starved mid-assembly.
 const GSO_SUPERPACKET_BYTES: usize = 65_536;
 
+/// Maximum time a packet may sit in the paced queue before the AQM is
+/// allowed to cut it, expressed as a drain-time byte budget
+/// (`pacing_rate × this`). Worst-case added queue latency is therefore
+/// 500 ms — well inside the broadcast playout window (1.5-3 s) and the
+/// NACK retransmit budget (10 × 100 ms). Encoder frame bursts (an IDR is
+/// several × the per-frame average) drain in well under this and must
+/// survive intact; cutting them was the dominant source of mid-GOP holes.
+const PACED_QUEUE_SOJOURN_BUDGET_SECS: f64 = 0.5;
+
 impl TransportLink {
     /// Enforce the BDP-relative byte bound on the paced queue with
     /// keyframe-protected oldest-drop.
@@ -250,8 +272,19 @@ impl TransportLink {
         let cap_bytes = {
             let cc = self.congestion.lock().unwrap();
             let bdp_cap = cc.inflight_cap_bytes(BDP_QUEUE_K);
+            // Drain-time bound (Little's law): the queue empties at
+            // pacing_rate, so `rate × budget` bounds the oldest packet's
+            // sojourn directly. The BDP cap alone collapses to the GSO floor
+            // on short-RTT paths (loopback BDP ≈ 30 B) and modest-RTT
+            // cellular (BDP ≈ 30 KB), where a single keyframe burst is
+            // larger than the floor — measured 2.3% SELF-inflicted loss on
+            // loopback with zero network loss, every drop a mid-GOP hole. A
+            // burst that drains within the sojourn budget must never be cut;
+            // a queue standing past it is genuine overload (the adapter's
+            // job) and still gets bounded.
+            let drain_cap = cc.pacing_rate() * PACED_QUEUE_SOJOURN_BUDGET_SECS;
             if bdp_cap > 0.0 {
-                (bdp_cap as usize).max(GSO_SUPERPACKET_BYTES)
+                (bdp_cap.max(drain_cap) as usize).max(GSO_SUPERPACKET_BYTES)
             } else {
                 PACED_QUEUE_BOOTSTRAP_BYTES
             }
@@ -265,6 +298,9 @@ impl TransportLink {
         // Drop the oldest non-keyframe packet repeatedly. Scan from the
         // front (oldest) for the first droppable (priority < Reference);
         // keyframes/config survive until they are all that is left.
+        let mut dropped_pkts = 0u64;
+        let mut dropped_bytes = 0u64;
+        let mut dropped_retx = 0u64;
         while total > cap_bytes {
             let drop_idx = q
                 .iter()
@@ -274,11 +310,37 @@ impl TransportLink {
                 Some(idx) => {
                     if let Some(pkt) = q.remove(idx) {
                         total -= pkt.data.len();
+                        dropped_pkts += 1;
+                        dropped_bytes += pkt.data.len() as u64;
+                        if pkt.is_retransmit {
+                            dropped_retx += 1;
+                        }
                     } else {
                         break;
                     }
                 }
                 None => break,
+            }
+        }
+        if dropped_pkts > 0 {
+            let pkts_total = self.aqm_dropped_pkts.fetch_add(dropped_pkts, Ordering::Relaxed)
+                + dropped_pkts;
+            self.aqm_dropped_bytes
+                .fetch_add(dropped_bytes, Ordering::Relaxed);
+            let retx_total =
+                self.aqm_dropped_retx.fetch_add(dropped_retx, Ordering::Relaxed) + dropped_retx;
+            let mut last = self.aqm_last_log.lock().unwrap();
+            if last.elapsed() >= std::time::Duration::from_secs(1) {
+                *last = Instant::now();
+                tracing::warn!(
+                    link_id = self.id,
+                    cap_bytes,
+                    queue_bytes = total,
+                    dropped_now = dropped_pkts,
+                    dropped_total = pkts_total,
+                    retx_dropped_total = retx_total,
+                    "paced-queue AQM dropped packets (each is a self-inflicted hole)"
+                );
             }
         }
     }
@@ -397,6 +459,10 @@ impl TransportLink {
                 last_refill: std::time::Instant::now(),
             }),
             paced_queue: Mutex::new(std::collections::VecDeque::new()),
+            aqm_dropped_pkts: AtomicU64::new(0),
+            aqm_dropped_bytes: AtomicU64::new(0),
+            aqm_dropped_retx: AtomicU64::new(0),
+            aqm_last_log: Mutex::new(Instant::now()),
             oracle: Mutex::new(CapacityOracle::new()),
             prev_retransmissions: AtomicU64::new(0),
             prev_loss_pkts_sent: AtomicU64::new(0),
@@ -1651,6 +1717,40 @@ mod tests {
         assert!(
             q.iter().any(|p| p.sequence == 0),
             "keyframe must be protected from the oldest-drop"
+        );
+    }
+
+    /// On a short-RTT path the BDP collapses to bytes (loopback: ~60 B) and
+    /// the old pure-BDP cap fell to the 64 KiB GSO floor — smaller than one
+    /// IDR burst, so every keyframe burst was trimmed into mid-GOP holes
+    /// (measured 2.3% self-inflicted loss over loopback). The drain-time
+    /// bound must let a burst that clears within the sojourn budget survive.
+    #[test]
+    fn paced_queue_transient_burst_survives_short_rtt_path() {
+        use strata_transport::sender::OutputPacket;
+        let link = make_loopback_link(14);
+        {
+            let mut cc = link.congestion.lock().unwrap();
+            cc.on_rtt_sample(200.0); // RTprop 0.2 ms — loopback-like
+            cc.on_bandwidth_sample(300_000, 1_000_000, false); // ~2.4 Mbps
+        }
+        // ~90 KB burst (one IDR at a few hundred kbit): over the 64 KiB GSO
+        // floor, but drains in ~0.3 s at pacing rate — inside the budget.
+        let mut q = std::collections::VecDeque::new();
+        for s in 0..64u64 {
+            q.push_back(OutputPacket {
+                data: Bytes::from(vec![0u8; 1400]),
+                priority: Priority::Standard,
+                sequence: s,
+                is_retransmit: false,
+                is_fec_repair: false,
+            });
+        }
+        link.enforce_paced_queue_bound(&mut q);
+        assert_eq!(
+            q.len(),
+            64,
+            "a transient burst inside the drain-time budget must not be cut"
         );
     }
 

@@ -207,7 +207,12 @@ fn install_delivered_stream_gate(pad: &gst::Pad) {
             if let gst::EventView::CustomDownstream(c) = ev.view()
                 && c.structure().is_some_and(|s| s.name() == "strata/discont")
             {
-                state.lock().unwrap().pending_discont = true;
+                let mut st = state.lock().unwrap();
+                st.pending_discont = true;
+                eprintln!(
+                    "DeliveredStream gate: discont event (last_dts={})",
+                    st.last_dts.map(|d| d / 1_000_000).unwrap_or(0)
+                );
             }
             return gst::PadProbeReturn::Ok;
         }
@@ -240,6 +245,14 @@ fn install_delivered_stream_gate(pad: &gst::Pad) {
                 // Reset the DTS baseline to this IDR: the forward jump across
                 // the skipped gap is expected and must not look like a regression.
                 st.last_dts = dts;
+                // PTS-stamped resume marker: lets a decode error found in the
+                // HLS output be attributed to "gate knew about this splice"
+                // vs "splice the gate never saw" (e.g. a leaky-queue drop).
+                eprintln!(
+                    "DeliveredStream gate: resumed at clean IDR pts={} (dropped {} total)",
+                    buf.pts().map(|t| t.mseconds()).unwrap_or(0),
+                    st.dropped
+                );
                 return gst::PadProbeReturn::Ok;
             }
             st.dropped += 1;
@@ -1748,11 +1761,11 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
              tsparse set-timestamps=true alignment=7 ! \
              tsdemux name=d \
              d. ! \
-             queue max-size-buffers=600 max-size-bytes=0 max-size-time=2000000000 \
+             queue max-size-buffers=0 max-size-bytes=0 max-size-time=10000000000 \
              leaky=downstream ! \
              {parser} name=vparse ! mux. \
              d. ! \
-             queue max-size-buffers=200 max-size-bytes=0 max-size-time=2000000000 \
+             queue max-size-buffers=0 max-size-bytes=0 max-size-time=10000000000 \
              leaky=downstream ! \
              aacparse name=aparse ! mux. \
              mpegtsmux name=mux alignment=7 pat-interval=1 pmt-interval=1 ! \
