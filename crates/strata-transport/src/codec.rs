@@ -506,6 +506,13 @@ impl GenerationState {
         }
         if data.len() > self.symbol_len {
             self.symbol_len = data.len();
+            // Expand existing rows (as add_repair does): try_recover slices
+            // every pivot row to k + symbol_len, and gf_mul_acc truncates to
+            // the shorter operand — a stale short row panics the former and
+            // silently drops the tail of back-substitutions in the latter.
+            for row in &mut self.matrix_rows {
+                row.resize(self.k + self.symbol_len, 0);
+            }
         }
         self.source_symbols.insert(index, data.clone());
 
@@ -1253,6 +1260,29 @@ mod tests {
     }
 
     // ─── Multi-loss recovery (deterministic) ────────────────────────────
+
+    /// A matrix row created while the generation's symbols were short must be
+    /// expanded when a longer SOURCE symbol arrives later. add_source
+    /// previously grew symbol_len without resizing existing rows (unlike
+    /// add_repair), so try_recover sliced the stale short row out of range —
+    /// field crash: "range end index 1247 out of range for slice of length 179"
+    /// at codec.rs:624, which killed the receiver rx thread mid-stream.
+    #[test]
+    fn longer_source_after_short_rows_does_not_panic_recovery() {
+        let k = 3;
+        let mut g = GenerationState::new(7, k, 1);
+        // Short source + short repair arrive first: rows are k+16 wide.
+        g.add_source(1, Bytes::from(vec![0x22; 16]));
+        g.add_repair(0, &[0xAA; 16]);
+        // A longer source then grows symbol_len; existing rows must grow too.
+        g.add_source(2, Bytes::from(vec![0x33; 1200]));
+        // Column 0 is missing and the (formerly short) repair row is its
+        // pivot: pre-fix this sliced row[k..k+1200] on a 19-byte row.
+        let recovered = g.try_recover();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].0, 0);
+        assert_eq!(recovered[0].1.len(), 1200);
+    }
 
     #[test]
     fn rlnc_recover_two_losses_with_two_repairs() {
