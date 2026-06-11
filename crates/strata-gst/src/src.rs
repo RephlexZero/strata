@@ -40,6 +40,11 @@ mod imp {
         /// Set by `unlock()` to interrupt the blocking `recv()` in `create()`.
         /// Cleared by `unlock_stop()` when the pipeline resumes.
         flushing: AtomicBool,
+        /// Whether `create()` has produced a buffer yet. The strata/discont
+        /// custom event must not be pushed before the first buffer (caps and
+        /// segment are not negotiated yet); the startup discont needs no
+        /// event anyway — the gate accepts the first keyframe regardless.
+        first_buffer_sent: AtomicBool,
     }
 
     impl StrataSrc {
@@ -224,6 +229,7 @@ mod imp {
     impl BaseSrcImpl for StrataSrc {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
             self.flushing.store(false, Ordering::SeqCst);
+            self.first_buffer_sent.store(false, Ordering::SeqCst);
 
             let settings = lock_or_recover(&self.settings);
             let mut receiver_guard = lock_or_recover(&self.receiver);
@@ -406,10 +412,28 @@ mod imp {
                         if discont {
                             let buf_ref = buffer.get_mut().unwrap();
                             buf_ref.set_flags(gst::BufferFlags::DISCONT);
+                            // The DISCONT flag does not survive tsdemux: the
+                            // demuxer re-times its output and the flag never
+                            // reaches the delivered-stream gate on the parser
+                            // pad, so splices decoded as grey frames. Custom
+                            // serialized events ARE forwarded by
+                            // tsparse/tsdemux/baseparse — push one ahead of
+                            // the buffer so the gate can resync. Skipped
+                            // before the first buffer (startup discont):
+                            // serialized events may not precede caps/segment.
+                            if self.first_buffer_sent.load(Ordering::SeqCst) {
+                                let ev = gst::event::CustomDownstream::new(
+                                    gst::Structure::builder("strata/discont").build(),
+                                );
+                                if let Some(pad) = self.obj().static_pad("src") {
+                                    let _ = pad.push_event(ev);
+                                }
+                            }
                         } else {
                             // Suppress tracing for every packet to avoid log spam
                             // println!("StrataSrc: producing buffer");
                         }
+                        self.first_buffer_sent.store(true, Ordering::SeqCst);
                         return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(
                             buffer,
                         ));

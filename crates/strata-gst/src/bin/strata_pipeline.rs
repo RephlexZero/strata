@@ -178,29 +178,65 @@ fn install_delivered_stream_gate(pad: &gst::Pad) {
         waiting_for_keyframe: bool,
         last_dts: Option<u64>,
         dropped: u64,
+        started: bool,
+        pending_discont: bool,
     }
     let state = Mutex::new(GateState {
         // Start by waiting: never hand the muxer a mid-GOP opening run.
         waiting_for_keyframe: true,
         last_dts: None,
         dropped: 0,
+        // Whether we've ever resumed. The first keyframe of the stream
+        // legitimately carries GStreamer's startup DISCONT, and there is no
+        // prior reference frame for it to corrupt — so we accept it. Only
+        // *mid-stream* keyframes that carry DISCONT are treated as damaged.
+        started: false,
+        // Set by a "strata/discont" custom event; applied to the next buffer.
+        pending_discont: false,
     });
-    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+    pad.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+        move |_pad, info| {
+        // stratasrc signals a skipped gap with a serialized custom event
+        // because the buffer DISCONT flag does not survive tsdemux (field
+        // observation: 580 aggregator discontinuities, zero DISCONT-flagged
+        // buffers at this pad — the gate never engaged and splices decoded
+        // as grey frames). The event rides the same serialized stream, so
+        // the first buffer after it is the first post-gap buffer.
+        if let Some(gst::PadProbeData::Event(ev)) = &info.data {
+            if let gst::EventView::CustomDownstream(c) = ev.view()
+                && c.structure().is_some_and(|s| s.name() == "strata/discont")
+            {
+                state.lock().unwrap().pending_discont = true;
+            }
+            return gst::PadProbeReturn::Ok;
+        }
         let Some(gst::PadProbeData::Buffer(buf)) = &info.data else {
             return gst::PadProbeReturn::Ok;
         };
         let flags = buf.flags();
         let is_keyframe = !flags.contains(gst::BufferFlags::DELTA_UNIT);
-        let is_discont = flags.contains(gst::BufferFlags::DISCONT);
         let dts = buf.dts().map(|t| t.nseconds());
 
         let mut st = state.lock().unwrap();
+        let is_discont =
+            flags.contains(gst::BufferFlags::DISCONT) || std::mem::take(&mut st.pending_discont);
         if is_discont {
             st.waiting_for_keyframe = true;
         }
         if st.waiting_for_keyframe {
-            if is_keyframe {
+            // Resume only on a keyframe we can trust. A keyframe that *itself*
+            // carries DISCONT sits right after a skipped gap: at the byte
+            // level the hole may have truncated the head of this IDR, so it
+            // can be a damaged keyframe. Resuming on it is exactly how a
+            // corrupt reference frame reached the decoder (grey / "ref with
+            // POC"). Drop it and wait for the next CLEAN keyframe instead.
+            // Exception: the very first keyframe (startup DISCONT, no prior
+            // reference to corrupt) is always accepted so the stream can lock.
+            let trustworthy_keyframe = is_keyframe && (!st.started || !is_discont);
+            if trustworthy_keyframe {
                 st.waiting_for_keyframe = false;
+                st.started = true;
                 // Reset the DTS baseline to this IDR: the forward jump across
                 // the skipped gap is expected and must not look like a regression.
                 st.last_dts = dts;
@@ -209,17 +245,27 @@ fn install_delivered_stream_gate(pad: &gst::Pad) {
             st.dropped += 1;
             if st.dropped.is_power_of_two() {
                 eprintln!(
-                    "DeliveredStream gate: dropped {} non-keyframe buffer(s) awaiting IDR after loss",
+                    "DeliveredStream gate: dropped {} buffer(s) awaiting a clean IDR after loss",
                     st.dropped
                 );
             }
             return gst::PadProbeReturn::Drop;
         }
         // Monotonic-DTS guard: a backwards DTS is what kills mpegtsmux.
+        // Dropping ONLY the offending buffer is not enough — it may be a
+        // reference frame, and silently deleting one leaves every following
+        // P-frame decoding against a missing reference (full-frame grey at
+        // the far decoder, invisible to every metric here). Treat a DTS
+        // regression like a discontinuity: drop and RESYNC to the next
+        // clean keyframe.
         if let (Some(d), Some(last)) = (dts, st.last_dts)
             && d < last
         {
+            st.waiting_for_keyframe = true;
             st.dropped += 1;
+            eprintln!(
+                "DeliveredStream gate: DTS regression ({d} < {last}) — resyncing to next clean IDR"
+            );
             return gst::PadProbeReturn::Drop;
         }
         if dts.is_some() {

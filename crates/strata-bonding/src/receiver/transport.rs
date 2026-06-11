@@ -96,6 +96,10 @@ impl TransportBondingReceiver {
                 let tick_interval = Duration::from_millis(10);
                 let mut dropped_since_log: u64 = 0;
                 let mut total_dropped: u64 = 0;
+                // A dropped payload is a hole in the byte stream; the next
+                // payload we manage to send must carry DISCONT so the egress
+                // resyncs rather than splicing across the drop.
+                let mut carry_discont = false;
                 let mut last_drop_log = Instant::now();
                 let drop_log_interval = Duration::from_secs(1);
 
@@ -144,12 +148,27 @@ impl TransportBondingReceiver {
                         *s = snapshot;
                     }
 
-                    for p in ready {
+                    for mut p in ready {
                         // Use try_send to avoid blocking the jitter thread
                         // when the downstream consumer (GStreamer) stalls.
                         // Dropping late frames is better than deadlocking
                         // the entire receive pipeline.
+                        //
+                        // A dropped payload is itself a discontinuity, and if
+                        // the dropped payload was *already* flagged DISCONT,
+                        // destroying it would lose that marker entirely —
+                        // downstream would then splice the hole with no resync
+                        // signal and the decoder would render a corrupt AU.
+                        // Carry the flag onto the next payload we DO send.
+                        if carry_discont {
+                            p.1 = true;
+                            carry_discont = false;
+                        }
                         if output_tx_clone.try_send(p).is_err() {
+                            // The drop itself is a discontinuity (and may have
+                            // carried a DISCONT we just lost) — flag the next
+                            // successful send so the marker is never erased.
+                            carry_discont = true;
                             dropped_since_log += 1;
                             total_dropped += 1;
                         }

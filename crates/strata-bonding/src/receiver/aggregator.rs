@@ -88,6 +88,15 @@ pub struct ReassemblyBuffer {
     /// the downstream MPEG-TS demuxer see a PTS/continuity regression and
     /// post a fatal "Timestamping error on input streams".
     last_emitted_seq: Option<u64>,
+    /// Durable "a gap was skipped and not yet signalled" flag. ANY path that
+    /// advances `next_seq` past never-emitted sequences (head-of-line gap
+    /// skip in `tick`, window-overflow eviction in `push`, desync resync
+    /// rewind) sets this; `tick` attaches it to the next released payload as
+    /// the `discont` marker and only clears it once emitted. Without this,
+    /// the push-side skip paths silently spliced a hole into the delivered
+    /// byte stream with no DISCONT — handing the H.265 decoder a corrupt
+    /// access unit (the grey / "ref with POC" artifact) that no metric saw.
+    pending_discont: bool,
 }
 
 /// Configuration for the reassembly jitter buffer.
@@ -258,6 +267,7 @@ impl ReassemblyBuffer {
             consecutive_late: 0,
             max_late_seq: 0,
             last_emitted_seq: None,
+            pending_discont: false,
         }
     }
 
@@ -501,6 +511,10 @@ impl ReassemblyBuffer {
                     }
                 }
                 self.next_seq = resync_target;
+                // The rewind jumped next_seq forward across never-emitted
+                // sequences; the next released payload must carry DISCONT so
+                // the egress drops the damaged GOP instead of splicing it.
+                self.pending_discont = true;
                 self.consecutive_late = 0;
                 self.max_late_seq = 0;
                 // Reset latency state but preserve loss EWMA. Hard-resetting
@@ -538,6 +552,11 @@ impl ReassemblyBuffer {
                 let skipped = new_next - self.next_seq;
                 self.lost_packets += skipped;
                 self.advance_window(new_next);
+                // Window-overflow eviction drops never-emitted sequences
+                // below new_next. Mark a pending discontinuity so the next
+                // released payload is flagged — previously this path advanced
+                // silently and spliced the hole with no DISCONT.
+                self.pending_discont = true;
             }
         }
 
@@ -576,7 +595,10 @@ impl ReassemblyBuffer {
             .unwrap_or(self.latency);
 
         // Set after a gap skip; cleared after the next packet is released.
-        let mut discont = false;
+        // Seeded from `pending_discont` so a skip recorded on the push side
+        // (overflow eviction / resync rewind) is attached to the next payload
+        // released here, even though that release happens on a later tick.
+        let mut discont = std::mem::take(&mut self.pending_discont);
 
         // While loop to process available packets or skip gaps
         loop {
@@ -615,6 +637,13 @@ impl ReassemblyBuffer {
 
             // No packets or waiting for gap to fill
             break;
+        }
+
+        // A gap was skipped this tick but no follower was releasable yet (or a
+        // push-side skip is still pending) — carry the flag so the NEXT
+        // released payload is marked, rather than dropping it on the floor.
+        if discont {
+            self.pending_discont = true;
         }
 
         // Track delivery + loss for adaptive sizing
@@ -728,6 +757,77 @@ mod tests {
         let out = buf.tick(start + Duration::from_millis(50));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, Bytes::from_static(b"P1"));
+    }
+
+    /// A head-of-line gap skip must flag the released follower DISCONT so the
+    /// egress drops the damaged GOP instead of splicing across the hole.
+    #[test]
+    fn gap_skip_flags_discont() {
+        let mut buf = ReassemblyBuffer::new_for_test(0, Duration::from_millis(50));
+        let start = Instant::now();
+        buf.push(1, Bytes::from_static(b"P1"), start); // P0 lost
+        let out = buf.tick(start + Duration::from_millis(50));
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].1,
+            "released payload after a gap skip must be DISCONT"
+        );
+    }
+
+    /// Window-overflow eviction in `push` previously advanced `next_seq`
+    /// silently, splicing a hole with no DISCONT. It must now mark the next
+    /// released payload.
+    #[test]
+    fn window_overflow_flags_discont() {
+        let mut buf = ReassemblyBuffer::with_config(
+            0,
+            ReassemblyConfig {
+                buffer_capacity: 16,
+                ..ReassemblyConfig::test_defaults()
+            },
+        );
+        let start = Instant::now();
+        // seq 20 is >= next_seq(0) + capacity(16) → forces the window to 5,
+        // dropping never-emitted seqs 0..5 silently in the old code.
+        buf.push(20, Bytes::from_static(b"P20"), start);
+        let out = buf.tick(start + Duration::from_millis(20));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, Bytes::from_static(b"P20"));
+        assert!(
+            out[0].1,
+            "payload released after window-overflow eviction must be DISCONT"
+        );
+    }
+
+    /// A gap skipped on one tick whose follower only becomes releasable on a
+    /// later tick must still carry the DISCONT forward (the flag is durable,
+    /// not dropped on the floor at tick boundaries).
+    #[test]
+    fn pending_discont_survives_across_ticks() {
+        let mut buf = ReassemblyBuffer::with_config(
+            0,
+            ReassemblyConfig {
+                start_latency: Duration::from_millis(50),
+                skip_after: Some(Duration::from_millis(50)),
+                ..ReassemblyConfig::test_defaults()
+            },
+        );
+        let start = Instant::now();
+        // P0 lost. P1 arrives late, at t=40ms.
+        buf.push(
+            1,
+            Bytes::from_static(b"P1"),
+            start + Duration::from_millis(40),
+        );
+        // Tick at 50ms: the gap (P0, first available P1 arrived at 40ms) has
+        // not yet aged skip_after=50ms, so nothing is skipped or released.
+        let out = buf.tick(start + Duration::from_millis(50));
+        assert!(out.is_empty(), "nothing should release yet");
+        // Tick at 95ms: P1 has now aged >50ms → gap skipped AND P1 released,
+        // carrying the discontinuity.
+        let out = buf.tick(start + Duration::from_millis(95));
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1, "carried-forward discont must reach the payload");
     }
 
     #[test]
