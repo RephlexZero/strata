@@ -226,6 +226,18 @@ fi
         echo "interface = \"${IFACES[$i]}\""
         echo ""
     done
+    # Optional [scheduler] redundancy/broadcast — for masking a bursty link by
+    # duplicating critical (keyframe) packets across links. Off unless set, so
+    # default runs are unchanged. critical_broadcast sends every keyframe to
+    # ALL alive links (directly protects reference frames against per-link
+    # burst loss); redundancy_enabled duplicates other important packets when
+    # spare capacity allows.
+    if [[ -n "${STRATA_REDUNDANCY_ENABLED:-}" || -n "${STRATA_CRITICAL_BROADCAST:-}" ]]; then
+        echo "[scheduler]"
+        [[ -n "${STRATA_REDUNDANCY_ENABLED:-}" ]] && echo "redundancy_enabled = ${STRATA_REDUNDANCY_ENABLED}"
+        [[ -n "${STRATA_CRITICAL_BROADCAST:-}" ]] && echo "critical_broadcast = ${STRATA_CRITICAL_BROADCAST}"
+        echo ""
+    fi
 } > "$SENDER_TOML"
 
 # Receiver config: profile drives playout; ceiling only if explicitly set.
