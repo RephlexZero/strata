@@ -593,6 +593,17 @@ impl BitrateAdapter {
         // `recommended_fec_overhead`).
         const AQM_DROPS_PER_TICK_THRESHOLD: u64 = 5;
         const AQM_SUSTAINED_TICKS: u32 = 2;
+        // Self-congestion only makes sense when we are actually offering near
+        // capacity. AQM drops while the target sits far below usable capacity
+        // are NOT the encoder overdriving — they are burst-loss artifacts from
+        // a flapping link (a modem momentarily losing its grant), and pinning
+        // bitrate to the floor in response is exactly wrong. The drain clamp
+        // already makes `usable_kbps` honest (per-link capacity is bounded by
+        // the pacing rate), so the raw pressure ratio is a valid "am I near
+        // capacity?" gate. Without it, a bursty 2nd modem (~10 AQM drops/tick)
+        // latched this permanently and held a 2-link bond at the 500 kbps
+        // floor despite 1.4-4 Mbps usable (field 2026-06-15).
+        const SELF_CONGEST_MIN_PRESSURE: f64 = 0.7;
         let aqm_total: u64 = links.iter().filter_map(|l| l.aqm_dropped_total).sum();
         let aqm_delta = aqm_total.saturating_sub(self.prev_aqm_dropped);
         self.prev_aqm_dropped = aqm_total;
@@ -601,14 +612,15 @@ impl BitrateAdapter {
         } else {
             self.aqm_dropping_ticks = 0;
         }
-        self.self_congested = self.aqm_dropping_ticks >= AQM_SUSTAINED_TICKS;
+        self.self_congested =
+            self.aqm_dropping_ticks >= AQM_SUSTAINED_TICKS && pressure >= SELF_CONGEST_MIN_PRESSURE;
         if self.self_congested {
             pressure = pressure.max(self.config.pressure_threshold + 0.05);
             info!(
                 target: "strata::adapt",
                 "[adapt] self-congestion: AQM dropped {aqm_delta} pkts this tick \
-                 ({} sustained ticks) — forcing over-pressure",
-                self.aqm_dropping_ticks
+                 ({} sustained ticks, pressure {:.2}) — forcing over-pressure",
+                self.aqm_dropping_ticks, pressure
             );
         }
 
@@ -1378,40 +1390,101 @@ mod tests {
     #[test]
     fn sustained_aqm_drops_force_reduce() {
         let mut adapter = BitrateAdapter::new(AdaptationConfig {
-            max_bitrate_kbps: 10_000,
+            max_bitrate_kbps: 8_000,
             min_bitrate_kbps: 500,
+            initial_bitrate_kbps: 1_500,
             min_interval: Duration::ZERO,
             ..Default::default()
         });
+        // The real overdrive case: the capacity estimate is optimistic (8000)
+        // but the drain clamp pins usable to the pacing rate (~1500), and the
+        // encoder is offering right at it (pressure ≈ 1.0). Here AQM drops DO
+        // mean we are overdriving, so self-congestion must engage.
         let mut links = make_links(&[(8_000.0, true)]);
-        // Converge: capacity ample, target climbs toward usable.
-        for _ in 0..30 {
+        links[0].drain_rate_kbps = Some(1_500.0);
+        for _ in 0..15 {
             adapter.update(&links);
         }
         let before = adapter.current_target_kbps();
-        assert!(before > 2_000, "precondition: target climbed ({before})");
-        // AQM starts deleting ~50 packets per tick — counter rises each tick.
+        assert!(
+            before > 800,
+            "precondition: target near the clamped capacity ({before})"
+        );
+        // Two sustained AQM-drop ticks (~50 pkts each) latch the detector
+        // while the encoder is still offering near capacity.
         let mut total = 0u64;
+        for _ in 0..2 {
+            total += 50;
+            links[0].aqm_dropped_total = Some(total);
+            adapter.update(&links);
+        }
+        assert!(
+            adapter.self_congested,
+            "sustained AQM drops near capacity must latch self-congestion"
+        );
+        // Continued drops force the target down. (The latch self-releases once
+        // it has backed the encoder away from capacity — correct: from there,
+        // further drops are link bursts, not overdrive.)
         for _ in 0..6 {
             total += 50;
             links[0].aqm_dropped_total = Some(total);
             adapter.update(&links);
         }
-        assert!(adapter.self_congested, "sustained AQM drops must latch");
         assert!(
             adapter.current_target_kbps() < before,
             "target must reduce under self-congestion ({} → {})",
             before,
             adapter.current_target_kbps()
         );
-        // Counter stops rising → latch releases.
+        // Drops stop → detector clears.
         for _ in 0..3 {
+            links[0].aqm_dropped_total = Some(total);
+            adapter.update(&links);
+        }
+        assert!(!adapter.self_congested, "latch must clear when drops stop");
+    }
+
+    /// Field regression (2026-06-15): a bursty 2nd modem produced ~10 AQM
+    /// drops/tick, which latched self-congestion permanently and pinned a
+    /// 2-link bond at the 500 kbps floor despite 1.4-4 Mbps usable. AQM drops
+    /// while the target sits far below usable capacity are link-burst
+    /// artifacts, NOT overdrive — they must not force the bitrate down.
+    #[test]
+    fn aqm_drops_below_capacity_do_not_pin() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 8_000,
+            min_bitrate_kbps: 500,
+            initial_bitrate_kbps: 500, // start at the floor, as the field bond was
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+        // Ample, genuinely drainable capacity (usable ~6800) but the encoder
+        // sits at the 500 floor — pressure ≈ 500/6800 ≈ 0.07, far below the
+        // self-congest gate. AQM drops here are a bursting link, not overdrive.
+        let mut links = make_links(&[(8_000.0, true)]);
+        links[0].drain_rate_kbps = Some(8_000.0);
+        let mut total = 0u64;
+        let start = adapter.current_target_kbps();
+        for _ in 0..6 {
+            total += 50; // sustained AQM drops, well over the absolute threshold
             links[0].aqm_dropped_total = Some(total);
             adapter.update(&links);
         }
         assert!(
             !adapter.self_congested,
-            "latch must release when drops stop"
+            "AQM drops with target ≪ usable are link bursts, must not latch self-congestion"
+        );
+        // And the encoder must be free to climb, not pinned at the floor.
+        for _ in 0..20 {
+            total += 50;
+            links[0].aqm_dropped_total = Some(total);
+            adapter.update(&links);
+        }
+        assert!(
+            adapter.current_target_kbps() > start,
+            "bitrate must climb toward usable capacity, not stay pinned ({} → {})",
+            start,
+            adapter.current_target_kbps()
         );
     }
 
