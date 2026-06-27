@@ -1,65 +1,88 @@
-# AGENTS.md
+# Workspace operating guide — Strata
 
-Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+Strata is an open-source bonded cellular video transport (Rust). Knowledge
+lives as plain markdown; read `hot.md` + `index.md` first, open `wiki/` pages
+only when relevant. Keep this file under ~200 lines.
 
-**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+## Navigation protocol (read in this order)
 
-## 1. Think Before Coding
+1. **`hot.md`** — what's in flight right now. Read it first, every session.
+2. **`index.md`** — one line per wiki page. Scan to decide relevance.
+3. **`wiki/…`** — open only the pages flagged as relevant. Do **not** read the whole folder.
+4. **`raw/…`** — original sources. Never read unless explicitly told to, or ingesting a new source.
 
-**Don't assume. Don't hide confusion. Surface tradeoffs.**
+## Maintenance protocol (after meaningful work)
 
-Before implementing:
-- State your assumptions explicitly. If uncertain, ask.
-- If multiple interpretations exist, present them - don't pick silently.
-- If a simpler approach exists, say so. Push back when warranted.
-- If something is unclear, stop. Name what's confusing. Ask.
+- Append a dated line to **`log.md`** describing what changed or was decided.
+- Update **`index.md`** if any `wiki/` pages were added, renamed, or retired.
+- Refresh **`hot.md`** if the current focus shifted.
+- Keep `wiki/` notes **atomic**: one concept per file, with frontmatter
+  (`summary`, `tags`, `related`, `updated`).
 
-## 2. Simplicity First
+## Strata architecture
 
-**Minimum code that solves the problem. Nothing speculative.**
+**Crates:**
+- `strata-bonding` — scheduler, adaptation, capacity oracle, per-link transport
+- `strata-transport` — wire format, FEC, ARQ, congestion control (BBR-based)
+- `strata-gst` — GStreamer sink/source elements, `strata-pipeline` binary
 
-- No features beyond what was asked.
-- No abstractions for single-use code.
-- No "flexibility" or "configurability" that wasn't requested.
-- No error handling for impossible scenarios.
-- If you write 200 lines and it could be 50, rewrite it.
+**Sender path:** GStreamer pipeline → `mpegtsmux` → `stratasink` →
+`BondingScheduler` → per-link `TransportLink` (UDP)
 
-Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+**Receiver path:** `strata_receiver` → packet reassembly → `stratasrc` → HLS/RTMP
 
-## 3. Surgical Changes
+**Key source files:**
+- `crates/strata-bonding/src/adaptation.rs` — `BitrateAdapter`, ramp-up/down, feedback loop
+- `crates/strata-bonding/src/scheduler/bonding.rs` — `BondingScheduler`, EDPF, BLEST, IoDS
+- `crates/strata-bonding/src/net/transport.rs` — `TransportLink`, capacity estimation, pacing
+- `crates/strata-bonding/src/scheduler/oracle.rs` — `CapacityOracle` (PPD-based)
+- `crates/strata-transport/src/congestion.rs` — `BiscayController` (BBR-based)
+- `crates/strata-gst/src/bin/strata_pipeline.rs` — GStreamer sender pipeline construction
+- `crates/strata-bonding/src/config.rs` — `SchedulerConfig` (capacity_floor_bps = 5 Mbps)
 
-**Touch only what you must. Clean up only your own mess.**
+**Key patterns:**
+- Per-link alive detection: ≥50% loss for 3+ windows → dead
+- Capacity chain: Oracle (PPD) → BBR btl_bw → ack_delivery_bps fallback
+- Adaptation defaults: ramp_up=250 kbps/step, ramp_down_factor=0.7, grace_period=5 s
+- PAT/PMT interval = 1 (every packet) for loss resilience
+- SO_SNDBUF = 512 KB to absorb startup burst
 
-When editing existing code:
-- Don't "improve" adjacent code, comments, or formatting.
-- Don't refactor things that aren't broken.
-- Match existing style, even if you'd do it differently.
-- If you notice unrelated dead code, mention it - don't delete it.
+**Hardware (dev/test):** 2× Huawei HiLink modems, Band 8 (900 MHz)
+- Modem 1: `enp2s0f0u4` (192.168.8.x) · Modem 2: `enp11s0f3u1u3` (192.168.9.x)
+- Band lock: `scripts/band-lock.sh`
 
-When your changes create orphans:
-- Remove imports/variables/functions that YOUR changes made unused.
-- Don't remove pre-existing dead code unless asked.
+## Build & test
 
-The test: Every changed line should trace directly to the user's request.
-
-## 4. Goal-Driven Execution
-
-**Define success criteria. Loop until verified.**
-
-Transform tasks into verifiable goals:
-- "Add validation" → "Write tests for invalid inputs, then make them pass"
-- "Fix the bug" → "Write a test that reproduces it, then make it pass"
-- "Refactor X" → "Ensure tests pass before and after"
-
-For multi-step tasks, state a brief plan:
+```bash
+cargo check                              # quick compile check
+cargo test -p strata-bonding --lib      # 350+ unit tests
+cargo test -p strata-bonding --tests    # integration tests (multi-link, pipeline)
+STRATA_NETEM_TESTS=1 cargo test ...    # netem/netns tests — needs CAP_NET_ADMIN
 ```
-1. [Step] → verify: [check]
-2. [Step] → verify: [check]
-3. [Step] → verify: [check]
-```
 
-Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+Pre-existing warnings in `strata-gst` (unused mut, unused var) — not our changes.
 
----
+## Coding & collaboration rails
 
-**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+- **Surgical changes.** Touch only what the task needs. No drive-by refactors.
+- **Simplicity first.** No features, abstractions, or error handling beyond
+  what was asked. Three similar lines beat a premature abstraction.
+- **Verify before claiming done.** Run it, show the output. Don't assert
+  success you haven't observed.
+- **Match the surrounding code.** Naming, comment density, and idioms should
+  read like what's already there.
+- **No sycophancy.** If a request is wrong or based on a wrong premise, say
+  so plainly and propose the better path.
+- **Ask when genuinely uncertain.** A clarifying question beats a confident
+  guess that has to be unwound later.
+- **No comments unless the WHY is non-obvious.** Hidden constraint, subtle
+  invariant, workaround for a specific bug — otherwise omit.
+
+## House rules
+
+- Everything that must travel between machines must be a **committed file** —
+  shell hooks and `~/.claude/` config are per-machine.
+- `CLAUDE.md` and `GEMINI.md` are symlinks to `AGENTS.md` (the canonical file).
+  Edit `AGENTS.md` only.
+- Don't `@import` `wiki/` or `raw/` here — imports load at launch and defeat
+  the index-first savings.
