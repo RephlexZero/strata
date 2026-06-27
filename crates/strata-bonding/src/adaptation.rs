@@ -899,14 +899,22 @@ impl BitrateAdapter {
         // coincides with actual loss evidence. Pure jitter without residual
         // loss can't be fixed by cutting the encoder — doing so just
         // degrades visible quality while the underlying OWD spike blows
-        // through.  Gate on jitter_loss_context (post-FEC or EWMA loss
-        // elevated) OR queue growth so jitter-only blips don't trigger
-        // oscillation.
-        let late_pressure =
-            feedback.late_rate > 0.05 && (jitter_loss_context || max_queue_depth >= 60);
+        // through.
+        let late_pressure = feedback.late_rate > 0.05 && jitter_loss_context;
+        // A deep paced queue is NOT bufferbloat on its own. That queue is
+        // bounded by a drain-time byte budget (pacing_rate × 0.5s, see
+        // net::transport) that deliberately passes keyframe bursts intact, so
+        // its packet count routinely spikes to hundreds during a healthy IDR
+        // burst that drains well inside the playout window. A raw packet-count
+        // gate here (`queue_depth >= 90`) fired on those benign bursts (~65% of
+        // ticks in field test 2026-06-27) and pinned the encoder to the 500
+        // floor at pressure ~0.1 with usable ~4.7 Mbps. The genuine "queue
+        // standing past its sojourn budget" signal is the AQM-drop counter,
+        // which update() already turns into pressure-gated self-congestion.
+        // Delay pressure here is therefore receiver-visible only: jitter-buffer
+        // growth/overflow and late arrivals under loss.
         let delay_pressure = (jitter_growth_ms > 120 && jitter_loss_context)
             || feedback.jitter_buffer_ms > 3000
-            || max_queue_depth >= 90
             || late_pressure;
         let bufferbloat = delay_pressure;
         // EWMA-smooth goodput (α=0.3) to filter end-of-window noise artifacts
@@ -2272,6 +2280,64 @@ mod tests {
         assert!(
             adapter.current_target_kbps() < before,
             "link collapse should force bitrate cut: before {} after {}",
+            before,
+            adapter.current_target_kbps()
+        );
+    }
+
+    #[test]
+    fn deep_paced_queue_without_loss_does_not_cut() {
+        // Regression (field 2026-06-27): a keyframe burst fills the byte-bounded
+        // paced queue to hundreds of packets, but it drains within the sojourn
+        // budget — no loss, flat jitter, abundant capacity, low pressure. The
+        // old `queue_depth >= 90` packet-count gate misread this as bufferbloat
+        // and pinned the encoder to the floor. With congestion_sustain=ZERO any
+        // delay_pressure would cut immediately, so this proves the gate is gone.
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_interval: Duration::ZERO,
+            initial_bitrate_kbps: 2_000,
+            congestion_sustain: Duration::ZERO,
+            ..Default::default()
+        });
+
+        let links = vec![
+            LinkCapacity {
+                link_id: 0,
+                capacity_kbps: 4_000.0,
+                alive: true,
+                loss_rate: 0.0,
+                rtt_ms: 70.0,
+                queue_depth: Some(300),
+                drain_rate_kbps: None,
+                aqm_dropped_total: None,
+            },
+            LinkCapacity {
+                link_id: 1,
+                capacity_kbps: 4_000.0,
+                alive: true,
+                loss_rate: 0.0,
+                rtt_ms: 95.0,
+                queue_depth: Some(450),
+                drain_rate_kbps: None,
+                aqm_dropped_total: None,
+            },
+        ];
+
+        let feedback = ReceiverFeedback {
+            goodput_bps: 1_950_000,
+            fec_repair_rate: 0.0,
+            jitter_buffer_ms: 100,
+            loss_after_fec: 0.0,
+            late_rate: 0.0,
+        };
+
+        let before = adapter.current_target_kbps();
+        adapter.update_with_feedback(&links, &feedback);
+
+        assert!(
+            adapter.current_target_kbps() >= before,
+            "deep but healthy paced queue must not cut bitrate: before {} after {}",
             before,
             adapter.current_target_kbps()
         );
