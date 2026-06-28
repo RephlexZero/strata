@@ -256,6 +256,14 @@ pub struct BitrateAdapter {
     /// Smoothing prevents single bursty LTE seconds from triggering
     /// unnecessary bitrate reductions.
     ewma_loss_fec: f32,
+    /// Max per-link CHANNEL (wire) loss observed on the last `update()`.
+    /// FEC parity is sized to this, NOT to `ewma_loss_fec`: the post-FEC
+    /// residual folds in cross-link reorder and late-arrival loss that
+    /// parity cannot repair, and feeding it back inflates FEC into its own
+    /// repair-microburst congestion source (field 2026-06-27: ~2% wire loss,
+    /// ~60% post-FEC residual, FEC pinned at 41% while the encoder sat at the
+    /// 500 kbps floor with 3.7 Mbps spare).
+    max_link_loss: f64,
     /// EWMA-smoothed goodput (bps) from receiver feedback.
     /// Prevents single low-sample outliers (e.g. end-of-window artifacts)
     /// from triggering spurious goodput-shortfall reductions.
@@ -343,6 +351,7 @@ impl BitrateAdapter {
             zero_capacity_ticks: 0,
             last_increase_time: None,
             ewma_loss_fec: 0.0,
+            max_link_loss: 0.0,
             ewma_goodput_bps: 0.0,
             capacity_ewma: HashMap::new(),
             last_burst_time: None,
@@ -412,26 +421,32 @@ impl BitrateAdapter {
             BASE_OVERHEAD
         };
 
-        // Loss-driven scaling independent of mode avoids being stuck at 10%
-        // overhead when links are lossy but mode hysteresis has not latched.
+        // Loss-driven scaling avoids being stuck at 10% overhead when links
+        // are genuinely lossy but mode hysteresis has not latched.
         //
-        // EXCEPT under self-congestion: when the paced-queue AQM is cutting
-        // our own standing queue, the loss is congestive (offered exceeds
-        // drained), and parity packets ADD to the offer — scaling FEC with
-        // that loss is a positive-feedback death spiral. Field runs sat at
-        // "overhead_pct=50.0 spare_kbps=0" with ~80% measured loss on a
-        // link whose only real problem was being offered 1.5× its drain
-        // rate. FEC inflation is for RANDOM channel loss only; congestive
-        // loss is the bitrate adapter's job (which `self_congested` is
-        // simultaneously forcing down via the over-pressure path).
+        // Sized to per-link CHANNEL loss (`max_link_loss`), NOT the post-FEC
+        // residual (`ewma_loss_fec`). FEC parity only repairs random channel
+        // loss; the residual also folds in cross-link reorder and late-arrival
+        // loss that parity CANNOT fix. Driving FEC from the residual is a
+        // positive-feedback death spiral: repair packets are emitted in bursts
+        // at generation boundaries, those microbursts overflow marginal-link
+        // buffers → late packets → higher residual → still more parity. Field
+        // 2026-06-27: ~2% wire loss but ~60% residual (cross-link reorder)
+        // pinned FEC at 41% while the encoder sat at the 500 floor with 3.7
+        // Mbps spare and both links idle.
+        //
+        // EXCEPT under self-congestion: when the paced-queue AQM is cutting our
+        // own standing queue, the loss is congestive (offered exceeds drained)
+        // and parity only adds to the offer — pin to baseline (that's the
+        // bitrate adapter's job, via the over-pressure path).
         let loss_scaled = if self.self_congested {
             BASE_OVERHEAD
         } else {
-            (BASE_OVERHEAD + self.ewma_loss_fec as f64 * 0.50).min(MAX_OVERHEAD)
+            (BASE_OVERHEAD + self.max_link_loss * 0.50).min(MAX_OVERHEAD)
         };
 
         let mut overhead = spare_scaled.max(loss_scaled);
-        if self.ewma_loss_fec as f64 >= 0.25 && !self.self_congested {
+        if self.max_link_loss >= 0.25 && !self.self_congested {
             overhead = overhead.max(MIN_LOSSY_OVERHEAD);
         }
 
@@ -548,6 +563,16 @@ impl BitrateAdapter {
             .sum();
 
         let alive_count = links.iter().filter(|l| l.alive).count();
+
+        // Max per-link CHANNEL loss this tick — drives FEC parity sizing in
+        // `recommended_fec_overhead`. Channel (wire) loss is what parity can
+        // actually repair; the post-FEC residual is not (it includes reorder
+        // and late-arrival loss, and feeding it back is the FEC death spiral).
+        self.max_link_loss = links
+            .iter()
+            .filter(|l| l.alive)
+            .map(|l| l.loss_rate)
+            .fold(0.0_f64, f64::max);
 
         // Log per-link detail
         for l in links {
@@ -1503,7 +1528,7 @@ mod tests {
     #[test]
     fn fec_overhead_pinned_under_self_congestion() {
         let mut adapter = BitrateAdapter {
-            ewma_loss_fec: 0.8, // would normally drive overhead to 50%
+            max_link_loss: 0.8, // genuine channel loss: would drive overhead to 50%
             ..Default::default()
         };
         adapter.self_congested = false;
@@ -1513,6 +1538,28 @@ mod tests {
             adapter.recommended_fec_overhead() <= 0.11,
             "self-congestion must pin FEC to baseline, got {}",
             adapter.recommended_fec_overhead()
+        );
+    }
+
+    /// The FEC death spiral: a high POST-FEC residual (cross-link reorder /
+    /// late arrivals) with a CLEAN channel must NOT inflate parity. Extra
+    /// repair packets cannot recover reorder/late loss, and their bursts at
+    /// generation boundaries become their own congestion source. Field
+    /// 2026-06-27: ~2% wire loss but ~60% residual pinned FEC at 41% while
+    /// the encoder sat at the 500 kbps floor with 3.7 Mbps spare and both
+    /// links idle. Parity must follow channel loss, not the residual.
+    #[test]
+    fn fec_overhead_not_inflated_by_reorder_residual() {
+        let mut adapter = BitrateAdapter {
+            ewma_loss_fec: 0.6,  // high post-FEC residual (reorder/late)
+            max_link_loss: 0.02, // but the wire itself is clean
+            ..Default::default()
+        };
+        adapter.self_congested = false;
+        let overhead = adapter.recommended_fec_overhead();
+        assert!(
+            overhead <= 0.12,
+            "reorder/late residual must not inflate FEC on a clean channel, got {overhead}"
         );
     }
 

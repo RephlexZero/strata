@@ -35,15 +35,29 @@ are now visible (9833b84). Adaptation loop closes on drain rate with retransmit
 admission control (4e6a017). Self-congestion is now gated on pressure so a
 bursty link can't permanently pin the bitrate (4cbda48).
 
-Latest (2026-06-27): removed the `max_queue_depth >= 90/60` packet-count gates
-from the adapter's `delay_pressure`/`late_pressure` — a deep paced queue during
-keyframe bursts was misread as bufferbloat and pinned the encoder to the 500
-floor despite ~4.7 Mbps usable and loss ≈ 0. Bufferbloat is now AQM-drop +
-receiver-delay based (see [Adaptation-Delay-Pressure](wiki/Adaptation-Delay-Pressure.md)).
-Field-confirmed the false-positive class is gone (pure-bufferbloat reduces
-57→0). **Open:** the post-fix run was loss-bound (~40 % post-FEC) so the
-average-bitrate win isn't demonstrated yet; the remaining real loss-driven
-collapse is **lever 2** (per-link loss → EDPF, route around the bad link).
+Latest (2026-06-28): **FEC death spiral fixed.** Investigated why the
+post-fix run stayed loss-bound — and it was NOT "lever 2" (links were clean,
+~2% wire loss; EDPF already routes around loss/delay). `recommended_fec_overhead`
+was sizing parity from `ewma_loss_fec` (the *post-FEC residual*, which includes
+cross-link reorder + late loss parity can't fix). That fed a loop: reorder loss
+→ more parity → repair microbursts overflow buffers → more late loss → more
+parity. Field run pinned FEC at **41.6%** with the encoder at the 500 floor and
+3.7 Mbps spare. Fix: size parity to per-link CHANNEL loss (`max_link_loss`),
+not the residual (see [Adaptation-FEC-Sizing](wiki/Adaptation-FEC-Sizing.md)).
+366 tests pass. **Field-validated** (run orangepi-3870): on *worse* radio than
+the baseline, post-FEC residual 7%→1.5%, discontinuities 925→285, gate drops
+1772→348; death-spiral signature gone (0 ticks high-FEC + low channel loss);
+floor time now tracks real loss, not a phantom.
+
+Prior (2026-06-27): removed the `max_queue_depth >= 90/60` packet-count gates
+from `delay_pressure`/`late_pressure` (deep paced queue ≠ bufferbloat); see
+[Adaptation-Delay-Pressure](wiki/Adaptation-Delay-Pressure.md).
+
+**Open:** demonstrate the bitrate *holding high* in a clean-radio window (this
+run was link-0-degraded); consider whether one degraded link of two should pin
+the global encoder as hard as it does (per-link-loss → bitrate, not just FEC).
+Watch adaptive-redundancy duplication as a wire-overhead contributor when spare
+is large (was off this run).
 
 ---
-_Last updated: 2026-06-27_
+_Last updated: 2026-06-28_

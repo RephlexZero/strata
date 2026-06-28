@@ -22,6 +22,7 @@ Scan before opening any full page. Keep summaries to one line.
 |------|---------|------|
 | [wiki/Architecture.md](wiki/Architecture.md) | Transport protocol, bonding engine, scheduling algorithms, FEC/ARQ, congestion control | architecture, internals |
 | [wiki/Adaptation-Delay-Pressure.md](wiki/Adaptation-Delay-Pressure.md) | Why the bitrate adapter measures bufferbloat via AQM/receiver delay, never raw paced-queue packet count | adaptation, congestion, invariant |
+| [wiki/Adaptation-FEC-Sizing.md](wiki/Adaptation-FEC-Sizing.md) | Why FEC parity is sized to per-link channel loss, never the post-FEC residual (the microburst death spiral) | adaptation, fec, invariant |
 | [wiki/Strata-Platform.md](wiki/Strata-Platform.md) | Control plane, dashboard, agent, portal — full fleet management architecture | platform, fleet |
 
 ## Operations

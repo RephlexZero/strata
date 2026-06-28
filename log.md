@@ -5,6 +5,46 @@ the top. One dated entry per day — enough to reconstruct *why* later.
 
 Format: `## YYYY-MM-DD` heading per day, bullet per entry.
 
+## 2026-06-28
+
+- adapt(fec): **stop the FEC death spiral.** Traced why the post-fix run
+  (orangepi-11528) stayed loss-bound. Root cause was NOT "lever 2" (per-link
+  loss → EDPF, route around a bad link) — both links were clean (~2% wire
+  loss; EDPF already de-rates by loss/delay/jitter). It was
+  `recommended_fec_overhead` sizing parity from `ewma_loss_fec` (the *post-FEC
+  residual*), which folds in cross-link reorder + late-arrival loss that parity
+  cannot repair. Feedback loop: reorder loss → more parity → repair microbursts
+  at generation boundaries overflow marginal-link buffers → more late/reorder
+  loss → still more parity. Field evidence (run 2026-06-27, receiver
+  65.109.5.169): per-link wire loss ~2% but receiver post-FEC residual ~17%
+  cumulative (spiking ~36%), FEC overhead pinned at **41.6%** while the encoder
+  sat at the **500 floor with 3.7 Mbps spare** and both links idle; 2.66× wire
+  redundancy, playout buffer pinned at the 3 s cap 75% of ticks, 925
+  discontinuities, 0 resync churn. The `self_congested` guard that pins FEC to
+  baseline can't fire at the floor (pressure ≈ 0.085 ≪ 0.7; lowering it
+  reintroduces the 2026-06-15 bursty-modem bug).
+- adapt(fec): **fix** — size FEC parity to per-link CHANNEL loss
+  (`max_link_loss`), not the post-FEC residual: strictly more correct (more
+  protection for real channel loss, none for reorder/late). New field
+  `max_link_loss` set in `update()`; driver swap in `recommended_fec_overhead`.
+  New regression test `fec_overhead_not_inflated_by_reorder_residual`; existing
+  `fec_overhead_pinned_under_self_congestion` updated to the channel-loss
+  driver. 366 lib + integration tests pass; fmt clean. See
+  [Adaptation-FEC-Sizing](wiki/Adaptation-FEC-Sizing.md), related
+  [Adaptation-Delay-Pressure](wiki/Adaptation-Delay-Pressure.md).
+- adapt(fec): **field-validated** (run orangepi-3870, 120 s, clean EOS,
+  10 HLS segments, damaged=0). Hit *worse* radio than the baseline (link 0
+  ~8% mean channel loss vs ~2%), yet receiver-side quality improved sharply:
+  post-FEC residual mean **7%→1.5%** (90% of ticks <5% vs 63%), discontinuities
+  **925→285**, egress-gate drops **1772→348**, playout pinned at the 3 s cap
+  **75%→61%**. Death-spiral signature gone: **0** ticks of high-FEC (>25%) with
+  low channel loss (<5%); all 21 high-FEC ticks co-occurred with genuine high
+  channel loss. Encoder floor time now tracks real loss (mean channel loss
+  12.5% at floor vs 8.3% above) — correct adaptation, not a phantom collapse.
+  Note redundancy_enabled=false, so the wire overhead was FEC+retransmits only.
+- **Open:** secondary contributor to the 2.66× — adaptive-redundancy
+  duplication also floods when spare is huge. Watch on field validation.
+
 ## 2026-06-27
 
 - Initialized AI workspace (LLM wiki pattern) from ai-workspace-template: added
