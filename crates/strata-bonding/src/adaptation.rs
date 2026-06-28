@@ -82,8 +82,8 @@ pub struct AdaptationConfig {
 
 /// Default sustain duration for non-severe congestion signals.
 ///
-/// Cellular HARQ stalls produce single-tick `loss_pressure` /
-/// `link_collapse` / `late_pressure` signals that clear within
+/// Cellular HARQ stalls produce single-tick `link_collapse` /
+/// `late_pressure` / `burst_loss` signals that clear within
 /// 200–800 ms (see field-test data). Without a sustain gate, every such
 /// stall triggers a 30 % bitrate cut followed by a slow ramp-up,
 /// producing the sawtooth encoder behaviour visible as on-wire artifacts.
@@ -866,17 +866,16 @@ impl BitrateAdapter {
             .unwrap_or((self.current_target_kbps, AdaptationReason::Capacity));
 
         // Apply receiver-side pressure signals.
-        // loss_after_fec is now per-interval (delta-based) at the receiver,
-        // but LTE loss is bursty so we EWMA-smooth it (α=0.3, ~2s half-life)
-        // to avoid reacting to a single bad second.
+        // loss_after_fec is per-interval (delta-based) at the receiver, but LTE
+        // loss is bursty so we EWMA-smooth it (α=0.3, ~2s half-life) to avoid
+        // reacting to a single bad second.  This smoothed residual no longer
+        // drives an encoder cut (see below); it now only feeds
+        // `jitter_loss_context` and the FEC burst-lift.
         //
-        // When goodput is positive, update normally.
-        // When goodput is zero (stall), decay the EWMA toward 0 slowly
-        // (α=0.05) instead of freezing it.  Previously, freezing caused the
-        // EWMA to latch at ~1.0 after a stall and never recover — the
-        // goodput_bps > 0 guard prevented any update, so loss_pressure stayed
-        // true indefinitely.  A slow decay lets the system re-probe after
-        // ~10 seconds of stall, matching the grace period + ramp-up cadence.
+        // When goodput is positive, update normally.  When goodput is zero
+        // (stall), decay the EWMA toward 0 (×0.9) instead of freezing it, so a
+        // stall can't latch the signal high and poison the contexts that read
+        // it; this lets the system re-probe after ~10s of stall.
         let ewma_loss_before = self.ewma_loss_fec;
         if feedback.goodput_bps > 0 {
             self.ewma_loss_fec = 0.3 * feedback.loss_after_fec + 0.7 * self.ewma_loss_fec;
@@ -884,18 +883,15 @@ impl BitrateAdapter {
             // Stall: decay loss toward 0 so the system can eventually recover.
             self.ewma_loss_fec *= 0.9;
         }
-        // Cellular links can show 5-10% baseline loss; use 15% as the
-        // "real congestion" threshold on the smoothed signal.
-        //
-        // High loss_fec with healthy goodput can be a reorder-buffer artifact,
-        // so keep the goodput gate. Require BOTH instantaneous and EWMA
-        // goodput health to avoid stale-high EWMA masking sustained degradation.
-        // The EWMA (α=0.3, ~2s half-life) already filters single-window noise.
-        // If the smoothed post-FEC loss exceeds 15%, that is sustained real
-        // congestion.  The previous goodput gate compared against the (low)
-        // target, making it structurally impossible to fire when the target was
-        // conservative — exactly the scenario where loss pressure matters most.
-        let loss_pressure = self.ewma_loss_fec > 0.15 || link_collapse;
+        // The post-FEC residual (`ewma_loss_fec`) deliberately does NOT cut the
+        // encoder.  It folds in cross-link reorder and late-arrival loss that
+        // parity can't repair and that cutting the encoder can't fix — the same
+        // signal that drove the FEC death spiral.  Real *channel* loss is already
+        // priced into the capacity path (per-link `smoothed * (1 - loss)` →
+        // pressure), and delivered-throughput collapse is caught by
+        // `goodput_shortfall` below (headroom-aware and reorder-immune).  What
+        // remains as a hard receiver-side cut is the genuine per-link melt
+        // detector, `link_collapse` (high loss AND deep queue).
         // Instantaneous severe loss: if a single reporting window shows >35%
         // loss-after-FEC, that is unambiguously bad regardless of what EWMA or
         // goodput say.  LTE loss is bursty (0% → 40% → 0% in consecutive
@@ -1019,22 +1015,33 @@ impl BitrateAdapter {
         // lags the encoder rate by at least one RTT.
         let goodput_shortfall = self.ewma_goodput_bps > 0.0
             && self.ewma_goodput_bps < target_before_update as f64 * 1000.0 * 0.7;
+        // A *severe* shortfall (delivering < 50% of the pre-update rate) is the
+        // grace-bypass tier.  Because it compares against the pre-update target,
+        // a stale post-increase reading still reflects the OLD rate and can't
+        // trip it (ramp steps keep new/old < 2×).  This is the trustworthy,
+        // reorder-immune replacement for the residual signal's grace pass-through.
+        let severe_goodput_shortfall = self.ewma_goodput_bps > 0.0
+            && self.ewma_goodput_bps < target_before_update as f64 * 1000.0 * 0.5;
 
         // After a rate increase, receiver metrics are stale for a few seconds
-        // (they still reflect the old encoder rate).  Suppress goodput-shortfall
-        // reductions during this grace period so we don't immediately revert
-        // every increase.  Delay pressure and loss_pressure pass through grace
-        // because they use EWMA-smoothed signals that already handle staleness —
-        // if smoothed loss > 15% even during grace, the congestion is sustained.
+        // (they still reflect the old encoder rate).  Suppress ordinary
+        // goodput-shortfall reductions during this grace period so we don't
+        // immediately revert every increase.  Delay pressure, link collapse and
+        // *severe* goodput shortfall pass through grace: the first two are
+        // instantaneous, and a severe shortfall is measured against the
+        // pre-update target, so staleness reflects the old rate and can't fake it.
         let feedback_grace = self
             .last_increase_time
             .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5));
-        // Do not apply burst-loss cuts on the exact same tick as a capacity-path
-        // increase. This avoids increase→burst-cut ping-pong from stale feedback.
+        // Do not apply same-tick cuts on the exact tick of a capacity-path
+        // increase. This avoids increase→cut ping-pong from stale feedback.
         let raw_signal = if feedback_grace {
-            loss_pressure || delay_pressure || (burst_loss && !increased_this_tick)
+            link_collapse
+                || delay_pressure
+                || (burst_loss && !increased_this_tick)
+                || (severe_goodput_shortfall && !increased_this_tick)
         } else {
-            loss_pressure || delay_pressure || goodput_shortfall || burst_loss
+            link_collapse || delay_pressure || goodput_shortfall || burst_loss
         };
 
         // Sustained-duration gate: brief cellular HARQ bursts produce
@@ -1072,7 +1079,7 @@ impl BitrateAdapter {
             .unwrap_or(0);
         info!(
             target: "strata::adapt",
-            "[adapt] fb: loss_fec={:.3} ewma_loss={:.3}→{:.3} late={:.3} jitter={}ms(+{}ms) qmax={} gp={}kbps peak_gp={}kbps | loss_p={} link_collapse={} burst={} severe={} bb={} late_p={} gp_short={} grace={} cap_cut={} allow_cut={} inc_tick={} raw={} held_ms={} sustained={} → reduce={}",
+            "[adapt] fb: loss_fec={:.3} ewma_loss={:.3}→{:.3} late={:.3} jitter={}ms(+{}ms) qmax={} gp={}kbps peak_gp={}kbps | gp_short_sev={} link_collapse={} burst={} severe={} bb={} late_p={} gp_short={} grace={} cap_cut={} allow_cut={} inc_tick={} raw={} held_ms={} sustained={} → reduce={}",
             feedback.loss_after_fec,
             ewma_loss_before,
             self.ewma_loss_fec,
@@ -1082,7 +1089,7 @@ impl BitrateAdapter {
             max_queue_depth,
             feedback.goodput_bps / 1000,
             self.goodput_peak_bps as u64 / 1000,
-            loss_pressure,
+            severe_goodput_shortfall,
             link_collapse,
             burst_loss,
             severe_burst,
@@ -1113,7 +1120,7 @@ impl BitrateAdapter {
             // state, let congestion cuts fall back to the static floor so the
             // encoder can actually retreat instead of staying stuck near its
             // pre-collapse target.
-            let floor_kbps = if loss_pressure || burst_loss || severe_burst || late_pressure {
+            let floor_kbps = if link_collapse || burst_loss || severe_burst || late_pressure {
                 self.config.min_bitrate_kbps
             } else {
                 self.effective_floor_kbps()
@@ -1125,20 +1132,18 @@ impl BitrateAdapter {
                 self.last_command_time = Some(Instant::now());
                 self.consecutive_decreases += 1;
                 self.consecutive_increases = 0;
-                // Mark burst on any loss-driven cut, not just single-window
-                // burst_loss.  Sustained loss_pressure is a bursty-network
-                // signal too — without this, the adapter cuts on loss, waits
-                // for EWMA to decay (~3s), then ramps back up into the next
-                // burst.  Treating every loss-driven cut as a burst event
-                // prevents that sawtooth during sustained bursty periods.
-                if burst_loss || loss_pressure {
+                // Mark burst on a melt-driven cut too, not just single-window
+                // burst_loss — a collapsing link is a bursty-network signal, so
+                // arming the ramp-up cooldown here prevents cut→decay→ramp back
+                // into the next burst (the sawtooth).
+                if burst_loss || link_collapse {
                     self.last_burst_time = Some(Instant::now());
                 }
                 if severe_burst {
                     self.last_increase_time = None;
                 }
 
-                let reason = if loss_pressure || burst_loss || severe_burst {
+                let reason = if link_collapse || burst_loss || severe_burst {
                     AdaptationReason::Congestion
                 } else {
                     AdaptationReason::Capacity
@@ -1254,15 +1259,13 @@ impl BitrateAdapter {
         // of > 0.90, raising the effective utilisation ceiling from 59.5% to
         // 72% of raw capacity.
         let ramp_up_threshold = self.config.pressure_threshold - 0.05;
-        // Suppress ramp-up when EWMA post-FEC loss exceeds the loss_pressure
-        // threshold.  Without this, update() ramps up on capacity headroom
-        // while update_with_feedback() cuts on loss — causing sawtooth.
-        let loss_suppressed = self.ewma_loss_fec > 0.15;
-        if pressure < ramp_up_threshold
-            && self.consecutive_increases >= 3
-            && !burst_cooldown
-            && !loss_suppressed
-        {
+        // Ramp-up is gated on pressure (capacity headroom), a run of increasing
+        // capacity, the burst cooldown, and the goodput-peak ceiling below — but
+        // NOT on post-FEC residual loss.  That residual includes reorder/late
+        // loss the links are still delivering through; suppressing ramp-up on it
+        // pinned the encoder below real headroom (sibling of the FEC death
+        // spiral).  Genuine bursts/melts arm `burst_cooldown` via last_burst_time.
+        if pressure < ramp_up_threshold && self.consecutive_increases >= 3 && !burst_cooldown {
             let target = current + self.config.ramp_up_kbps_per_step;
             let target = target.min(self.config.max_bitrate_kbps);
             // Cap below the pressure threshold to avoid overshooting into
@@ -1824,8 +1827,9 @@ mod tests {
         }
         let baseline = adapter.current_target_kbps();
 
-        // Inject severe loss — goodput_ceil drops, EWMA loss builds, adapter must cut.
-        // After ~3 ticks ewma_loss_fec > 0.25 (extreme_loss) which bypasses grace.
+        // Inject severe degradation: goodput collapses to 500 kbps and
+        // loss_after_fec 0.60.  burst-loss (>0.35) plus the goodput shortfall
+        // against the high baseline both drive the cut.
         let bad = ReceiverFeedback {
             goodput_bps: 500_000, // 500 kbps — severely degraded
             fec_repair_rate: 0.0,
@@ -2107,9 +2111,10 @@ mod tests {
     }
 
     #[test]
-    fn loss_pressure_gated_on_goodput() {
-        // Mild ewma_loss (below 15% EWMA threshold) should not trigger
-        // reduction even after several iterations.
+    fn mild_residual_loss_with_healthy_goodput_does_not_cut() {
+        // Mild post-FEC residual (10%) with healthy goodput must not cut the
+        // encoder: the residual no longer drives a reduction, and goodput is
+        // well above the shortfall threshold.
         let mut adapter = BitrateAdapter::new(AdaptationConfig {
             max_bitrate_kbps: 10_000,
             min_interval: Duration::ZERO,
@@ -2120,8 +2125,8 @@ mod tests {
         let links = make_links(&[(10_000.0, true)]);
         adapter.update(&links); // prime
 
-        // loss_after_fec = 0.10 → EWMA converges to ~0.10 which is below
-        // the 0.15 loss_pressure threshold.
+        // loss_after_fec = 0.10 with goodput at the full 2 Mbps target:
+        // no shortfall, no burst, no melt → no cut.
         let feedback = ReceiverFeedback {
             goodput_bps: 2_000_000,
             fec_repair_rate: 0.0,
@@ -2139,6 +2144,51 @@ mod tests {
         assert!(
             adapter.current_target_kbps() >= before,
             "should not reduce when loss is below EWMA threshold: was {} now {}",
+            before,
+            adapter.current_target_kbps()
+        );
+    }
+
+    #[test]
+    fn high_residual_loss_with_headroom_does_not_cut_encoder() {
+        // Core of the residual-override removal: a post-FEC residual well above
+        // the old 0.15 gate, but with healthy goodput, clean channel loss and
+        // ample capacity headroom, must NOT cut the encoder.  This is the
+        // reorder/late-loss case the FEC fix proved untrustworthy; on the old
+        // code `loss_pressure` (ewma > 0.15) would force a reduction here.
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_interval: Duration::ZERO,
+            initial_bitrate_kbps: 2_000,
+            ..Default::default()
+        });
+
+        let links = make_links(&[(10_000.0, true)]); // clean channel, big headroom
+        adapter.update(&links); // prime
+
+        // Healthy goodput at the target, but a high post-FEC residual (a
+        // reorder/late artifact, not channel loss).
+        let feedback = ReceiverFeedback {
+            goodput_bps: 2_000_000,
+            fec_repair_rate: 0.0,
+            jitter_buffer_ms: 100,
+            loss_after_fec: 0.25, // above the old 0.15 loss_pressure gate
+            late_rate: 0.0,
+        };
+
+        let before = adapter.current_target_kbps();
+        for _ in 0..6 {
+            adapter.update_with_feedback(&links, &feedback);
+        }
+
+        assert!(
+            adapter.ewma_loss_fec > 0.15,
+            "residual must exceed the old gate for this test to be meaningful: {:.3}",
+            adapter.ewma_loss_fec
+        );
+        assert!(
+            adapter.current_target_kbps() >= before,
+            "high residual with healthy goodput + headroom must not cut: was {} now {}",
             before,
             adapter.current_target_kbps()
         );
@@ -2458,8 +2508,7 @@ mod tests {
 
     #[test]
     fn goodput_shortfall_drives_reduction_not_loss() {
-        // Low goodput alone (without loss) should reduce via goodput_shortfall,
-        // not loss_pressure.
+        // Low goodput alone (without loss) should reduce via goodput_shortfall.
         let mut adapter = BitrateAdapter::new(AdaptationConfig {
             max_bitrate_kbps: 10_000,
             min_interval: Duration::ZERO,
@@ -2585,13 +2634,13 @@ mod tests {
             adapter.update_with_feedback(&links, &clean);
         }
 
-        // KEY ASSERTION: EWMA must recover to below 0.15 (the loss_pressure
-        // threshold) within 10 clean ticks.  If it's still above 0.15 after
-        // 10 clean updates, the adaptation layer is permanently poisoned.
+        // KEY ASSERTION: the residual EWMA must recover near zero within 10
+        // clean ticks — it still feeds `jitter_loss_context` and the FEC
+        // burst-lift, so a latched-high value would poison those.
         assert!(
             adapter.ewma_loss_fec < 0.15,
-            "EWMA should recover below loss_pressure threshold after 10 clean \
-             ticks, got {:.3} — EWMA is permanently poisoned",
+            "EWMA should recover after 10 clean ticks, got {:.3} — \
+             residual is permanently poisoned",
             adapter.ewma_loss_fec
         );
     }
@@ -2813,8 +2862,9 @@ mod tests {
     // ── Regression: EWMA loss decay during stall ─────────────────────
 
     /// When goodput drops to zero after the EWMA has climbed high,
-    /// the decay (×0.9 per tick) should bring it below the loss_pressure
-    /// threshold within ~15 ticks, preventing permanent stall.
+    /// the decay (×0.9 per tick) should bring the residual back near zero
+    /// within ~15 ticks, so it can't latch high and poison
+    /// `jitter_loss_context` / FEC sizing.
     #[test]
     fn ewma_loss_decays_during_zero_goodput_stall() {
         let mut adapter = BitrateAdapter::new(AdaptationConfig {
@@ -2859,7 +2909,7 @@ mod tests {
         // 0.9^20 ≈ 0.12, so from ~0.7 → ~0.09 after 20 ticks
         assert!(
             adapter.ewma_loss_fec < 0.15,
-            "EWMA should have decayed below loss_pressure threshold: {:.3}",
+            "EWMA should have decayed back toward zero: {:.3}",
             adapter.ewma_loss_fec
         );
     }

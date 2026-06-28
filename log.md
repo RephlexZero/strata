@@ -7,6 +7,25 @@ Format: `## YYYY-MM-DD` heading per day, bullet per entry.
 
 ## 2026-06-28
 
+- adapt(encoder): **remove the post-FEC residual override on the encoder
+  bitrate.** Sibling of the FEC-sizing fix: the residual (`ewma_loss_fec`) folds
+  in reorder/late loss the encoder can't fix, so it must not move the bitrate.
+  Deleted the two `ewma_loss_fec > 0.15` gates — `loss_pressure` (forced an
+  encoder cut) and `loss_suppressed` (blocked ramp-up); both were binary,
+  headroom-blind, and pinned/cut the encoder while spare bandwidth existed. The
+  encoder now follows the continuous capacity path (per-link channel-loss
+  discount → pressure, already correct), goodput shortfall (delivered < 0.7×
+  offered — headroom-aware, reorder-immune), AQM self-congestion, and genuine
+  per-link melt (`link_collapse`, the half `loss_pressure` legitimately
+  bundled). Hardened goodput shortfall with a severe tier (< 0.5× pre-update
+  target) that bypasses the post-increase grace — replacing the residual's grace
+  pass-through with a trustworthy, staleness-robust signal. Residual is kept only
+  for `jitter_loss_context` and the FEC burst-lift. New regression test
+  `high_residual_loss_with_headroom_does_not_cut_encoder` (fails on old code);
+  renamed `loss_pressure_gated_on_goodput` →
+  `mild_residual_loss_with_healthy_goodput_does_not_cut`. 367 unit + all
+  integration tests pass, clippy clean. New note Adaptation-Encoder-Cut-Signals
+  + index row. Branch `fix/adapt-goodput-not-residual`.
 - adapt(fec): **stop the FEC death spiral.** Traced why the post-fix run
   (orangepi-11528) stayed loss-bound. Root cause was NOT "lever 2" (per-link
   loss → EDPF, route around a bad link) — both links were clean (~2% wire
