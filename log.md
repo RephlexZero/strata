@@ -7,6 +7,21 @@ Format: `## YYYY-MM-DD` heading per day, bullet per entry.
 
 ## 2026-06-28
 
+- adapt(encoder): **gate the burst reflex on a real goodput collapse** (field
+  follow-up to the residual-override removal). Field run orangepi-10360 showed
+  the encoder still slammed to the 500 floor 34% of ticks with ~5.3 Mbps spare —
+  not via the removed EWMA gates, but via `burst_loss`/`severe_burst`, which
+  keyed on the *instantaneous* `loss_after_fec`. That residual is the same
+  reorder/late-contaminated signal: 72 burst windows averaged 5.3 Mbps delivered
+  goodput (100% >= 2 Mbps) while reporting 0.65 mean loss-after-FEC; damaged=0
+  all run. Fix: `burst_loss` now also requires `goodput_bps > 0 && goodput <
+  0.7x offered` — a reorder spike with healthy goodput no longer cuts; a real
+  burst (goodput collapses too) still cuts same-window. `severe_burst` inherits
+  it. New regression test `burst_loss_does_not_cut_when_goodput_is_healthy`
+  (trips severe_burst on old code). 368 tests pass, clippy clean. Wiki note +
+  orangepi-10360 evidence updated. Same run confirmed FEC overhead 16.8% mean
+  (was 41.6% pinned — death spiral dead) and ramp-up recovery to 2.5 Mbps. Field
+  re-test pending.
 - adapt(encoder): **remove the post-FEC residual override on the encoder
   bitrate.** Sibling of the FEC-sizing fix: the residual (`ewma_loss_fec`) folds
   in reorder/late loss the encoder can't fix, so it must not move the bitrate.

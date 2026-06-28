@@ -12,8 +12,9 @@ Removed the post-FEC **residual override on the encoder bitrate**: the
 ramp-up (`loss_suppressed`) are gone. The encoder is now driven by the
 continuous capacity path (per-link channel-loss discount → pressure), goodput
 shortfall (headroom-aware, reorder-immune), AQM self-congestion and genuine
-per-link melt (`link_collapse`). Residual now only feeds jitter context + FEC
-burst-lift. See [Adaptation-Encoder-Cut-Signals](wiki/Adaptation-Encoder-Cut-Signals.md).
+per-link melt (`link_collapse`). The burst reflex (`burst_loss`/`severe_burst`)
+is likewise gated on a real goodput collapse, not the raw residual (field-driven,
+orangepi-10360). See [Adaptation-Encoder-Cut-Signals](wiki/Adaptation-Encoder-Cut-Signals.md).
 
 ## Open questions / decisions pending
 
@@ -41,12 +42,16 @@ are now visible (9833b84). Adaptation loop closes on drain rate with retransmit
 admission control (4e6a017). Self-congestion is now gated on pressure so a
 bursty link can't permanently pin the bitrate (4cbda48).
 
-Latest (2026-06-28): **Residual override removed from the encoder.** The two
-`ewma_loss_fec > 0.15` gates (encoder cut `loss_pressure` + ramp-up block
-`loss_suppressed`) are gone; the encoder follows the continuous capacity path +
-goodput shortfall instead. New regression test
-`high_residual_loss_with_headroom_does_not_cut_encoder` (fails on old code).
-367 unit + all integration tests pass, clippy clean.
+Latest (2026-06-28): **Residual override removed from the encoder, then the
+burst path gated on goodput.** First the two `ewma_loss_fec > 0.15` gates
+(encoder cut `loss_pressure` + ramp-up block `loss_suppressed`) were removed.
+Field test **orangepi-10360** then showed the encoder STILL floored 34% of ticks
+(~5.3 Mbps spare) — via `burst_loss`/`severe_burst`, which keyed on the
+*instantaneous* post-FEC residual (72 burst windows at mean 5.3 Mbps goodput =
+reorder, not loss). Fix: the burst path now also requires a real
+delivered-throughput collapse (goodput < 0.7× offered). FEC overhead held 16.8%
+(no death spiral); ramp-up recovered to 2.5 Mbps. 368 tests pass, clippy clean.
+**Field re-test pending.**
 See [Adaptation-Encoder-Cut-Signals](wiki/Adaptation-Encoder-Cut-Signals.md).
 
 Prior (2026-06-28, now on main): **FEC death spiral fixed.** Investigated why the

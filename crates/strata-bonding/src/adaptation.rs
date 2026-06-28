@@ -892,18 +892,20 @@ impl BitrateAdapter {
         // `goodput_shortfall` below (headroom-aware and reorder-immune).  What
         // remains as a hard receiver-side cut is the genuine per-link melt
         // detector, `link_collapse` (high loss AND deep queue).
-        // Instantaneous severe loss: if a single reporting window shows >35%
-        // loss-after-FEC, that is unambiguously bad regardless of what EWMA or
-        // goodput say.  LTE loss is bursty (0% → 40% → 0% in consecutive
-        // windows) so the EWMA is structurally too slow to react — by the time
-        // it crosses any threshold the burst is over.  This check catches burst
-        // events immediately, bypasses goodput_ok (which stays stale-high during
-        // bursts), and bypasses grace.
-        // Gate on goodput > 0: when the reorder buffer stalls (one link dies),
-        // loss_after_fec reads 1.0 with goodput=0 — that's an artifact, not real
-        // congestion.  Real burst loss always has *some* goodput (degraded but
-        // non-zero) because the working link is still delivering packets.
-        let burst_loss = feedback.loss_after_fec > 0.35 && feedback.goodput_bps > 0;
+        // Instantaneous burst cut: a single window with >35% loss-after-FEC,
+        // fast enough to bypass grace and the sustain gate.  But loss-after-FEC
+        // alone is reorder/late-contaminated — field run orangepi-10360 saw 72
+        // such "burst" windows at a mean 5.3 Mbps delivered goodput (delivery was
+        // fine; the residual was just late/out-of-order), yet they slammed the
+        // encoder to the floor under ~5 Mbps of spare.  So require an *actual*
+        // delivered-throughput collapse too: goodput positive (not a total
+        // stall — a dead link reads loss 1.0 with goodput 0, an artifact handled
+        // elsewhere) but below 70% of the offered rate.  A reorder spike with
+        // healthy goodput no longer cuts; a real loss burst, where goodput drops
+        // with the loss, still cuts immediately (same-window via instant goodput).
+        let burst_loss = feedback.loss_after_fec > 0.35
+            && feedback.goodput_bps > 0
+            && (feedback.goodput_bps as f64) < target_before_update as f64 * 1000.0 * 0.7;
         // Treat sustained post-FEC loss >50% with queue growth as an emergency.
         // This allows an additional same-tick reduction even if capacity-path
         // logic already cut once.
@@ -2189,6 +2191,45 @@ mod tests {
         assert!(
             adapter.current_target_kbps() >= before,
             "high residual with healthy goodput + headroom must not cut: was {} now {}",
+            before,
+            adapter.current_target_kbps()
+        );
+    }
+
+    #[test]
+    fn burst_loss_does_not_cut_when_goodput_is_healthy() {
+        // Field orangepi-10360: instantaneous loss_after_fec spiked to 40-97%
+        // from cross-link reorder while the receiver still delivered ~5 Mbps.
+        // A burst cut must require an actual delivered-throughput collapse, not a
+        // reorder-inflated residual — otherwise the encoder slams to the floor
+        // under ample headroom.  On the old code this tripped severe_burst.
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_interval: Duration::ZERO,
+            congestion_sustain: Duration::ZERO,
+            initial_bitrate_kbps: 2_000,
+            ..Default::default()
+        });
+        let links = make_links(&[(10_000.0, true), (10_000.0, true)]);
+        adapter.update(&links); // prime
+
+        // High instantaneous post-FEC residual, but goodput well above the
+        // offered rate (delivery is fine — the "loss" is late/reordered).
+        // jitter held flat/low so delay_pressure can't confound the burst path.
+        let reorder_spike = ReceiverFeedback {
+            goodput_bps: 5_000_000, // >> 2 Mbps target — no real collapse
+            fec_repair_rate: 0.0,
+            jitter_buffer_ms: 100,
+            loss_after_fec: 0.60, // would have tripped burst_loss/severe_burst
+            late_rate: 0.0,
+        };
+        let before = adapter.current_target_kbps();
+        for _ in 0..5 {
+            adapter.update_with_feedback(&links, &reorder_spike);
+        }
+        assert!(
+            adapter.current_target_kbps() >= before,
+            "reorder-driven residual with healthy goodput must not cut: was {} now {}",
             before,
             adapter.current_target_kbps()
         );
