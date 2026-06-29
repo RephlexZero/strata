@@ -25,6 +25,7 @@ Scan before opening any full page. Keep summaries to one line.
 | [wiki/Adaptation-FEC-Sizing.md](wiki/Adaptation-FEC-Sizing.md) | Why FEC parity is sized to per-link channel loss, never the post-FEC residual (the microburst death spiral) | adaptation, fec, invariant |
 | [wiki/Adaptation-Encoder-Cut-Signals.md](wiki/Adaptation-Encoder-Cut-Signals.md) | What may cut the encoder bitrate (capacity pressure, goodput shortfall, AQM, per-link melt) — and why the post-FEC residual may not | adaptation, congestion, invariant |
 | [wiki/Strata-Platform.md](wiki/Strata-Platform.md) | Control plane, dashboard, agent, portal — full fleet management architecture | platform, fleet |
+| [wiki/MPEG-TS-Mux-Overhead.md](wiki/MPEG-TS-Mux-Overhead.md) | mpegtsmux pat/pmt-interval are 90 kHz ticks, not packet counts — =1 tripled wire bandwidth and drove the AQM self-loss saga; use 9000 (100 ms) | gstreamer, mux, bandwidth, gotcha |
 
 ## Operations
 

@@ -5,24 +5,34 @@
 
 ## Current focus
 
-Branch `fix/adapt-goodput-not-residual` (off `main`, which now carries the
-merged `fix/delivered-stream-integrity` work incl. the FEC death-spiral fix).
-Removed the post-FEC **residual override on the encoder bitrate**: the
-`ewma_loss_fec > 0.15` gates that cut the encoder (`loss_pressure`) and blocked
-ramp-up (`loss_suppressed`) are gone. The encoder is now driven by the
-continuous capacity path (per-link channel-loss discount → pressure), goodput
-shortfall (headroom-aware, reorder-immune), AQM self-congestion and genuine
-per-link melt (`link_collapse`). The burst reflex (`burst_loss`/`severe_burst`)
-is likewise gated on a real goodput collapse, not the raw residual (field-driven,
-orangepi-10360). See [Adaptation-Encoder-Cut-Signals](wiki/Adaptation-Encoder-Cut-Signals.md).
+Branch `fix/adapt-goodput-not-residual` (off `main`). **The discontinuity /
+playout-window investigation is RESOLVED — root cause was a single mux constant.**
+`mpegtsmux pat-interval=1 pmt-interval=1` (those are 90 kHz ticks, default 9000,
+NOT a packet count) emitted PAT/PMT before nearly every packet, **tripling wire
+bandwidth** (2.3 Mbps video → 7 Mbps muxed). That overflowed the per-link
+paced-queue AQM into ~243k self-inflicted holes/run — which masqueraded as
+channel loss, reorder, FEC death spirals, bufferbloat, and a pinned 3 s playout
+window. Fixed: `pat-interval=9000 pmt-interval=9000` (100 ms) at all 3 sender
+sites. Field-validated (orangepi-57909): AQM drops 243k→330, discontinuities
+~1200→121, playout off the 3 s cap to ~1.8 s. Companion: `rc-mode=cbr` on the
+Rockchip encoder (AQM bursts −98%). See
+[MPEG-TS-Mux-Overhead](wiki/MPEG-TS-Mux-Overhead.md).
+
+Earlier on this branch (still valid, all field-validated): removed the post-FEC
+**residual override on the encoder bitrate** (`ewma_loss_fec > 0.15` gates that
+cut the encoder / blocked ramp-up), and gated the burst reflex on a real goodput
+collapse. The encoder follows the continuous capacity path, goodput shortfall,
+AQM self-congestion and `link_collapse`. See
+[Adaptation-Encoder-Cut-Signals](wiki/Adaptation-Encoder-Cut-Signals.md).
 
 ## Open questions / decisions pending
 
 - **Field-validate this change**: finally watch the bitrate HOLD HIGH in a
   clean-radio window (prior runs were link-0-degraded) — confirm the encoder
   no longer cuts/pins when headroom exists.
-- How to handle stream discontinuities when FEC partially recovers a gap —
-  should the egress gate still signal a discontinuity or suppress it?
+- ~~Stream discontinuities under real Band 8~~ — **resolved**: they were
+  self-inflicted AQM loss from the `pat-interval=1` mux bloat, not a genuine
+  recovery-signalling question. See [MPEG-TS-Mux-Overhead](wiki/MPEG-TS-Mux-Overhead.md).
 - Long-term: move capacity oracle from PPD to a hybrid BBR+PPD model once
   the drain-rate loop is stable?
 - Field test on Orange Pi: validate redundancy/broadcast flag behaviour under
@@ -80,4 +90,4 @@ override that pinned it is gone — but still needs field confirmation. Watch
 adaptive-redundancy duplication as a wire-overhead contributor when spare is large.
 
 ---
-_Last updated: 2026-06-28_
+_Last updated: 2026-06-29_

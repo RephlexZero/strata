@@ -5,6 +5,35 @@ the top. One dated entry per day — enough to reconstruct *why* later.
 
 Format: `## YYYY-MM-DD` heading per day, bullet per entry.
 
+## 2026-06-29
+
+- gst(mux): **the whole encoder-cut / FEC / playout saga was one wrong mux
+  constant.** `mpegtsmux pat-interval=1 pmt-interval=1` — those properties are
+  **90 kHz ticks (default 9000 = 100 ms), not a packet count** — so `=1` emitted
+  PAT+PMT (376 B) before nearly every video packet, **tripling wire bandwidth**.
+  Found via a step-by-step field diagnosis: instrumented the playout-window term
+  breakdown (showed it sized entirely by delay-spread, a symptom), then traced a
+  ~243k-packet/run paced-queue **AQM self-inflicted-loss** flood. Walked back two
+  wrong hypotheses (broadcast/redundancy duplication — redundancy was OFF; then
+  encoder overshoot) by checking config and adding a **pre-mux encoder-output
+  probe**: encoder emitted **2.26 Mbps** (tracking target) but the **post-mux
+  sink saw 7.0 Mbps (3.1×)** — proving the muxer, not the encoder, was the flood.
+  Fix: `pat-interval=9000 pmt-interval=9000` at all 3 sender sites
+  (`strata_pipeline.rs`). Field-validated (orangepi-57909): post-mux egress
+  7.0→2.55 Mbps, AQM drops 243k→330, receiver lost ~85k→799, discontinuities
+  ~1200→121, playout window unpinned from the 3 s cap to ~1.8 s. PAT/PMT keep the
+  HEADER→Critical→FEC-protected path, so 100 ms is ample resilience. New note
+  [MPEG-TS-Mux-Overhead](wiki/MPEG-TS-Mux-Overhead.md); AGENTS.md pattern
+  corrected. The encoder, adapter, FEC sizing and playout logic were all correct.
+- gst(encoder): **companion fix — `rc-mode=cbr` on the Rockchip MPP encoder**
+  (`codec.rs::configure_static_props`, find_property-guarded like header-mode).
+  The BSP default rc-mode let the encoder burst past the 0.5 s paced-queue budget
+  even at the right average rate; CBR smooths it. Field-measured AQM bursts −98%.
+  Kept independent of the mux fix. Diagnostic instrumentation kept: sink
+  egress-rate log + transport snapshot `retransmissions`/`fec_repairs_sent`
+  (useful telemetry); the pre-mux probe + window-term breakdown were removed as
+  one-shot debug.
+
 ## 2026-06-28
 
 - adapt(encoder): **gate the burst reflex on a real goodput collapse** (field

@@ -582,7 +582,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
          {hw_fmt_conv}! {enc_fragment} \
          ! {parser_fragment} \
          {video_to_mux}{audio} \
-         mpegtsmux name=mux alignment=7 pat-interval=1 pmt-interval=1 \
+         mpegtsmux name=mux alignment=7 pat-interval=9000 pmt-interval=9000 \
          ! stratasink name=rsink",
         w = res_w,
         h = res_h,
@@ -914,7 +914,7 @@ fn run_sender_passthrough(
     let pipeline_str = format!(
         "uridecodebin name=urisrc uri=\"{uri}\" \
          ! parsebin name=pbin \
-         mpegtsmux name=mux alignment=7 pat-interval=1 pmt-interval=1 \
+         mpegtsmux name=mux alignment=7 pat-interval=9000 pmt-interval=9000 \
          ! stratasink name=rsink",
         uri = source_uri,
     );
@@ -1768,7 +1768,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
              queue max-size-buffers=0 max-size-bytes=0 max-size-time=10000000000 \
              leaky=downstream ! \
              aacparse name=aparse ! mux. \
-             mpegtsmux name=mux alignment=7 pat-interval=1 pmt-interval=1 ! \
+             mpegtsmux name=mux alignment=7 pat-interval=9000 pmt-interval=9000 ! \
              hlssink name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
              target-duration=2 max-files=10 playlist-length=6",
             bind = bind_str,

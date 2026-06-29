@@ -300,6 +300,18 @@ impl CodecController {
         if self.backend == EncoderBackend::Rockchip && enc.find_property("header-mode").is_some() {
             enc.set_property_from_str("header-mode", "each-idr");
         }
+        // Pin constant-bitrate rate control on the Rockchip MPP encoder. Its
+        // default rc-mode lets the encoder overshoot the target heavily on
+        // high-complexity / high-motion content — field-measured at ~2.7×
+        // (6.8 Mbps emitted against a 2.5 Mbps target), which overflows the
+        // per-link paced-queue AQM budget and turns into self-inflicted loss
+        // (holes the receiver reports as discontinuities). CBR makes the
+        // emitted rate track the target the adapter sets, matching the
+        // transport's paced-rate model. The "cbr" nick is GstMppEncRcMode-
+        // specific, so guard to Rockchip + property presence like header-mode.
+        if self.backend == EncoderBackend::Rockchip && enc.find_property("rc-mode").is_some() {
+            enc.set_property_from_str("rc-mode", "cbr");
+        }
     }
 
     /// Force a keyframe on the encoder via a GStreamer force-keyunit event.
