@@ -222,7 +222,11 @@ fn upload_bytes(agent: &ureq::Agent, base_url: &str, filename: &str, body: &[u8]
     let url = format!("{base_url}{filename}");
     let content_type = content_type_for_hls(filename);
 
-    match agent.put(&url).header("Content-Type", content_type).send(body) {
+    match agent
+        .put(&url)
+        .header("Content-Type", content_type)
+        .send(body)
+    {
         Ok(resp) => {
             let status = resp.status().as_u16();
             if (200..300).contains(&status) {
@@ -621,7 +625,9 @@ mod tests {
     // ── rewrite_playlist_discontinuities ────────────────────────────────
 
     fn sample_playlist(segments: &[&str]) -> String {
-        let mut p = String::from("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n");
+        let mut p = String::from(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n",
+        );
         for seg in segments {
             p.push_str("#EXTINF:1.000,\n");
             p.push_str(seg);
@@ -648,12 +654,18 @@ mod tests {
         let out = rewrite_playlist_discontinuities(&playlist, &discontinuous, &mut state);
 
         let lines: Vec<&str> = out.lines().collect();
-        let tagged_idx = lines.iter().position(|&l| l == "#EXT-X-DISCONTINUITY").unwrap();
+        let tagged_idx = lines
+            .iter()
+            .position(|&l| l == "#EXT-X-DISCONTINUITY")
+            .unwrap();
         assert_eq!(lines[tagged_idx + 1], "#EXTINF:1.000,");
         assert_eq!(lines[tagged_idx + 2], "segment00001.ts");
         // Untouched segments get no tag.
         assert_eq!(
-            lines.iter().filter(|&&l| l == "#EXT-X-DISCONTINUITY").count(),
+            lines
+                .iter()
+                .filter(|&&l| l == "#EXT-X-DISCONTINUITY")
+                .count(),
             1
         );
         // No segment has yet rolled off, so the sequence is present but zero.

@@ -214,7 +214,10 @@ fn configure_hlssink3_muxer(hls: &gst::Element) {
 /// `pending_resumes` — the bus watch in `run_receiver` matches that against
 /// `hlssink3`'s `hls-segment-added` messages to mark the corresponding segment
 /// for `#EXT-X-DISCONTINUITY` in `hls_upload.rs`.
-fn install_delivered_stream_gate(pad: &gst::Pad, pending_resumes: Arc<Mutex<VecDeque<gst::ClockTime>>>) {
+fn install_delivered_stream_gate(
+    pad: &gst::Pad,
+    pending_resumes: Arc<Mutex<VecDeque<gst::ClockTime>>>,
+) {
     struct GateState {
         waiting_for_keyframe: bool,
         last_dts: Option<u64>,
