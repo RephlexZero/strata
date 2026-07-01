@@ -20,8 +20,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Maximum retries per segment upload before giving up for that poll cycle.
@@ -37,6 +37,12 @@ pub struct HlsUploaderConfig {
     pub base_url: String,
     /// Name of the playlist file (e.g. "playlist.m3u8").
     pub playlist_filename: String,
+    /// Segment filenames that start a real timeline gap (a DeliveredStream
+    /// gate resume — see `strata_pipeline.rs:install_delivered_stream_gate`).
+    /// The uploader marks these with `#EXT-X-DISCONTINUITY` before upload;
+    /// the set only grows, so the uploader tracks which entries are still
+    /// within the live playlist's sliding window itself.
+    pub discontinuous_segments: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Handle to a running HLS uploader thread.
@@ -104,6 +110,7 @@ fn uploader_loop(config: &HlsUploaderConfig, stop: &AtomicBool) {
     let mut uploaded: HashSet<String> = HashSet::new();
     let agent = ureq::Agent::new_with_defaults();
     let playlist_path = config.segment_dir.join(&config.playlist_filename);
+    let mut discontinuity_state = DiscontinuityState::default();
 
     eprintln!(
         "HLS uploader: watching {} → {}",
@@ -134,16 +141,16 @@ fn uploader_loop(config: &HlsUploaderConfig, stop: &AtomicBool) {
             // This guarantees YouTube has the segment data before the
             // playlist references it.
             if new_uploaded && playlist_path.exists() {
-                upload_file_with_retry(
+                upload_playlist_with_retry(
                     &agent,
-                    &config.base_url,
-                    &config.playlist_filename,
+                    config,
                     &playlist_path,
+                    &mut discontinuity_state,
                 );
             }
         }
 
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(250));
     }
 
     // Final: upload any remaining segments, then playlist
@@ -157,12 +164,7 @@ fn uploader_loop(config: &HlsUploaderConfig, stop: &AtomicBool) {
         }
     }
     if playlist_path.exists() {
-        upload_file_with_retry(
-            &agent,
-            &config.base_url,
-            &config.playlist_filename,
-            &playlist_path,
-        );
+        upload_playlist_with_retry(&agent, config, &playlist_path, &mut discontinuity_state);
     }
 
     eprintln!(
@@ -211,15 +213,16 @@ fn upload_file(agent: &ureq::Agent, base_url: &str, filename: &str, path: &Path)
             return false;
         }
     };
+    upload_bytes(agent, base_url, filename, &body)
+}
 
+/// Upload in-memory bytes to `{base_url}{filename}` via HTTP PUT.
+/// Returns `true` on success.
+fn upload_bytes(agent: &ureq::Agent, base_url: &str, filename: &str, body: &[u8]) -> bool {
     let url = format!("{base_url}{filename}");
     let content_type = content_type_for_hls(filename);
 
-    match agent
-        .put(&url)
-        .header("Content-Type", content_type)
-        .send(&body[..])
-    {
+    match agent.put(&url).header("Content-Type", content_type).send(body) {
         Ok(resp) => {
             let status = resp.status().as_u16();
             if (200..300).contains(&status) {
@@ -234,6 +237,124 @@ fn upload_file(agent: &ureq::Agent, base_url: &str, filename: &str, path: &Path)
             false
         }
     }
+}
+
+/// Read the playlist hlssink3 just wrote, tag any segment in
+/// `config.discontinuous_segments` with `#EXT-X-DISCONTINUITY`, and upload
+/// the rewritten copy (with retry). The on-disk file is left untouched —
+/// hlssink3 owns and rewrites it every segment, so our edits only ever live
+/// in the uploaded copy.
+fn upload_playlist_with_retry(
+    agent: &ureq::Agent,
+    config: &HlsUploaderConfig,
+    playlist_path: &Path,
+    state: &mut DiscontinuityState,
+) -> bool {
+    let text = match std::fs::read_to_string(playlist_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "HLS uploader: failed to read {}: {}",
+                playlist_path.display(),
+                e
+            );
+            return false;
+        }
+    };
+    let discontinuous = config.discontinuous_segments.lock().unwrap();
+    let rewritten = rewrite_playlist_discontinuities(&text, &discontinuous, state);
+    drop(discontinuous);
+
+    for attempt in 0..MAX_UPLOAD_RETRIES {
+        if upload_bytes(
+            agent,
+            &config.base_url,
+            &config.playlist_filename,
+            rewritten.as_bytes(),
+        ) {
+            return true;
+        }
+        if attempt + 1 < MAX_UPLOAD_RETRIES {
+            let delay = RETRY_BASE_DELAY * 2u32.saturating_pow(attempt);
+            std::thread::sleep(delay);
+        }
+    }
+    eprintln!(
+        "HLS uploader: giving up on {} after {} attempts",
+        config.playlist_filename, MAX_UPLOAD_RETRIES
+    );
+    false
+}
+
+/// Tracks, across polling cycles, which segments currently in the live
+/// playlist's sliding window are marked discontinuous, and how many tagged
+/// segments have already rolled out of that window (the playlist's
+/// `#EXT-X-DISCONTINUITY-SEQUENCE`).
+#[derive(Default)]
+struct DiscontinuityState {
+    in_playlist: HashSet<String>,
+    sequence: u32,
+}
+
+/// Insert `#EXT-X-DISCONTINUITY` before the `#EXTINF:` of any segment named
+/// in `discontinuous`, and maintain `#EXT-X-DISCONTINUITY-SEQUENCE` as tagged
+/// segments roll out of the playlist's sliding window. `hlssink3` has no
+/// concept of an application-driven discontinuity (it never emits either
+/// tag itself), so this is reconstructed from the plain playlist text on
+/// every upload.
+fn rewrite_playlist_discontinuities(
+    text: &str,
+    discontinuous: &HashSet<String>,
+    state: &mut DiscontinuityState,
+) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let current_segments: HashSet<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+
+    // Segments that rolled out of the window since the last poll count
+    // toward the discontinuity sequence; segments newly visible and tagged
+    // join the live set.
+    let rolled_off = state
+        .in_playlist
+        .iter()
+        .filter(|name| !current_segments.contains(name.as_str()))
+        .count();
+    state.sequence += rolled_off as u32;
+    state
+        .in_playlist
+        .retain(|name| current_segments.contains(name.as_str()));
+    for &name in &current_segments {
+        if discontinuous.contains(name) {
+            state.in_playlist.insert(name.to_string());
+        }
+    }
+
+    let mut out = String::with_capacity(text.len() + 64);
+    for (i, line) in lines.iter().enumerate() {
+        if *line == "#EXTM3U" {
+            out.push_str(line);
+            out.push('\n');
+            if state.sequence > 0 || !state.in_playlist.is_empty() {
+                out.push_str(&format!(
+                    "#EXT-X-DISCONTINUITY-SEQUENCE:{}\n",
+                    state.sequence
+                ));
+            }
+            continue;
+        }
+        if line.starts_with("#EXTINF:")
+            && let Some(&uri) = lines.get(i + 1)
+            && state.in_playlist.contains(uri)
+        {
+            out.push_str("#EXT-X-DISCONTINUITY\n");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Return the appropriate MIME type for an HLS file.
@@ -497,6 +618,69 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // ── rewrite_playlist_discontinuities ────────────────────────────────
+
+    fn sample_playlist(segments: &[&str]) -> String {
+        let mut p = String::from("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n");
+        for seg in segments {
+            p.push_str("#EXTINF:1.000,\n");
+            p.push_str(seg);
+            p.push('\n');
+        }
+        p
+    }
+
+    #[test]
+    fn rewrite_untagged_playlist_is_unchanged_besides_passthrough() {
+        let playlist = sample_playlist(&["segment00000.ts", "segment00001.ts"]);
+        let discontinuous = HashSet::new();
+        let mut state = DiscontinuityState::default();
+        let out = rewrite_playlist_discontinuities(&playlist, &discontinuous, &mut state);
+        assert_eq!(out, playlist);
+        assert_eq!(state.sequence, 0);
+    }
+
+    #[test]
+    fn rewrite_tags_discontinuity_before_matching_segment() {
+        let playlist = sample_playlist(&["segment00000.ts", "segment00001.ts", "segment00002.ts"]);
+        let discontinuous: HashSet<String> = ["segment00001.ts".to_string()].into_iter().collect();
+        let mut state = DiscontinuityState::default();
+        let out = rewrite_playlist_discontinuities(&playlist, &discontinuous, &mut state);
+
+        let lines: Vec<&str> = out.lines().collect();
+        let tagged_idx = lines.iter().position(|&l| l == "#EXT-X-DISCONTINUITY").unwrap();
+        assert_eq!(lines[tagged_idx + 1], "#EXTINF:1.000,");
+        assert_eq!(lines[tagged_idx + 2], "segment00001.ts");
+        // Untouched segments get no tag.
+        assert_eq!(
+            lines.iter().filter(|&&l| l == "#EXT-X-DISCONTINUITY").count(),
+            1
+        );
+        // No segment has yet rolled off, so the sequence is present but zero.
+        assert!(out.contains("#EXT-X-DISCONTINUITY-SEQUENCE:0"));
+    }
+
+    #[test]
+    fn rewrite_increments_sequence_as_tagged_segment_rolls_off_window() {
+        let discontinuous: HashSet<String> = ["segment00000.ts".to_string()].into_iter().collect();
+        let mut state = DiscontinuityState::default();
+
+        // First poll: segment00000 is tagged and still in the window.
+        let p1 = sample_playlist(&["segment00000.ts", "segment00001.ts"]);
+        let out1 = rewrite_playlist_discontinuities(&p1, &discontinuous, &mut state);
+        assert!(out1.contains("#EXT-X-DISCONTINUITY-SEQUENCE:0"));
+        let lines1: Vec<&str> = out1.lines().collect();
+        let seg_idx = lines1.iter().position(|&l| l == "segment00000.ts").unwrap();
+        assert_eq!(lines1[seg_idx - 1], "#EXTINF:1.000,");
+        assert_eq!(lines1[seg_idx - 2], "#EXT-X-DISCONTINUITY");
+
+        // Second poll: segment00000 has slid out of the sliding window.
+        let p2 = sample_playlist(&["segment00001.ts", "segment00002.ts"]);
+        let out2 = rewrite_playlist_discontinuities(&p2, &discontinuous, &mut state);
+        assert!(out2.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1"));
+        assert!(!out2.contains("#EXT-X-DISCONTINUITY\n"));
+    }
+
     // ── HlsUploaderHandle lifecycle ─────────────────────────────────────
 
     #[test]
@@ -506,6 +690,7 @@ mod tests {
             segment_dir: dir.clone(),
             base_url: "https://localhost:0/file=".to_string(),
             playlist_filename: "playlist.m3u8".to_string(),
+            discontinuous_segments: Arc::new(Mutex::new(HashSet::new())),
         });
         // Signal stop — should not hang
         handle.stop();
@@ -520,6 +705,7 @@ mod tests {
                 segment_dir: dir.clone(),
                 base_url: "https://localhost:0/file=".to_string(),
                 playlist_filename: "playlist.m3u8".to_string(),
+                discontinuous_segments: Arc::new(Mutex::new(HashSet::new())),
             });
             // handle dropped here — should signal stop and join cleanly
         }
