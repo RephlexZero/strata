@@ -133,7 +133,7 @@ jobs:
             -v "$PWD":/workspaces/strata \
             -w /workspaces/strata \
             rust:bookworm \
-            bash -lc 'cargo test --manifest-path crates/strata-transport/Cargo.toml --lib gf_mul_acc_matches_scalar_for_all_coefficients -- --exact'
+            bash -c 'cargo test --manifest-path crates/strata-transport/Cargo.toml --lib codec::tests::gf_mul_acc_matches_scalar_for_all_coefficients -- --exact'
 
   # ── Network integration tests (needs sudo, heavier) ────────
   integration:

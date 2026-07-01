@@ -10,5 +10,14 @@ cargo fmt --all -- --check
 echo "[pre-push] Clippy..."
 cargo clippy --workspace --all-targets -- -D warnings
 
+echo "[pre-push] Security audit..."
+if command -v cargo-audit >/dev/null 2>&1; then
+  # Non-blocking, matching the CI audit job (continue-on-error): advisories
+  # with no available fix shouldn't block a push.
+  cargo audit || echo "[pre-push] ⚠ cargo audit found issues (non-blocking, see above)"
+else
+  echo "[pre-push] ⚠ cargo-audit not installed, skipping (cargo install cargo-audit)"
+fi
+
 echo "[pre-push] ✓ All checks passed"
 exit 0
