@@ -1357,6 +1357,8 @@ impl LinkSender for TransportLink {
             drain_factor = cc.drain_factor(),
             pkts_sent = stats.packets_sent,
             pkts_acked = stats.packets_acked,
+            retransmissions = stats.retransmissions,
+            fec_repairs_sent = stats.fec_repairs_sent,
             "get_metrics: full snapshot"
         );
 

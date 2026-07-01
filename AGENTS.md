@@ -44,7 +44,11 @@ only when relevant. Keep this file under ~200 lines.
 - Per-link alive detection: ≥50% loss for 3+ windows → dead
 - Capacity chain: Oracle (PPD) → BBR btl_bw → ack_delivery_bps fallback
 - Adaptation defaults: ramp_up=250 kbps/step, ramp_down_factor=0.7, grace_period=5 s
-- PAT/PMT interval = 1 (every packet) for loss resilience
+- PAT/PMT interval = 9000 (90 kHz ticks = 100 ms) for loss resilience. **Not 1**:
+  the property is in 90 kHz ticks, so `=1` (~11 µs) emits PAT+PMT before nearly
+  every packet and tripled wire bandwidth (field: 2.3 Mbps video → 7 Mbps muxed),
+  overflowing the paced-queue AQM into self-inflicted loss. PAT/PMT carry the
+  HEADER flag → Critical priority → FEC-protected, so 100 ms is ample resilience.
 - SO_SNDBUF = 512 KB to absorb startup burst
 
 **Hardware (dev/test):** 2× Huawei HiLink modems, Band 8 (900 MHz)
@@ -86,3 +90,48 @@ Pre-existing warnings in `strata-gst` (unused mut, unused var) — not our chang
   Edit `AGENTS.md` only.
 - Don't `@import` `wiki/` or `raw/` here — imports load at launch and defeat
   the index-first savings.
+
+<!-- gitnexus:start -->
+# GitNexus — Code Intelligence
+
+This project is indexed by GitNexus as **strata** (5981 symbols, 16830 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+
+> Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
+
+## Always Do
+
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "main"})`.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
+- For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
+
+## Never Do
+
+- NEVER edit a function, class, or method without first running `impact` on it.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
+- NEVER commit changes without running `detect_changes()` to check affected scope.
+
+## Resources
+
+| Resource | Use for |
+|----------|---------|
+| `gitnexus://repo/strata/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/strata/clusters` | All functional areas |
+| `gitnexus://repo/strata/processes` | All execution flows |
+| `gitnexus://repo/strata/process/{name}` | Step-by-step execution trace |
+
+## CLI
+
+| Task | Read this skill file |
+|------|---------------------|
+| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
+| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
+| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
+| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
+| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
+| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+
+<!-- gitnexus:end -->

@@ -81,6 +81,12 @@ mod imp {
         /// signal left is the TS random-access-indicator bit. See
         /// [`crate::ts_keyframe`].
         pub(crate) ts_keyframe: Mutex<crate::ts_keyframe::TsKeyframeScanner>,
+        /// Diagnostic: encoder+mux egress bytes accumulated since the last
+        /// throttled log, and the instant of that log. Lets us measure the
+        /// actual rate entering the sink (vs the adapter's bitrate target) to
+        /// catch encoder overshoot independent of the transport.
+        pub(crate) ingress_bytes_acc: std::sync::atomic::AtomicU64,
+        pub(crate) ingress_last_log: Mutex<std::time::Instant>,
     }
 
     impl Default for StrataSink {
@@ -101,6 +107,8 @@ mod imp {
                 adaptation_startup_ramp_ms: AtomicU32::new(0),
                 adaptation_startup_floor_kbps: AtomicU32::new(0),
                 ts_keyframe: Mutex::new(crate::ts_keyframe::TsKeyframeScanner::new()),
+                ingress_bytes_acc: std::sync::atomic::AtomicU64::new(0),
+                ingress_last_log: Mutex::new(std::time::Instant::now()),
             }
         }
     }
@@ -694,6 +702,26 @@ mod imp {
                 can_drop,
                 "render: buffer received"
             );
+
+            // Diagnostic: throttled encoder+mux egress rate. Compared against
+            // the adapter's bitrate target, this isolates encoder overshoot
+            // (source producing far above target) from transport-side flooding.
+            self.ingress_bytes_acc
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            if let Ok(mut last) = self.ingress_last_log.lock() {
+                let elapsed = last.elapsed();
+                if elapsed >= std::time::Duration::from_secs(1) {
+                    let bytes = self.ingress_bytes_acc.swap(0, Ordering::Relaxed);
+                    let kbps = (bytes as f64 * 8.0 / 1000.0) / elapsed.as_secs_f64();
+                    *last = std::time::Instant::now();
+                    tracing::info!(
+                        target: "strata::sink",
+                        egress_kbps = kbps as u64,
+                        bytes,
+                        "encoder+mux egress rate"
+                    );
+                }
+            }
 
             if let Some(rt) = lock_or_recover(&self.runtime).as_mut() {
                 match rt.try_send_packet(data, profile) {

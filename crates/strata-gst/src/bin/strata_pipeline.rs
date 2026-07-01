@@ -1,5 +1,6 @@
 use gst::MessageView;
 use gst::prelude::*;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::sync::{Arc, Mutex};
 use strata_bonding::metrics::MetricsServer;
@@ -144,6 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn register_plugins() -> Result<(), gst::glib::BoolError> {
     gststrata::sink::register(None)?;
     gststrata::src::register(None)?;
+    gsthlssink3::plugin_desc::plugin_register_static()?;
     Ok(())
 }
 
@@ -160,6 +162,40 @@ fn configure_mpegtsmux(pipeline: &gst::Pipeline) {
     }
 }
 
+/// Reach `hlssink3`'s internal `mpegtsmux` (it muxes `video`/`audio` request
+/// pads itself rather than accepting a pre-muxed stream — see
+/// `gst-plugin-hlssink3`'s `hlssink3/imp.rs`, which wires it into its
+/// internal `splitmuxsink` as that element's `muxer` property) and apply the
+/// same settings `configure_mpegtsmux` applies to a standalone `mpegtsmux`:
+/// alignment for UDP-style packetisation and preserved timestamps. PAT/PMT
+/// interval is left at mpegtsmux's own default (9000 = 100 ms — already what
+/// we want, see AGENTS.md on `pat-interval`): setting it explicitly here hits
+/// a `tsmux_set_pmt_interval: assertion 'program != NULL' failed` critical,
+/// because this internal muxer doesn't have a program until splitmuxsink
+/// actually starts muxing, unlike a top-level `mpegtsmux name=mux` whose
+/// pads (and program) are requested immediately while `gst::parse::launch`
+/// parses the bin description.
+fn configure_hlssink3_muxer(hls: &gst::Element) {
+    let Some(bin) = hls.downcast_ref::<gst::Bin>() else {
+        return;
+    };
+    let Some(splitmux) = bin.by_name("split_mux_sink") else {
+        eprintln!("hlssink3: could not find internal splitmuxsink to configure its muxer");
+        return;
+    };
+    if splitmux.find_property("muxer").is_none() {
+        return;
+    }
+    let muxer = splitmux.property::<gst::Element>("muxer");
+    if muxer.find_property("alignment").is_some() {
+        muxer.set_property("alignment", 7i32);
+    }
+    if muxer.find_property("skew-corrections").is_some() {
+        muxer.set_property("skew-corrections", false);
+        eprintln!("hlssink3's internal mpegtsmux: disabled skew-corrections (GStreamer ≥1.28)");
+    }
+}
+
 /// Install the DeliveredStream gate (A2) on a parsed-video src pad.
 ///
 /// The bonding transport delivers in-order but, under loss, gap-skips leave the
@@ -172,14 +208,23 @@ fn configure_mpegtsmux(pipeline: &gst::Pipeline) {
 ///      next keyframe (the standard "decode from next IDR after loss");
 ///   3. drop any buffer whose DTS regresses below the last emitted (the actual
 ///      crash trigger), so the muxer only ever sees monotonic DTS.
-fn install_delivered_stream_gate(pad: &gst::Pad) {
-    use std::sync::Mutex;
+///
+/// Every mid-stream resume is a genuine timeline jump in the egress HLS, so it
+/// also stamps DISCONT on the resumed buffer and records its running time in
+/// `pending_resumes` — the bus watch in `run_receiver` matches that against
+/// `hlssink3`'s `hls-segment-added` messages to mark the corresponding segment
+/// for `#EXT-X-DISCONTINUITY` in `hls_upload.rs`.
+fn install_delivered_stream_gate(
+    pad: &gst::Pad,
+    pending_resumes: Arc<Mutex<VecDeque<gst::ClockTime>>>,
+) {
     struct GateState {
         waiting_for_keyframe: bool,
         last_dts: Option<u64>,
         dropped: u64,
         started: bool,
         pending_discont: bool,
+        segment: Option<gst::FormattedSegment<gst::ClockTime>>,
     }
     let state = Mutex::new(GateState {
         // Start by waiting: never hand the muxer a mid-GOP opening run.
@@ -193,6 +238,7 @@ fn install_delivered_stream_gate(pad: &gst::Pad) {
         started: false,
         // Set by a "strata/discont" custom event; applied to the next buffer.
         pending_discont: false,
+        segment: None,
     });
     pad.add_probe(
         gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
@@ -204,6 +250,12 @@ fn install_delivered_stream_gate(pad: &gst::Pad) {
         // as grey frames). The event rides the same serialized stream, so
         // the first buffer after it is the first post-gap buffer.
         if let Some(gst::PadProbeData::Event(ev)) = &info.data {
+            if let gst::EventView::Segment(seg_ev) = ev.view()
+                && let Some(segment) = seg_ev.segment().downcast_ref::<gst::ClockTime>()
+            {
+                state.lock().unwrap().segment = Some(segment.clone());
+                return gst::PadProbeReturn::Ok;
+            }
             if let gst::EventView::CustomDownstream(c) = ev.view()
                 && c.structure().is_some_and(|s| s.name() == "strata/discont")
             {
@@ -216,12 +268,13 @@ fn install_delivered_stream_gate(pad: &gst::Pad) {
             }
             return gst::PadProbeReturn::Ok;
         }
-        let Some(gst::PadProbeData::Buffer(buf)) = &info.data else {
+        let Some(buf) = info.buffer() else {
             return gst::PadProbeReturn::Ok;
         };
         let flags = buf.flags();
         let is_keyframe = !flags.contains(gst::BufferFlags::DELTA_UNIT);
         let dts = buf.dts().map(|t| t.nseconds());
+        let pts = buf.pts();
 
         let mut st = state.lock().unwrap();
         let is_discont =
@@ -240,6 +293,20 @@ fn install_delivered_stream_gate(pad: &gst::Pad) {
             // reference to corrupt) is always accepted so the stream can lock.
             let trustworthy_keyframe = is_keyframe && (!st.started || !is_discont);
             if trustworthy_keyframe {
+                // A mid-stream resume (not the stream's very first keyframe) is
+                // a real splice: stamp DISCONT so the muxer/sink see it, and
+                // queue its running time for hls-segment-added correlation.
+                if st.started {
+                    if let (Some(segment), Some(pts)) = (&st.segment, pts)
+                        && let Some(running_time) = segment.to_running_time(pts)
+                    {
+                        pending_resumes.lock().unwrap().push_back(running_time);
+                    }
+                    info.buffer_mut()
+                        .unwrap()
+                        .make_mut()
+                        .set_flags(gst::BufferFlags::DISCONT);
+                }
                 st.waiting_for_keyframe = false;
                 st.started = true;
                 // Reset the DTS baseline to this IDR: the forward jump across
@@ -250,7 +317,7 @@ fn install_delivered_stream_gate(pad: &gst::Pad) {
                 // vs "splice the gate never saw" (e.g. a leaky-queue drop).
                 eprintln!(
                     "DeliveredStream gate: resumed at clean IDR pts={} (dropped {} total)",
-                    buf.pts().map(|t| t.mseconds()).unwrap_or(0),
+                    pts.map(|t| t.mseconds()).unwrap_or(0),
                     st.dropped
                 );
                 return gst::PadProbeReturn::Ok;
@@ -471,10 +538,10 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // packet corrupt up to ~2 s of video (every P-frame references the
     // damaged frame until the next IDR — the "clear for a moment then
     // grey/blocky" symptom). A 1 s IDR halves that error-propagation
-    // window while still keeping every 2 s segment keyframe-aligned
-    // (the receiver's hlssink closes a segment at the first keyframe past
-    // target-duration), so YouTube ingest stays happy. key-int-max is in
-    // frames, so `framerate` == 1 s.
+    // window while still keeping every segment keyframe-aligned (the
+    // receiver's hlssink closes a segment at the first keyframe past
+    // target-duration=1s, so each segment is one GOP), so YouTube ingest
+    // stays happy. key-int-max is in frames, so `framerate` == 1 s.
     let key_int = framerate;
 
     // Parse codec type
@@ -582,7 +649,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
          {hw_fmt_conv}! {enc_fragment} \
          ! {parser_fragment} \
          {video_to_mux}{audio} \
-         mpegtsmux name=mux alignment=7 pat-interval=1 pmt-interval=1 \
+         mpegtsmux name=mux alignment=7 pat-interval=9000 pmt-interval=9000 \
          ! stratasink name=rsink",
         w = res_w,
         h = res_h,
@@ -914,7 +981,7 @@ fn run_sender_passthrough(
     let pipeline_str = format!(
         "uridecodebin name=urisrc uri=\"{uri}\" \
          ! parsebin name=pbin \
-         mpegtsmux name=mux alignment=7 pat-interval=1 pmt-interval=1 \
+         mpegtsmux name=mux alignment=7 pat-interval=9000 pmt-interval=9000 \
          ! stratasink name=rsink",
         uri = source_uri,
     );
@@ -1760,17 +1827,16 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
              leaky=downstream ! \
              tsparse set-timestamps=true alignment=7 ! \
              tsdemux name=d \
+             hlssink3 name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
+             target-duration=1 max-files=10 playlist-length=6 \
              d. ! \
              queue max-size-buffers=0 max-size-bytes=0 max-size-time=10000000000 \
              leaky=downstream ! \
-             {parser} name=vparse ! mux. \
+             {parser} name=vparse ! hls.video \
              d. ! \
              queue max-size-buffers=0 max-size-bytes=0 max-size-time=10000000000 \
              leaky=downstream ! \
-             aacparse name=aparse ! mux. \
-             mpegtsmux name=mux alignment=7 pat-interval=1 pmt-interval=1 ! \
-             hlssink name=hls location=\"{seg}\" playlist-location=\"{pl}\" \
-             target-duration=2 max-files=10 playlist-length=6",
+             aacparse name=aparse ! hls.audio",
             bind = bind_str,
             parser = relay_parser,
             seg = seg_location.display(),
@@ -1832,11 +1898,18 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     // HLS re-mux egress: install the DeliveredStream gate on the parsed video
     // and disable mpegtsmux skew correction so it preserves our timestamps.
+    // `pending_resumes`/`discontinuous_segments` carry gate-resume running
+    // times to the bus loop below, which maps them onto hlssink3's
+    // `hls-segment-added` messages so hls_upload.rs knows which segments to
+    // mark with `#EXT-X-DISCONTINUITY`.
+    let pending_resumes: Arc<Mutex<VecDeque<gst::ClockTime>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
+    let discontinuous_segments: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     if use_hls_relay {
         if let Some(vparse) = pipeline.by_name("vparse")
             && let Some(src) = vparse.static_pad("src")
         {
-            install_delivered_stream_gate(&src);
+            install_delivered_stream_gate(&src, pending_resumes.clone());
             eprintln!("DeliveredStream gate installed on vparse src pad");
         }
         // Audio rides a monotonic-DTS-only gate (see pipeline comment): mpegtsmux
@@ -1848,7 +1921,9 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             install_monotonic_dts_gate(&src);
             eprintln!("Monotonic-DTS gate installed on aparse src pad");
         }
-        configure_mpegtsmux(&pipeline);
+        if let Some(hls) = pipeline.by_name("hls") {
+            configure_hlssink3_muxer(&hls);
+        }
     }
 
     // Setup AppSink (only used for non-relay monitor/record modes)
@@ -1906,6 +1981,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 segment_dir: hls_dir,
                 base_url,
                 playlist_filename: "playlist.m3u8".into(),
+                discontinuous_segments: discontinuous_segments.clone(),
             },
         ))
     } else {
@@ -1956,6 +2032,15 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Receiver running... Waiting for signal or EOS.");
     }
 
+    // Most recently closed HLS segment (running-time start, filename), used to
+    // attribute queued gate-resume running times to the segment they fell in.
+    // hlssink3 reports a segment only once it has fully closed, so a resume
+    // queued during segment N is still unclaimed when segment N's own message
+    // arrives — it's only resolved one message later, against segment N+1's
+    // start, which is exactly the lag find_new_segments() already holds the
+    // newest segment back for (see hls_upload.rs).
+    let mut last_segment: Option<(gst::ClockTime, String)> = None;
+
     // Standard GStreamer message loop
     for msg in bus.iter_timed(gst::ClockTime::NONE) {
         match msg.view() {
@@ -1973,6 +2058,40 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // Filter spammy stats if needed, or keep for visualization
                     if s.name() == "strata-stats" {
                         eprintln!("Element Message: {}", s);
+                    }
+                    if s.name() == "hls-segment-added"
+                        && let (Ok(location), Ok(running_time)) = (
+                            s.get::<String>("location"),
+                            s.get::<gst::ClockTime>("running-time"),
+                        )
+                    {
+                        if let Some((prev_start, prev_location)) = &last_segment {
+                            let mut resumes = pending_resumes.lock().unwrap();
+                            let mut claimed_any = false;
+                            while resumes.front().is_some_and(|r| *r < running_time) {
+                                resumes.pop_front();
+                                claimed_any = true;
+                            }
+                            if claimed_any {
+                                discontinuous_segments.lock().unwrap().insert(
+                                    std::path::Path::new(prev_location)
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| prev_location.clone()),
+                                );
+                                eprintln!(
+                                    "DeliveredStream gate: marking segment {} as discontinuous (resume at running_time={})",
+                                    prev_location,
+                                    prev_start.mseconds()
+                                );
+                            }
+                        }
+                        eprintln!(
+                            "hlssink3: segment added, location={} running_time={}",
+                            location,
+                            running_time.mseconds()
+                        );
+                        last_segment = Some((running_time, location));
                     }
                 }
             }
