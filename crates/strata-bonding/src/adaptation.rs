@@ -352,6 +352,36 @@ pub struct BitrateAdapter {
     startup_ramp_started: Option<Instant>,
 }
 
+/// A downward override of `current_target_kbps` applied by
+/// `update_with_feedback` after `update()`'s own capacity-path commit.
+///
+/// Before this existed, `update_with_feedback` had three independent call
+/// sites that each directly wrote `self.current_target_kbps` and hand-rolled
+/// its own subset of the related bookkeeping (`last_command_time`,
+/// `last_increase_time`, `last_burst_time`, `consecutive_*`) — a discrepancy
+/// between any two sites was invisible without reading all three bodies side
+/// by side (review_findings.md §2.2). `TargetOverride` +
+/// [`BitrateAdapter::apply_target_override`] centralize that bookkeeping
+/// into one place; the flags below capture the real, intentional
+/// differences between the sites (e.g. the jitter-growth revert deliberately
+/// does NOT touch `last_command_time`, since it undoes a commit `update()`
+/// already made this same tick).
+///
+/// This does not change WHEN an override applies or WHAT target it computes
+/// — each call site still owns its own trigger condition, and all three
+/// remain sequential downward-only refinements (each can further restrict
+/// whatever the previous stage left this tick, in the fixed order:
+/// increase-revert, then goodput-ceiling clamp, then the feedback congestion
+/// cut), not a one-of-N arbitrated choice.
+struct TargetOverride {
+    target_kbps: u32,
+    reason: AdaptationReason,
+    touch_last_command_time: bool,
+    clear_increase_grace: bool,
+    arm_burst_cooldown: bool,
+    count_as_decrease: bool,
+}
+
 impl BitrateAdapter {
     pub fn new(config: AdaptationConfig) -> Self {
         // If an explicit starting point is provided use it; otherwise fall back to
@@ -506,6 +536,24 @@ impl BitrateAdapter {
             spare_bw_kbps: self.spare_bw_kbps,
             recommended_fec_overhead: self.recommended_fec_overhead(),
         }
+    }
+
+    fn apply_target_override(&mut self, ov: TargetOverride) -> BitrateCommand {
+        self.current_target_kbps = ov.target_kbps;
+        if ov.touch_last_command_time {
+            self.last_command_time = Some(Instant::now());
+        }
+        if ov.clear_increase_grace {
+            self.last_increase_time = None;
+        }
+        if ov.arm_burst_cooldown {
+            self.last_burst_time = Some(Instant::now());
+        }
+        if ov.count_as_decrease {
+            self.consecutive_decreases += 1;
+            self.consecutive_increases = 0;
+        }
+        self.make_command(ov.target_kbps, ov.reason)
     }
 
     /// Per-tick slew-rate limit applied only to bitrate *increases*.
@@ -943,9 +991,17 @@ impl BitrateAdapter {
             && jitter_growth_ms > INCREASE_REVERT_JITTER_GROWTH_MS
             && jitter_loss_context
         {
-            self.current_target_kbps = target_before_update;
-            self.last_increase_time = None; // Don't activate grace for a reverted increase
-            result = Some(self.make_command(target_before_update, AdaptationReason::Capacity));
+            result = Some(self.apply_target_override(TargetOverride {
+                target_kbps: target_before_update,
+                reason: AdaptationReason::Capacity,
+                // `update()` already advanced `last_command_time` this tick
+                // if it committed the increase being reverted here — don't
+                // reset the min_interval clock a second time.
+                touch_last_command_time: false,
+                clear_increase_grace: true, // don't activate grace for a reverted increase
+                arm_burst_cooldown: false,
+                count_as_decrease: false,
+            }));
         }
 
         // Snapshot after the capacity-path update.  If the target already fell,
@@ -1113,10 +1169,14 @@ impl BitrateAdapter {
             if self.current_target_kbps > goodput_ceil_kbps
                 && peak_gp_kbps < (self.current_target_kbps as f64 * GOODPUT_CEILING_CLAMP_TRIGGER)
             {
-                self.current_target_kbps = goodput_ceil_kbps;
-                self.last_increase_time = None;
-                self.last_command_time = Some(Instant::now());
-                result = Some(self.make_command(goodput_ceil_kbps, AdaptationReason::Congestion));
+                result = Some(self.apply_target_override(TargetOverride {
+                    target_kbps: goodput_ceil_kbps,
+                    reason: AdaptationReason::Congestion,
+                    touch_last_command_time: true,
+                    clear_increase_grace: true,
+                    arm_burst_cooldown: false,
+                    count_as_decrease: false,
+                }));
             }
         }
 
@@ -1247,28 +1307,27 @@ impl BitrateAdapter {
             let new_target = new_target.max(floor_kbps);
 
             if new_target < self.current_target_kbps {
-                self.current_target_kbps = new_target;
-                self.last_command_time = Some(Instant::now());
-                self.consecutive_decreases += 1;
-                self.consecutive_increases = 0;
-                // Mark burst on a melt-driven cut too, not just single-window
-                // burst_loss — a collapsing link is a bursty-network signal, so
-                // arming the ramp-up cooldown here prevents cut→decay→ramp back
-                // into the next burst (the sawtooth).
-                if burst_loss || link_collapse {
-                    self.last_burst_time = Some(Instant::now());
-                }
-                if severe_burst {
-                    self.last_increase_time = None;
-                }
-
                 let reason = if link_collapse || burst_loss || severe_burst {
                     AdaptationReason::Congestion
                 } else {
                     AdaptationReason::Capacity
                 };
-
-                result = Some(self.make_command(new_target, reason));
+                result = Some(self.apply_target_override(TargetOverride {
+                    target_kbps: new_target,
+                    reason,
+                    touch_last_command_time: true,
+                    // Only a severe burst needs to suppress a would-be grace
+                    // period — an ordinary sustained cut doesn't imply the
+                    // most recent increase (if any) was itself wrong.
+                    clear_increase_grace: severe_burst,
+                    // Mark burst on a melt-driven cut too, not just
+                    // single-window burst_loss — a collapsing link is a
+                    // bursty-network signal, so arming the ramp-up cooldown
+                    // here prevents cut→decay→ramp back into the next burst
+                    // (the sawtooth).
+                    arm_burst_cooldown: burst_loss || link_collapse,
+                    count_as_decrease: true,
+                }));
             }
         }
 
