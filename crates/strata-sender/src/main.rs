@@ -101,8 +101,12 @@ async fn main() -> anyhow::Result<()> {
     // Shutdown signal
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Channel for sending messages to the control plane WebSocket
-    let (control_tx, control_rx) = mpsc::channel::<String>(128);
+    // Channel for sending messages to the control plane WebSocket. Note:
+    // the control plane's own per-agent command channel (`ws_agent.rs`)
+    // uses 64, not this value — an unexplained mismatch, flagged rather
+    // than silently unified (E9).
+    const CONTROL_OUTGOING_CHANNEL_CAPACITY: usize = 128;
+    let (control_tx, control_rx) = mpsc::channel::<String>(CONTROL_OUTGOING_CHANNEL_CAPACITY);
 
     // Reconnect signal (portal can trigger reconnect after enrollment)
     let (reconnect_tx, _reconnect_rx) = watch::channel(());

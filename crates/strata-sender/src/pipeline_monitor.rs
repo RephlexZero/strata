@@ -11,10 +11,13 @@ use strata_common::protocol::{Envelope, StreamEndReason, StreamEndedPayload};
 
 use crate::AgentState;
 
-/// Run the pipeline monitor loop. Checks every 500ms whether the
-/// child process has exited unexpectedly.
+/// Poll interval for the pipeline monitor loop (E9).
+const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Run the pipeline monitor loop. Checks every `MONITOR_POLL_INTERVAL`
+/// whether the child process has exited unexpectedly.
 pub async fn run(state: Arc<AgentState>) {
-    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    let mut interval = tokio::time::interval(MONITOR_POLL_INTERVAL);
 
     loop {
         interval.tick().await;

@@ -55,8 +55,12 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 
     tracing::info!(receiver_id = %receiver_id, "receiver connected");
 
-    // Create channel for sending messages to this receiver
-    let (tx, mut rx) = mpsc::channel::<String>(64);
+    // Create channel for sending messages to this receiver. Note: the
+    // receiver's own outbound channel to its control-plane WS write task
+    // (strata-receiver's `main.rs`) uses 128, not this value — an
+    // unexplained mismatch, flagged here rather than silently unified (E9).
+    const RECEIVER_COMMAND_CHANNEL_CAPACITY: usize = 64;
+    let (tx, mut rx) = mpsc::channel::<String>(RECEIVER_COMMAND_CHANNEL_CAPACITY);
 
     // Register in shared state
     state
@@ -216,7 +220,7 @@ async fn authenticate_enrollment(
             let claims = auth::Claims {
                 sub: receiver_id.clone(),
                 iss: "strata-control".into(),
-                exp: now + 3600,
+                exp: now + auth::SESSION_TOKEN_TTL_SECS,
                 iat: now,
                 role: "receiver".into(),
                 owner: Some(owner_id.clone()),

@@ -280,7 +280,13 @@ async fn start_stream(
             };
             let rcv_envelope = Envelope::new("receiver.stream.start", &rcv_payload);
             let rcv_json = serde_json::to_string(&rcv_envelope).unwrap();
-            let _ = rcv_handle.tx.send(rcv_json).await;
+            if rcv_handle.tx.send(rcv_json).await.is_err() {
+                tracing::warn!(
+                    stream_id = %stream_id,
+                    receiver_id = %rcv_id,
+                    "receiver.stream.start command dropped: receiver channel closed"
+                );
+            }
         }
 
         // Increment active_streams counter
@@ -363,7 +369,13 @@ async fn stop_stream(
         };
         let envelope = Envelope::new("stream.stop", &stop_payload);
         let json = serde_json::to_string(&envelope).unwrap();
-        let _ = agent.tx.send(json).await;
+        if agent.tx.send(json).await.is_err() {
+            tracing::warn!(
+                stream_id = %stream_id,
+                sender_id = %sender_id,
+                "stream.stop command dropped: agent channel closed"
+            );
+        }
     }
 
     // Send stop command to the receiver too — without this the receiver's
@@ -380,7 +392,13 @@ async fn stop_stream(
         };
         let rcv_envelope = Envelope::new("receiver.stream.stop", &rcv_stop_payload);
         let rcv_json = serde_json::to_string(&rcv_envelope).unwrap();
-        let _ = rcv_handle.tx.send(rcv_json).await;
+        if rcv_handle.tx.send(rcv_json).await.is_err() {
+            tracing::warn!(
+                stream_id = %stream_id,
+                receiver_id = %rcv_id,
+                "receiver.stream.stop command dropped: receiver channel closed"
+            );
+        }
     }
 
     // Notify dashboard
@@ -395,14 +413,15 @@ async fn stop_stream(
     );
 
     // Safety timeout: if the agent never sends stream.ended, force the
-    // transition after 15 seconds so the UI doesn't get stuck in "stopping".
+    // transition so the UI doesn't get stuck in "stopping".
+    const STOP_FORCE_END_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
     {
         let state = state.clone();
         let stream_id = stream_id.clone();
         let sender_id = sender_id.clone();
         let owner_id = user.user_id.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            tokio::time::sleep(STOP_FORCE_END_TIMEOUT).await;
             let result = sqlx::query(
                 "UPDATE streams SET state = 'ended', ended_at = $1 WHERE id = $2 AND state = 'stopping'",
             )
@@ -570,10 +589,17 @@ async fn pick_receiver_links(state: &AppState, owner_id: &str) -> (Option<String
     (None, build_receiver_links())
 }
 
+/// Fallback link ports assumed for an unmanaged (env-var-configured)
+/// receiver — the first 3 of `strata-receiver`'s own CLI default
+/// (`--link-ports 5000,5002,5004,5006,5008,5010`). This is an assumption,
+/// not a live discovery: if that default ever changes, this must be
+/// updated too, or set `RECEIVER_LINKS` explicitly (E9).
+const FALLBACK_RECEIVER_PORTS: [u16; 3] = [5000, 5002, 5004];
+
 /// Build the list of receiver link addresses from environment config.
 ///
 /// Reads `RECEIVER_LINKS` (comma-separated `host:port` pairs).
-/// Falls back to `RECEIVER_HOST` with ports 5000, 5002, 5004.
+/// Falls back to `RECEIVER_HOST` with `FALLBACK_RECEIVER_PORTS`.
 fn build_receiver_links() -> Vec<String> {
     if let Ok(links) = std::env::var("RECEIVER_LINKS") {
         return links
@@ -584,9 +610,8 @@ fn build_receiver_links() -> Vec<String> {
     }
 
     let host = std::env::var("RECEIVER_HOST").unwrap_or_else(|_| "strata-receiver".into());
-    vec![
-        format!("{host}:5000"),
-        format!("{host}:5002"),
-        format!("{host}:5004"),
-    ]
+    FALLBACK_RECEIVER_PORTS
+        .iter()
+        .map(|p| format!("{host}:{p}"))
+        .collect()
 }

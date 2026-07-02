@@ -56,8 +56,14 @@ pub async fn run(
     heartbeat_interval: u64,
     mut outgoing_rx: mpsc::Receiver<String>,
 ) -> anyhow::Result<()> {
-    let mut backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(30);
+    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    // Fraction of the deterministic backoff added as random jitter, so a
+    // control-plane restart doesn't make every agent reconnect in lockstep
+    // (a thundering herd against the O(n·argon2) enrollment scan — E9).
+    const BACKOFF_JITTER_FRACTION: f64 = 0.2;
+
+    let mut backoff = INITIAL_BACKOFF;
 
     loop {
         // Check for a pending enrollment token (from portal or initial CLI arg).
@@ -89,7 +95,7 @@ pub async fn run(
                 if *state.shutdown.borrow() {
                     return Ok(());
                 }
-                backoff = Duration::from_secs(1);
+                backoff = INITIAL_BACKOFF;
             }
             Err(e) => {
                 state
@@ -104,9 +110,10 @@ pub async fn run(
             return Ok(());
         }
 
-        tracing::info!(backoff_s = backoff.as_secs(), "reconnecting");
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(max_backoff);
+        let jittered = backoff.mul_f64(1.0 + rand::random::<f64>() * BACKOFF_JITTER_FRACTION);
+        tracing::info!(backoff_s = jittered.as_secs_f64(), "reconnecting");
+        tokio::time::sleep(jittered).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 

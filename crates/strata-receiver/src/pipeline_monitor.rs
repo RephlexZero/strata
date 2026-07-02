@@ -11,8 +11,11 @@ use strata_common::protocol::{Envelope, ReceiverStreamEndedPayload, StreamEndRea
 
 use crate::ReceiverState;
 
+/// Poll interval for the pipeline monitor loop (E9).
+const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 pub async fn run(state: Arc<ReceiverState>) {
-    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    let mut interval = tokio::time::interval(MONITOR_POLL_INTERVAL);
 
     loop {
         interval.tick().await;

@@ -62,9 +62,14 @@ pub struct ReceiverHandle {
     pub hostname: Option<String>,
 }
 
+/// Capacity of the dashboard broadcast channel. A lagging subscriber just
+/// drops old events (`RecvError::Lagged`, handled in `ws_dashboard.rs`) —
+/// this bounds how much slack a slow browser gets before that happens.
+const DASHBOARD_BROADCAST_CAPACITY: usize = 1024;
+
 impl AppState {
     pub fn new(pool: PgPool, jwt: JwtContext) -> Self {
-        let (dashboard_tx, _) = broadcast::channel(1024);
+        let (dashboard_tx, _) = broadcast::channel(DASHBOARD_BROADCAST_CAPACITY);
         Self {
             inner: Arc::new(Inner {
                 pool,

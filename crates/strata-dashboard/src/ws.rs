@@ -5,7 +5,8 @@
 //! handshake — not a `?token=` query param, since those end up in
 //! proxy/access logs), receives `DashboardEvent`s, and exposes them as
 //! Leptos signals for reactive UI updates. Reconnects automatically with a
-//! fixed 3-second delay on disconnect.
+//! ~3-4s jittered delay on disconnect (E9: avoids every tab reconnecting
+//! in lockstep after a control-plane restart).
 
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -186,6 +187,12 @@ fn setup_websocket(
 }
 
 /// Schedule a WebSocket reconnection after a fixed delay (3 seconds).
+/// Base reconnect delay (ms). A control-plane restart makes every open
+/// dashboard tab reconnect at once; `RECONNECT_JITTER_MS` spreads that out
+/// so they don't all hit `/ws` in the same instant (E9).
+const RECONNECT_BASE_MS: i32 = 3_000;
+const RECONNECT_JITTER_MS: f64 = 1_000.0;
+
 fn schedule_reconnect(
     url: String,
     token: String,
@@ -197,11 +204,12 @@ fn schedule_reconnect(
         setup_websocket(url.clone(), token.clone(), set_event, set_connected);
     }) as Box<dyn FnMut()>);
 
+    let delay_ms = RECONNECT_BASE_MS + (js_sys::Math::random() * RECONNECT_JITTER_MS) as i32;
     let _ = web_sys::window()
         .unwrap()
         .set_timeout_with_callback_and_timeout_and_arguments_0(
             reconnect.as_ref().unchecked_ref(),
-            3_000,
+            delay_ms,
         );
     reconnect.forget();
 }

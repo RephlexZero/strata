@@ -57,8 +57,12 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 
     tracing::info!(sender_id = %sender_id, "agent connected");
 
-    // Create a channel for sending messages to this agent
-    let (tx, mut rx) = mpsc::channel::<String>(64);
+    // Create a channel for sending messages to this agent. Note: the
+    // agent's own outbound channel to its control-plane WS write task
+    // (strata-sender's `main.rs`) uses 128, not this value — an unexplained
+    // mismatch, flagged here rather than silently unified (E9).
+    const AGENT_COMMAND_CHANNEL_CAPACITY: usize = 64;
+    let (tx, mut rx) = mpsc::channel::<String>(AGENT_COMMAND_CHANNEL_CAPACITY);
 
     // Register agent in shared state
     state
@@ -220,7 +224,7 @@ async fn authenticate_enrollment(
             let claims = auth::Claims {
                 sub: sender_id.clone(),
                 iss: "strata-control".into(),
-                exp: now + 3600,
+                exp: now + auth::SESSION_TOKEN_TTL_SECS,
                 iat: now,
                 role: "sender".into(),
                 owner: Some(owner_id.clone()),

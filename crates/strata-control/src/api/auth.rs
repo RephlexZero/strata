@@ -126,7 +126,7 @@ async fn login(
     let claims = auth::Claims {
         sub: user_id.clone(),
         iss: "strata-control".into(),
-        exp: now + 3600, // 1 hour
+        exp: now + auth::SESSION_TOKEN_TTL_SECS,
         iat: now,
         role: role.clone(),
         owner: None,

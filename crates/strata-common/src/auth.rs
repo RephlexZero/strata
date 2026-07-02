@@ -53,6 +53,14 @@ pub fn verify_password(password: &str, hash: &str) -> Result<bool, AuthError> {
 
 // ── JWT (Ed25519-signed) ────────────────────────────────────────────
 
+/// Session token lifetime for every JWT this control plane issues (user
+/// login, sender/receiver device sessions). No refresh flow exists yet —
+/// a session simply stops working once this elapses (E4/E9: a broadcast
+/// operator mid-stream, or a device mid-reconnect, gets logged out with no
+/// warning). Flagged, not changed here — refresh is a design decision, not
+/// a naming fix.
+pub const SESSION_TOKEN_TTL_SECS: i64 = 3600;
+
 /// Claims embedded in a JWT token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {

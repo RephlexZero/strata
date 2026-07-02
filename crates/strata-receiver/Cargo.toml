@@ -30,6 +30,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 
+# Reconnect backoff jitter
+rand = { workspace = true }
+
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
