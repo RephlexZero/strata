@@ -5,6 +5,57 @@ the top. One dated entry per day — enough to reconstruct *why* later.
 
 Format: `## YYYY-MM-DD` heading per day, bullet per entry.
 
+## 2026-07-02 (cont'd — Batch 3.4 landed: platform timing hygiene, E9)
+
+- Implemented [PLATFORM_REVIEW.md](PLATFORM_REVIEW.md) E9: named the
+  platform's own magic-number sprawl (JWT expiry, reconnect backoff,
+  channel capacities, timeouts, fallback ports) and added the one real
+  behavior change the finding calls for — jitter on every reconnect loop,
+  since a control-plane restart currently makes every agent, receiver, and
+  open dashboard tab reconnect in lockstep (a thundering herd against E4's
+  still-open O(n·argon2) enrollment scan).
+  - JWT expiry: new `strata_common::auth::SESSION_TOKEN_TTL_SECS`, used at
+    all 3 production call sites that each hardcoded `now + 3600`
+    (`api/auth.rs`, `ws_agent.rs`, `ws_receiver.rs`); left the 3 test-only
+    literals in `strata-common/src/auth.rs`'s test module alone.
+  - Reconnect backoff (byte-for-byte duplicated in `strata-sender`/
+    `strata-receiver`'s `control.rs`): named `INITIAL_BACKOFF`/
+    `MAX_BACKOFF`, added `BACKOFF_JITTER_FRACTION` (±20%, via a new `rand`
+    dependency already vendored workspace-wide). Left the cross-crate
+    duplication itself alone — the finding asks for "one documented config
+    module *per crate*", not a shared dedup, and a cross-crate refactor is
+    a bigger, separate call.
+  - Dashboard reconnect (`strata-dashboard/src/ws.rs`): fixed 3s → 3-4s
+    jittered, via `js_sys::Math::random()` rather than pulling in `rand`
+    (which needs extra getrandom/wasm32 backend wiring on this target).
+  - Channel capacities named across `state.rs`/`ws_agent.rs`/
+    `ws_receiver.rs`/both `main.rs`: found and flagged (not silently
+    unified) a real discrepancy — the control plane's per-device command
+    channels are 64, but the agent/receiver's own outbound channel to the
+    same link is 128.
+  - Named `STOP_FORCE_END_TIMEOUT` (15s, `api/streams.rs`),
+    `MONITOR_POLL_INTERVAL` (500ms, both `pipeline_monitor.rs`),
+    `FALLBACK_RECEIVER_PORTS` (with a comment that it must track
+    `strata-receiver`'s own CLI default, not a live discovery).
+  - Converted the 3 silently-dropped command sends the finding actually
+    names (`receiver.stream.start`/`stream.stop`/`receiver.stream.stop` in
+    `api/streams.rs`) to log a warning on failure. Left every other
+    `let _ = ...send(...)` alone (best-effort dashboard broadcasts,
+    auth-error responses to sockets about to close, watch-channel
+    reconnect signals) — not the "command drops" this finding names, and
+    logging them would just add noise for expected failure paths.
+  - Full-workspace build + clippy clean; 18/18 `strata-control` tests,
+    `strata-sender`/`strata-receiver` unit tests, and `strata-dashboard`
+    against `wasm32-unknown-unknown` all pass.
+  - `mcp__gitnexus__detect_changes`: "medium" risk (touches multiple
+    crates' entry points), scoped to exactly the files this touched.
+  - Updated PLATFORM_REVIEW.md's E9 status, top banner, and sequencing
+    table; `hot.md` refreshed.
+  - **Remaining**: N3, §2.2's full redesign (deliberately deferred), the
+    CorsLayer/`/metrics` posture decision, then E1 (protocol crate), E2
+    (state machine + reconciliation), E4 (device identity), E6 (port
+    allocation), E8 (receiver telemetry).
+
 ## 2026-07-02 (cont'd — Batch 3.2 landed: dashboard WS auth + scoping, E3)
 
 - Implemented [PLATFORM_REVIEW.md](PLATFORM_REVIEW.md) E3: `GET /ws`

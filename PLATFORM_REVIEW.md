@@ -8,10 +8,10 @@
 that starts, stops, observes and configures it.
 
 > **Implementation status (2026-07-02, updated same day):** E5, E7, E10,
-> and now E3 (dashboard WS auth + scoping) are **done and merged to
-> `main`**. E9 (timing/jitter hygiene), E1 (protocol crate), E2 (state
-> machine), E4 (device identity), E6 (port allocation), E8 (receiver
-> telemetry) are **not started**. See
+> E3 (dashboard WS auth + scoping), and now E9 (timing/constants hygiene +
+> reconnect jitter) are **done and merged to `main`**. E1 (protocol
+> crate), E2 (state machine), E4 (device identity), E6 (port allocation),
+> E8 (receiver telemetry) are **not started**. See
 > `.claude/plans/rosy-squishing-treasure.md` for the intended order and
 > notes on why E1/E2/E4 in particular were held back rather than rushed.
 
@@ -260,7 +260,7 @@ Add a `DashboardEvent::ReceiverStreamStats` (trivial once E1 lands) and
 render both sides; disagreements between them are exactly the diagnostic the
 field runs keep needing.
 
-### E9. ⬜ NOT STARTED — Platform timing/constants hygiene pass
+### E9. ✅ DONE — Platform timing/constants hygiene pass
 
 The plane has its own magic-number sprawl, in the same shapes the transport
 audit flagged: heartbeat 10 s (CLI default), reconnect backoff 1→30 s
@@ -275,8 +275,27 @@ no refresh; a broadcast operator mid-stream gets logged out), fallback ports
 module per crate with the same rigor as `net/transport.rs`'s named-const
 block, and add jitter to every reconnect loop.
 
-**Status (2026-07-02):** not started — the agent assigned to this made no
-progress before an account-level usage limit cut it off.
+**Status (2026-07-02, done same day):** every literal named at its site
+(not a shared cross-crate module — "one documented config module per
+crate" per this finding's own wording, so `strata-common`/`strata-control`/
+`strata-sender`/`strata-receiver`/`strata-dashboard` each keep their own
+consts rather than a new dependency edge between them): JWT expiry →
+`strata_common::auth::SESSION_TOKEN_TTL_SECS`; reconnect backoff →
+`INITIAL_BACKOFF`/`MAX_BACKOFF` in both sender/receiver `control.rs`;
+channel capacities → `DASHBOARD_BROADCAST_CAPACITY`,
+`AGENT_COMMAND_CHANNEL_CAPACITY`/`RECEIVER_COMMAND_CHANNEL_CAPACITY` (64)
+vs `CONTROL_OUTGOING_CHANNEL_CAPACITY` (128, the 64-vs-128 mismatch
+flagged, not silently unified); stop force-end → `STOP_FORCE_END_TIMEOUT`;
+monitor poll → `MONITOR_POLL_INTERVAL`; fallback ports →
+`FALLBACK_RECEIVER_PORTS`. The one behavior change: jitter added to every
+reconnect loop (agent, receiver, dashboard) — ±20% via `rand` natively,
+`js_sys::Math::random()` in the WASM dashboard client (avoids `rand`'s
+getrandom/wasm32 backend complications). The 3 silently-dropped command
+sends actually named in this finding (`receiver.stream.start`/
+`stream.stop`/`receiver.stream.stop` in `api/streams.rs`) now log a
+warning on failure; other `let _ = ...send(...)` sites (best-effort
+broadcasts, auth-error responses, watch-channel signals) were left as-is —
+not the "command drops" this finding names.
 
 ### E10. ✅ DONE — Decide what the portal is
 
@@ -339,7 +358,7 @@ work.
 Status column added 2026-07-02, updated same day — the actual order landed
 1 (partially, just the SQL bug + orphan, not the rest of E7's sagas), 2
 (E3, out of order — picked up same-day as a contained, well-scoped item),
-5, and 8's E10 only; 3, 4, 6, and the rest of 8 are still unstarted.
+5, and 8's E9/E10 (E8 still open); 3, 4, and 6 are still unstarted.
 
 | Status | Order | Item | Why first |
 |---|---|---|---|
@@ -350,4 +369,4 @@ Status column added 2026-07-02, updated same day — the actual order landed
 | ✅ DONE | 5 | E5 bonding-profile ownership | protects the transport tuning investment |
 | ⬜ NOT STARTED | 6 | E4 device identity | before any real fleet exists |
 | ⬜ NOT STARTED | 7 | E6 port allocation | before multi-stream receivers are attempted |
-| 🟡 E10 done, E8/E9 not started | 8 | E8, E9, E10 | quality-of-life, in any order |
+| 🟡 E9/E10 done, E8 not started | 8 | E8, E9, E10 | quality-of-life, in any order |
