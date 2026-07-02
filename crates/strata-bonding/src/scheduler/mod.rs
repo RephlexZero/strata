@@ -15,7 +15,6 @@ pub mod blest;
 pub mod bonding;
 pub mod edpf;
 pub mod ewma;
-pub mod fec;
 pub mod iods;
 pub mod kalman;
 pub mod oracle;
