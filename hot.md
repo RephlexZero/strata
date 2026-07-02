@@ -15,21 +15,26 @@ L1-L8, N1, N2, N4-N7, N9, §2.3, §2.4.1 — plus §2.2's bookkeeping-
 centralization half and §1c's double-count acknowledgment (comment-only).
 Only **N3** (dead `congestion_headroom_ratio`/`congestion_trigger_ratio`
 config knobs) remains in the control-loop audit. From
-[PLATFORM_REVIEW.md](PLATFORM_REVIEW.md): E5/E7/E10 (SQL bug, receiver-stop
-wiring, bonding-config override removal, portal retirement). See the
-2026-07-02 log entries for the full per-item list, plus one real gap
-surfaced: `strata-sender`'s local onboarding portal (`portal.rs`, :3001)
-has nothing left to serve now that `strata-portal` is retired — needs a
-follow-up decision.
+[PLATFORM_REVIEW.md](PLATFORM_REVIEW.md): E5/E7/E10/**E3** (SQL bug,
+receiver-stop wiring, bonding-config override removal, portal retirement,
+dashboard WS auth + owner scoping) are done. E3: `ws_dashboard.rs` now
+requires the same `auth.login` JWT handshake as the agent/receiver WS, and
+`DashboardEvent`s are tagged with `owner_id` end-to-end so one operator can
+no longer see another's fleet. See the 2026-07-02 log entries for the full
+per-item list, plus one real gap surfaced: `strata-sender`'s local
+onboarding portal (`portal.rs`, :3001) has nothing left to serve now that
+`strata-portal` is retired — needs a follow-up decision.
 
 **Still to do** (see the plan file for scope): N3 (`config.rs` dead-knob
 deletion, small); §2.2's full evidence-struct/ranking redesign (deliberately
 NOT attempted — see review_findings.md §2.2 for why the lower-risk
-bookkeeping-only consolidation was chosen instead); dashboard WS
-auth/scoping (E3); platform timing/jitter hygiene (E9); then the larger
-executive items in dependency order — E1 (one `strata-protocol` crate,
-unblocks E2/E8), E2 (stream state machine + reconciliation), E4 (device
-identity, kills the O(n·argon2) reconnect-storm risk), E6 (real per-stream
+bookkeeping-only consolidation was chosen instead); platform timing/jitter
+hygiene (E9); a deliberately-deferred `CorsLayer::permissive()`/
+unauthenticated-`/metrics` posture decision (flagged, not changed, per E3's
+own instruction); then the larger executive items in dependency order — E1
+(one `strata-protocol` crate, unblocks E2/E8), E2 (stream state machine +
+reconciliation), E4 (device identity, kills the O(n·argon2) reconnect-storm
+risk), E6 (real per-stream
 port allocation), E8 (surface receiver-side telemetry on the dashboard).
 
 **Sandbox note:** this environment's `RLIMIT_MEMLOCK` is hard-capped at
@@ -148,4 +153,4 @@ override that pinned it is gone — but still needs field confirmation. Watch
 adaptive-redundancy duplication as a wire-overhead contributor when spare is large.
 
 ---
-_Last updated: 2026-07-02 (batch 1-3 + Batch 2 adaptation.rs fixes landed on main; N3 + platform E1/E2/E3/E4/E6/E8/E9 items remain)_
+_Last updated: 2026-07-02 (batch 1-3 + Batch 2 adaptation.rs + Batch 3.2 dashboard WS auth (E3) landed on main; N3 + platform E1/E2/E4/E6/E8/E9 items remain)_

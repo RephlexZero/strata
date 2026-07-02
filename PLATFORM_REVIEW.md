@@ -7,10 +7,11 @@
 [review_findings.md](review_findings.md); this document is about the plane
 that starts, stops, observes and configures it.
 
-> **Implementation status (2026-07-02):** E5, E7, and E10 are **done and
-> merged to `main`**. E3 (dashboard WS auth), E9 (timing/jitter hygiene),
-> E1 (protocol crate), E2 (state machine), E4 (device identity), E6 (port
-> allocation), E8 (receiver telemetry) are **not started**. See
+> **Implementation status (2026-07-02, updated same day):** E5, E7, E10,
+> and now E3 (dashboard WS auth + scoping) are **done and merged to
+> `main`**. E9 (timing/jitter hygiene), E1 (protocol crate), E2 (state
+> machine), E4 (device identity), E6 (port allocation), E8 (receiver
+> telemetry) are **not started**. See
 > `.claude/plans/rosy-squishing-treasure.md` for the intended order and
 > notes on why E1/E2/E4 in particular were held back rather than rushed.
 
@@ -31,19 +32,21 @@ never established, and every gap below is a symptom of one of them:
    event with no snapshot/resync path. Any missed event (a WS blip, a control
    restart) permanently desyncs the DB from reality, and the code "handles"
    this by guessing (orphan-marking streams on disconnect).
-3. **Security is declared, not enforced.** The wiki's security model
-   (per-owner isolation, ed25519 device auth, one-time tokens) is
-   substantially unimplemented: the dashboard WS is unauthenticated and
-   unscoped, device-key auth is a TODO, enrollment tokens are permanent
-   reusable passwords.
+3. 🟡 PARTIALLY ADDRESSED 2026-07-02 (E3) — **Security is declared, not
+   enforced.** The wiki's security model (per-owner isolation, ed25519
+   device auth, one-time tokens) is substantially unimplemented: ~~the
+   dashboard WS is unauthenticated and unscoped~~ (fixed — E3), device-key
+   auth is still a TODO, enrollment tokens are still permanent reusable
+   passwords (both E4, not started).
 4. ✅ FIXED 2026-07-02 (E5) — **The plane reaches into the transport's tuning.** The control plane
    hardcodes a bonding config that silently reverses field-validated
    transport defaults — the exact cross-layer override failure class the
    transport audit keeps finding inside the bonding crate.
 
 None of this needs a rewrite. It needs ~10 deliberate, ordered changes.
-Properties 1-3 (protocol, reconciliation, security) are still unaddressed
-as of 2026-07-02 — see the status markers on E1/E2/E3/E4 below.
+Properties 1-2 (protocol, reconciliation) are still unaddressed; property 3
+(security) is partially addressed (E3 done, E4 not started) as of
+2026-07-02 — see the status markers on E1/E2/E3/E4 below.
 
 ---
 
@@ -98,7 +101,7 @@ control plane reconciles — re-adopting streams that are still running,
 ending the ones that aren't — instead of orphan-marking on disconnect.
 WS-drop then only means "unobserved", never "dead".
 
-### E3. ⬜ NOT STARTED — Authenticate and scope the dashboard WebSocket
+### E3. ✅ DONE (core fix); CORS/`/metrics` flagged, not changed — Authenticate and scope the dashboard WebSocket
 
 `GET /ws` ([ws_dashboard.rs](crates/strata-control/src/ws_dashboard.rs)) has
 **no authentication of any kind** — no extractor, no middleware, the handler
@@ -120,9 +123,27 @@ broadcast channels per owner). Also: `CorsLayer::permissive()` and the
 unauthenticated `/metrics` on the same listener deserve a production posture
 decision at the same time.
 
-**Status (2026-07-02):** not started — the agent assigned to this made no
-progress before an account-level usage limit cut it off; still fully
-unauthenticated and unscoped on `main` as described above.
+**Status (2026-07-02, done same day):** both bugs fixed. `ws_dashboard.rs`
+now requires an `auth.login` first message (a JWT bearer token, mirroring
+`ws_agent.rs`/`ws_receiver.rs`'s handshake exactly) before sending anything;
+rejects device-role tokens (`claims.owner.is_some()`) so only real user
+sessions can open the feed. `AppState::dashboard_tx` now carries
+`(owner_id, DashboardEvent)` tuples — every `broadcast_dashboard` call site
+(`ws_agent.rs`, `ws_receiver.rs`, `api/streams.rs`) was updated to supply the
+owning user's ID, and `ws_dashboard.rs` filters its subscription to the
+connected user's own `owner_id` before forwarding anything to the browser;
+the initial snapshot query is scoped the same way. The dashboard client
+(`strata-dashboard/src/ws.rs`) now sends the token as the first WS message
+instead of a `?token=` query param. Two new integration tests
+(`dashboard_ws_scopes_events_to_owner`, `dashboard_ws_rejects_invalid_token`
+in `crates/strata-control/tests/api_integration.rs`, using a real
+`tokio_tungstenite` client against a real `TcpListener` — WS upgrades can't
+be exercised through axum's oneshot tower-service testing) prove a second
+owner's event never reaches the first owner's socket, and that an invalid
+token gets rejected and the connection closed. `CorsLayer::permissive()` and
+the unauthenticated `/metrics` endpoint (`main.rs`) were **not** touched —
+per this finding's own instruction to flag them for a deliberate posture
+decision rather than silently change deployment-facing behavior.
 
 ### E4. ⬜ NOT STARTED — Real device identity (the current one is a placeholder in disguise)
 
@@ -296,12 +317,13 @@ is silently swallowed — the state machine of E2 must not inherit that);
 `serde_json::to_string(...).unwrap()` on every outgoing message;
 `Envelope::new` panics on serialization failure while `try_new` sits unused.
 
-**The security model doc should be re-titled "target state".** Owner
-isolation is genuinely enforced in the REST layer (consistent
-`owner_id`-scoped queries — good), but the WS surfaces (E3) and device
-identity (E4) don't implement the doc. Until they do, the wiki overstating
-the live system is the same credibility problem the 2026-05-29 transport
-review called out.
+**The security model doc should be re-titled "target state" — partially
+resolved 2026-07-02.** Owner isolation is genuinely enforced in the REST
+layer (consistent `owner_id`-scoped queries — good); the dashboard WS
+surface (E3) now enforces it too. Device identity (E4) still doesn't
+implement the doc (enrollment tokens remain permanent, device-key auth is
+still a TODO). Until E4 lands, the wiki overstating the live system is the
+same credibility problem the 2026-05-29 transport review called out.
 
 **What's fine (leave it alone):** the crate boundaries themselves; axum +
 sqlx + migrations; DashMap-based hubs; UUIDv7 prefixed IDs; the enrollment
@@ -314,14 +336,15 @@ work.
 
 ## 3. Suggested sequencing
 
-Status column added 2026-07-02 — the actual order landed 1 (partially,
-just the SQL bug + orphan, not the rest of E7's sagas), 5, and 8's E10
-only; everything else is unstarted, including E3 despite being ranked #2.
+Status column added 2026-07-02, updated same day — the actual order landed
+1 (partially, just the SQL bug + orphan, not the rest of E7's sagas), 2
+(E3, out of order — picked up same-day as a contained, well-scoped item),
+5, and 8's E10 only; 3, 4, 6, and the rest of 8 are still unstarted.
 
 | Status | Order | Item | Why first |
 |---|---|---|---|
 | ✅ DONE (SQL bug + orphan only; rest of E7 open) | 1 | E7's SQL bind bug + stop-path receiver orphan | small, likely user-visible today |
-| ⬜ NOT STARTED | 2 | E3 dashboard WS auth + scoping | exposed surface, small fix |
+| ✅ DONE | 2 | E3 dashboard WS auth + scoping | exposed surface, small fix |
 | ⬜ NOT STARTED | 3 | E1 protocol crate | unblocks E2/E8 cheaply, deletes 41-type copy |
 | ⬜ NOT STARTED | 4 | E2 state machine + reconciliation | biggest correctness win |
 | ✅ DONE | 5 | E5 bonding-profile ownership | protects the transport tuning investment |

@@ -5,6 +5,53 @@ the top. One dated entry per day — enough to reconstruct *why* later.
 
 Format: `## YYYY-MM-DD` heading per day, bullet per entry.
 
+## 2026-07-02 (cont'd — Batch 3.2 landed: dashboard WS auth + scoping, E3)
+
+- Implemented [PLATFORM_REVIEW.md](PLATFORM_REVIEW.md) E3: `GET /ws`
+  (`ws_dashboard.rs`) had no authentication at all and the broadcast channel
+  was global (every operator saw every other operator's fleet). Fixed both:
+  - `ws_dashboard.rs` now requires an `auth.login` first message carrying a
+    JWT (mirrors `ws_agent.rs`/`ws_receiver.rs`'s handshake exactly, per the
+    finding's own "like the agent WS" instruction — not the previous unread
+    `?token=` query param, since tokens in URLs end up in proxy logs).
+    Device-role tokens (`claims.owner.is_some()`) are rejected — only real
+    user sessions may open the dashboard feed.
+  - `AppState::dashboard_tx` now carries `(owner_id, DashboardEvent)`
+    instead of a bare `DashboardEvent`; every `broadcast_dashboard` call
+    site (`ws_agent.rs` ×6, `ws_receiver.rs` ×1, `api/streams.rs` ×3) now
+    supplies the owning user's ID (threaded from auth for the two WS hubs,
+    from `AuthUser` for the REST handlers). `ws_dashboard.rs` filters its
+    subscription — and the initial snapshot queries — to the connected
+    user's own `owner_id`.
+  - Updated the dashboard client (`strata-dashboard/src/ws.rs`) to send the
+    token as the first WS message instead of the URL query param, and to
+    tell the Envelope-wrapped auth response apart from the (still
+    un-enveloped) live event stream.
+  - Two new integration tests in `crates/strata-control/tests/
+    api_integration.rs` (`dashboard_ws_scopes_events_to_owner`,
+    `dashboard_ws_rejects_invalid_token`), using a real `tokio_tungstenite`
+    client against a real `TcpListener` — WS upgrades can't be exercised
+    through axum's oneshot tower-service testing that the rest of this file
+    uses. New dev-dependency: `tokio-tungstenite` (already vendored in the
+    workspace via `strata-sender`/`strata-receiver`).
+  - Deliberately NOT touched: `CorsLayer::permissive()` and the
+    unauthenticated `/metrics` endpoint — the finding explicitly asks to
+    flag these for a deliberate deployment-posture decision, not silently
+    change them.
+  - 18/18 `strata-control` integration tests pass (Postgres via `docker
+    compose up -d postgres`), full-workspace `cargo build`/clippy clean,
+    `strata-dashboard` checked against the real `wasm32-unknown-unknown`
+    target (added via `rustup target add`).
+  - `mcp__gitnexus__detect_changes` confirmed "low" risk, scoped to exactly
+    the 10 touched files.
+  - Updated PLATFORM_REVIEW.md's E3 status, the "Security is declared, not
+    enforced" verdict bullet (now partially addressed), and the sequencing
+    table; `hot.md` refreshed.
+  - **Remaining**: N3, §2.2's full redesign (deliberately deferred), the
+    CorsLayer/`/metrics` posture decision, platform E9 hygiene, then E1
+    (protocol crate), E2 (state machine + reconciliation), E4 (device
+    identity), E6 (port allocation), E8 (receiver telemetry).
+
 ## 2026-07-02 (cont'd — Batch 2 landed)
 
 - Continued [review_findings.md](review_findings.md) implementation:
