@@ -62,6 +62,39 @@ use strata_transport::sender::{Sender, SenderConfig};
 use strata_transport::session::RttTracker;
 use strata_transport::wire::{Packet, PacketHeader, ReceiverReportPacket};
 
+/// Explicit state for whether receiver feedback on this link is
+/// probe-contaminated and should be ignored by the `BitrateAdapter`.
+///
+/// Replaces a far-future-`Instant` sentinel (`Instant::now() +
+/// PROBE_FEEDBACK_COOLDOWN * 100`) that was used to "hold the block open"
+/// while a probe ran. That trick made the running-probe state indistinguishable
+/// from a very long cooldown from the reader's side — if a probe ever failed
+/// to call `set_saturation_probe_active(false)` (crash, early return), feedback
+/// was silently ignored for 150 s with nothing in the code explaining why.
+/// With this enum the two situations are distinct, inspectable states.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ProbeFeedbackBlock {
+    /// No probe has run recently; feedback is trustworthy.
+    Clear,
+    /// A saturation probe is actively pinning traffic on this link right
+    /// now — feedback is unconditionally contaminated until the probe ends.
+    ProbeRunning,
+    /// The probe ended; feedback remains contaminated until this deadline
+    /// (see `PROBE_FEEDBACK_COOLDOWN`).
+    Cooldown(Instant),
+}
+
+impl ProbeFeedbackBlock {
+    /// Whether feedback should currently be treated as contaminated.
+    fn is_blocked(&self, now: Instant) -> bool {
+        match self {
+            ProbeFeedbackBlock::Clear => false,
+            ProbeFeedbackBlock::ProbeRunning => true,
+            ProbeFeedbackBlock::Cooldown(deadline) => now < *deadline,
+        }
+    }
+}
+
 /// A link backed by `strata-transport::Sender`.
 ///
 /// Uses `quinn-udp` for GSO/GRO-accelerated UDP I/O when the kernel supports
@@ -152,13 +185,13 @@ pub struct TransportLink {
     prev_retransmissions: AtomicU64,
     /// Previous packets_sent snapshot for per-interval loss_rate.
     prev_loss_pkts_sent: AtomicU64,
-    /// While `Some`, a saturation probe is active on this link OR within
-    /// the post-probe cooldown. Receiver reports covering this window are
-    /// contaminated by the probe's traffic pin (the disturbance shows up
-    /// ~1 report interval *after* the window closes), so the encoder
-    /// `BitrateAdapter` ignores feedback while this is set. `None` once the
-    /// cooldown has elapsed.
-    probe_feedback_block_until: Mutex<Option<Instant>>,
+    /// While blocked (`ProbeRunning` or `Cooldown` before its deadline), a
+    /// saturation probe is active on this link OR within the post-probe
+    /// cooldown. Receiver reports covering this window are contaminated by
+    /// the probe's traffic pin (the disturbance shows up ~1 report interval
+    /// *after* the window closes), so the encoder `BitrateAdapter` ignores
+    /// feedback while blocked. See `ProbeFeedbackBlock`.
+    probe_feedback_block: Mutex<ProbeFeedbackBlock>,
     /// `packets_acked` snapshot from the previous `get_metrics`, used to
     /// detect ACK *progress* (not just a nonzero total).
     prev_acked_liveness: AtomicU64,
@@ -254,6 +287,74 @@ const GSO_SUPERPACKET_BYTES: usize = 65_536;
 /// several × the per-frame average) drain in well under this and must
 /// survive intact; cutting them was the dominant source of mid-GOP holes.
 const PACED_QUEUE_SOJOURN_BUDGET_SECS: f64 = 0.5;
+
+/// Minimum delivery-rate sample (bits/sec) treated as a real signal rather
+/// than measurement noise near zero. Gates the goodput-vs-ack-rate delivery
+/// signal choice and the btl_bw-capping/fallback logic in `get_metrics`.
+/// ~100 kbps is comfortably above single-sample ACK-timing jitter yet far
+/// below any link this bonding stack targets.
+const MEANINGFUL_BASELINE_BPS: f64 = 100_000.0;
+
+/// Floor on the pacing rate as a fraction of the oracle's slow-decaying
+/// peak capacity estimate. Stops the congestion controller from starving a
+/// link below 20% of what it has proven capable of, which would otherwise
+/// create a death spiral (oracle collapse → pacing collapse → less
+/// delivery → further oracle collapse).
+const PACING_FLOOR_VS_PEAK: f64 = 0.2;
+
+/// Token-bucket burst window: caps accumulated tokens at this many seconds
+/// of data at the current pacing rate. Bounds how much a long idle period
+/// can let the bucket build up before the next send.
+const TOKEN_BUCKET_BURST_SECS: f64 = 0.01;
+
+/// Floor on the token-bucket burst cap in bytes, applied regardless of
+/// pacing rate — keeps the bucket able to burst enough for initial probes
+/// before the pacing rate has ramped up from zero.
+const TOKEN_BUCKET_MIN_BURST_BYTES: f64 = 10_000.0;
+
+/// Clamp band (microseconds) for the SRTT-derived ACK-rate sampling
+/// interval: never sample faster than this (avoids spikes from batched
+/// ACKs) even if SRTT is tiny.
+const ACK_RATE_MIN_INTERVAL_US: u64 = 250_000;
+/// Upper end of the same clamp band — never wait longer than this to take
+/// a sample even if SRTT is large, keeping the rate estimate responsive.
+const ACK_RATE_MAX_INTERVAL_US: u64 = 1_000_000;
+
+/// Multiple of SRTT beyond which an ACK-rate sampling interval is treated
+/// as an idle gap (scheduler burst boundary) rather than a real
+/// measurement — the interval's baseline is reset instead of computing a
+/// rate diluted by idle time.
+const ACK_RATE_IDLE_GAP_SRTT_MULT: u64 = 4;
+/// Clamp band (microseconds) for the idle-gap threshold itself, in case
+/// SRTT is momentarily very small or very large.
+const ACK_RATE_IDLE_GAP_MIN_US: u64 = 500_000;
+const ACK_RATE_IDLE_GAP_MAX_US: u64 = 2_000_000;
+
+const _: () = assert!(ACK_RATE_MIN_INTERVAL_US < ACK_RATE_MAX_INTERVAL_US);
+const _: () = assert!(ACK_RATE_IDLE_GAP_MIN_US < ACK_RATE_IDLE_GAP_MAX_US);
+
+/// Minimum interval (microseconds) between per-link ACK-rate samples in
+/// `get_metrics`'s `per_link_ack_rate` path — a fixed 500 ms band, distinct
+/// from the SRTT-derived `ACK_RATE_*` window above (different accounting
+/// path: per-link bytes_acked vs. the global total_received counter), used
+/// to avoid spikes from batched ACKs.
+const PER_LINK_ACK_RATE_MIN_INTERVAL_US: u64 = 500_000;
+
+/// Cap on BBR's `btl_bw` relative to the measured per-link ACK rate:
+/// `btl_bw` is a windowed-max filter so it can lag a fast-rising ACK rate,
+/// and this bounds how far it is allowed to run ahead before being clipped
+/// back toward the ACK-confirmed rate. Adjacent to
+/// `ACK_RATE_FALLBACK_HEADROOM_MULT` below but NOT confirmed co-tuned with
+/// it (per audit) — don't merge them into one constant.
+const BTLBW_VS_ACK_RATE_CAP_MULT: f64 = 1.5;
+
+/// Headroom applied to the ACK delivery rate when it is used as the
+/// capacity fallback (no oracle estimate, no btl_bw yet), so the adapter
+/// doesn't fall back to the static capacity floor when actual achievable
+/// throughput is already known from ACK measurements. Adjacent to
+/// `BTLBW_VS_ACK_RATE_CAP_MULT` above but NOT confirmed co-tuned with it
+/// (per audit) — don't merge them into one constant.
+const ACK_RATE_FALLBACK_HEADROOM_MULT: f64 = 1.2;
 
 impl TransportLink {
     /// The paced-queue byte budget shared by the AQM
@@ -473,7 +574,7 @@ impl TransportLink {
             oracle: Mutex::new(CapacityOracle::new()),
             prev_retransmissions: AtomicU64::new(0),
             prev_loss_pkts_sent: AtomicU64::new(0),
-            probe_feedback_block_until: Mutex::new(None),
+            probe_feedback_block: Mutex::new(ProbeFeedbackBlock::Clear),
             prev_acked_liveness: AtomicU64::new(0),
             last_ack_or_report: Mutex::new(Instant::now()),
             sndbuf_state: Mutex::new((std::time::Instant::now(), 0)),
@@ -513,7 +614,7 @@ impl TransportLink {
         // prevents a death spiral where oracle collapse → pacing collapse →
         // less delivery → further oracle collapse.
         let peak_cap_bytes = self.oracle.lock().unwrap().peak_cap() / 8.0;
-        let floor_rate = peak_cap_bytes * 0.2;
+        let floor_rate = peak_cap_bytes * PACING_FLOOR_VS_PEAK;
         let base_rate = cc_pacing_rate.max(floor_rate);
 
         // RTT-aware bufferbloat throttle.
@@ -544,7 +645,9 @@ impl TransportLink {
         let elapsed = now.duration_since(p.last_refill).as_secs_f64();
         p.tokens += pacing_rate * elapsed;
         // Burst cap: 10 ms of data (or 10 KB minimum for startup)
-        p.tokens = p.tokens.min((pacing_rate * 0.01).max(10_000.0));
+        p.tokens = p
+            .tokens
+            .min((pacing_rate * TOKEN_BUCKET_BURST_SECS).max(TOKEN_BUCKET_MIN_BURST_BYTES));
         p.last_refill = now;
 
         let mut q = self.paced_queue.lock().unwrap();
@@ -555,8 +658,11 @@ impl TransportLink {
         let mut to_send = Vec::new();
         while let Some(pkt) = q.front() {
             let len = pkt.data.len() as f64;
-            // Allow sending if we have tokens, OR if we have a minimum burst debt
-            // (e.g. allow going negative up to 1 MTU)
+            // Check-then-subtract: admit whenever the balance is still
+            // non-negative, THEN deduct this packet's bytes. That ordering
+            // is what lets the balance go negative by up to one packet
+            // (~1 MTU) rather than a separate "OR" condition — it's an
+            // emergent burst-debt allowance, not two rules.
             if p.tokens >= 0.0 {
                 p.tokens -= len;
                 to_send.push(q.pop_front().unwrap());
@@ -788,7 +894,8 @@ impl TransportLink {
                         let rtt = self.rtt.lock().unwrap();
                         rtt.srtt_us()
                     };
-                    let min_interval_us = (srtt_us as u64).clamp(250_000, 1_000_000);
+                    let min_interval_us =
+                        (srtt_us as u64).clamp(ACK_RATE_MIN_INTERVAL_US, ACK_RATE_MAX_INTERVAL_US);
 
                     if interval_us >= min_interval_us && prev_us > 0 {
                         let delta_bytes = total_acked.saturating_sub(prev_bytes);
@@ -799,7 +906,8 @@ impl TransportLink {
                             // without computing a rate — the interval includes
                             // idle time which would dilute the measurement and
                             // underestimate the link's actual delivery rate.
-                            let max_interval_us = (srtt_us as u64 * 4).clamp(500_000, 2_000_000);
+                            let max_interval_us = (srtt_us as u64 * ACK_RATE_IDLE_GAP_SRTT_MULT)
+                                .clamp(ACK_RATE_IDLE_GAP_MIN_US, ACK_RATE_IDLE_GAP_MAX_US);
                             if interval_us > max_interval_us {
                                 self.prev_ack_bytes.store(total_acked, Ordering::Relaxed);
                                 self.prev_ack_time_us.store(now_us, Ordering::Relaxed);
@@ -1089,7 +1197,8 @@ impl LinkSender for TransportLink {
 
         // Require ≥ 500ms between rate samples to avoid spikes from batch
         // ACKs. This gives a smoother, more accurate delivery rate.
-        let per_link_ack_rate = if interval_us >= 500_000 && prev_us > 0 {
+        let per_link_ack_rate = if interval_us >= PER_LINK_ACK_RATE_MIN_INTERVAL_US && prev_us > 0
+        {
             // Commit the snapshot for next interval
             self.prev_pkts_acked
                 .store(per_link_ack_bytes, Ordering::Relaxed);
@@ -1150,7 +1259,7 @@ impl LinkSender for TransportLink {
         // (entries expire before ACKs arrive). The receiver-reported goodput
         // is more accurate since it measures actual delivered data.
         let goodput = *self.goodput_ewma_bps.lock().unwrap();
-        let delivery_signal = if goodput > 100_000.0 {
+        let delivery_signal = if goodput > MEANINGFUL_BASELINE_BPS {
             goodput
         } else {
             per_link_ack_rate
@@ -1251,8 +1360,8 @@ impl LinkSender for TransportLink {
         // use ack_delivery_bps as a direct proxy for achievable throughput.
         let oracle_cap = oracle.estimated_cap();
         let btl_bw_capped = if btl_bw_bps > 0.0 {
-            let capped = if per_link_ack_rate > 100_000.0 {
-                btl_bw_bps.min(per_link_ack_rate * 1.5)
+            let capped = if per_link_ack_rate > MEANINGFUL_BASELINE_BPS {
+                btl_bw_bps.min(per_link_ack_rate * BTLBW_VS_ACK_RATE_CAP_MULT)
             } else {
                 btl_bw_bps
             };
@@ -1282,11 +1391,11 @@ impl LinkSender for TransportLink {
             }
         } else if btl_bw_capped > 0.0 {
             btl_bw_capped
-        } else if per_link_ack_rate > 100_000.0 {
-            // Fallback: use ack delivery rate with 20% headroom as capacity.
+        } else if per_link_ack_rate > MEANINGFUL_BASELINE_BPS {
+            // Fallback: use ack delivery rate with headroom as capacity.
             // This prevents the adapter from using the 5 Mbps floor when
             // actual achievable throughput is known from ACK measurements.
-            per_link_ack_rate * 1.2
+            per_link_ack_rate * ACK_RATE_FALLBACK_HEADROOM_MULT
         } else {
             0.0
         };
@@ -1400,10 +1509,10 @@ impl LinkSender for TransportLink {
                 }
             }),
             probe_active: self
-                .probe_feedback_block_until
+                .probe_feedback_block
                 .lock()
                 .unwrap()
-                .is_some_and(|t| Instant::now() < t),
+                .is_blocked(Instant::now()),
             inferred_regime,
             bdp_bytes,
             inflight_cap_bytes,
@@ -1454,14 +1563,14 @@ impl LinkSender for TransportLink {
 
     fn set_saturation_probe_active(&self, active: bool) {
         self.oracle.lock().unwrap().set_probe_active(active);
-        let mut block = self.probe_feedback_block_until.lock().unwrap();
-        if active {
-            // Hold the block open with a far-future deadline while the
-            // probe runs; the real cooldown starts when it ends.
-            *block = Some(Instant::now() + PROBE_FEEDBACK_COOLDOWN * 100);
+        let mut block = self.probe_feedback_block.lock().unwrap();
+        *block = if active {
+            // Block unconditionally while the probe runs; the cooldown
+            // deadline is set only once it ends, below.
+            ProbeFeedbackBlock::ProbeRunning
         } else {
-            *block = Some(Instant::now() + PROBE_FEEDBACK_COOLDOWN);
-        }
+            ProbeFeedbackBlock::Cooldown(Instant::now() + PROBE_FEEDBACK_COOLDOWN)
+        };
     }
 
     fn set_failover_broadcast_active(&self, active: bool) {
@@ -1819,6 +1928,46 @@ mod tests {
             Some("unknown"),
             "auto restores measurement-based inference"
         );
+    }
+
+    /// N9 regression: the probe-feedback block state must be an explicit,
+    /// directly-inspectable variant at every stage, not something inferred
+    /// by comparing an `Instant` against a far-future sentinel.
+    #[test]
+    fn probe_feedback_block_state_is_explicit_not_inferred() {
+        let link = make_loopback_link(15);
+
+        assert_eq!(
+            *link.probe_feedback_block.lock().unwrap(),
+            ProbeFeedbackBlock::Clear,
+            "no probe has run yet"
+        );
+        assert!(!link.get_metrics().probe_active);
+
+        link.set_saturation_probe_active(true);
+        assert_eq!(
+            *link.probe_feedback_block.lock().unwrap(),
+            ProbeFeedbackBlock::ProbeRunning,
+            "an active probe must be its own explicit state, not a deadline \
+             far enough in the future to look permanent"
+        );
+        assert!(link.get_metrics().probe_active);
+
+        link.set_saturation_probe_active(false);
+        let now = Instant::now();
+        match *link.probe_feedback_block.lock().unwrap() {
+            ProbeFeedbackBlock::Cooldown(deadline) => {
+                let remaining = deadline.saturating_duration_since(now);
+                assert!(
+                    remaining <= PROBE_FEEDBACK_COOLDOWN,
+                    "cooldown deadline must be bounded by PROBE_FEEDBACK_COOLDOWN \
+                     (~1.5s), not the old far-future (150s) sentinel; got \
+                     {remaining:?} remaining"
+                );
+            }
+            other => panic!("expected Cooldown state after probe ends, got {other:?}"),
+        }
+        assert!(link.get_metrics().probe_active, "still within cooldown");
     }
 
     #[test]
