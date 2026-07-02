@@ -5,16 +5,19 @@ structure in `strata-bonding` / `strata-transport`. Audit only — no code
 changes made. Every pre-found lead was independently re-verified against the
 source (and git history where the intent was ambiguous).
 
-> **Implementation status (2026-07-02):** all of L1, L5, L6, L7, L8, N1, N2,
-> N6, N9, and §2.4.1 are **done and merged to `main`** — see `git log
-> --oneline` for the "Merge batch 1.x" commits, and
-> `.claude/plans/rosy-squishing-treasure.md` for exactly what landed and any
-> caveats. L2, L3, L4, N3, N4, N5, N7 and the §2.2 ranked-decision
-> consolidation are **not started** (this is `adaptation.rs` — deliberately
-> held back as the highest-risk item, see the plan file). The magic-number
-> naming pass (§1) is done for `congestion.rs`, `oracle.rs`, `bonding.rs`,
-> and `net/transport.rs`, but not yet for `adaptation.rs`, and a few rows
-> even in the touched files were skipped — see the ✅/⬜ marks below.
+> **Implementation status (2026-07-02, updated same day — Batch 2 landed):**
+> all of L1, L2, L3, L4, L5, L6, L7, L8, N1, N2, N4, N6, N7, N9, §2.3, and
+> §2.4.1 are **done and merged to `main`** (commits `b28d983`/`f7ee15c`
+> for Phase A, `97707f9` for Phase B — see `.claude/plans/
+> rosy-squishing-treasure.md` for exactly what landed and any caveats).
+> N3 and the FEC-sizing-sustain half of §2.4 are still **not started**.
+> N5 and §2.2 are **done, but not by conversion/full redesign** — see
+> their entries below for exactly what was done instead and why. The
+> magic-number naming pass (§1) is now done for `adaptation.rs` too
+> (aside from the EWMA α values, which are §1b/docs-only by design), on
+> top of `congestion.rs`, `oracle.rs`, `bonding.rs`, and `net/transport.rs`
+> — a few rows even in the touched files were skipped — see the ✅/⬜
+> marks below.
 
 Severity scale: **nit** / **worth-a-comment** / **worth-a-fix**. Items marked
 **worth-a-fix (high)** are the ones I'd land first.
@@ -40,16 +43,17 @@ worthless (dampening a bootstrap constant) and the line reads as an accidental
 double-application to anyone tracing a Cautious transition. If kept, it needs
 a two-line comment. *worth-a-fix*
 
-### L2. ⬜ NOT STARTED — `adaptation.rs:524-529` — stale EWMA comment — **confirmed: code is intent, comment is stale**
+### L2. ✅ DONE — `adaptation.rs:524-529` — stale EWMA comment — **confirmed: code is intent, comment is stale**
 
 Git history settles it: commit `9c0286a` introduced
 `CAP_EWMA_ALPHA_DOWN = 0.7` with the matching comment; commit `e76a40e`
 ("fix(adaptation): stabilize capacity estimation and prevent target collapse")
 deliberately changed the constant 0.7 → 0.5 and did not touch the comment.
 The 0.5 is the tuned survivor of a real stabilization fix — fix the comment
-to say α=0.5, not the constant. *worth-a-comment*
+to say α=0.5, not the constant. *worth-a-comment* — **done 2026-07-02**:
+comment corrected to α=0.5.
 
-### L3. ⬜ NOT STARTED — `adaptation.rs:834` / `:920` — `ewma_loss_fec > 0.08` context gate — **confirmed: the anti-pattern re-entering through a side door**
+### L3. ✅ DONE — `adaptation.rs:834` / `:920` — `ewma_loss_fec > 0.08` context gate — **confirmed: the anti-pattern re-entering through a side door**
 
 The use is narrower than the removed `> 0.15` gates (context flag, not a
 direct cut), but the context is **not independent evidence**. By the code's
@@ -78,9 +82,15 @@ document why residual-as-context is acceptable here when it wasn't at 0.15.
 Also: `jitter_loss_context_pre` (line 834) and `jitter_loss_context`
 (line 920) are the same expression computed twice per tick against
 pre-/post-update EWMA values — if that staleness split is deliberate it needs
-a comment; if not, it's drift waiting to happen. *worth-a-fix*
+a comment; if not, it's drift waiting to happen. *worth-a-fix* — **done
+2026-07-02**: both gates now read channel-side `max_link_loss` (computed
+once per tick in `update()`) instead of the residual, computed once and
+reused for both use sites (the pre/post duplication is gone along with the
+self-confirmation bug, since `max_link_loss` doesn't change mid-tick). Two
+new regression tests (`late_pressure_does_not_trigger_on_clean_channel_reorder`,
+`late_pressure_triggers_with_real_channel_loss`) lock in the fix.
 
-### L4. ⬜ NOT STARTED — `adaptation.rs:691` / `:843` — duplicated `loss_rate >= 0.55 && queue_depth >= 60` — **confirmed duplicate; conjunct is defensible but under-justified**
+### L4. ✅ DONE (consolidation) — `adaptation.rs:691` / `:843` — duplicated `loss_rate >= 0.55 && queue_depth >= 60` — **confirmed duplicate; conjunct is defensible but under-justified**
 
 Verbatim-identical expression in `update()` (`per_link_collapse`, suppresses
 ramp-up) and `update_with_feedback()` (`link_collapse`, eligibility for a hard
@@ -100,7 +110,12 @@ direction:** extract one named helper (`fn link_melting(&LinkCapacity) ->
 bool`) so the two sites can't drift, and consider replacing the raw-count
 conjunct with the established honest signal (per-link AQM-drop delta) or
 documenting why raw count is acceptable inside this conjunction.
-*worth-a-fix (consolidation), worth-a-comment (threshold)*
+*worth-a-fix (consolidation), worth-a-comment (threshold)* — **done
+2026-07-02**: extracted `fn link_melting(l: &LinkCapacity) -> bool` with
+named `LINK_MELT_LOSS_RATE`/`LINK_MELT_QUEUE_DEPTH` consts; both call sites
+now use it. The threshold-vs-AQM-drop-delta question (the "worth-a-comment"
+half) was not revisited — left as the existing 0.55/60 pair, just
+de-duplicated.
 
 ### L5. ✅ DONE — `fec.rs` `GilbertElliott` — **confirmed dead — and the finding is bigger: the entire module is dead**
 
@@ -244,7 +259,7 @@ strongly suggesting these SchedulerConfig fields are the abandoned older
 home of the pair. Worse than L8: at least L8's knob does *something*.
 Delete them (or wire them). *worth-a-fix*
 
-### N4. ⬜ NOT STARTED — `adaptation.rs:940` — `jitter_buffer_ms > 3000` hardcodes the receiver's *default* playout ceiling
+### N4. ✅ DONE — `adaptation.rs:940` — `jitter_buffer_ms > 3000` hardcodes the receiver's *default* playout ceiling
 
 The receiver's max playout window is config-tunable
 (`ReceiverConfig::max_latency`, default 3000 ms — [config.rs:292](crates/strata-bonding/src/config.rs#L292)).
@@ -254,9 +269,21 @@ jitter buffer legitimately uses the window the operator granted; deploy with
 `max_latency = 1.5 s` and the "overflow" arm can never fire. Same
 misleading-config class as L8. Sender and receiver configs are separate
 processes, so this needs either a plumbed value or a documented contract.
-*worth-a-fix*
+*worth-a-fix* — **done 2026-07-02**: new `AdaptationConfig::
+jitter_buffer_ceiling_ms` field (default 3000, matching `ReceiverConfig::
+max_latency`'s own default), wired from the control plane's shared
+`bonding_config` JSON blob — `strata-gst/src/sink.rs::apply_config` was
+discarding the parsed `receiver` section entirely; it now reads
+`receiver.max_latency` and threads it into the `BitrateAdapter`
+construction in the stats thread. Regression test
+`jitter_buffer_ceiling_is_configurable_not_hardcoded` proves the ceiling is
+config-driven. Note: for platform-started streams `bonding_config` is
+currently forced `Value::Null` (PLATFORM_REVIEW.md E5), so this plumb-through
+is live for standalone/TOML-configured streams today and falls back to the
+matching default otherwise — not a live discrepancy yet, but will matter the
+moment E5's "no override" policy gains a real profile system.
 
-### N5. ⬜ NOT STARTED — Tick-count sustain constants silently rescale with `stats_interval_ms`
+### N5. ✅ DONE (documented, not converted) — Tick-count sustain constants silently rescale with `stats_interval_ms`
 
 `AQM_SUSTAINED_TICKS = 2`, `ZERO_CAP_COLLAPSE_TICKS = 2`,
 `over_pressure_ticks >= 2`, `consecutive_increases >= 3` (adaptation.rs) are
@@ -268,7 +295,18 @@ operator halving `stats_interval_ms` for snappier telemetry silently halves
 every sustain window in the encoder loop — the opposite of what the
 sustain-gate fixes on this branch were for. Convert to wall-clock durations
 (the `congestion_started` pattern already in the same file) or document the
-coupling on `stats_interval_ms` itself. *worth-a-fix*
+coupling on `stats_interval_ms` itself. *worth-a-fix* — **decided
+2026-07-02**: took the finding's own offered fallback (document, don't
+convert). Converting all four to `Instant`-tracked wall-clock sustains would
+require every existing tick-count-driven regression test in this module
+(AQM latch, zero-capacity collapse, ramp-up gating — a dozen+ tests) to
+either sleep for real wall-clock seconds (multi-second CI slowdown) or
+special-case a zero-duration config override that would defeat the "more
+than one tick" semantics under test. Given the size of that blast radius for
+a single "worth-a-fix" (not "high") item, documented the coupling instead:
+doc comments at each of the four sites plus on `SchedulerConfig::
+stats_interval_ms` itself, and fixed the stale "500ms" comment to correctly
+reference the `stats_interval_ms` default (1000 ms) it was actually assuming.
 
 ### N6. ✅ DONE — `congestion.rs` drain_factor floor: three contradictory documented values
 
@@ -278,7 +316,7 @@ Field doc says "decays toward **0.1**" (line 213-215); the getter doc says
 from two earlier tunings. *worth-a-comment* — **done 2026-07-02**: both
 docs corrected to 0.5.
 
-### N7. ⬜ NOT STARTED — `adaptation.rs:670-676` — "consecutive increases" counts *flat* capacity, and 0.90–0.95 is a dead zone
+### N7. ✅ DONE — `adaptation.rs:670-676` — "consecutive increases" counts *flat* capacity, and 0.90–0.95 is a dead zone
 
 `aggregate >= prev * 0.95` increments `consecutive_increases` — so a
 perfectly flat capacity "increases" every tick, and the ramp gate
@@ -287,7 +325,11 @@ That behavior (ramp on stability) is probably what you want, but the name and
 the plan-level description ("a run of increasing capacity") say something
 stronger than the code checks. Meanwhile a tick in the 0.90–0.95 band
 increments *neither* counter, freezing both trends. Rename or comment.
-*worth-a-comment*
+*worth-a-comment* — **done 2026-07-02**: kept the field name (renaming it
+would ripple through the whole file and its tests for a comment-level fix),
+documented the real semantics at both the field and its update site, and
+named the 0.90/0.95 trend-band constants
+(`CAPACITY_TREND_STABLE_ABOVE`/`CAPACITY_TREND_DECREASE_BELOW`).
 
 ### N8. ◻ NO ACTION NEEDED — `queue_building()` doc premise correction (plan §1)
 
@@ -322,26 +364,26 @@ Status column added 2026-07-02. ✅ = named/fixed; ⬜ = still a bare literal.
 
 | Status | Location | Literal | Gates | Note |
 |---|---|---|---|---|
-| ⬜ | adaptation.rs:604-608 | `2.0` / `5.0` | pressure sentinels for "zero capacity" / "no links" | arbitrary sentinels flow into `DegradationStage::from_pressure(1/p)`; name them |
-| ⬜ | adaptation.rs:643 | `+ 0.05` | self-congestion pressure bump past threshold | |
-| ⬜ | adaptation.rs:670/673 | `0.95` / `0.90` | capacity trend up/down bands | see N7 dead zone |
-| ⬜ | adaptation.rs:703 | `0.80` | "at ceiling" for MaxReliability switch | |
-| ⬜ | adaptation.rs:709 | `* 1.2` | MaxReliability → MaxQuality hysteresis | pairs with `quality_cap_kbps` |
-| ⬜ | adaptation.rs:762 | `50` kbps / `0.10` | command-commit threshold | |
-| ⬜ | adaptation.rs:795 | `200` kbps / `0.10` | grace-arming threshold | |
-| ⬜ | adaptation.rs:830-856 | `160` ms | jitter-growth increase-revert | |
-| ⬜ | adaptation.rs:906-913 | `0.35`, `0.7`, `0.50`, `200` ms | burst / severe-burst definition | the 0.7 goodput conjunct is the new (good) fix; still unnamed |
-| ⬜ | adaptation.rs:917 | `* 0.8` | burst EWMA lift | |
-| ⬜ | adaptation.rs:926 | `0.05` | late-rate threshold | see L3 |
-| ⬜ | adaptation.rs:939-940 | `120` ms, `3000` ms | delay pressure | 3000 → N4 |
-| ⬜ | adaptation.rs:1007 | `0.85` | goodput-ceiling clamp trigger | |
-| ⬜ | adaptation.rs:1018-1026 | `0.7` / `0.5` | goodput shortfall / severe tiers | |
-| ⬜ | adaptation.rs:1037 | `5` s | feedback grace | promote or name; interacts with ramp cadence |
-| ⬜ | adaptation.rs:1114 | `min(0.55)` | severe-burst cut factor | |
-| ⬜ | adaptation.rs:1257 | `10` s | burst cooldown | named only in comment |
-| ⬜ | adaptation.rs:1263/1275 | `- 0.05` | ramp-up hysteresis gap | commented, unnamed |
-| ⬜ | adaptation.rs:1281 | `1.3` | ramp ceiling vs peak goodput | |
-| ⬜ | adaptation.rs:1330-1332 | `0.5` / `0.8` | dynamic floor (peak-half / EWMA cap) | commented well, unnamed |
+| ✅ | adaptation.rs:604-608 | `2.0` / `5.0` | pressure sentinels for "zero capacity" / "no links" | named `ZERO_CAPACITY_PRESSURE_SENTINEL`/`NO_LINKS_PRESSURE_SENTINEL`, 2026-07-02 |
+| ✅ | adaptation.rs:643 | `+ 0.05` | self-congestion pressure bump past threshold | named `SELF_CONGEST_PRESSURE_BUMP`, 2026-07-02 |
+| ✅ | adaptation.rs:670/673 | `0.95` / `0.90` | capacity trend up/down bands | named `CAPACITY_TREND_STABLE_ABOVE`/`CAPACITY_TREND_DECREASE_BELOW` (N7), 2026-07-02 |
+| ✅ | adaptation.rs:703 | `0.80` | "at ceiling" for MaxReliability switch | named `AT_CEILING_FRACTION`, 2026-07-02 |
+| ✅ | adaptation.rs:709 | `* 1.2` | MaxReliability → MaxQuality hysteresis | named `QUALITY_CAP_HYSTERESIS_MULT`, 2026-07-02 |
+| ✅ | adaptation.rs:762 | `50` kbps / `0.10` | command-commit threshold | named `COMMAND_COMMIT_ABS_FLOOR_KBPS`/`COMMAND_COMMIT_PCT`, 2026-07-02 |
+| ✅ | adaptation.rs:795 | `200` kbps / `0.10` | grace-arming threshold | named `GRACE_ARM_ABS_KBPS`/`GRACE_ARM_PCT`, 2026-07-02 |
+| ✅ | adaptation.rs:830-856 | `160` ms | jitter-growth increase-revert | named `INCREASE_REVERT_JITTER_GROWTH_MS`, 2026-07-02 |
+| ✅ | adaptation.rs:906-913 | `0.35`, `0.7`, `0.50`, `200` ms | burst / severe-burst definition | named `BURST_LOSS_AFTER_FEC_THRESHOLD`/`GOODPUT_SHORTFALL_RATIO`/`SEVERE_BURST_LOSS_AFTER_FEC_THRESHOLD`/`SEVERE_BURST_JITTER_BUFFER_MS`, 2026-07-02; `GOODPUT_SHORTFALL_RATIO` shared with the goodput-shortfall tier below (same 70% ratio, two signals) |
+| ✅ | adaptation.rs:917 | `* 0.8` | burst EWMA lift | named `BURST_EWMA_LIFT_FACTOR`, 2026-07-02 |
+| ✅ | adaptation.rs:926 | `0.05` | late-rate threshold | named `LATE_RATE_THRESHOLD` (L3), 2026-07-02 |
+| ✅ | adaptation.rs:939-940 | `120` ms, `3000` ms | delay pressure | named `DELAY_PRESSURE_JITTER_GROWTH_MS`; 3000 → N4 (now `AdaptationConfig::jitter_buffer_ceiling_ms`, config-driven), 2026-07-02 |
+| ✅ | adaptation.rs:1007 | `0.85` | goodput-ceiling clamp trigger | named `GOODPUT_CEILING_CLAMP_TRIGGER`, 2026-07-02 |
+| ✅ | adaptation.rs:1018-1026 | `0.7` / `0.5` | goodput shortfall / severe tiers | named `GOODPUT_SHORTFALL_RATIO`/`SEVERE_GOODPUT_SHORTFALL_RATIO`, 2026-07-02 |
+| ✅ | adaptation.rs:1037 | `5` s | feedback grace | named `FEEDBACK_GRACE_PERIOD`, 2026-07-02; not promoted to config |
+| ✅ | adaptation.rs:1114 | `min(0.55)` | severe-burst cut factor | named `SEVERE_BURST_MAX_REDUCTION_FACTOR`, 2026-07-02 |
+| ✅ | adaptation.rs:1257 | `10` s | burst cooldown | named `RAMP_UP_BURST_COOLDOWN`, 2026-07-02 |
+| ✅ | adaptation.rs:1263/1275 | `- 0.05` | ramp-up hysteresis gap | named `RAMP_UP_HYSTERESIS_GAP`, 2026-07-02 |
+| ✅ | adaptation.rs:1281 | `1.3` | ramp ceiling vs peak goodput | named `RAMP_UP_GOODPUT_PEAK_CEILING_MULT`, 2026-07-02 |
+| ✅ | adaptation.rs:1330-1332 | `0.5` / `0.8` | dynamic floor (peak-half / EWMA cap) | named `DYNAMIC_FLOOR_PEAK_HALF`/`DYNAMIC_FLOOR_EWMA_CAP_FRACTION`, 2026-07-02 |
 | ⬜ | congestion.rs:261-262 | `100_000.0`, `14_000.0` | bootstrap pacing / cwnd | skipped in the 2026-07-02 pass — not caught at the time |
 | ✅ | congestion.rs:363-365 | `0.05`, `3.0`, `8.0` | gradient severity → drain decay | named `RTPROP_QUEUE_FRACTION_FLOOR`/`GRAD_SEVERITY_MAX_MULT`/`GRAD_DECAY_PER_SEVERITY`/`GRAD_SEVERITY_DECAY_CAP` |
 | ⬜ | congestion.rs:393 | `0.9` | modem flow-control drain step | still bare — **no rate-limit**, per-call decay depends on caller frequency; floor 0.5 bounds the damage |
@@ -396,7 +438,7 @@ inventory are now written up at
 The naming-pass half (shared constants for the recurring 0.3/0.05 and 0.2
 pairs) is **not done** — each EWMA still has its own local literal.
 
-### 1c. ⬜ NOT STARTED — Stacked scaling layers on one quantity
+### 1c. 🟡 PARTIALLY DONE (comment only) — Stacked scaling layers on one quantity
 
 - **FEC overhead**: after L5, the live chain is clean —
   `recommended_fec_overhead` (0.10–0.50) → `R = round(32·ratio).clamp(1,32)`.
@@ -410,7 +452,11 @@ pairs) is **not done** — each EWMA still has its own local literal.
   they multiply: 0.5 × 0.25 = 8× reduction from the same bloat event).
   The comments in `flush_paced` do order them deliberately (floor before
   throttle), but the two delay reducers double-counting one queue is
-  unacknowledged. *worth-a-comment, and a candidate consolidation*
+  unacknowledged. *worth-a-comment, and a candidate consolidation* — **done
+  2026-07-02 (comment only)**: `flush_paced` now explicitly acknowledges the
+  double-count next to `rtt_throttle`. The consolidation itself (merging or
+  choosing one of the two reducers) was not attempted — that's a behavior
+  change to the live pacing path, out of scope for a comment-level fix.
 - **capacity**: oracle bounds → `ORACLE_SANE_BTLBW_MULT` rejection →
   `btl_bw.min(ack_rate×1.5).clamp(100k, 50M)` → adaptation drain-clamp →
   loss discount → EWMA → headroom. Six layers, each individually justified;
@@ -438,7 +484,7 @@ adapter tick, a severe burst can legitimately cut twice
 (`capacity_already_cut` is bypassed by `severe_burst` — documented as an
 emergency; fine).
 
-### 2.2 ⬜ NOT STARTED — The arbitration boolean pile — consolidate
+### 2.2 🟡 PARTIALLY DONE — The arbitration boolean pile — consolidate
 
 Confirmed the plan's suspicion, and it's worse than "one guard per fix":
 `current_target_kbps` is mutated in **four distinct places** in a single
@@ -459,13 +505,27 @@ into a struct, rank the pressure signals (LinkFailure > severe_burst >
 sustained congestion > capacity > ramp-up), and commit the target **once** at
 the end through a single function that owns all bookkeeping. This is the
 plan's "unify into one ranked decision", and I'd rate it the highest-value
-refactor in the file. *worth-a-fix (high)* — **not started as of
-2026-07-02**; deliberately held back as the highest-risk item in the whole
-audit (this is the live encoder control loop). See
-`.claude/plans/rosy-squishing-treasure.md` Batch 2 for the intended
-approach when this is picked up.
+refactor in the file. *worth-a-fix (high)* — **partially done 2026-07-02**:
+landed the bookkeeping-centralization half — a `TargetOverride` struct +
+`BitrateAdapter::apply_target_override` that all three explicit-mutation
+sites (increase-revert, goodput-ceiling clamp, feedback cut) now go
+through, with each site's previously-implicit bookkeeping differences (e.g.
+increase-revert deliberately not touching `last_command_time`) made
+explicit as struct fields. **Deliberately not done**: the full "collect
+evidence, rank, commit once" redesign. On inspection the three sites are
+not actually racing alternatives needing arbitration — they're a
+fixed-order sequential cascade of downward-only refinements, each narrowing
+whatever the previous stage left that tick. Forcing that into a strict
+one-of-N ranked model risked changing real behavior in the live encoder
+loop in ways a mechanical refactor can't fully guarantee against without
+field hardware to validate on. This was a deliberate risk/value call, not
+an oversight — see the commit message on `97707f9` for the full reasoning.
+The guard pile itself (`feedback_grace`, `capacity_already_cut`,
+`allow_feedback_cut`, etc.) is unchanged; only where the resulting
+bookkeeping writes live was consolidated. 359 tests pass unchanged
+(the actual verification that no arbitration behavior shifted).
 
-### 2.3 ⬜ NOT STARTED — Additive-up / multiplicative-down asymmetry — deliberate, undocumented
+### 2.3 ✅ DONE — Additive-up / multiplicative-down asymmetry — deliberate, undocumented
 
 The asymmetry is AIMD-shaped and consistent with every comment ("recover
 cautiously, cut decisively"), so I read it as intent — but nowhere stated.
@@ -476,7 +536,9 @@ clean ticks to re-reach 3 Mbps, and any single `raw_signal` tick resets the
 sustain clock while `burst_cooldown` (10 s) can re-arm on the way. That
 recovery-time-linear-in-gap behavior is the field-visible "slow climb after
 every dip" and should be a named design choice, not archaeology.
-*worth-a-comment*
+*worth-a-comment* — **done 2026-07-02**: documented as deliberate AIMD
+design intent, with the worked recovery-time numbers, on
+`AdaptationConfig::ramp_up_kbps_per_step`/`ramp_down_factor`.
 
 ### 2.4 Cooldown/grace timescale table
 
@@ -526,8 +588,8 @@ class:
 1. ✅ DONE — `failover_rtt_spike_factor` vs oracle.rs:295 hardcoded 3.0 (L8).
 2. ⬜ NOT STARTED — `congestion_headroom_ratio` / `congestion_trigger_ratio` — dead knobs, the
    live pair lives in `AdaptationConfig` (N3).
-3. ⬜ NOT STARTED — `ReceiverConfig::max_latency` vs adaptation.rs:940 hardcoded 3000 ms (N4).
-4. ⬜ NOT STARTED — `stats_interval_ms` silently rescales all adapter tick-count sustains (N5).
+3. ✅ DONE — `ReceiverConfig::max_latency` vs adaptation.rs:940 hardcoded 3000 ms (N4).
+4. ✅ DONE (documented, not converted) — `stats_interval_ms` silently rescales all adapter tick-count sustains (N5).
 
 Promotion candidates (tunables in behavior, constants in code) — flag only,
 per plan; the config surface is a maintainer decision:
@@ -552,19 +614,25 @@ itself was removed (2026-07-02, PLATFORM_REVIEW.md E5).
 
 ## Suggested landing order
 
-Status as of 2026-07-02 — the actual landing order ended up 1, 2, 4, then
-half of 5 (L6/L8, not N3/N4/N5) landing together (out of the original
-sequence, since they shared files with other in-flight work); 3 and 6 are
-the two big remaining items.
+Status as of 2026-07-02 (updated same day — Batch 2 landed) — the actual
+landing order ended up 1, 2, 4, then half of 5 (L6/L8, not N3/N4/N5)
+landing together (out of the original sequence, since they shared files
+with other in-flight work), then 3 and 6 landed together as Batch 2. Only
+N3 remains unstarted.
 
 1. ✅ DONE — **N1** RSRQ/RSRP bug + **N2** decision on the dead radio feed-forward
    (they're one work item: wire it fixed, or cut it).
 2. ✅ DONE — **L5** delete dead `scheduler/fec.rs`.
-3. ⬜ NOT STARTED — **2.2** adapter decision consolidation (ranked pressures, single commit).
+3. 🟡 PARTIALLY DONE — **2.2** adapter decision consolidation (ranked pressures,
+   single commit). Landed the bookkeeping-centralization half; the full
+   evidence-struct/ranking redesign was deliberately not attempted — see
+   §2.2 above for why.
 4. ✅ DONE — **2.4.1** failover sustain gate.
-5. **L6** ✅ DONE `lower_bound_peak` decay; **L8** ✅ DONE / **N3/N4/N5** ⬜ NOT STARTED — config-vs-hardcode
-   reconciliation (L8 landed with L6 since they share `oracle.rs`/`bonding.rs`; N3/N4/N5 all live in the
-   untouched `adaptation.rs`/`config.rs`, deferred with Batch 2).
-6. ⬜ NOT STARTED — **L3/L4** context-gate and link-melt helper.
-7. Comment/naming pass: **L1** ✅, **L2** ⬜, **L7** ✅, **N6** ✅, **N7** ⬜,
-   **§1b polarity doc** ✅ (docs half only — see §1b status above).
+5. **L6** ✅ DONE `lower_bound_peak` decay; **L8** ✅ DONE; **N4/N5** ✅ DONE;
+   **N3** ⬜ NOT STARTED — config-vs-hardcode reconciliation (L8 landed with
+   L6 since they share `oracle.rs`/`bonding.rs`; N4/N5 landed with Batch 2;
+   N3 is a `config.rs`-only dead-knob deletion, still open).
+6. ✅ DONE — **L3/L4** context-gate and link-melt helper.
+7. Comment/naming pass: **L1** ✅, **L2** ✅, **L7** ✅, **N6** ✅, **N7** ✅,
+   **§1b polarity doc** ✅ (docs half only — see §1b status above, naming
+   pass for the recurring 0.3/0.05/0.2 EWMA pairs still not done).

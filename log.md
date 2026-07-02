@@ -5,6 +5,56 @@ the top. One dated entry per day — enough to reconstruct *why* later.
 
 Format: `## YYYY-MM-DD` heading per day, bullet per entry.
 
+## 2026-07-02 (cont'd — Batch 2 landed)
+
+- Continued [review_findings.md](review_findings.md) implementation:
+  Batch 2 (`adaptation.rs`), done solo rather than via background agent per
+  the plan's own caution (Batch 1.2/1.3 both needed hand-fixing after agent
+  handoff). Two commits, both on `main` directly:
+  - **Phase A** (`b28d983`/`f7ee15c`): L2 (stale α comment), L3 (the
+    `jitter_loss_context` gate was self-confirming — gated on the post-FEC
+    residual, which a pure reorder/late burst inflates in the same window
+    as the signals it's meant to corroborate; now gated on channel-side
+    `max_link_loss` instead, computed once and reused, fixing the
+    pre/post-update duplication too — two new regression tests), L4
+    (extracted `fn link_melting()` for a duplicated loss/queue-depth
+    check), N4 (the `jitter_buffer_ms > 3000` hardcode is now
+    `AdaptationConfig::jitter_buffer_ceiling_ms`, wired from the receiver's
+    real `max_latency` via `sink.rs::apply_config`, which had been
+    silently discarding the parsed `receiver` config section entirely), N5
+    (documented, not converted — the tick-count sustain gates'
+    `stats_interval_ms` coupling; full wall-clock conversion would force
+    a dozen+ existing tests to either sleep for real seconds or special-
+    case a zero-duration override that defeats the "sustained" semantics
+    under test), N7 (`consecutive_increases` doc + named trend-band
+    consts), §2.3 (AIMD asymmetry documented as deliberate design intent
+    with worked recovery numbers), §1c (acknowledged the `drain_factor`/
+    `rtt_bufferbloat_throttle` double-count in a comment), plus a full
+    named-const pass over the remaining `adaptation.rs` §1a magic numbers.
+  - **Phase B** (`97707f9`): §2.2's bookkeeping-centralization half — a
+    `TargetOverride` struct + `apply_target_override` that the three
+    explicit `current_target_kbps`-mutation sites now share, instead of
+    each hand-rolling its own subset of `last_command_time`/
+    `last_increase_time`/`last_burst_time`/`consecutive_*`. Deliberately
+    did NOT attempt the full "collect evidence, rank, commit once"
+    redesign the finding describes — on inspection the three sites are a
+    fixed-order sequential cascade of downward-only refinements, not
+    actual competing alternatives, and forcing that into a strict ranked
+    model risked changing real arbitration behavior in the live encoder
+    loop without field hardware to validate against. 359 `strata-bonding`
+    tests pass **unchanged** through both commits — the actual proof nothing
+    behavioral shifted in Phase B's mechanical extraction.
+  - `mcp__gitnexus__detect_changes` run before each commit; both scoped to
+    exactly the intended files/symbols, "critical" risk reflecting blast
+    radius (the live encoder control loop) not unexpected fallout.
+  - Only **N3** (dead `congestion_headroom_ratio`/`congestion_trigger_ratio`
+    config knobs) remains unstarted in the control-loop audit.
+  - Updated `review_findings.md`'s status markers/tables to match; this
+    entry; `hot.md` refreshed next.
+  - **Remaining**: dashboard WS auth/scoping (E3), platform E9 hygiene
+    pass, then E1 (protocol crate), E2 (state machine + reconciliation),
+    E4 (device identity), E6 (port allocation), E8 (receiver telemetry).
+
 ## 2026-07-02
 
 - Started implementing [review_findings.md](review_findings.md) +
