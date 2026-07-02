@@ -838,7 +838,8 @@ impl BitrateAdapter {
         const COMMAND_COMMIT_PCT: f64 = 0.10;
         let abs_change = (new_target as i64 - self.current_target_kbps as i64).unsigned_abs();
         let pct_change = abs_change as f64 / self.current_target_kbps.max(1) as f64;
-        let target_changed = abs_change > COMMAND_COMMIT_ABS_FLOOR_KBPS && pct_change > COMMAND_COMMIT_PCT;
+        let target_changed =
+            abs_change > COMMAND_COMMIT_ABS_FLOOR_KBPS && pct_change > COMMAND_COMMIT_PCT;
         let interval_ok = self
             .last_command_time
             .is_none_or(|t| t.elapsed() >= self.config.min_interval);
@@ -1122,7 +1123,8 @@ impl BitrateAdapter {
         // Compare smoothed goodput against the PRE-update target since goodput
         // lags the encoder rate by at least one RTT.
         let goodput_shortfall = self.ewma_goodput_bps > 0.0
-            && self.ewma_goodput_bps < target_before_update as f64 * 1000.0 * GOODPUT_SHORTFALL_RATIO;
+            && self.ewma_goodput_bps
+                < target_before_update as f64 * 1000.0 * GOODPUT_SHORTFALL_RATIO;
         // A *severe* shortfall (delivering < 50% of the pre-update rate) is the
         // grace-bypass tier.  Because it compares against the pre-update target,
         // a stale post-increase reading still reflects the OLD rate and can't
