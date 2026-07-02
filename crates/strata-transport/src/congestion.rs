@@ -420,8 +420,7 @@ impl BiscayController {
         if self.delay_grad_ewma > trip {
             // Severity scales with how far past the trip point we are.
             let over = (self.delay_grad_ewma / trip).clamp(1.0, GRAD_SEVERITY_MAX_MULT);
-            let decay =
-                1.0 - GRAD_DECAY_PER_SEVERITY * (over - 1.0).min(GRAD_SEVERITY_DECAY_CAP);
+            let decay = 1.0 - GRAD_DECAY_PER_SEVERITY * (over - 1.0).min(GRAD_SEVERITY_DECAY_CAP);
             self.drain_factor = (self.drain_factor * decay).max(0.5);
         } else if self.delay_grad_ewma < 0.5 * trip {
             // Gradient back near baseline — queue drained, recover.
@@ -650,8 +649,8 @@ impl BiscayController {
         if excess <= 0.0 {
             return false;
         }
-        let trip =
-            (Self::GRAD_TRIP_SIGMA * self.rtt_masd).max(RTPROP_QUEUE_FRACTION_FLOOR * self.rt_prop_us);
+        let trip = (Self::GRAD_TRIP_SIGMA * self.rtt_masd)
+            .max(RTPROP_QUEUE_FRACTION_FLOOR * self.rt_prop_us);
         excess > trip
     }
 
@@ -1014,7 +1013,11 @@ impl BiscayController {
                 // Only apply the UP-probe gain when this link holds the
                 // phase-shifted probe token; otherwise cruise at 1.0× to prevent
                 // simultaneous probing from all bonded links.
-                let gain = if self.probe_allowed { PROBE_UP_GAIN } else { 1.0 };
+                let gain = if self.probe_allowed {
+                    PROBE_UP_GAIN
+                } else {
+                    1.0
+                };
                 self.btl_bw * gain
             }
             BbrPhase::ProbeRtt => {

@@ -1197,8 +1197,7 @@ impl LinkSender for TransportLink {
 
         // Require ≥ 500ms between rate samples to avoid spikes from batch
         // ACKs. This gives a smoother, more accurate delivery rate.
-        let per_link_ack_rate = if interval_us >= PER_LINK_ACK_RATE_MIN_INTERVAL_US && prev_us > 0
-        {
+        let per_link_ack_rate = if interval_us >= PER_LINK_ACK_RATE_MIN_INTERVAL_US && prev_us > 0 {
             // Commit the snapshot for next interval
             self.prev_pkts_acked
                 .store(per_link_ack_bytes, Ordering::Relaxed);
