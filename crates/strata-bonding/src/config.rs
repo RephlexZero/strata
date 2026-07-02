@@ -327,6 +327,14 @@ pub struct SchedulerConfig {
     pub critical_broadcast: bool,
     pub failover_enabled: bool,
     pub failover_duration_ms: u64,
+    /// RTT multiple that triggers the fast-failover broadcast: this tick's
+    /// smoothed RTT vs. the *previous tick's* value
+    /// (`BondingScheduler::check_failover_conditions`). This governs that
+    /// single-tick detector only — it does NOT feed the capacity oracle's
+    /// downshift detector (`CapacityOracle::should_reset`, oracle.rs), which
+    /// hardcodes its own multiple against a slow RTT baseline EWMA on a
+    /// different timescale. The two happen to share the number 3 by
+    /// coincidence; changing this value does not change downshift behavior.
     pub failover_rtt_spike_factor: f64,
     pub congestion_headroom_ratio: f64,
     pub congestion_trigger_ratio: f64,

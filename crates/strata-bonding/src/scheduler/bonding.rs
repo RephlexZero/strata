@@ -24,6 +24,17 @@ use tracing::{debug, error, warn};
 /// against fresh evidence.
 const FAILOVER_BROADCAST_COOLDOWN: Duration = Duration::from_millis(500);
 
+/// Number of consecutive ticks a link's RTT must stay over
+/// `failover_rtt_spike_factor` × its previous smoothed value before the
+/// fast-failover broadcast triggers (§2.4.1). A single-tick threshold fires
+/// on routine cellular jitter (a 20ms→60ms blip is normal), and broadcasting
+/// duplicates every packet to every link for `failover_duration_ms` —
+/// doubling offered load exactly when a link wobbles, the same
+/// self-amplification class as an already-fixed FEC death spiral elsewhere
+/// in this codebase. Requiring sustain filters transient blips while still
+/// reacting quickly to a real handover/route change.
+const RTT_SPIKE_SUSTAIN_TICKS: u32 = 2;
+
 /// Top-level bonding packet scheduler.
 ///
 /// Uses an **Earliest Delivery Path First (EDPF)** scheduler with
@@ -72,6 +83,10 @@ pub struct BondingScheduler<L: LinkSender + ?Sized + 'static> {
     prev_broadcast_active: bool,
     prev_phases: HashMap<usize, crate::net::interface::LinkPhase>,
     prev_rtts: HashMap<usize, f64>,
+    /// Consecutive ticks a link's RTT has been over
+    /// `failover_rtt_spike_factor` × its previous smoothed value. Reset to 0
+    /// the moment a tick isn't a spike. See `RTT_SPIKE_SUSTAIN_TICKS`.
+    rtt_spike_streak: HashMap<usize, u32>,
 
     /// Counter for consecutive all-links-dead failures (for escalation)
     consecutive_dead_count: u64,
@@ -167,6 +182,7 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             prev_broadcast_active: false,
             prev_phases: HashMap::new(),
             prev_rtts: HashMap::new(),
+            rtt_spike_streak: HashMap::new(),
             consecutive_dead_count: 0,
             total_dead_drops: Arc::new(AtomicU64::new(0)),
             probe_owner: None,
@@ -803,16 +819,32 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
                 }
             }
 
-            // Check for RTT spike (>Nx previous smoothed value)
-            if let Some(prev_rtt) = self.prev_rtts.get(id)
-                && m.rtt_ms > prev_rtt * rtt_spike_factor
-                && *prev_rtt > 0.0
-            {
+            // Check for RTT spike (>Nx the last known-good baseline),
+            // sustained for RTT_SPIKE_SUSTAIN_TICKS consecutive ticks. A
+            // single-tick threshold fires on routine cellular jitter (a
+            // 20ms->60ms blip is normal); requiring sustain filters that
+            // while still reacting within RTT_SPIKE_SUSTAIN_TICKS ticks to a
+            // real handover/route change.
+            //
+            // The baseline is frozen at the last non-spike RTT and held
+            // through the whole streak (rather than re-comparing against
+            // last tick's value each time) — a step change to a new, stable,
+            // elevated RTT must count as a sustained spike even though it
+            // isn't still *increasing* tick over tick.
+            let baseline = *self.prev_rtts.get(id).unwrap_or(&m.rtt_ms);
+            let is_spike = baseline > 0.0 && m.rtt_ms > baseline * rtt_spike_factor;
+            let streak = self.rtt_spike_streak.entry(*id).or_insert(0);
+            if is_spike {
+                *streak += 1;
+            } else {
+                *streak = 0;
+                self.prev_rtts.insert(*id, m.rtt_ms);
+            }
+            if *streak >= RTT_SPIKE_SUSTAIN_TICKS {
                 trigger_failover = true;
             }
 
             self.prev_phases.insert(*id, m.phase);
-            self.prev_rtts.insert(*id, m.rtt_ms);
         }
 
         if trigger_failover {
@@ -1462,6 +1494,10 @@ mod tests {
 
     #[test]
     fn test_fast_failover_triggers_on_rtt_spike() {
+        // §2.4.1: the RTT-spike trigger requires RTT_SPIKE_SUSTAIN_TICKS
+        // consecutive spike ticks, not one — a single tick fires on routine
+        // cellular jitter and broadcasting doubles offered load exactly when
+        // a link wobbles.
         let mut scheduler = BondingScheduler::new();
         let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
         scheduler.add_link(l1.clone());
@@ -1472,10 +1508,46 @@ mod tests {
 
         // Simulate RTT spike (>3x previous)
         l1.set_rtt(50.0); // 5x of original
-        scheduler.refresh_metrics();
 
-        // Should trigger failover
-        assert!(scheduler.in_failover_mode());
+        // One spike tick alone must not trigger failover.
+        scheduler.refresh_metrics();
+        assert!(
+            !scheduler.in_failover_mode(),
+            "a single RTT-spike tick must not trigger failover"
+        );
+
+        // A second consecutive spike tick must trigger it.
+        scheduler.refresh_metrics();
+        assert!(
+            scheduler.in_failover_mode(),
+            "two consecutive RTT-spike ticks must trigger failover"
+        );
+    }
+
+    #[test]
+    fn test_fast_failover_rtt_spike_streak_resets_on_normal_tick() {
+        // A spike tick followed by a tick back within the baseline must not
+        // carry the streak forward into a later, unrelated spike tick.
+        let mut scheduler = BondingScheduler::new();
+        let l1 = Arc::new(MockLink::new(1, 10_000_000.0, 10.0));
+        scheduler.add_link(l1.clone());
+
+        scheduler.refresh_metrics(); // baseline: 10ms
+
+        l1.set_rtt(50.0); // spike tick (streak=1)
+        scheduler.refresh_metrics();
+        assert!(!scheduler.in_failover_mode());
+
+        l1.set_rtt(10.0); // back within baseline*factor -> streak resets to 0
+        scheduler.refresh_metrics();
+        assert!(!scheduler.in_failover_mode());
+
+        l1.set_rtt(50.0); // an isolated second spike tick (streak=1 again, not 2)
+        scheduler.refresh_metrics();
+        assert!(
+            !scheduler.in_failover_mode(),
+            "two isolated single-tick spikes separated by a normal tick must not trigger failover"
+        );
     }
 
     #[test]
