@@ -7,6 +7,13 @@
 [review_findings.md](review_findings.md); this document is about the plane
 that starts, stops, observes and configures it.
 
+> **Implementation status (2026-07-02):** E5, E7, and E10 are **done and
+> merged to `main`**. E3 (dashboard WS auth), E9 (timing/jitter hygiene),
+> E1 (protocol crate), E2 (state machine), E4 (device identity), E6 (port
+> allocation), E8 (receiver telemetry) are **not started**. See
+> `.claude/plans/rosy-squishing-treasure.md` for the intended order and
+> notes on why E1/E2/E4 in particular were held back rather than rushed.
+
 ---
 
 ## 0. Verdict
@@ -29,18 +36,20 @@ never established, and every gap below is a symptom of one of them:
    substantially unimplemented: the dashboard WS is unauthenticated and
    unscoped, device-key auth is a TODO, enrollment tokens are permanent
    reusable passwords.
-4. **The plane reaches into the transport's tuning.** The control plane
+4. ✅ FIXED 2026-07-02 (E5) — **The plane reaches into the transport's tuning.** The control plane
    hardcodes a bonding config that silently reverses field-validated
    transport defaults — the exact cross-layer override failure class the
    transport audit keeps finding inside the bonding crate.
 
 None of this needs a rewrite. It needs ~10 deliberate, ordered changes.
+Properties 1-3 (protocol, reconciliation, security) are still unaddressed
+as of 2026-07-02 — see the status markers on E1/E2/E3/E4 below.
 
 ---
 
 ## 1. Executive change list (ranked)
 
-### E1. One protocol crate, one dispatch path
+### E1. ⬜ NOT STARTED — One protocol crate, one dispatch path
 
 Today the protocol lives in three places that can drift independently:
 
@@ -63,7 +72,7 @@ site handles it; dashboard/portal delete `types.rs` and import the crate. Add
 `agent_version`; nothing reads it) — the first schema evolution will otherwise
 be a fleet-wide flag day.
 
-### E2. Reconciliation over guessing: a real stream state machine
+### E2. ⬜ NOT STARTED — Reconciliation over guessing: a real stream state machine
 
 Stream state is mutated by **seven** independent sites, all via raw SQL string
 states: REST start (`'starting'`), first-stats inference (`'starting'→'live'`,
@@ -89,7 +98,7 @@ control plane reconciles — re-adopting streams that are still running,
 ending the ones that aren't — instead of orphan-marking on disconnect.
 WS-drop then only means "unobserved", never "dead".
 
-### E3. Authenticate and scope the dashboard WebSocket
+### E3. ⬜ NOT STARTED — Authenticate and scope the dashboard WebSocket
 
 `GET /ws` ([ws_dashboard.rs](crates/strata-control/src/ws_dashboard.rs)) has
 **no authentication of any kind** — no extractor, no middleware, the handler
@@ -111,7 +120,11 @@ broadcast channels per owner). Also: `CorsLayer::permissive()` and the
 unauthenticated `/metrics` on the same listener deserve a production posture
 decision at the same time.
 
-### E4. Real device identity (the current one is a placeholder in disguise)
+**Status (2026-07-02):** not started — the agent assigned to this made no
+progress before an account-level usage limit cut it off; still fully
+unauthenticated and unscoped on `main` as described above.
+
+### E4. ⬜ NOT STARTED — Real device identity (the current one is a placeholder in disguise)
 
 - Device-key auth is `TODO` on **both** sides ([ws_agent.rs:173](crates/strata-control/src/ws_agent.rs#L173),
   [sender control.rs:130](crates/strata-sender/src/control.rs#L130)); the
@@ -135,7 +148,7 @@ submits its ed25519 public key, and reconnects authenticate by signature
 challenge (the keygen code already exists in `strata-common::auth`). Delete
 the decorative session token or actually use it.
 
-### E5. The control plane must stop overriding transport tuning
+### E5. ✅ DONE — The control plane must stop overriding transport tuning
 
 [streams.rs:226-235](crates/strata-control/src/api/streams.rs#L226) hardcodes
 the `bonding_config` sent with every managed stream:
@@ -162,7 +175,16 @@ override should be a versioned, reviewed artifact (DB row or checked-in file),
 not a `json!` literal in a REST handler. This is the platform-side twin of
 the config-centralization findings in review_findings.md Part 3.
 
-### E6. Per-stream port allocation (make `max_streams` true or delete it)
+**Status (2026-07-02):** done, the "nothing — let defaults rule" half only.
+Deleted the hardcoded `bonding_config` JSON literal and the
+`?buffer=2000` URL override; both now fall through to
+`SchedulerConfig::default()`/`ReceiverConfig`'s tuned values. The "named
+profiles" mechanism itself (a versioned, reviewed way to *explicitly*
+override per-stream) was **not** built — out of scope for a fix, since
+the REST API has no override mechanism to plug into today; that's a
+separate feature if/when it's wanted.
+
+### E6. ⬜ NOT STARTED — Per-stream port allocation (make `max_streams` true or delete it)
 
 `pick_receiver_links` hands **every** stream the receiver's *entire*
 `link_ports` list, and `receiver.stream.start` tells the receiver to bind
@@ -175,33 +197,38 @@ receiver replies with the allocated ports, control forwards them to the
 sender. Until then, set `max_streams = 1` everywhere so the fiction is at
 least consistent.
 
-### E7. Make start/stop transactional sagas (and fix the stop-path orphan)
+### E7. 🟡 PARTIALLY DONE — Make start/stop transactional sagas (and fix the stop-path orphan)
 
 Concrete holes in the current sequences, all confirmed by reading:
 
-- **Stop never notifies the receiver.** `receiver.stream.stop` has a fully
+- ✅ DONE (2026-07-02) — **Stop never notifies the receiver.** `receiver.stream.stop` has a fully
   implemented handler in the receiver daemon and **zero senders** in the
   control plane. Stopping a stream leaves the receiver pipeline running
   (a UDP listener doesn't EOS when the sender stops) and `active_streams`
   is never decremented on the normal path — the capacity-aware assignment
   degrades monotonically until the receiver reconnects.
-- **Start is non-atomic with a partial rollback**: DB insert → receiver
+- ⬜ NOT STARTED — **Start is non-atomic with a partial rollback**: DB insert → receiver
   command → counter increment → agent send; if the agent send fails, the
   rollback marks the row ended but does not stop the receiver or decrement
   the counter.
-- **`active_streams` is a hand-maintained counter** (increment in streams.rs,
+- 🟡 MITIGATED, NOT FIXED — **`active_streams` is a hand-maintained counter** (increment in streams.rs,
   decrement in ws_receiver.rs, reset-to-0 on disconnect) — it will drift;
   it should be `COUNT(*)` over streams, or at least reconciled by E2.
-- **Likely hard bug:** the concurrent-stream guard
+  (Fixing the stop-notify bug above means the decrement handler now
+  actually fires on the normal path, closing the most common drift source
+  — but the counter itself is still hand-maintained, not derived, so E2's
+  reconciliation is still the real fix.)
+- ✅ DONE (2026-07-02) — **Likely hard bug:** the concurrent-stream guard
   ([streams.rs:72-79](crates/strata-control/src/api/streams.rs#L72)) binds
   **two** parameters to a query with **one** placeholder — with sqlx/Postgres
   that's a runtime error on every call, which would 500 every platform
   stream-start. If platform starts currently work, verify why; if they don't,
   this is the smoking gun. Either way the second `.bind` must go.
-- Minor: if a sender reports 0 connected interfaces, `link_count` becomes 0
+  Confirmed it was the smoking gun; regression test added.
+- ✅ DONE (2026-07-02) — Minor: if a sender reports 0 connected interfaces, `link_count` becomes 0
   and the stream starts with an empty destination list — guard it.
 
-### E8. Receiver-side telemetry is discarded — surface it
+### E8. ⬜ NOT STARTED — Receiver-side telemetry is discarded — surface it
 
 `receiver.stream.stats` arrives at the control plane and is **dropped at
 trace level** ([ws_receiver.rs:275-285](crates/strata-control/src/ws_receiver.rs#L275)).
@@ -212,7 +239,7 @@ Add a `DashboardEvent::ReceiverStreamStats` (trivial once E1 lands) and
 render both sides; disagreements between them are exactly the diagnostic the
 field runs keep needing.
 
-### E9. Platform timing/constants hygiene pass
+### E9. ⬜ NOT STARTED — Platform timing/constants hygiene pass
 
 The plane has its own magic-number sprawl, in the same shapes the transport
 audit flagged: heartbeat 10 s (CLI default), reconnect backoff 1→30 s
@@ -227,7 +254,10 @@ no refresh; a broadcast operator mid-stream gets logged out), fallback ports
 module per crate with the same rigor as `net/transport.rs`'s named-const
 block, and add jitter to every reconnect loop.
 
-### E10. Decide what the portal is
+**Status (2026-07-02):** not started — the agent assigned to this made no
+progress before an account-level usage limit cut it off.
+
+### E10. ✅ DONE — Decide what the portal is
 
 `strata-portal` duplicates a third of the dashboard (system stats, interface
 management, enrollment, config) against a *different* API surface
@@ -238,6 +268,16 @@ from E4 and a defined local API contract), or fold its unique pieces
 (enrollment, local diagnostics) into a served-by-the-agent page and retire
 the crate. Keeping both without a decision is how the sbd/Thompson-sampling
 "documented but dead" pattern starts.
+
+**Status (2026-07-02):** decided and done — user chose outright retirement
+(not the fold-into-agent-page option, which would have been a new feature).
+`strata-portal` deleted along with its workspace membership, `portal-dev`
+compose service, and CI step. **Real gap surfaced, not yet decided:**
+`strata-sender/src/portal.rs` (the local HTTP server on `:3001`) served
+this crate's built assets for on-device enrollment/diagnostics and now has
+nothing to serve — it won't crash, but that UI is non-functional until a
+follow-up decision is made (static page, fold into the agent, or
+something else).
 
 ---
 
@@ -274,13 +314,17 @@ work.
 
 ## 3. Suggested sequencing
 
-| Order | Item | Why first |
-|---|---|---|
-| 1 | E7's SQL bind bug + stop-path receiver orphan | small, likely user-visible today |
-| 2 | E3 dashboard WS auth + scoping | exposed surface, small fix |
-| 3 | E1 protocol crate | unblocks E2/E8 cheaply, deletes 41-type copy |
-| 4 | E2 state machine + reconciliation | biggest correctness win |
-| 5 | E5 bonding-profile ownership | protects the transport tuning investment |
-| 6 | E4 device identity | before any real fleet exists |
-| 7 | E6 port allocation | before multi-stream receivers are attempted |
-| 8 | E8, E9, E10 | quality-of-life, in any order |
+Status column added 2026-07-02 — the actual order landed 1 (partially,
+just the SQL bug + orphan, not the rest of E7's sagas), 5, and 8's E10
+only; everything else is unstarted, including E3 despite being ranked #2.
+
+| Status | Order | Item | Why first |
+|---|---|---|---|
+| ✅ DONE (SQL bug + orphan only; rest of E7 open) | 1 | E7's SQL bind bug + stop-path receiver orphan | small, likely user-visible today |
+| ⬜ NOT STARTED | 2 | E3 dashboard WS auth + scoping | exposed surface, small fix |
+| ⬜ NOT STARTED | 3 | E1 protocol crate | unblocks E2/E8 cheaply, deletes 41-type copy |
+| ⬜ NOT STARTED | 4 | E2 state machine + reconciliation | biggest correctness win |
+| ✅ DONE | 5 | E5 bonding-profile ownership | protects the transport tuning investment |
+| ⬜ NOT STARTED | 6 | E4 device identity | before any real fleet exists |
+| ⬜ NOT STARTED | 7 | E6 port allocation | before multi-stream receivers are attempted |
+| 🟡 E10 done, E8/E9 not started | 8 | E8, E9, E10 | quality-of-life, in any order |
