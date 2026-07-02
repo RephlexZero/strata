@@ -9,10 +9,9 @@
 #   cargo build -p strata-agent  && docker compose restart strata-sender-sim
 #   cargo build -p strata-gst    && docker compose restart strata-sender-sim strata-receiver
 #
-# For web development (dashboard / portal) use the hot-reload profile
+# For web development (dashboard) use the hot-reload profile
 # instead — no manual builds or restarts needed:
 #   docker compose --profile web-dev up dashboard-dev
-#   docker compose --profile web-dev up portal-dev
 #
 # The host dev container and the Docker runtime are both Debian 12
 # (bookworm) with identical GStreamer 1.22 packages, so the binaries

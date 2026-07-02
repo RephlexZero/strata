@@ -45,13 +45,11 @@ browser refreshes automatically.
 
 ```bash
 docker compose --profile web-dev up --build dashboard-dev   # :8080
-docker compose --profile web-dev up --build portal-dev      # :8081
 ```
 
 | Dev Server | URL | Proxies to |
 |---|---|---|
 | `dashboard-dev` | http://localhost:8080 | `strata-control:3000` |
-| `portal-dev` | http://localhost:8081 | `strata-sender-sim:3001` |
 
 ## Services
 
@@ -62,7 +60,6 @@ docker compose --profile web-dev up --build portal-dev      # :8081
 | `strata-sender-sim` | 3001 | Simulated sender agent |
 | `strata-receiver` | 5000-5004/udp | Bonded transport receiver |
 | `dashboard-dev` | 8080 | Dashboard hot-reload (profile: web-dev) |
-| `portal-dev` | 8081 | Portal hot-reload (profile: web-dev) |
 
 ## Seed Data
 

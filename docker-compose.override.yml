@@ -24,8 +24,6 @@ services:
       - ./target/debug/strata-pipeline:/usr/local/bin/strata-pipeline:ro
       # GStreamer bonding plugin
       - ./target/debug/libgststrata.so:/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgststrata.so:ro
-      # Portal WASM app (locally built)
-      - ./crates/strata-portal/dist:/app/portal:ro
 
   strata-receiver:
     volumes:
