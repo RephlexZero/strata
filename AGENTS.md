@@ -38,7 +38,7 @@ only when relevant. Keep this file under ~200 lines.
 - `crates/strata-bonding/src/scheduler/oracle.rs` — `CapacityOracle` (PPD-based)
 - `crates/strata-transport/src/congestion.rs` — `BiscayController` (BBR-based)
 - `crates/strata-gst/src/bin/strata_pipeline.rs` — GStreamer sender pipeline construction
-- `crates/strata-bonding/src/config.rs` — `SchedulerConfig` (capacity_floor_bps = 5 Mbps)
+- `crates/strata-bonding/src/config.rs` — `SchedulerConfig` (capacity_floor_bps default = 1.5 Mbps; the control plane no longer overrides this for platform-started streams — PLATFORM_REVIEW.md E5 fixed 2026-07-02)
 
 **Key patterns:**
 - Per-link alive detection: ≥50% loss for 3+ windows → dead

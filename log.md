@@ -5,8 +5,100 @@ the top. One dated entry per day — enough to reconstruct *why* later.
 
 Format: `## YYYY-MM-DD` heading per day, bullet per entry.
 
+## 2026-07-02
+
+- Started implementing [review_findings.md](review_findings.md) +
+  [PLATFORM_REVIEW.md](PLATFORM_REVIEW.md) in full, per plan
+  `rosy-squishing-treasure`. Dispatched 9 parallel worktree-isolated agents
+  for the batch 1-3 items; 6 of 9 produced real work before an account-level
+  usage limit cut them off mid-task (3 — adaptation.rs consolidation,
+  dashboard WS auth, platform E9 hygiene — made zero progress and need
+  redoing). Reviewed, fixed, tested, and merged the 6 landed batches to
+  `main` directly:
+  - **L5**: deleted the entire dead `scheduler/fec.rs` module (RaptorQ/UEP,
+    ~726 lines) — zero external references confirmed.
+  - **L1/N1/N2/N6** (`congestion.rs`): deleted the dead Cautious pacing
+    dampening line; fixed the real RSRQ/RSRP bug (N1 — the PreHandover
+    guard compared RSRP against an RSRQ threshold, always true) with a new
+    `rsrq_history` field and a >=3-sample floor; documented the radio
+    feed-forward's live-caller gap (no modem currently produces real
+    RadioMetrics); fixed two stale drain_factor docs. Caught and fixed a
+    real bug in the agent's own regression tests (letting CQI go flat let
+    the "CQI stable" edge revert Cautious->Normal before the RSRQ guard
+    ever ran).
+  - **L6/L8/§2.4.1** (`oracle.rs`+`bonding.rs`): gave `lower_bound_peak`
+    the same 1%/s decay `peak_estimate` already has (fixes the
+    never-decaying 40%-of-peak floor behind a real "phantom capacity"
+    field incident); documented that the failover RTT-spike detector and
+    the oracle's downshift detector are intentionally independent despite
+    sharing the number 3; required 2 consecutive RTT-spike ticks (not 1)
+    before the failover broadcast fires — finished wiring this myself
+    after the agent left the constant unused.
+  - **N9/L7** (`net/transport.rs`): replaced the far-future-`Instant`
+    probe-feedback sentinel with an explicit `ProbeFeedbackBlock` enum;
+    reworded the token-bucket comment; named the remaining `§1a` magic
+    numbers.
+  - **E5/E7** (`streams.rs`): fixed the concurrent-stream-guard SQL
+    bind-count bug (one placeholder, two binds — likely 500'd every
+    platform stream-start); wired `receiver.stream.stop` on stop (fixes
+    the receiver-pipeline-orphan and `active_streams` drift together);
+    removed the hardcoded `bonding_config` override that force-enabled
+    `redundancy_enabled`/`critical_broadcast` and pinned the floor to
+    5 Mbps against `SchedulerConfig::default()`'s field-tuned values;
+    added a regression test. (Recovered this branch's work after an
+    accidental `git checkout --` briefly wiped it — re-applied from the
+    reviewed diff.)
+  - **E10**: retired `strata-portal` per explicit user decision (invest vs.
+    retire vs. protocol-only migrate vs. skip — user chose retire).
+    Removed the crate, workspace member, `portal-dev` compose service, CI
+    step, and doc references. Flagged a real follow-up gap: `strata-sender`'s
+    local onboarding HTTP server (`portal.rs`, `:3001`) served this crate's
+    build output and now has nothing to serve.
+  - New wiki page [Adaptation-EWMA-Conventions](wiki/Adaptation-EWMA-Conventions.md)
+    (§1b): states the rise-fast/fall-slow-for-capacities vs
+    rise-slow/fall-fast-for-floors polarity rule implicit across the
+    dozen-plus EWMAs in the bonding/transport stack.
+  - Environment note: this sandbox's `RLIMIT_MEMLOCK` (hard-capped 8 MB)
+    intermittently (now persistently) fails 8 `strata-bonding` monoio/
+    io_uring tests with `OS OutOfMemory` — confirmed identical failures on
+    unmodified `main`, unrelated to any of the above. User approved
+    `--no-verify` commits (with the reason noted in each message) rather
+    than blocking on a full-workspace pre-commit hook that can't pass in
+    this sandbox regardless of code correctness.
+  - **Remaining** (not yet done): adaptation.rs §2.2 ranked-decision
+    consolidation + its smaller fixes (L2/L3/L4/N4/N5/N7), dashboard WS
+    auth/scoping (E3), platform E9 hygiene pass, then the larger
+    executive items E1 (protocol crate), E2 (state machine +
+    reconciliation), E4 (device identity), E6 (port allocation), E8
+    (receiver telemetry).
+
 ## 2026-07-01
 
+- Executed [review_plan.md](review_plan.md) in full → [review_findings.md](review_findings.md)
+  (Fable 5, audit only, no code changes). All 8 pre-found leads verified with
+  verdicts; headline new finds: `congestion.rs:853` compares RSRP where the
+  guard means RSRQ (always-true condition), the entire Biscay radio
+  feed-forward has **no live caller** (`notify_rf_metrics` uncalled — the
+  state machine in congestion.rs is dead in production), ALL of
+  `scheduler/fec.rs` (RaptorQ/UEP/GilbertElliott) is dead code (live FEC is
+  RLNC via `set_fec_rate(32, R)`), `congestion_headroom_ratio`/
+  `congestion_trigger_ratio` are dead config knobs, adapter tick-count
+  sustains silently rescale with `stats_interval_ms`, and the failover
+  broadcast triggers off a single RTT sample while the encoder cut needs
+  1.5 s sustain. Suggested landing order at the end of the report.
+- Wrote [PLATFORM_REVIEW.md](PLATFORM_REVIEW.md): top-down architecture
+  review of the management plane + web (control/dashboard/portal/sender/
+  receiver daemons). Ten ranked executive changes (E1–E10). Headliners:
+  dashboard `/ws` is unauthenticated and unscoped (any client gets full
+  fleet telemetry; violates the stated per-owner security model); protocol
+  exists in 3 divergent copies (partial enums, stringly dispatch, 41
+  hand-copied dashboard types); WS-drop is conflated with stream death and
+  there is no state reconciliation; control plane hardcodes a bonding_config
+  that force-enables `redundancy_enabled`+`critical_broadcast` (both
+  default-OFF after field incidents) and pins capacity_floor to 5 Mbps;
+  `receiver.stream.stop` is never sent (stop path orphans receiver
+  pipelines); likely-fatal extra-bind SQL bug in the stream-start
+  concurrency guard; device-key auth is TODO with O(n·argon2) connect scans.
 - Merged `fix/adapt-goodput-not-residual` to `main` (4 commits: FEC sizing on
   channel loss not residual, burst reflex gated on real goodput collapse,
   PAT/PMT mux-bloat fix, HLS egress/discontinuity hardening). All 415 tests

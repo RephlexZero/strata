@@ -8,14 +8,33 @@
 `fix/adapt-goodput-not-residual` **merged to `main`** (2026-07-01): all four
 fixes below, plus HLS egress hardening. 415 tests pass, clippy clean.
 
-Also new: [review_plan.md](review_plan.md) — an audit brief for the incoming
-Fable 5 model to review magic numbers and control-loop structure in the
-adaptation/congestion/oracle/FEC stack. A recon pass already surfaced
-concrete leads (a likely-dead `pacing_rate *= 0.7` in `congestion.rs:845`, a
-stale EWMA comment in `adaptation.rs:524-529`, a surviving `queue_depth >= 60`
-sibling of the already-fixed `>= 90` bug at `adaptation.rs:691`/`:843`, an
-apparently-unwired `GilbertElliott` model in `fec.rs`) — none fixed yet, that
-review is the next real task on this codebase.
+**Both audits (2026-07-01) are now PARTIALLY IMPLEMENTED (2026-07-02, in
+progress) — plan at `.claude/plans/rosy-squishing-treasure.md`.** Landed on
+`main`: L1/L5/L6/L8/N1/N2/N6/N9/L7/§2.4.1 (all of `strata-bonding`/
+`strata-transport`'s congestion.rs/oracle.rs/bonding.rs/transport.rs fixes
+from [review_findings.md](review_findings.md)) plus E5/E7/E10 (SQL bug,
+receiver-stop wiring, bonding-config override removal, portal retirement)
+from [PLATFORM_REVIEW.md](PLATFORM_REVIEW.md). See the 2026-07-02 log entry
+for the full per-item list, plus one real gap it surfaced: `strata-sender`'s
+local onboarding portal (`portal.rs`, :3001) has nothing left to serve now
+that `strata-portal` is retired — needs a follow-up decision.
+
+**Still to do** (see the plan file for scope): `adaptation.rs`'s
+L2/L3/L4/N4/N5/N7 fixes + the §2.2 ranked-decision consolidation (highest
+remaining value, highest risk — the encoder control loop); dashboard WS
+auth/scoping (E3); platform timing/jitter hygiene (E9); then the larger
+executive items in dependency order — E1 (one `strata-protocol` crate,
+unblocks E2/E8), E2 (stream state machine + reconciliation), E4 (device
+identity, kills the O(n·argon2) reconnect-storm risk), E6 (real per-stream
+port allocation), E8 (surface receiver-side telemetry on the dashboard).
+
+**Sandbox note:** this environment's `RLIMIT_MEMLOCK` is hard-capped at
+8 MB, which now persistently fails 8 `strata-bonding` monoio/io_uring tests
+(`OS OutOfMemory`) — confirmed on unmodified `main`, not a regression.
+User approved `--no-verify` commits (reason noted in each message) since
+the full-workspace pre-commit hook can't pass here regardless of code
+correctness; every change was still verified with crate-scoped
+`cargo test`/`clippy` before committing.
 
 **The discontinuity /
 playout-window investigation is RESOLVED — root cause was a single mux constant.**
@@ -125,4 +144,4 @@ override that pinned it is gone — but still needs field confirmation. Watch
 adaptive-redundancy duplication as a wire-overhead contributor when spare is large.
 
 ---
-_Last updated: 2026-07-01 (merge to main + review_plan.md)_
+_Last updated: 2026-07-02 (batch 1-3 fixes landed on main; adaptation.rs consolidation + platform E1-E9 items remain)_
