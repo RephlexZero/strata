@@ -15,8 +15,9 @@ use tower::ServiceExt;
 
 use strata_common::auth::JwtContext;
 
-/// Build a test app with a fresh database pool and return (Router, JwtContext).
-async fn test_app() -> Option<Router> {
+/// Build a fresh `AppState` against a clean test database, or `None` if no
+/// test database is reachable (skips the caller's test).
+async fn test_state() -> Option<strata_control::state::AppState> {
     let db_url = match std::env::var("TEST_DATABASE_URL") {
         Ok(url) => url,
         Err(_) => {
@@ -52,13 +53,32 @@ async fn test_app() -> Option<Router> {
     let _ = sqlx::query("DELETE FROM users").execute(&pool).await;
 
     let (jwt, _seed) = JwtContext::generate();
-    let state = strata_control::state::AppState::new(pool, jwt);
+    Some(strata_control::state::AppState::new(pool, jwt))
+}
 
+/// Build a test app with a fresh database pool and return the Router.
+async fn test_app() -> Option<Router> {
+    let state = test_state().await?;
+    Some(
+        Router::new()
+            .nest("/api", strata_control::api::router())
+            .with_state(state),
+    )
+}
+
+/// Like `test_app`, but also returns the underlying `AppState` (needed to
+/// drive the dashboard broadcast channel directly, and to mount `/ws` for
+/// WebSocket tests).
+async fn test_app_with_state() -> Option<(Router, strata_control::state::AppState)> {
+    let state = test_state().await?;
     let app = Router::new()
         .nest("/api", strata_control::api::router())
-        .with_state(state);
-
-    Some(app)
+        .route(
+            "/ws",
+            axum::routing::get(strata_control::ws_dashboard::handler),
+        )
+        .with_state(state.clone());
+    Some((app, state))
 }
 
 /// Helper: parse JSON response body.
@@ -278,6 +298,43 @@ async fn register_and_login(app: &Router) -> String {
 
     let body = json_body(resp).await;
     body["token"].as_str().unwrap().to_string()
+}
+
+/// Like `register_and_login`, but also returns the new user's ID (needed to
+/// drive `AppState::broadcast_dashboard` directly in WS tests).
+async fn register_and_login_with_id(app: &Router) -> (String, String) {
+    let email = format!("user-{}@test.com", uuid::Uuid::now_v7());
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/auth/register",
+            serde_json::json!({
+                "email": email,
+                "password": "password123"
+            }),
+        ))
+        .await
+        .unwrap();
+    let user_id = json_body(resp).await["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/auth/login",
+            serde_json::json!({
+                "email": email,
+                "password": "password123"
+            }),
+        ))
+        .await
+        .unwrap();
+    let token = json_body(resp).await["token"].as_str().unwrap().to_string();
+
+    (user_id, token)
 }
 
 // ── Sender CRUD Tests ───────────────────────────────────────────────
@@ -650,4 +707,141 @@ async fn users_cannot_see_each_others_senders() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+// ── Dashboard WebSocket: auth + owner scoping (E3) ───────────────────
+
+/// Send the `auth.login` handshake envelope a real dashboard client sends
+/// as its first WS message (see `strata-dashboard/src/ws.rs::
+/// build_auth_message` and `ws_dashboard.rs::authenticate`).
+async fn ws_send_auth(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    token: &str,
+) {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let envelope = serde_json::json!({
+        "id": "test-auth",
+        "type": "auth.login",
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "payload": { "token": token },
+    });
+    ws.send(Message::Text(envelope.to_string().into()))
+        .await
+        .unwrap();
+}
+
+/// Receive the next text message, or `None` if nothing arrives within
+/// `timeout` (used to assert a filtered-out event never shows up).
+async fn ws_recv_json(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    timeout: std::time::Duration,
+) -> Option<serde_json::Value> {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    loop {
+        match tokio::time::timeout(timeout, ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                return Some(serde_json::from_str(&text).unwrap());
+            }
+            Ok(Some(Ok(_))) => continue, // ignore ping/pong/binary
+            Ok(Some(Err(_))) | Ok(None) => return None,
+            Err(_) => return None, // timed out
+        }
+    }
+}
+
+#[tokio::test]
+async fn dashboard_ws_scopes_events_to_owner() {
+    let Some((app, state)) = test_app_with_state().await else {
+        return;
+    };
+
+    let (user_a_id, token_a) = register_and_login_with_id(&app).await;
+    let (user_b_id, _token_b) = register_and_login_with_id(&app).await;
+
+    // Spin up a real TCP listener — WebSocket upgrades need an actual
+    // bidirectional connection, not axum's oneshot tower-service testing.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect dashboard WS");
+    ws_send_auth(&mut ws_a, &token_a).await;
+    let auth_response = ws_recv_json(&mut ws_a, std::time::Duration::from_secs(2))
+        .await
+        .expect("auth.login.response");
+    assert_eq!(auth_response["type"], "auth.login.response");
+    assert_eq!(auth_response["payload"]["success"], true);
+
+    // An event owned by user B must never reach user A's socket.
+    state.broadcast_dashboard(
+        user_b_id.clone(),
+        strata_common::protocol::DashboardEvent::SenderStatus {
+            sender_id: "sender-b".into(),
+            online: true,
+            status: None,
+        },
+    );
+    // An event owned by user A must reach it.
+    state.broadcast_dashboard(
+        user_a_id.clone(),
+        strata_common::protocol::DashboardEvent::SenderStatus {
+            sender_id: "sender-a".into(),
+            online: true,
+            status: None,
+        },
+    );
+
+    let received = ws_recv_json(&mut ws_a, std::time::Duration::from_secs(2))
+        .await
+        .expect("user A's own event");
+    assert_eq!(received["sender_id"], "sender-a");
+
+    // Nothing else should arrive — user B's event must have been filtered,
+    // not merely delayed.
+    let leaked = ws_recv_json(&mut ws_a, std::time::Duration::from_millis(300)).await;
+    assert!(
+        leaked.is_none(),
+        "another owner's event leaked onto this socket: {leaked:?}"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_ws_rejects_invalid_token() {
+    let Some((app, _state)) = test_app_with_state().await else {
+        return;
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect dashboard WS");
+    ws_send_auth(&mut ws, "not-a-real-token").await;
+
+    let response = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
+        .await
+        .expect("auth.login.response");
+    assert_eq!(response["type"], "auth.login.response");
+    assert_eq!(response["payload"]["success"], false);
+
+    // The server closes the connection after rejecting auth.
+    let after = ws_recv_json(&mut ws, std::time::Duration::from_secs(2)).await;
+    assert!(
+        after.is_none(),
+        "expected the socket to close after auth rejection"
+    );
 }

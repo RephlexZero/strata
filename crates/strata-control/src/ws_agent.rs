@@ -35,9 +35,9 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // Wait for the first message — must be auth.login
-    let (sender_id, hostname) = match ws_rx.next().await {
+    let (sender_id, owner_id, hostname) = match ws_rx.next().await {
         Some(Ok(Message::Text(text))) => match authenticate(&state, &text).await {
-            Ok((sid, hostname, response_json)) => {
+            Ok((sid, owner_id, hostname, response_json)) => {
                 if ws_tx
                     .send(Message::Text(response_json.into()))
                     .await
@@ -45,7 +45,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                 {
                     return;
                 }
-                (sid, hostname)
+                (sid, owner_id, hostname)
             }
             Err(err_json) => {
                 let _ = ws_tx.send(Message::Text(err_json.into())).await;
@@ -66,11 +66,14 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
         .insert(sender_id.clone(), AgentHandle { tx, hostname });
 
     // Notify dashboard
-    state.broadcast_dashboard(DashboardEvent::SenderStatus {
-        sender_id: sender_id.clone(),
-        online: true,
-        status: None,
-    });
+    state.broadcast_dashboard(
+        owner_id.clone(),
+        DashboardEvent::SenderStatus {
+            sender_id: sender_id.clone(),
+            online: true,
+            status: None,
+        },
+    );
 
     // Bidirectional message loop
     loop {
@@ -79,7 +82,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_agent_message(&state, &sender_id, &text).await;
+                        handle_agent_message(&state, &sender_id, &owner_id, &text).await;
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(_)) => break,
@@ -105,11 +108,14 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     state.agents().remove(&sender_id);
     state.device_status().remove(&sender_id);
     state.stream_stats().remove(&sender_id);
-    state.broadcast_dashboard(DashboardEvent::SenderStatus {
-        sender_id: sender_id.clone(),
-        online: false,
-        status: None,
-    });
+    state.broadcast_dashboard(
+        owner_id.clone(),
+        DashboardEvent::SenderStatus {
+            sender_id: sender_id.clone(),
+            online: false,
+            status: None,
+        },
+    );
 
     // Transition any active streams to 'ended' — the agent is gone so they
     // are definitely not running any more.
@@ -126,12 +132,15 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 
     for (stream_id,) in &orphaned {
         state.live_streams().remove(stream_id);
-        state.broadcast_dashboard(DashboardEvent::StreamStateChanged {
-            stream_id: stream_id.clone(),
-            sender_id: sender_id.clone(),
-            state: strata_common::models::StreamState::Ended,
-            error: Some("agent disconnected".into()),
-        });
+        state.broadcast_dashboard(
+            owner_id.clone(),
+            DashboardEvent::StreamStateChanged {
+                stream_id: stream_id.clone(),
+                sender_id: sender_id.clone(),
+                state: strata_common::models::StreamState::Ended,
+                error: Some("agent disconnected".into()),
+            },
+        );
     }
     if !orphaned.is_empty() {
         tracing::warn!(sender_id = %sender_id, count = orphaned.len(), "cleaned up orphaned streams");
@@ -148,11 +157,11 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 }
 
 /// Authenticate the agent from the first message.
-/// Returns `Ok((sender_id, response_json))` on success.
+/// Returns `Ok((sender_id, owner_id, hostname, response_json))` on success.
 async fn authenticate(
     state: &AppState,
     raw: &str,
-) -> Result<(String, Option<String>, String), String> {
+) -> Result<(String, String, Option<String>, String), String> {
     // Parse envelope
     let envelope: Envelope =
         serde_json::from_str(raw).map_err(|e| error_response(&format!("invalid message: {e}")))?;
@@ -183,7 +192,7 @@ async fn authenticate_enrollment(
     state: &AppState,
     token: &str,
     payload: &AuthLoginPayload,
-) -> Result<(String, Option<String>, String), String> {
+) -> Result<(String, String, Option<String>, String), String> {
     // Find senders with enrollment tokens.
     // Include already-enrolled senders so agents can reconnect after
     // a restart without requiring a separate device_key auth flow.
@@ -233,7 +242,12 @@ async fn authenticate_enrollment(
 
             tracing::info!(sender_id = %sender_id, hostname = %payload.hostname, "sender enrolled");
 
-            return Ok((sender_id.clone(), Some(payload.hostname.clone()), json));
+            return Ok((
+                sender_id.clone(),
+                owner_id.clone(),
+                Some(payload.hostname.clone()),
+                json,
+            ));
         }
     }
 
@@ -241,7 +255,7 @@ async fn authenticate_enrollment(
 }
 
 /// Handle an incoming message from an authenticated agent.
-async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
+async fn handle_agent_message(state: &AppState, sender_id: &str, owner_id: &str, raw: &str) {
     let envelope: Envelope = match serde_json::from_str(raw) {
         Ok(e) => e,
         Err(e) => {
@@ -266,11 +280,14 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
                     .insert(sender_id.to_string(), payload.clone());
 
                 // Broadcast to dashboard
-                state.broadcast_dashboard(DashboardEvent::SenderStatus {
-                    sender_id: sender_id.to_string(),
-                    online: true,
-                    status: Some(payload),
-                });
+                state.broadcast_dashboard(
+                    owner_id,
+                    DashboardEvent::SenderStatus {
+                        sender_id: sender_id.to_string(),
+                        online: true,
+                        status: Some(payload),
+                    },
+                );
             }
         }
         "stream.stats" => {
@@ -294,16 +311,19 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
 
                     // Only broadcast state change on the actual transition
                     if rows.as_ref().map(|r| r.rows_affected()).unwrap_or(0) > 0 {
-                        state.broadcast_dashboard(DashboardEvent::StreamStateChanged {
-                            stream_id: payload.stream_id.clone(),
-                            sender_id: sender_id.to_string(),
-                            state: strata_common::models::StreamState::Live,
-                            error: None,
-                        });
+                        state.broadcast_dashboard(
+                            owner_id,
+                            DashboardEvent::StreamStateChanged {
+                                stream_id: payload.stream_id.clone(),
+                                sender_id: sender_id.to_string(),
+                                state: strata_common::models::StreamState::Live,
+                                error: None,
+                            },
+                        );
                     }
                 }
 
-                state.broadcast_dashboard(DashboardEvent::StreamStats(payload.clone()));
+                state.broadcast_dashboard(owner_id, DashboardEvent::StreamStats(payload.clone()));
 
                 // Cache latest stats for the /metrics endpoint
                 state.stream_stats().insert(sender_id.to_string(), payload);
@@ -324,12 +344,15 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, raw: &str) {
                 .execute(state.pool())
                 .await;
 
-                state.broadcast_dashboard(DashboardEvent::StreamStateChanged {
-                    stream_id: payload.stream_id,
-                    sender_id: sender_id.to_string(),
-                    state: strata_common::models::StreamState::Ended,
-                    error: None,
-                });
+                state.broadcast_dashboard(
+                    owner_id,
+                    DashboardEvent::StreamStateChanged {
+                        stream_id: payload.stream_id,
+                        sender_id: sender_id.to_string(),
+                        state: strata_common::models::StreamState::Ended,
+                        error: None,
+                    },
+                );
             }
         }
         // Route request-response messages back to pending callers

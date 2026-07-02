@@ -26,8 +26,10 @@ struct Inner {
     pub device_status: DashMap<String, DeviceStatusPayload>,
     /// Pending request-response calls to agents, keyed by request_id.
     pub pending_requests: DashMap<String, oneshot::Sender<serde_json::Value>>,
-    /// Broadcast channel for dashboard WebSocket subscribers.
-    pub dashboard_tx: broadcast::Sender<DashboardEvent>,
+    /// Broadcast channel for dashboard WebSocket subscribers, tagged with
+    /// the owning user's ID so each subscriber can filter to only their own
+    /// resources (see `broadcast_dashboard`/`subscribe_dashboard`).
+    pub dashboard_tx: broadcast::Sender<(String, DashboardEvent)>,
     /// Streams that have already transitioned to 'live' (avoids repeated
     /// UPDATE queries on every stats tick).
     pub live_streams: DashSet<String>,
@@ -127,14 +129,20 @@ impl AppState {
         &self.inner.receiver_status
     }
 
-    /// Broadcast a dashboard event to all subscribed browsers.
-    pub fn broadcast_dashboard(&self, event: DashboardEvent) {
+    /// Broadcast a dashboard event to all subscribed browsers, tagged with
+    /// the ID of the user who owns the sender/receiver/stream it concerns.
+    /// Subscribers filter to their own `owner_id` (see `ws_dashboard.rs`) —
+    /// the channel itself is still global, but nothing is delivered across
+    /// owners.
+    pub fn broadcast_dashboard(&self, owner_id: impl Into<String>, event: DashboardEvent) {
         // Ignore send errors (no subscribers).
-        let _ = self.inner.dashboard_tx.send(event);
+        let _ = self.inner.dashboard_tx.send((owner_id.into(), event));
     }
 
-    /// Subscribe to dashboard events (returns a receiver).
-    pub fn subscribe_dashboard(&self) -> broadcast::Receiver<DashboardEvent> {
+    /// Subscribe to dashboard events (returns a receiver). Each item is
+    /// `(owner_id, event)` — the receiver must filter to the connected
+    /// user's own `owner_id` before forwarding to the browser.
+    pub fn subscribe_dashboard(&self) -> broadcast::Receiver<(String, DashboardEvent)> {
         self.inner.dashboard_tx.subscribe()
     }
 }

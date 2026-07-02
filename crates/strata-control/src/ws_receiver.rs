@@ -33,9 +33,9 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // Wait for the first message — must be auth.login
-    let (receiver_id, hostname) = match ws_rx.next().await {
+    let (receiver_id, owner_id, hostname) = match ws_rx.next().await {
         Some(Ok(Message::Text(text))) => match authenticate(&state, &text).await {
-            Ok((rid, hostname, response_json)) => {
+            Ok((rid, owner_id, hostname, response_json)) => {
                 if ws_tx
                     .send(Message::Text(response_json.into()))
                     .await
@@ -43,7 +43,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                 {
                     return;
                 }
-                (rid, hostname)
+                (rid, owner_id, hostname)
             }
             Err(err_json) => {
                 let _ = ws_tx.send(Message::Text(err_json.into())).await;
@@ -124,12 +124,18 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 
     for (stream_id, sender_id) in &orphaned {
         state.live_streams().remove(stream_id);
-        state.broadcast_dashboard(DashboardEvent::StreamStateChanged {
-            stream_id: stream_id.clone(),
-            sender_id: sender_id.clone(),
-            state: strata_common::models::StreamState::Ended,
-            error: Some("receiver disconnected".into()),
-        });
+        // A stream's receiver is only ever picked from the same owner as its
+        // sender (see `pick_receiver_links` in api/streams.rs), so this
+        // receiver's own owner_id is the correct scope for its streams.
+        state.broadcast_dashboard(
+            owner_id.clone(),
+            DashboardEvent::StreamStateChanged {
+                stream_id: stream_id.clone(),
+                sender_id: sender_id.clone(),
+                state: strata_common::models::StreamState::Ended,
+                error: Some("receiver disconnected".into()),
+            },
+        );
     }
     if !orphaned.is_empty() {
         tracing::warn!(
@@ -146,7 +152,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 async fn authenticate(
     state: &AppState,
     raw: &str,
-) -> Result<(String, Option<String>, String), String> {
+) -> Result<(String, String, Option<String>, String), String> {
     let envelope: Envelope =
         serde_json::from_str(raw).map_err(|e| error_response(&format!("invalid message: {e}")))?;
 
@@ -172,7 +178,7 @@ async fn authenticate_enrollment(
     state: &AppState,
     token: &str,
     payload: &ReceiverAuthLoginPayload,
-) -> Result<(String, Option<String>, String), String> {
+) -> Result<(String, String, Option<String>, String), String> {
     let rows = sqlx::query_as::<_, (String, String, String)>(
         "SELECT id, owner_id, enrollment_token FROM receivers WHERE enrollment_token IS NOT NULL",
     )
@@ -238,7 +244,12 @@ async fn authenticate_enrollment(
                 "receiver enrolled"
             );
 
-            return Ok((receiver_id.clone(), Some(payload.hostname.clone()), json));
+            return Ok((
+                receiver_id.clone(),
+                owner_id.clone(),
+                Some(payload.hostname.clone()),
+                json,
+            ));
         }
     }
 

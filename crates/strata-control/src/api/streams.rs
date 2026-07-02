@@ -306,6 +306,7 @@ async fn start_stream(
 
     // Notify dashboard
     state.broadcast_dashboard(
+        user.user_id.clone(),
         strata_common::protocol::DashboardEvent::StreamStateChanged {
             stream_id: stream_id.clone(),
             sender_id: sender_id.clone(),
@@ -384,6 +385,7 @@ async fn stop_stream(
 
     // Notify dashboard
     state.broadcast_dashboard(
+        user.user_id.clone(),
         strata_common::protocol::DashboardEvent::StreamStateChanged {
             stream_id: stream_id.clone(),
             sender_id: sender_id.clone(),
@@ -398,6 +400,7 @@ async fn stop_stream(
         let state = state.clone();
         let stream_id = stream_id.clone();
         let sender_id = sender_id.clone();
+        let owner_id = user.user_id.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             let result = sqlx::query(
@@ -410,6 +413,7 @@ async fn stop_stream(
             if result.as_ref().map(|r| r.rows_affected()).unwrap_or(0) > 0 {
                 state.live_streams().remove(&stream_id);
                 state.broadcast_dashboard(
+                    owner_id,
                     strata_common::protocol::DashboardEvent::StreamStateChanged {
                         stream_id,
                         sender_id,

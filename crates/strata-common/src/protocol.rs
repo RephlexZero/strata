@@ -171,6 +171,21 @@ pub struct AuthLoginResponsePayload {
     pub error: Option<String>,
 }
 
+/// First message a dashboard (browser) WebSocket client must send on
+/// `/ws` to authenticate — mirrors the agent/receiver `auth.login`
+/// handshake rather than the previous (unread) `?token=` query param,
+/// since tokens in URLs end up in proxy/access logs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardAuthPayload {
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardAuthResponsePayload {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamStartPayload {
     pub stream_id: String,
