@@ -10,7 +10,6 @@ members = [
     "crates/strata-sender",
     "crates/strata-receiver",
     "crates/strata-dashboard",
-    "crates/strata-portal",
 ]
 exclude = ["crates/strata-transport/fuzz"]
 

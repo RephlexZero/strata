@@ -52,7 +52,6 @@ jobs:
         run: |
           cargo check \
             -p strata-dashboard \
-            -p strata-portal \
             --target wasm32-unknown-unknown
 
   # ── Tests ───────────────────────────────────────────────────
