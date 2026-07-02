@@ -195,6 +195,10 @@ pub struct BiscayController {
     cqi_history: VecDeque<(Instant, u8)>,
     /// RSRP history for slope tracking.
     rsrp_history: VecDeque<(Instant, f64)>,
+    /// RSRQ history — level-only guard for the Cautious→PreHandover edge
+    /// (RSRQ is noisier and lower-resolution than RSRP, so we don't slope
+    /// it, just require a few samples before trusting the latest reading).
+    rsrq_history: VecDeque<(Instant, f64)>,
     /// SINR → capacity ceiling (kbps).
     sinr_capacity_ceiling: Option<f64>,
     /// Number of consecutive CQI drops.
@@ -209,7 +213,7 @@ pub struct BiscayController {
 
     // ─── Bufferbloat drain ───
     /// Multiplicative factor applied to pacing rate when bufferbloat is
-    /// detected (RTT >> RTprop). Decays toward 0.1 on bloat, recovers
+    /// detected (RTT >> RTprop). Decays toward 0.5 on bloat, recovers
     /// toward 1.0 when RTT normalises. Persists across `update_pacing_rate`
     /// calls so the reduction actually sticks.
     drain_factor: f64,
@@ -248,6 +252,59 @@ pub struct BiscayController {
     last_grad_tick: Instant,
 }
 
+// ─── Tuning Constants ───────────────────────────────────────────────────────
+
+/// Floor for the delay-gradient/queue-building trip point, expressed as a
+/// fraction of the link's own windowed-min RTprop. Path-relative "meaningful
+/// standing queue" unit shared by `on_delay_gradient_us` and
+/// `queue_building()` — without it an ultra-smooth link's near-zero jitter
+/// would make the trip hair-trigger.
+const RTPROP_QUEUE_FRACTION_FLOOR: f64 = 0.05;
+
+/// Clamp on how far past its trip point the delay gradient is allowed to
+/// scale the drain-severity multiplier in `on_delay_gradient_us`. Bounds a
+/// single extreme sample from collapsing `drain_factor` to its floor in one
+/// step.
+const GRAD_SEVERITY_MAX_MULT: f64 = 8.0;
+
+/// `drain_factor` decay applied per unit of gradient severity beyond the
+/// trip point (see `GRAD_SEVERITY_MAX_MULT`). Same numeric value as
+/// `RTPROP_QUEUE_FRACTION_FLOOR` but a distinct, unrelated tuning — do not
+/// merge the two.
+const GRAD_DECAY_PER_SEVERITY: f64 = 0.05;
+
+/// Cap on the severity term (`over − 1.0`) before it's multiplied by
+/// `GRAD_DECAY_PER_SEVERITY`, bounding the maximum single-tick decay of
+/// `drain_factor` from the delay-gradient signal.
+const GRAD_SEVERITY_DECAY_CAP: f64 = 3.0;
+
+/// ProbeBw UP-phase pacing gain applied when this link holds the
+/// phase-shifted probe token (measures spare capacity above `btl_bw`).
+const PROBE_UP_GAIN: f64 = 1.25;
+
+/// Fraction of `btl_bw` paced during the ProbeRtt drain — deliberately
+/// minimal so RTprop can be re-measured off an un-bloated queue.
+const PROBE_RTT_PACING_GAIN: f64 = 0.5;
+
+/// Pacing-rate multiplier applied in the Cautious radio state (~30%
+/// proactive reduction while CQI is dropping).
+const CAUTIOUS_PACING_GAIN: f64 = 0.7;
+
+/// Pacing-rate multiplier applied in the PreHandover radio state — minimal,
+/// drain-only sending while the link prepares for a cellular handover.
+const PRE_HANDOVER_PACING_GAIN: f64 = 0.1;
+
+/// Typical single-packet payload size (bytes) assumed when sizing the
+/// minimum congestion window below. Not a protocol limit (see
+/// `wire::MAX_PAYLOAD_LEN`) — just the conventional MTU-minus-headers packet
+/// size used to express "a couple of packets" as a byte floor.
+const TYPICAL_PACKET_BYTES: f64 = 1400.0;
+
+/// Minimum congestion window (bytes): two packets. `cwnd` must never
+/// collapse below this even when a tiny BDP is computed, so the ACK clock
+/// keeps ticking.
+const MIN_CWND_BYTES: f64 = 2.0 * TYPICAL_PACKET_BYTES;
+
 impl BiscayController {
     /// Create a new controller with default parameters.
     pub fn new() -> Self {
@@ -274,6 +331,7 @@ impl BiscayController {
 
             cqi_history: VecDeque::with_capacity(16),
             rsrp_history: VecDeque::with_capacity(16),
+            rsrq_history: VecDeque::with_capacity(16),
             sinr_capacity_ceiling: None,
             consecutive_cqi_drops: 0,
 
@@ -357,11 +415,13 @@ impl BiscayController {
 
         // Trip point: max(kσ of this link's gradient jitter, 5% of its
         // own RTprop). Both terms are path-relative — no absolute constant.
-        let trip = (Self::GRAD_TRIP_SIGMA * self.delay_grad_jitter).max(0.05 * self.rt_prop_us);
+        let trip = (Self::GRAD_TRIP_SIGMA * self.delay_grad_jitter)
+            .max(RTPROP_QUEUE_FRACTION_FLOOR * self.rt_prop_us);
         if self.delay_grad_ewma > trip {
             // Severity scales with how far past the trip point we are.
-            let over = (self.delay_grad_ewma / trip).clamp(1.0, 8.0);
-            let decay = 1.0 - 0.05 * (over - 1.0).min(3.0);
+            let over = (self.delay_grad_ewma / trip).clamp(1.0, GRAD_SEVERITY_MAX_MULT);
+            let decay =
+                1.0 - GRAD_DECAY_PER_SEVERITY * (over - 1.0).min(GRAD_SEVERITY_DECAY_CAP);
             self.drain_factor = (self.drain_factor * decay).max(0.5);
         } else if self.delay_grad_ewma < 0.5 * trip {
             // Gradient back near baseline — queue drained, recover.
@@ -519,7 +579,7 @@ impl BiscayController {
         self.cwnd
     }
 
-    /// Get the bufferbloat drain factor (0.2–1.0).
+    /// Get the bufferbloat drain factor (0.5–1.0).
     pub fn drain_factor(&self) -> f64 {
         self.drain_factor
     }
@@ -590,7 +650,8 @@ impl BiscayController {
         if excess <= 0.0 {
             return false;
         }
-        let trip = (Self::GRAD_TRIP_SIGMA * self.rtt_masd).max(0.05 * self.rt_prop_us);
+        let trip =
+            (Self::GRAD_TRIP_SIGMA * self.rtt_masd).max(RTPROP_QUEUE_FRACTION_FLOOR * self.rt_prop_us);
         excess > trip
     }
 
@@ -798,6 +859,17 @@ impl BiscayController {
     // ─── Radio feed-forward ─────────────────────────────────────────────
 
     /// Update with new radio metrics from the modem supervisor.
+    ///
+    /// No live caller yet: the Normal/Cautious/PreHandover state machine
+    /// this drives is wired up end-to-end
+    /// (`BondingScheduler::notify_rf_metrics` →
+    /// `LinkSender::on_rf_metrics` → here), but nothing in the codebase
+    /// currently produces real `RadioMetrics` — the only USB modems in use
+    /// run NCM/ECM mode with no QMI/MBIM metric interface (see
+    /// `strata-bonding/src/modem/health.rs`), so `notify_rf_metrics` has
+    /// zero callers in production. This method is exercised only by unit
+    /// tests today; it's a deliberate integration seam for a future
+    /// QMI/MBIM-capable modem poller, not dead code to remove.
     pub fn on_radio_metrics(&mut self, metrics: &RadioMetrics) {
         let now = Instant::now();
 
@@ -827,6 +899,12 @@ impl BiscayController {
             self.rsrp_history.pop_front();
         }
 
+        // RSRQ level tracking (PreHandover guard — see evaluate_state_transition)
+        self.rsrq_history.push_back((now, metrics.rsrq_db));
+        if self.rsrq_history.len() > 16 {
+            self.rsrq_history.pop_front();
+        }
+
         // Evaluate state transitions
         self.evaluate_state_transition();
 
@@ -842,16 +920,26 @@ impl BiscayController {
                 // CQI dropping for 3+ readings → CAUTIOUS
                 if self.consecutive_cqi_drops >= 3 {
                     self.state = BiscayState::Cautious;
-                    self.pacing_rate *= 0.7; // 30% reduction
+                    // `update_pacing_rate()` (called unconditionally right
+                    // after `evaluate_state_transition()` in
+                    // `on_radio_metrics`) rebuilds `pacing_rate` from
+                    // scratch and applies its own Cautious ×0.7 dampening —
+                    // writing it here too was a double-application that
+                    // only survived when `update_pacing_rate` early-returns
+                    // (SlowStart with `btl_bw <= 0`).
                 }
             }
             BiscayState::Cautious => {
-                // RSRP slope < -2.5 dB/s AND RSRQ < -12 → PRE_HANDOVER
+                // RSRP slope < -2.5 dB/s AND RSRQ < -12 dB → PRE_HANDOVER.
+                // Requires >= 3 RSRQ samples: a 2-sample level read is too
+                // noisy to gate a transition this disruptive (PreHandover
+                // forces pacing x0.1 and a full BBR reset on exit).
                 let rsrp_slope = self.rsrp_slope_db_per_sec();
-                let latest_rsrp = self.rsrp_history.back().map(|(_, v)| *v).unwrap_or(0.0);
-
-                if rsrp_slope < -2.5 && latest_rsrp < -12.0 {
-                    self.state = BiscayState::PreHandover;
+                if rsrp_slope < -2.5 && self.rsrq_history.len() >= 3 {
+                    let latest_rsrq = self.rsrq_history.back().map(|(_, v)| *v).unwrap_or(0.0);
+                    if latest_rsrq < -12.0 {
+                        self.state = BiscayState::PreHandover;
+                    }
                 }
 
                 // CQI stable (no drops for 3 readings) → NORMAL
@@ -923,22 +1011,22 @@ impl BiscayController {
             }
             BbrPhase::ProbeBw => {
                 // Pacing rate = BtlBw × pacing_gain.
-                // Only apply the UP-probe gain (1.25×) when this link holds the
+                // Only apply the UP-probe gain when this link holds the
                 // phase-shifted probe token; otherwise cruise at 1.0× to prevent
                 // simultaneous probing from all bonded links.
-                let gain = if self.probe_allowed { 1.25 } else { 1.0 };
+                let gain = if self.probe_allowed { PROBE_UP_GAIN } else { 1.0 };
                 self.btl_bw * gain
             }
             BbrPhase::ProbeRtt => {
                 // Minimal sending during RTT probe
-                self.btl_bw * 0.5
+                self.btl_bw * PROBE_RTT_PACING_GAIN
             }
         };
 
         // Apply radio-aware state dampening
         match self.state {
-            BiscayState::Cautious => rate *= 0.7,
-            BiscayState::PreHandover => rate *= 0.1, // minimal — drain only
+            BiscayState::Cautious => rate *= CAUTIOUS_PACING_GAIN,
+            BiscayState::PreHandover => rate *= PRE_HANDOVER_PACING_GAIN, // minimal — drain only
             BiscayState::Normal => {}
         }
 
@@ -958,7 +1046,7 @@ impl BiscayController {
         if self.btl_bw > 0.0 && self.rt_prop_us < f64::MAX {
             self.cwnd = self.btl_bw * (self.rt_prop_us / 1_000_000.0);
             // Minimum cwnd: 2 packets
-            self.cwnd = self.cwnd.max(2800.0);
+            self.cwnd = self.cwnd.max(MIN_CWND_BYTES);
         }
 
         debug!(
@@ -1117,6 +1205,117 @@ mod tests {
             "Cautious state should reduce pacing rate: {} vs {}",
             cc.pacing_rate(),
             rate_before_cautious
+        );
+    }
+
+    // ─── N1: PreHandover guard must gate on RSRQ, not RSRP level ────────
+    //
+    // Regression for a bug where the Cautious→PreHandover guard read
+    // `latest_rsrp < -12.0` — RSRP is dBm (typically -70 to -120 on any
+    // attached LTE modem), so that comparison was always true, meaning
+    // PreHandover fired on RSRP slope alone. The comment always said RSRQ
+    // (dB, typically -3 to -20); the code just tested the wrong field.
+
+    #[test]
+    fn prehandover_guard_checks_rsrq_not_rsrp_level() {
+        let mut cc = BiscayController::new();
+        // Drive into Cautious via CQI drops.
+        for cqi in [15, 12, 10, 8u8] {
+            cc.on_radio_metrics(&RadioMetrics {
+                cqi,
+                sinr_db: 10.0,
+                rsrp_dbm: -80.0,
+                rsrq_db: -6.0, // healthy RSRQ throughout
+                timestamp: Some(Instant::now()),
+            });
+        }
+        assert_eq!(cc.state, BiscayState::Cautious);
+
+        // Give the RSRQ guard its >= 3 samples, all healthy. CQI must keep
+        // dropping (not go flat) or `consecutive_cqi_drops` resets to 0 and
+        // the "CQI stable for 3 readings" edge reverts us straight back to
+        // Normal before the RSRQ guard ever runs.
+        for cqi in [7u8, 6, 5] {
+            cc.on_radio_metrics(&RadioMetrics {
+                cqi,
+                sinr_db: 10.0,
+                rsrp_dbm: -80.0,
+                rsrq_db: -6.0,
+                timestamp: Some(Instant::now()),
+            });
+        }
+        assert_eq!(cc.state, BiscayState::Cautious, "sanity: still Cautious");
+
+        // Force a deterministic, steep RSRP slope (well past -2.5 dB/s) by
+        // rewriting the oldest history entry's timestamp/value — same
+        // technique the windowed-min RTprop test above uses.
+        let oldest = cc.rsrp_history.front_mut().unwrap();
+        oldest.0 = Instant::now() - Duration::from_secs(1);
+        oldest.1 = -60.0;
+
+        // RSRQ stays healthy (-6 dB) even though RSRP is now crashing.
+        cc.on_radio_metrics(&RadioMetrics {
+            cqi: 4,
+            sinr_db: 10.0,
+            rsrp_dbm: -90.0, // ~ -30 dB/s slope vs the rewritten oldest sample
+            rsrq_db: -6.0,
+            timestamp: Some(Instant::now()),
+        });
+
+        assert_eq!(
+            cc.state,
+            BiscayState::Cautious,
+            "healthy RSRQ must veto PreHandover even with a steep RSRP slope \
+             (pre-fix this compared -6.0 dB as if it were RSRP — always \
+             < -12.0 — so it always fired)"
+        );
+    }
+
+    #[test]
+    fn prehandover_triggers_on_steep_slope_and_bad_rsrq() {
+        let mut cc = BiscayController::new();
+        for cqi in [15, 12, 10, 8u8] {
+            cc.on_radio_metrics(&RadioMetrics {
+                cqi,
+                sinr_db: 10.0,
+                rsrp_dbm: -80.0,
+                rsrq_db: -14.0, // genuinely bad RSRQ throughout
+                timestamp: Some(Instant::now()),
+            });
+        }
+        assert_eq!(cc.state, BiscayState::Cautious);
+
+        // CQI must keep dropping here too, for the same reason as the test
+        // above — otherwise the "CQI stable for 3 readings" edge reverts us
+        // to Normal before the RSRQ guard runs.
+        for cqi in [7u8, 6, 5] {
+            cc.on_radio_metrics(&RadioMetrics {
+                cqi,
+                sinr_db: 10.0,
+                rsrp_dbm: -80.0,
+                rsrq_db: -14.0,
+                timestamp: Some(Instant::now()),
+            });
+        }
+        assert_eq!(cc.state, BiscayState::Cautious, "sanity: still Cautious");
+
+        let oldest = cc.rsrp_history.front_mut().unwrap();
+        oldest.0 = Instant::now() - Duration::from_secs(1);
+        oldest.1 = -60.0;
+
+        cc.on_radio_metrics(&RadioMetrics {
+            cqi: 4,
+            sinr_db: 10.0,
+            rsrp_dbm: -95.0,
+            rsrq_db: -14.0,
+            timestamp: Some(Instant::now()),
+        });
+
+        assert_eq!(
+            cc.state,
+            BiscayState::PreHandover,
+            "steep RSRP slope + genuinely bad RSRQ (< -12 dB) with >= 3 \
+             samples must trigger PreHandover"
         );
     }
 
