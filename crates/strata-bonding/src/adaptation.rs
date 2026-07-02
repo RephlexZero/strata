@@ -36,8 +36,18 @@ pub struct AdaptationConfig {
     /// Default: 0.15 (15% headroom for FEC + control overhead).
     pub headroom: f64,
     /// How quickly to ramp up after recovery (kbps per step).
+    ///
+    /// Deliberately additive-up / multiplicative-down (AIMD-shaped): "recover
+    /// cautiously, cut decisively". With the defaults (250 kbps/step,
+    /// ramp_down_factor 0.7), a single 3 Mbps → 2.1 Mbps cut is instant, but
+    /// climbing back to 3 Mbps takes ~4 ticks (~4 s) if gates stay open the
+    /// whole time; a collapse to the 500 kbps floor takes ~10 s of clean
+    /// ticks. Recovery time is linear in the size of the gap the cut left —
+    /// this is the field-visible "slow climb after every dip" pattern, and
+    /// it is intentional, not an accident of the two knobs' values.
     pub ramp_up_kbps_per_step: u32,
     /// How quickly to ramp down on congestion (multiplier, e.g., 0.7 = 30% cut).
+    /// See the asymmetry note on [`AdaptationConfig::ramp_up_kbps_per_step`].
     pub ramp_down_factor: f64,
     /// Minimum interval between bitrate commands.
     pub min_interval: Duration,
@@ -78,6 +88,16 @@ pub struct AdaptationConfig {
     /// Bitrate (kbps) the startup ramp begins at. Clamped at runtime to
     /// `>= min_bitrate_kbps` and `<= initial_bitrate_kbps`.
     pub startup_floor_kbps: u32,
+    /// Receiver's playout-window ceiling (ms) — mirrors
+    /// `ReceiverConfig::max_latency`. The delay-pressure arm treats a jitter
+    /// buffer beyond this as overflow. Sender and receiver are separate
+    /// processes with independently-set configs, so this must be sourced
+    /// from the same config the receiver actually uses (see call sites in
+    /// `strata-gst`) rather than assumed — a mismatch here means the
+    /// adapter either cuts before the receiver's real ceiling or never
+    /// reacts to a genuine overflow. Default matches
+    /// `ReceiverConfig::max_latency`'s own default (3000 ms).
+    pub jitter_buffer_ceiling_ms: u32,
 }
 
 /// Default sustain duration for non-severe congestion signals.
@@ -109,6 +129,7 @@ impl Default for AdaptationConfig {
             congestion_sustain: CONGESTION_SUSTAIN_DEFAULT,
             startup_ramp: Duration::ZERO,
             startup_floor_kbps: 500,
+            jitter_buffer_ceiling_ms: 3_000,
         }
     }
 }
@@ -183,6 +204,23 @@ pub struct LinkCapacity {
     pub aqm_dropped_total: Option<u64>,
 }
 
+/// Loss rate above which a link is considered to be melting down, when
+/// paired with [`LINK_MELT_QUEUE_DEPTH`].
+const LINK_MELT_LOSS_RATE: f64 = 0.55;
+/// ARQ queue depth (packets) that, combined with [`LINK_MELT_LOSS_RATE`],
+/// confirms a link is melting rather than just riding a benign IDR burst
+/// (queue depth alone is not trustworthy — see `Adaptation-Delay-Pressure`).
+const LINK_MELT_QUEUE_DEPTH: usize = 60;
+
+/// A single link is clearly melting down: high loss AND a deep ARQ queue.
+/// The loss-weighted aggregate can mask this behind a healthy sibling link,
+/// so callers check per-link rather than relying on the aggregate alone.
+fn link_melting(l: &LinkCapacity) -> bool {
+    l.alive
+        && l.loss_rate >= LINK_MELT_LOSS_RATE
+        && l.queue_depth.unwrap_or(0) >= LINK_MELT_QUEUE_DEPTH
+}
+
 /// Receiver-side telemetry feedback for the BitrateAdapter.
 ///
 /// Provides ground-truth metrics from the receiver that the sender
@@ -225,7 +263,10 @@ pub struct BitrateAdapter {
     /// Whether this adapter has ever observed non-zero aggregate capacity.
     /// Used to distinguish cold-start from mid-stream collapse.
     ever_had_capacity: bool,
-    /// Number of consecutive capacity increases (for ramp-up gating).
+    /// Number of consecutive ticks without a notable capacity decrease (for
+    /// ramp-up gating). Despite the name this is "no notable decrease", not
+    /// "increasing" — a flat capacity also counts, deliberately, since
+    /// ramp-up should gate on stability. See the comment at its update site.
     consecutive_increases: u32,
     /// Number of consecutive capacity decreases.
     consecutive_decreases: u32,
@@ -270,7 +311,9 @@ pub struct BitrateAdapter {
     ewma_goodput_bps: f64,
     /// Per-link EWMA-smoothed capacity (kbps). Filters out noisy spikes
     /// and dips from Oracle/BBR/ack-rate estimates on lossy LTE links.
-    /// α=0.3 gives ~2s half-life at 500ms update intervals.
+    /// α=0.3 gives ~2s half-life assuming ~1 tick/s (`stats_interval_ms`
+    /// default, config.rs) — see the tick-count caveat on
+    /// [`AQM_SUSTAINED_TICKS`] for how this assumption can go stale.
     capacity_ewma: HashMap<usize, f64>,
     /// When the last burst-loss cut happened.  Ramp-up is suppressed for a
     /// cooldown period after a burst to prevent the classic sawtooth where the
@@ -521,7 +564,7 @@ impl BitrateAdapter {
     /// a bitrate command if the encoder target should change.
     pub fn update(&mut self, links: &[LinkCapacity]) -> Option<BitrateCommand> {
         // EWMA-smooth per-link capacity before aggregation.
-        // Asymmetric: fast down (α=0.7) so drops are tracked quickly,
+        // Asymmetric: fast down (α=0.5) so drops are tracked quickly,
         // slow up (α=0.3) so recovery is conservative. Filters noisy
         // Oracle/BBR/ack-rate spikes on lossy LTE links.
         // Skip smoothing for zero capacity (cold-start: no data yet).
@@ -598,13 +641,20 @@ impl BitrateAdapter {
         // Compute usable capacity (with headroom)
         let usable_kbps = aggregate_kbps * (1.0 - self.config.headroom);
 
+        // Arbitrary sentinel pressure values (not derived from a ratio, since
+        // there is no usable capacity to divide by) that feed
+        // `DegradationStage::from_pressure(1/p)` — just need to be > 1.0 and
+        // ordered zero-capacity < no-links so the degradation stage escalates
+        // correctly between the two.
+        const ZERO_CAPACITY_PRESSURE_SENTINEL: f64 = 2.0;
+        const NO_LINKS_PRESSURE_SENTINEL: f64 = 5.0;
         // Compute pressure ratio (target / capacity; >1 = over-pressure)
         let mut pressure = if usable_kbps > 0.0 {
             self.current_target_kbps as f64 / usable_kbps
         } else if alive_count > 0 {
-            2.0 // Over-pressure: have links but zero capacity
+            ZERO_CAPACITY_PRESSURE_SENTINEL // have links but zero capacity
         } else {
-            5.0 // Extreme: no links alive
+            NO_LINKS_PRESSURE_SENTINEL // no links alive
         };
 
         // ── Self-congestion detector: paced-queue AQM drops ──────────────
@@ -617,6 +667,16 @@ impl BitrateAdapter {
         // also pins FEC overhead to baseline — see
         // `recommended_fec_overhead`).
         const AQM_DROPS_PER_TICK_THRESHOLD: u64 = 5;
+        // A TICK count, not a duration — this assumes ~1 tick/s
+        // (`SchedulerConfig::stats_interval_ms` default, config.rs). An
+        // operator who halves `stats_interval_ms` for snappier telemetry
+        // silently halves this sustain window too (~2s → ~1s), and doubling
+        // it doubles the window. Not converted to a wall-clock `Instant`
+        // sustain (the `congestion_started` pattern below) because doing so
+        // would require every existing tick-count-driven regression test in
+        // this module to either sleep for real wall-clock time or special-
+        // case a zero-duration override that would defeat the "more than
+        // one tick" semantics under test — left as a documented coupling.
         const AQM_SUSTAINED_TICKS: u32 = 2;
         // Self-congestion only makes sense when we are actually offering near
         // capacity. AQM drops while the target sits far below usable capacity
@@ -640,7 +700,12 @@ impl BitrateAdapter {
         self.self_congested =
             self.aqm_dropping_ticks >= AQM_SUSTAINED_TICKS && pressure >= SELF_CONGEST_MIN_PRESSURE;
         if self.self_congested {
-            pressure = pressure.max(self.config.pressure_threshold + 0.05);
+            // Nudge pressure just past the over-pressure threshold so the
+            // AQM latch reliably forces the reduce path this tick, even if
+            // the (optimistic) capacity estimate alone would have read as
+            // under-pressure.
+            const SELF_CONGEST_PRESSURE_BUMP: f64 = 0.05;
+            pressure = pressure.max(self.config.pressure_threshold + SELF_CONGEST_PRESSURE_BUMP);
             info!(
                 target: "strata::adapt",
                 "[adapt] self-congestion: AQM dropped {aqm_delta} pkts this tick \
@@ -666,11 +731,19 @@ impl BitrateAdapter {
             "BitrateAdapter::update input"
         );
 
-        // Track capacity trend (stable-or-increasing vs decreasing)
-        if aggregate_kbps >= self.prev_capacity_kbps * 0.95 {
+        // Track capacity trend. Despite the name, `consecutive_increases`
+        // really counts "no notable decrease" — a perfectly flat capacity
+        // also increments it, which is intentional (ramp-up gates on
+        // stability, not on a genuine upward run). A tick landing in the
+        // `CAPACITY_TREND_DECREASE_BELOW`..`CAPACITY_TREND_STABLE_ABOVE`
+        // dead zone (90-95% of the previous tick) advances neither counter,
+        // freezing both trends for that tick.
+        const CAPACITY_TREND_STABLE_ABOVE: f64 = 0.95;
+        const CAPACITY_TREND_DECREASE_BELOW: f64 = 0.90;
+        if aggregate_kbps >= self.prev_capacity_kbps * CAPACITY_TREND_STABLE_ABOVE {
             self.consecutive_increases += 1;
             self.consecutive_decreases = 0;
-        } else if aggregate_kbps < self.prev_capacity_kbps * 0.90 {
+        } else if aggregate_kbps < self.prev_capacity_kbps * CAPACITY_TREND_DECREASE_BELOW {
             self.consecutive_decreases += 1;
             self.consecutive_increases = 0;
         }
@@ -686,9 +759,7 @@ impl BitrateAdapter {
         // Suppress the ramp-up path by resetting the increase counter — the
         // capacity path then holds, and the feedback path is free to reduce
         // without fighting a concurrent increase.
-        let per_link_collapse = links
-            .iter()
-            .any(|l| l.alive && l.loss_rate >= 0.55 && l.queue_depth.unwrap_or(0) >= 60);
+        let per_link_collapse = links.iter().any(link_melting);
         if per_link_collapse || self.self_congested {
             // Self-congestion likewise must not race a concurrent ramp-up:
             // the AQM is already cutting packets, so adding rate is the
@@ -699,14 +770,20 @@ impl BitrateAdapter {
         // ─── Mode switching: MaxQuality ↔ MaxReliability ────────────
         // Switch to MaxReliability when encoder is at 80%+ of ceiling
         // and spare bandwidth exceeds threshold.
-        let at_ceiling =
-            self.current_target_kbps as f64 >= self.config.max_bitrate_kbps as f64 * 0.80;
+        const AT_CEILING_FRACTION: f64 = 0.80;
+        let at_ceiling = self.current_target_kbps as f64
+            >= self.config.max_bitrate_kbps as f64 * AT_CEILING_FRACTION;
         let big_spare = usable_kbps
             > (self.current_target_kbps + self.config.reliability_spare_threshold_kbps) as f64;
 
+        // Hysteresis gap back to MaxQuality: revert only once usable capacity
+        // falls meaningfully (20%) below the quality cap, not the instant it
+        // dips below it, so a link hovering right at the cap doesn't flap
+        // mode every tick.
+        const QUALITY_CAP_HYSTERESIS_MULT: f64 = 1.2;
         if at_ceiling && big_spare {
             self.mode = ReliabilityMode::MaxReliability;
-        } else if usable_kbps < self.config.quality_cap_kbps as f64 * 1.2 {
+        } else if usable_kbps < self.config.quality_cap_kbps as f64 * QUALITY_CAP_HYSTERESIS_MULT {
             // Not enough capacity to even reach the quality cap with spare
             self.mode = ReliabilityMode::MaxQuality;
         }
@@ -757,9 +834,11 @@ impl BitrateAdapter {
         // Only issue command if target changed meaningfully and enough time passed.
         // Use a relative threshold (>10% change) with a small absolute floor (50 kbps)
         // so that small-but-significant changes at low bitrates aren't suppressed.
+        const COMMAND_COMMIT_ABS_FLOOR_KBPS: u64 = 50;
+        const COMMAND_COMMIT_PCT: f64 = 0.10;
         let abs_change = (new_target as i64 - self.current_target_kbps as i64).unsigned_abs();
         let pct_change = abs_change as f64 / self.current_target_kbps.max(1) as f64;
-        let target_changed = abs_change > 50 && pct_change > 0.10;
+        let target_changed = abs_change > COMMAND_COMMIT_ABS_FLOOR_KBPS && pct_change > COMMAND_COMMIT_PCT;
         let interval_ok = self
             .last_command_time
             .is_none_or(|t| t.elapsed() >= self.config.min_interval);
@@ -789,10 +868,12 @@ impl BitrateAdapter {
         if target_changed && interval_ok {
             // Only activate grace period for substantial increases (>10% or >200kbps).
             // Minor capacity oscillations shouldn't keep grace permanently active.
+            const GRACE_ARM_ABS_KBPS: u32 = 200;
+            const GRACE_ARM_PCT: f64 = 0.10;
             if new_target > self.current_target_kbps {
                 let inc_abs = new_target - self.current_target_kbps;
                 let inc_pct = inc_abs as f64 / self.current_target_kbps.max(1) as f64;
-                if inc_abs > 200 || inc_pct > 0.10 {
+                if inc_abs > GRACE_ARM_ABS_KBPS || inc_pct > GRACE_ARM_PCT {
                     self.last_increase_time = Some(Instant::now());
                 }
             }
@@ -831,24 +912,35 @@ impl BitrateAdapter {
             .jitter_buffer_ms
             .saturating_sub(self.prev_jitter_buffer_ms);
         self.prev_jitter_buffer_ms = feedback.jitter_buffer_ms;
-        let jitter_loss_context_pre = feedback.loss_after_fec > 0.03 || self.ewma_loss_fec > 0.08;
+        // Independent evidence that a jitter/late-arrival signal reflects a
+        // real network event, not the event's own after-the-fact residual.
+        // Gated on the CHANNEL (wire) loss `update()` already computed this
+        // tick, not the post-FEC residual: a pure reorder/late-arrival burst
+        // inflates `jitter_growth_ms`/`late_rate` AND the residual in the
+        // same window, so using the residual as the "independent" conjunct
+        // was self-confirming (see git history / review notes for the
+        // incident this replaced). `max_link_loss` is set once per tick at
+        // the top of `update()` and does not change for the rest of this
+        // call, so — unlike the two residual-based reads this replaced —
+        // one evaluation here is valid for every use site below.
+        const CHANNEL_LOSS_CONTEXT_THRESHOLD: f64 = 0.03;
+        let jitter_loss_context = self.max_link_loss > CHANNEL_LOSS_CONTEXT_THRESHOLD;
         let max_queue_depth = links
             .iter()
             .filter(|l| l.alive)
             .filter_map(|l| l.queue_depth)
             .max()
             .unwrap_or(0);
-        let link_collapse = links
-            .iter()
-            .any(|l| l.alive && l.loss_rate >= 0.55 && l.queue_depth.unwrap_or(0) >= 60);
+        let link_collapse = links.iter().any(link_melting);
 
         // Clamp: if update() increased the target but the receiver is stalling
         // (jitter near the latency ceiling), revert the increase.  Capacity
         // looks fine from the sender's perspective but the receiver can't keep
         // up — pushing more data only deepens the jitter buffer.
+        const INCREASE_REVERT_JITTER_GROWTH_MS: u32 = 160;
         if self.current_target_kbps > target_before_update
-            && jitter_growth_ms > 160
-            && jitter_loss_context_pre
+            && jitter_growth_ms > INCREASE_REVERT_JITTER_GROWTH_MS
+            && jitter_loss_context
         {
             self.current_target_kbps = target_before_update;
             self.last_increase_time = None; // Don't activate grace for a reverted increase
@@ -869,8 +961,9 @@ impl BitrateAdapter {
         // loss_after_fec is per-interval (delta-based) at the receiver, but LTE
         // loss is bursty so we EWMA-smooth it (α=0.3, ~2s half-life) to avoid
         // reacting to a single bad second.  This smoothed residual no longer
-        // drives an encoder cut (see below); it now only feeds
-        // `jitter_loss_context` and the FEC burst-lift.
+        // drives an encoder cut (see below) or `jitter_loss_context` (which
+        // reads channel-side `max_link_loss` instead); it now only feeds
+        // the FEC burst-lift.
         //
         // When goodput is positive, update normally.  When goodput is zero
         // (stall), decay the EWMA toward 0 (×0.9) instead of freezing it, so a
@@ -903,27 +996,37 @@ impl BitrateAdapter {
         // elsewhere) but below 70% of the offered rate.  A reorder spike with
         // healthy goodput no longer cuts; a real loss burst, where goodput drops
         // with the loss, still cuts immediately (same-window via instant goodput).
-        let burst_loss = feedback.loss_after_fec > 0.35
+        const BURST_LOSS_AFTER_FEC_THRESHOLD: f32 = 0.35;
+        // Shared with `goodput_shortfall` below (§1b: same "70% of offered
+        // rate" ratio, two different signals — instantaneous here, EWMA there).
+        const GOODPUT_SHORTFALL_RATIO: f64 = 0.7;
+        let burst_loss = feedback.loss_after_fec > BURST_LOSS_AFTER_FEC_THRESHOLD
             && feedback.goodput_bps > 0
-            && (feedback.goodput_bps as f64) < target_before_update as f64 * 1000.0 * 0.7;
+            && (feedback.goodput_bps as f64)
+                < target_before_update as f64 * 1000.0 * GOODPUT_SHORTFALL_RATIO;
         // Treat sustained post-FEC loss >50% with queue growth as an emergency.
         // This allows an additional same-tick reduction even if capacity-path
         // logic already cut once.
-        let severe_burst =
-            burst_loss && feedback.loss_after_fec > 0.50 && feedback.jitter_buffer_ms > 200;
+        const SEVERE_BURST_LOSS_AFTER_FEC_THRESHOLD: f32 = 0.50;
+        const SEVERE_BURST_JITTER_BUFFER_MS: u32 = 200;
+        let severe_burst = burst_loss
+            && feedback.loss_after_fec > SEVERE_BURST_LOSS_AFTER_FEC_THRESHOLD
+            && feedback.jitter_buffer_ms > SEVERE_BURST_JITTER_BUFFER_MS;
         if burst_loss {
             // Lift EWMA rapidly during burst events so FEC overhead scaling
             // reflects the current loss regime, not only the smoothed history.
-            self.ewma_loss_fec = self.ewma_loss_fec.max(feedback.loss_after_fec * 0.8);
+            const BURST_EWMA_LIFT_FACTOR: f32 = 0.8;
+            self.ewma_loss_fec = self
+                .ewma_loss_fec
+                .max(feedback.loss_after_fec * BURST_EWMA_LIFT_FACTOR);
         }
-        // Rapid queue growth under loss context indicates the links are being overdriven.
-        let jitter_loss_context = feedback.loss_after_fec > 0.03 || self.ewma_loss_fec > 0.08;
         // A sustained late-arrival rate is delay pressure only when it
-        // coincides with actual loss evidence. Pure jitter without residual
-        // loss can't be fixed by cutting the encoder — doing so just
-        // degrades visible quality while the underlying OWD spike blows
-        // through.
-        let late_pressure = feedback.late_rate > 0.05 && jitter_loss_context;
+        // coincides with actual channel-loss evidence (`jitter_loss_context`,
+        // computed above). Pure jitter without real loss can't be fixed by
+        // cutting the encoder — doing so just degrades visible quality
+        // while the underlying OWD spike blows through.
+        const LATE_RATE_THRESHOLD: f32 = 0.05;
+        let late_pressure = feedback.late_rate > LATE_RATE_THRESHOLD && jitter_loss_context;
         // A deep paced queue is NOT bufferbloat on its own. That queue is
         // bounded by a drain-time byte budget (pacing_rate × 0.5s, see
         // net::transport) that deliberately passes keyframe bursts intact, so
@@ -936,8 +1039,10 @@ impl BitrateAdapter {
         // which update() already turns into pressure-gated self-congestion.
         // Delay pressure here is therefore receiver-visible only: jitter-buffer
         // growth/overflow and late arrivals under loss.
-        let delay_pressure = (jitter_growth_ms > 120 && jitter_loss_context)
-            || feedback.jitter_buffer_ms > 3000
+        const DELAY_PRESSURE_JITTER_GROWTH_MS: u32 = 120;
+        let delay_pressure = (jitter_growth_ms > DELAY_PRESSURE_JITTER_GROWTH_MS
+            && jitter_loss_context)
+            || feedback.jitter_buffer_ms > self.config.jitter_buffer_ceiling_ms
             || late_pressure;
         let bufferbloat = delay_pressure;
         // EWMA-smooth goodput (α=0.3) to filter end-of-window noise artifacts
@@ -999,12 +1104,13 @@ impl BitrateAdapter {
         // slow EWMA.  After a burst the EWMA decays toward the artificially
         // depressed encoder output (application-limited trap); the peak retains
         // the memory of what the links actually delivered before the event.
+        const GOODPUT_CEILING_CLAMP_TRIGGER: f64 = 0.85;
         if self.goodput_peak_bps > 0.0 {
             let peak_gp_kbps = self.goodput_peak_bps / 1000.0;
             let goodput_ceil_kbps = (peak_gp_kbps / (1.0 - self.config.headroom)) as u32;
             let goodput_ceil_kbps = goodput_ceil_kbps.max(self.config.min_bitrate_kbps);
             if self.current_target_kbps > goodput_ceil_kbps
-                && peak_gp_kbps < (self.current_target_kbps as f64 * 0.85)
+                && peak_gp_kbps < (self.current_target_kbps as f64 * GOODPUT_CEILING_CLAMP_TRIGGER)
             {
                 self.current_target_kbps = goodput_ceil_kbps;
                 self.last_increase_time = None;
@@ -1016,14 +1122,16 @@ impl BitrateAdapter {
         // Compare smoothed goodput against the PRE-update target since goodput
         // lags the encoder rate by at least one RTT.
         let goodput_shortfall = self.ewma_goodput_bps > 0.0
-            && self.ewma_goodput_bps < target_before_update as f64 * 1000.0 * 0.7;
+            && self.ewma_goodput_bps < target_before_update as f64 * 1000.0 * GOODPUT_SHORTFALL_RATIO;
         // A *severe* shortfall (delivering < 50% of the pre-update rate) is the
         // grace-bypass tier.  Because it compares against the pre-update target,
         // a stale post-increase reading still reflects the OLD rate and can't
         // trip it (ramp steps keep new/old < 2×).  This is the trustworthy,
         // reorder-immune replacement for the residual signal's grace pass-through.
+        const SEVERE_GOODPUT_SHORTFALL_RATIO: f64 = 0.5;
         let severe_goodput_shortfall = self.ewma_goodput_bps > 0.0
-            && self.ewma_goodput_bps < target_before_update as f64 * 1000.0 * 0.5;
+            && self.ewma_goodput_bps
+                < target_before_update as f64 * 1000.0 * SEVERE_GOODPUT_SHORTFALL_RATIO;
 
         // After a rate increase, receiver metrics are stale for a few seconds
         // (they still reflect the old encoder rate).  Suppress ordinary
@@ -1032,9 +1140,10 @@ impl BitrateAdapter {
         // *severe* goodput shortfall pass through grace: the first two are
         // instantaneous, and a severe shortfall is measured against the
         // pre-update target, so staleness reflects the old rate and can't fake it.
+        const FEEDBACK_GRACE_PERIOD: Duration = Duration::from_secs(5);
         let feedback_grace = self
             .last_increase_time
-            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5));
+            .is_some_and(|t| t.elapsed() < FEEDBACK_GRACE_PERIOD);
         // Do not apply same-tick cuts on the exact tick of a capacity-path
         // increase. This avoids increase→cut ping-pong from stale feedback.
         let raw_signal = if feedback_grace {
@@ -1109,9 +1218,15 @@ impl BitrateAdapter {
         );
 
         if feedback_reduction && allow_feedback_cut {
-            // Receiver signals congestion — force a reduction
+            // Receiver signals congestion — force a reduction. Severe bursts
+            // cut at least this hard regardless of the configured
+            // `ramp_down_factor`, since a milder configured factor would
+            // under-react to a confirmed emergency.
+            const SEVERE_BURST_MAX_REDUCTION_FACTOR: f64 = 0.55;
             let reduction_factor = if severe_burst {
-                self.config.ramp_down_factor.min(0.55)
+                self.config
+                    .ramp_down_factor
+                    .min(SEVERE_BURST_MAX_REDUCTION_FACTOR)
             } else {
                 self.config.ramp_down_factor
             };
@@ -1202,7 +1317,10 @@ impl BitrateAdapter {
             // feedback/ACK gap; collapsing on it produces a ~5s bitrate sawtooth
             // (grey/blocky frames) on a perfectly good link, so hold instead and
             // wait for confirmation. ZERO_CAP_COLLAPSE_TICKS at ~1s/tick ≈ 2s:
-            // a single transient zero holds; two consecutive zeros confirm collapse.
+            // a single transient zero holds; two consecutive zeros confirm
+            // collapse. Tick count, not a duration — see the
+            // `AQM_SUSTAINED_TICKS` comment for the `stats_interval_ms`
+            // coupling caveat.
             const ZERO_CAP_COLLAPSE_TICKS: u32 = 2;
             if had_capacity && self.zero_capacity_ticks >= ZERO_CAP_COLLAPSE_TICKS {
                 debug!(target: "strata::adapt", "decision: zero usable (sustained {} ticks → collapse) → min", self.zero_capacity_ticks);
@@ -1216,7 +1334,9 @@ impl BitrateAdapter {
             return (self.current_target_kbps, AdaptationReason::Capacity);
         }
 
-        // Over-pressure: need to reduce
+        // Over-pressure: need to reduce. `over_pressure_ticks` is a tick
+        // count, not a duration — see the `AQM_SUSTAINED_TICKS` comment for
+        // the `stats_interval_ms` coupling caveat.
         if pressure > self.config.pressure_threshold {
             if self.over_pressure_ticks >= 2 {
                 let target = (current as f64 * self.config.ramp_down_factor) as u32;
@@ -1252,33 +1372,41 @@ impl BitrateAdapter {
         // decays, we hand traffic to the next burst.  A 10s cooldown is ~1-2
         // typical burst intervals on cellular links, long enough to confirm
         // the network has genuinely stabilized before ramping again.
+        const RAMP_UP_BURST_COOLDOWN: Duration = Duration::from_secs(10);
         let burst_cooldown = self
             .last_burst_time
-            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(10));
+            .is_some_and(|t| t.elapsed() < RAMP_UP_BURST_COOLDOWN);
         // Ramp-up threshold uses pressure_threshold - 0.05 (5% hysteresis gap)
         // instead of the previous hardcoded 0.7.  With pressure_threshold=0.9
         // this gives a ramp-up zone of pressure < 0.85 and an over-pressure zone
         // of > 0.90, raising the effective utilisation ceiling from 59.5% to
         // 72% of raw capacity.
-        let ramp_up_threshold = self.config.pressure_threshold - 0.05;
+        const RAMP_UP_HYSTERESIS_GAP: f64 = 0.05;
+        let ramp_up_threshold = self.config.pressure_threshold - RAMP_UP_HYSTERESIS_GAP;
         // Ramp-up is gated on pressure (capacity headroom), a run of increasing
         // capacity, the burst cooldown, and the goodput-peak ceiling below — but
         // NOT on post-FEC residual loss.  That residual includes reorder/late
         // loss the links are still delivering through; suppressing ramp-up on it
         // pinned the encoder below real headroom (sibling of the FEC death
         // spiral).  Genuine bursts/melts arm `burst_cooldown` via last_burst_time.
+        // `consecutive_increases >= 3` is a tick count, not a duration — see
+        // the `AQM_SUSTAINED_TICKS` comment for the `stats_interval_ms`
+        // coupling caveat.
         if pressure < ramp_up_threshold && self.consecutive_increases >= 3 && !burst_cooldown {
             let target = current + self.config.ramp_up_kbps_per_step;
             let target = target.min(self.config.max_bitrate_kbps);
             // Cap below the pressure threshold to avoid overshooting into
             // over-pressure on the very next tick.
-            let safe_ceiling = (usable_kbps * (self.config.pressure_threshold - 0.05)) as u32;
+            let safe_ceiling =
+                (usable_kbps * (self.config.pressure_threshold - RAMP_UP_HYSTERESIS_GAP)) as u32;
             let target = target.min(safe_ceiling);
             // Cap ramp-up to 1.3x peak goodput — sender-side capacity is
             // optimistic on lossy links; real throughput is what matters.
             // Using the peak (not EWMA) avoids the post-burst ceiling trap.
+            const RAMP_UP_GOODPUT_PEAK_CEILING_MULT: f64 = 1.3;
             let target = if self.goodput_peak_bps > 0.0 {
-                let gp_ceiling = (self.goodput_peak_bps * 1.3 / 1000.0) as u32;
+                let gp_ceiling =
+                    (self.goodput_peak_bps * RAMP_UP_GOODPUT_PEAK_CEILING_MULT / 1000.0) as u32;
                 target.min(gp_ceiling)
             } else {
                 target
@@ -1327,9 +1455,11 @@ impl BitrateAdapter {
             // 0.5*peak gave 4.7 Mbps floor on links that averaged ~3 Mbps).
             // Smoothed goodput tracks recent sustained delivery and keeps
             // the floor from following transient outliers.
-            let peak_half = self.goodput_peak_bps * 0.5;
+            const DYNAMIC_FLOOR_PEAK_HALF: f64 = 0.5;
+            const DYNAMIC_FLOOR_EWMA_CAP_FRACTION: f64 = 0.8;
+            let peak_half = self.goodput_peak_bps * DYNAMIC_FLOOR_PEAK_HALF;
             let ewma_cap = if self.ewma_goodput_bps > 0.0 {
-                self.ewma_goodput_bps * 0.8
+                self.ewma_goodput_bps * DYNAMIC_FLOOR_EWMA_CAP_FRACTION
             } else {
                 peak_half
             };
@@ -1907,6 +2037,135 @@ mod tests {
         assert!(
             adapter.current_target_kbps() < before,
             "target should decrease on high jitter"
+        );
+    }
+
+    // ─── N4: jitter-buffer overflow ceiling must be configurable ──────────
+
+    /// The delay-pressure "jitter buffer overflow" arm must compare against
+    /// `AdaptationConfig::jitter_buffer_ceiling_ms` (sourced from the
+    /// receiver's actual `max_latency`), not a hardcoded 3000ms — a deploy
+    /// with a smaller receiver ceiling must see the adapter react at ITS
+    /// ceiling, not the receiver-default value.
+    #[test]
+    fn jitter_buffer_ceiling_is_configurable_not_hardcoded() {
+        let base = AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_bitrate_kbps: 500,
+            initial_bitrate_kbps: 5_000,
+            min_interval: Duration::ZERO,
+            congestion_sustain: Duration::ZERO,
+            ..Default::default()
+        };
+        let links = make_links(&[(10_000.0, true)]); // clean channel: loss_rate 0.0
+        let feedback = ReceiverFeedback {
+            goodput_bps: 8_000_000,
+            fec_repair_rate: 0.0,
+            jitter_buffer_ms: 150,
+            loss_after_fec: 0.0,
+            late_rate: 0.0,
+        };
+
+        // A low custom ceiling (100ms): 150ms jitter buffer overflows it.
+        let mut low_ceiling = BitrateAdapter::new(AdaptationConfig {
+            jitter_buffer_ceiling_ms: 100,
+            ..base.clone()
+        });
+        let start = low_ceiling.current_target_kbps();
+        low_ceiling.update_with_feedback(&links, &feedback);
+        assert!(
+            low_ceiling.current_target_kbps() < start,
+            "150ms jitter buffer must overflow a configured 100ms ceiling"
+        );
+
+        // The default ceiling (3000ms, matching ReceiverConfig::max_latency's
+        // own default): the same 150ms jitter buffer must NOT overflow it.
+        let mut default_ceiling = BitrateAdapter::new(base);
+        let start = default_ceiling.current_target_kbps();
+        default_ceiling.update_with_feedback(&links, &feedback);
+        assert_eq!(
+            default_ceiling.current_target_kbps(),
+            start,
+            "150ms jitter buffer must not overflow the default 3000ms ceiling"
+        );
+    }
+
+    // ─── L3: late/delay pressure must gate on channel loss, not residual ──
+
+    /// A pure reorder/late-arrival event inflates `late_rate`, growing
+    /// jitter, AND the post-FEC residual all in the same window — so gating
+    /// `late_pressure`/`delay_pressure` on the residual (`ewma_loss_fec`/
+    /// `loss_after_fec`) was self-confirming: the "independent evidence"
+    /// conjunct was satisfied by the very event it was meant to corroborate.
+    /// With a genuinely clean channel (`loss_rate` 0 on every link), this
+    /// must NOT cut the encoder no matter how high late-rate/jitter/residual
+    /// climb.
+    #[test]
+    fn late_pressure_does_not_trigger_on_clean_channel_reorder() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_bitrate_kbps: 500,
+            initial_bitrate_kbps: 5_000,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+        // Clean wire: loss_rate 0.0 on the only link.
+        let links = make_links(&[(10_000.0, true)]);
+        let start = adapter.current_target_kbps();
+
+        let mut jitter_ms = 0u32;
+        for _ in 0..6 {
+            jitter_ms += 200;
+            let feedback = ReceiverFeedback {
+                goodput_bps: 8_000_000, // healthy, well above target — no goodput shortfall
+                fec_repair_rate: 0.0,
+                jitter_buffer_ms: jitter_ms,
+                loss_after_fec: 0.10, // reorder/late residual, not real channel loss
+                late_rate: 0.10,      // > 0.05
+            };
+            adapter.update_with_feedback(&links, &feedback);
+        }
+        assert_eq!(
+            adapter.current_target_kbps(),
+            start,
+            "clean-channel reorder/late residual must not cut the encoder \
+             via late_pressure/delay_pressure, got {} (started at {})",
+            adapter.current_target_kbps(),
+            start
+        );
+    }
+
+    /// Companion to the above: the same late-rate/jitter-growth signal DOES
+    /// cut once there is real per-link channel loss to corroborate it.
+    #[test]
+    fn late_pressure_triggers_with_real_channel_loss() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_bitrate_kbps: 500,
+            initial_bitrate_kbps: 5_000,
+            min_interval: Duration::ZERO,
+            congestion_sustain: Duration::ZERO,
+            ..Default::default()
+        });
+        // Real channel loss above the CHANNEL_LOSS_CONTEXT_THRESHOLD (0.03).
+        let mut links = make_links(&[(10_000.0, true)]);
+        links[0].loss_rate = 0.05;
+        let start = adapter.current_target_kbps();
+
+        let feedback = ReceiverFeedback {
+            goodput_bps: 8_000_000,
+            fec_repair_rate: 0.0,
+            jitter_buffer_ms: 300,
+            loss_after_fec: 0.10,
+            late_rate: 0.10,
+        };
+        adapter.update_with_feedback(&links, &feedback);
+        assert!(
+            adapter.current_target_kbps() < start,
+            "late-rate/jitter-growth with real channel loss must still cut, \
+             got {} (started at {})",
+            adapter.current_target_kbps(),
+            start
         );
     }
 
@@ -2676,8 +2935,8 @@ mod tests {
         }
 
         // KEY ASSERTION: the residual EWMA must recover near zero within 10
-        // clean ticks — it still feeds `jitter_loss_context` and the FEC
-        // burst-lift, so a latched-high value would poison those.
+        // clean ticks — it still feeds the FEC burst-lift, so a
+        // latched-high value would poison that.
         assert!(
             adapter.ewma_loss_fec < 0.15,
             "EWMA should recover after 10 clean ticks, got {:.3} — \
@@ -2904,8 +3163,7 @@ mod tests {
 
     /// When goodput drops to zero after the EWMA has climbed high,
     /// the decay (×0.9 per tick) should bring the residual back near zero
-    /// within ~15 ticks, so it can't latch high and poison
-    /// `jitter_loss_context` / FEC sizing.
+    /// within ~15 ticks, so it can't latch high and poison FEC sizing.
     #[test]
     fn ewma_loss_decays_during_zero_goodput_stall() {
         let mut adapter = BitrateAdapter::new(AdaptationConfig {

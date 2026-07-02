@@ -635,6 +635,17 @@ impl TransportLink {
         // a link faster than the queue can drain.  Throttle applies AFTER the
         // CC floor because the floor exists to prevent CC-driven starvation,
         // while THIS mechanism deliberately starves a bloated link to recover.
+        //
+        // Acknowledged, not yet consolidated: `cc_pacing_rate` above already
+        // folds in congestion.rs's own `drain_factor`, which likewise responds
+        // to RTT rising above baseline. So a single bufferbloat event can be
+        // multiplied down by both reducers in the same tick (e.g. 0.5 ×
+        // 0.25 = 8x). Each is independently justified (different files,
+        // different baselines: `drain_factor` reacts to gradient/regime
+        // signals in congestion.rs, this throttle reacts to the srtt/min_rtt
+        // ratio here) and the ordering is deliberate (CC floor first, then
+        // this throttle), but the double-count itself is not — a candidate
+        // consolidation, not implemented here.
         let rtt_throttle = {
             let rtt = self.rtt.lock().unwrap();
             rtt_bufferbloat_throttle(rtt.srtt_us(), rtt.min_rtt_us())

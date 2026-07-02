@@ -74,6 +74,12 @@ mod imp {
         /// Bitrate (kbps) the startup ramp begins at. Clamped at runtime to
         /// `>= min_bitrate` and `<= initial`. 0 = use the adapter default.
         pub(crate) adaptation_startup_floor_kbps: AtomicU32,
+        /// Receiver's configured playout-window ceiling (ms), mirrored from
+        /// `BondingConfig::receiver.max_latency` via `apply_config` so the
+        /// adapter's delay-pressure arm tracks the actual receiver config
+        /// instead of assuming its default. 0 until a config is applied, in
+        /// which case `BitrateAdapter` falls back to its own default.
+        pub(crate) receiver_max_latency_ms: AtomicU32,
 
         /// Scans the muxed MPEG-TS to flag keyframe (IDR) access-unit packets so
         /// they can be marked critical for keyframe-protected scheduling. The
@@ -106,6 +112,7 @@ mod imp {
                 adaptation_initial_kbps: AtomicU32::new(0),
                 adaptation_startup_ramp_ms: AtomicU32::new(0),
                 adaptation_startup_floor_kbps: AtomicU32::new(0),
+                receiver_max_latency_ms: AtomicU32::new(0),
                 ts_keyframe: Mutex::new(crate::ts_keyframe::TsKeyframeScanner::new()),
                 ingress_bytes_acc: std::sync::atomic::AtomicU64::new(0),
                 ingress_last_log: Mutex::new(std::time::Instant::now()),
@@ -198,6 +205,10 @@ mod imp {
             match parse_config(config) {
                 Ok(parsed) => {
                     *lock_or_recover(&self.scheduler_config) = parsed.scheduler.clone();
+                    self.receiver_max_latency_ms.store(
+                        parsed.receiver.max_latency.as_millis() as u32,
+                        Ordering::Relaxed,
+                    );
                     if let Some(rt) = lock_or_recover(&self.runtime).as_ref() {
                         let _ = rt.apply_config(parsed);
                     }
@@ -485,6 +496,7 @@ mod imp {
             let adapt_initial = self.adaptation_initial_kbps.load(Ordering::Relaxed);
             let adapt_startup_ramp_ms = self.adaptation_startup_ramp_ms.load(Ordering::Relaxed);
             let adapt_startup_floor = self.adaptation_startup_floor_kbps.load(Ordering::Relaxed);
+            let receiver_max_latency_ms = self.receiver_max_latency_ms.load(Ordering::Relaxed);
 
             let handle = std::thread::Builder::new()
                 .name("strata-stats".into())
@@ -504,6 +516,11 @@ mod imp {
                             adapt_startup_floor
                         } else {
                             default_cfg.startup_floor_kbps
+                        },
+                        jitter_buffer_ceiling_ms: if receiver_max_latency_ms > 0 {
+                            receiver_max_latency_ms
+                        } else {
+                            default_cfg.jitter_buffer_ceiling_ms
                         },
                         ..default_cfg
                     });

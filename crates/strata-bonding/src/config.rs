@@ -345,6 +345,12 @@ pub struct SchedulerConfig {
     pub penalty_recovery: f64,
     pub jitter_latency_multiplier: f64,
     pub max_latency_ms: u64,
+    /// Period of the strata-gst stats thread that drives `BitrateAdapter::
+    /// update`/`update_with_feedback`. Several sustain gates in
+    /// `adaptation.rs` (`AQM_SUSTAINED_TICKS`, `ZERO_CAP_COLLAPSE_TICKS`,
+    /// `over_pressure_ticks`, `consecutive_increases`) are TICK counts
+    /// tuned assuming this field's default (~1 tick/s); changing this value
+    /// silently rescales those sustain windows.
     pub stats_interval_ms: u64,
     pub channel_capacity: usize,
     /// Interval between saturation probes for each link (seconds).
