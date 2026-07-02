@@ -555,6 +555,56 @@ async fn list_streams_empty() {
     assert!(body.as_array().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn start_stream_concurrent_guard_query_does_not_error() {
+    // Regression for E7's SQL bind bug: the concurrent-stream guard query
+    // (`SELECT EXISTS(... WHERE sender_id = $1 ...)`) has exactly one
+    // placeholder but the handler used to call `.bind()` twice, which
+    // sqlx/Postgres rejects at execution time. That query runs before the
+    // "sender is offline" check, so pre-fix this request would 500 with a
+    // DB parameter-count error; post-fix it reaches the offline check and
+    // returns a clean 400.
+    let Some(app) = test_app().await else {
+        return;
+    };
+
+    let token = register_and_login(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/senders",
+            &token,
+            serde_json::json!({ "name": "Never Connected" }),
+        ))
+        .await
+        .unwrap();
+    let body = json_body(resp).await;
+    let sender_id = body["sender_id"].as_str().unwrap().to_string();
+
+    let resp = app
+        .oneshot(auth_post(
+            &format!("/api/streams/start/{sender_id}"),
+            &token,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        400,
+        "expected a clean 400 (sender offline) past the concurrent-stream \
+         guard query, not a 500 from the bind-count bug"
+    );
+    let body = json_body(resp).await;
+    let msg = body["error"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("offline"),
+        "expected the offline-sender error, got: {msg}"
+    );
+}
+
 // ── Cross-User Isolation Tests ──────────────────────────────────────
 
 #[tokio::test]

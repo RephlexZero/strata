@@ -73,7 +73,6 @@ async fn start_stream(
         "SELECT EXISTS(SELECT 1 FROM streams WHERE sender_id = $1 AND state IN ('starting', 'live'))",
     )
     .bind(&sender_id)
-    .bind(&user.user_id)
     .fetch_one(state.pool())
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -148,9 +147,14 @@ async fn start_stream(
         })
         .unwrap_or(receiver_links.len());
     let link_count = enabled_count.min(receiver_links.len());
+    if link_count == 0 {
+        return Err(ApiError::bad_request(
+            "sender has no connected network interfaces",
+        ));
+    }
     let strata_dests: Vec<String> = receiver_links[..link_count]
         .iter()
-        .map(|addr| format!("strata://{addr}?buffer=2000"))
+        .map(|addr| format!("strata://{addr}"))
         .collect();
 
     tracing::info!(
@@ -223,16 +227,11 @@ async fn start_stream(
             }
         },
         destinations: strata_dests,
-        bonding_config: serde_json::json!({
-            "version": 1,
-            "scheduler": {
-                "critical_broadcast": true,
-                "redundancy_enabled": true,
-                "capacity_floor_bps": 5_000_000.0,
-                "failover_enabled": true,
-                "failover_duration_ms": 3000
-            }
-        }),
+        // No override — let `SchedulerConfig::default()` (and the agent's own
+        // config) govern. The control plane has no explicit-override
+        // mechanism from the REST API today; if one is added, plug it in
+        // here instead of forcing a profile on every platform stream.
+        bonding_config: serde_json::Value::Null,
         psk: None,
         relay_url: if relay_url.is_empty() {
             None
@@ -336,8 +335,8 @@ async fn stop_stream(
     user.require_role("operator")?;
 
     // Find the active stream for this sender
-    let stream_id = sqlx::query_scalar::<_, String>(
-        "SELECT s.id FROM streams s JOIN senders sn ON s.sender_id = sn.id \
+    let (stream_id, receiver_id) = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT s.id, s.receiver_id FROM streams s JOIN senders sn ON s.sender_id = sn.id \
          WHERE s.sender_id = $1 AND sn.owner_id = $2 AND s.state IN ('starting', 'live') \
          ORDER BY s.started_at DESC LIMIT 1",
     )
@@ -364,6 +363,23 @@ async fn stop_stream(
         let envelope = Envelope::new("stream.stop", &stop_payload);
         let json = serde_json::to_string(&envelope).unwrap();
         let _ = agent.tx.send(json).await;
+    }
+
+    // Send stop command to the receiver too — without this the receiver's
+    // UDP listener never EOS's and its pipeline keeps running after the
+    // sender stops. The receiver responds with `receiver.stream.ended`,
+    // which decrements `active_streams` on the normal path (see
+    // ws_receiver.rs).
+    if let Some(ref rcv_id) = receiver_id
+        && let Some(rcv_handle) = state.receivers().get(rcv_id)
+    {
+        let rcv_stop_payload = strata_common::protocol::ReceiverStreamStopPayload {
+            stream_id: stream_id.clone(),
+            reason: "user_request".into(),
+        };
+        let rcv_envelope = Envelope::new("receiver.stream.stop", &rcv_stop_payload);
+        let rcv_json = serde_json::to_string(&rcv_envelope).unwrap();
+        let _ = rcv_handle.tx.send(rcv_json).await;
     }
 
     // Notify dashboard
