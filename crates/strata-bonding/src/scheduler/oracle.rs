@@ -19,6 +19,42 @@ use std::time::Instant;
 /// confidence decays to 50% after this interval.
 const CONFIDENCE_HALF_LIFE_S: f64 = 30.0;
 
+/// Below this, `lower_bound`/`upper_bound` are treated as an unset noise
+/// floor rather than a real measurement: the 2×/3× growth caps and sanity
+/// ceilings that key off them don't apply yet, since there isn't enough
+/// signal to bound against. Used at all three "do we have a baseline yet"
+/// checks in this file.
+const MEANINGFUL_BASELINE_BPS: f64 = 100_000.0;
+
+/// Fraction of `lower_bound` preserved across a downshift soft-reset. The
+/// link likely still has *some* capacity after a handover, just not what
+/// was previously measured.
+const DOWNSHIFT_LOWER_BOUND_RETENTION: f64 = 0.5;
+
+/// Minimum interval between downshift resets, to prevent rapid re-triggering.
+const DOWNSHIFT_COOLDOWN_S: f64 = 10.0;
+
+/// Multiple of the slow RTT baseline EWMA (α≈0.05, see `update_baseline_rtt`)
+/// that counts as a "dramatic" spike for `should_reset`. This is a
+/// *different* detector than `SchedulerConfig::failover_rtt_spike_factor`
+/// (bonding.rs's fast single-tick failover trigger, which compares against
+/// the *previous tick's* RTT, not a slow baseline) — they happen to share
+/// the number 3 but answer genuinely different questions at genuinely
+/// different timescales. Do not wire them together; see
+/// `SchedulerConfig::failover_rtt_spike_factor`'s doc for the other side.
+const DOWNSHIFT_RTT_BASELINE_MULT: f64 = 3.0;
+
+/// Sanity cap on PPD (packet-pair dispersion) samples once a delivery
+/// baseline exists: never trust PPD above this multiple of `lower_bound`,
+/// since PPD can over-estimate in buffered/simulated networks even after
+/// the receiver-side dispersion guard.
+const PPD_SANITY_CAP_MULT: f64 = 3.0;
+
+/// Absolute ceiling on PPD samples before any delivery baseline exists.
+/// Generous on purpose — it only guards against pathological outliers
+/// before `lower_bound` is available to compute a relative cap.
+const PPD_ABSOLUTE_CEILING_BPS: f64 = 50_000_000.0;
+
 /// Per-link capacity estimator.
 ///
 /// Maintains a lower bound (max observed delivery rate) and an upper bound
@@ -142,7 +178,7 @@ impl CapacityOracle {
         // delay/loss) that can produce delivery spikes 5-10× the true link
         // rate. Without this cap a single spike can push lower_bound (and
         // thus estimated_cap) far above the physical capacity.
-        let capped = if self.lower_bound > 100_000.0 {
+        let capped = if self.lower_bound > MEANINGFUL_BASELINE_BPS {
             delivery_bps.min(self.lower_bound * 2.0)
         } else {
             delivery_bps
@@ -236,7 +272,7 @@ impl CapacityOracle {
             return;
         }
 
-        let capped_peak = if self.upper_bound > 100_000.0 {
+        let capped_peak = if self.upper_bound > MEANINGFUL_BASELINE_BPS {
             peak_bps.min(self.upper_bound * Self::PROBE_GROWTH_CAP)
         } else {
             peak_bps
@@ -272,7 +308,7 @@ impl CapacityOracle {
         self.confidence = 0.0;
         // Preserve 50% of the lower bound — the link likely still has
         // *some* capacity, just not what we previously measured.
-        self.lower_bound *= 0.5;
+        self.lower_bound *= DOWNSHIFT_LOWER_BOUND_RETENTION;
         // Also reset the peak so the 40% floor doesn't hold the link at the
         // pre-downshift level after a genuine capacity reduction (handover).
         self.lower_bound_peak = self.lower_bound;
@@ -287,12 +323,13 @@ impl CapacityOracle {
     /// not cumulative loss ratios, which can only increase over time
     /// and would cause permanent re-triggering.
     pub fn should_reset(&self, rtt_ms: f64, _loss_rate: f64) -> bool {
-        // Cooldown: don't reset more than once per 10 seconds.
-        if self.last_reset.elapsed().as_secs_f64() < 10.0 {
+        // Cooldown: don't reset more than once per DOWNSHIFT_COOLDOWN_S.
+        if self.last_reset.elapsed().as_secs_f64() < DOWNSHIFT_COOLDOWN_S {
             return false;
         }
-        // Dramatic RTT spike: > 3× the baseline EWMA
-        if self.baseline_rtt_ms > 5.0 && rtt_ms > self.baseline_rtt_ms * 3.0 {
+        // Dramatic RTT spike: > DOWNSHIFT_RTT_BASELINE_MULT × the baseline EWMA
+        if self.baseline_rtt_ms > 5.0 && rtt_ms > self.baseline_rtt_ms * DOWNSHIFT_RTT_BASELINE_MULT
+        {
             return true;
         }
         false
@@ -342,6 +379,21 @@ impl CapacityOracle {
         } else {
             self.peak_estimate *= 0.999;
         }
+
+        // Same slow decay for lower_bound_peak (L6). Its only other reset
+        // path is reset_on_downshift(), gated on a 3× RTT spike — a genuine
+        // slow capacity decline with no RTT signature (cell loading, SINR
+        // drift) would otherwise pin the 40%-of-peak floor in
+        // observe_delivery at the lifetime high-water mark forever. Mirror
+        // peak_estimate's decay so a sustained decline eventually drags the
+        // floor down instead of trapping estimated_cap — this is the exact
+        // mechanism documented in set_broadcast_active's doc as the trap
+        // behind the field "phantom capacity" incident.
+        if self.lower_bound > self.lower_bound_peak {
+            self.lower_bound_peak = self.lower_bound;
+        } else {
+            self.lower_bound_peak *= 0.999;
+        }
     }
 
     /// Recompute `estimated_cap` from bounds and confidence.
@@ -372,11 +424,11 @@ impl CapacityOracle {
         // Sanity cap: even after the receiver-side dispersion guard,
         // PPD can still over-estimate in buffered/simulated networks.
         // Never trust PPD above 3× observed delivery rate.
-        let cap = if self.lower_bound > 100_000.0 {
-            self.lower_bound * 3.0
+        let cap = if self.lower_bound > MEANINGFUL_BASELINE_BPS {
+            self.lower_bound * PPD_SANITY_CAP_MULT
         } else {
             // No delivery baseline yet — use a generous absolute ceiling
-            50_000_000.0
+            PPD_ABSOLUTE_CEILING_BPS
         };
         let capped_bps = capacity_bps.min(cap);
 
@@ -744,6 +796,49 @@ mod tests {
         assert!(
             oracle.estimated_cap() > 2_000_000.0,
             "PPD should raise estimate above lower bound"
+        );
+    }
+
+    // ─── L6: lower_bound_peak decay ─────────────────────────────────────
+
+    #[test]
+    fn lower_bound_peak_decays_under_sustained_lower_delivery() {
+        // A one-time high capacity sample sets lower_bound_peak (and thus
+        // the 40%-of-peak floor) high. With NO RTT spike — so
+        // reset_on_downshift never fires — a long run of sustained-but-lower
+        // delivery must still be able to drag lower_bound_peak (and the
+        // floor derived from it) down over time. Pre-fix, lower_bound_peak
+        // only ever increases outside of reset_on_downshift, so the floor
+        // stays pinned at 0.4 * 10M forever regardless of how long the
+        // link actually delivers less.
+        let mut oracle = CapacityOracle::new();
+
+        // Establish a high peak.
+        for _ in 0..5 {
+            oracle.observe_delivery(10_000_000.0);
+        }
+        let peak_before = oracle.lower_bound_peak;
+        assert!(peak_before > 9_000_000.0);
+        let floor_before = peak_before * 0.4;
+
+        // Sustained, genuinely lower delivery with no RTT spike (no call to
+        // update_baseline_rtt / reset_on_downshift at all).
+        for _ in 0..3000 {
+            oracle.observe_delivery(3_000_000.0);
+            oracle.tick();
+        }
+
+        let floor_after = oracle.lower_bound_peak * 0.4;
+        assert!(
+            floor_after < floor_before,
+            "lower_bound_peak floor must decay under sustained lower delivery \
+             with no RTT spike: before={floor_before}, after={floor_after}"
+        );
+        assert!(
+            oracle.lower_bound_peak < 7_000_000.0,
+            "lower_bound_peak should decay toward the new sustained rate \
+             instead of staying pinned near the old 10M peak, got {}",
+            oracle.lower_bound_peak
         );
     }
 }
