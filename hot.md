@@ -8,31 +8,32 @@
 `fix/adapt-goodput-not-residual` **merged to `main`** (2026-07-01): all four
 fixes below, plus HLS egress hardening. 415 tests pass, clippy clean.
 
-**Both audits (2026-07-01) are now MOSTLY IMPLEMENTED for the control-loop
-half (2026-07-02) — plan at `.claude/plans/rosy-squishing-treasure.md`.**
-Landed on `main`: all of `review_findings.md`'s control-loop items —
-L1-L8, N1, N2, N4-N7, N9, §2.3, §2.4.1 — plus §2.2's bookkeeping-
-centralization half and §1c's double-count acknowledgment (comment-only).
-Only **N3** (dead `congestion_headroom_ratio`/`congestion_trigger_ratio`
-config knobs) remains in the control-loop audit. From
-[PLATFORM_REVIEW.md](PLATFORM_REVIEW.md): E5/E7/E10/E3/**E9** (SQL bug,
-receiver-stop wiring, bonding-config override removal, portal retirement,
-dashboard WS auth + owner scoping, timing/constants hygiene) are done. E3:
-`ws_dashboard.rs` now requires the same `auth.login` JWT handshake as the
-agent/receiver WS, and `DashboardEvent`s are tagged with `owner_id`
-end-to-end so one operator can no longer see another's fleet. E9: named
-the platform's own magic-number sprawl per-crate (JWT TTL, backoff,
-channel capacities, timeouts) and added jitter to every reconnect loop
-(agent, receiver, dashboard) so a control-plane restart doesn't produce a
-thundering herd. See the 2026-07-02 log entries for the full per-item
-list, plus one real gap surfaced: `strata-sender`'s local onboarding
-portal (`portal.rs`, :3001) has nothing left to serve now that
-`strata-portal` is retired — needs a follow-up decision.
+**The control-loop audit (`review_findings.md`, 2026-07-01) is now FULLY
+IMPLEMENTED (2026-07-02)** — plan at `.claude/plans/
+rosy-squishing-treasure.md`. Landed on `main`: L1-L8, N1-N9, §2.3, §2.4.1
+(§2.2 done via a lower-risk bookkeeping-centralization, not the full
+evidence-struct/ranking redesign — deliberate, see §2.2's entry for why).
+N3 (dead `congestion_headroom_ratio`/`congestion_trigger_ratio` config
+knobs) was the last item, deleted clean (0 upstream impact per
+`mcp__gitnexus__impact`). From [PLATFORM_REVIEW.md](PLATFORM_REVIEW.md):
+E5/E7/E10/E3/**E9** (SQL bug, receiver-stop wiring, bonding-config
+override removal, portal retirement, dashboard WS auth + owner scoping,
+timing/constants hygiene) are done. E3: `ws_dashboard.rs` now requires the
+same `auth.login` JWT handshake as the agent/receiver WS, and
+`DashboardEvent`s are tagged with `owner_id` end-to-end so one operator
+can no longer see another's fleet. E9: named the platform's own
+magic-number sprawl per-crate (JWT TTL, backoff, channel capacities,
+timeouts) and added jitter to every reconnect loop (agent, receiver,
+dashboard) so a control-plane restart doesn't produce a thundering herd.
+See the 2026-07-02 log entries for the full per-item list, plus one real
+gap surfaced: `strata-sender`'s local onboarding portal (`portal.rs`,
+:3001) has nothing left to serve now that `strata-portal` is retired —
+needs a follow-up decision.
 
-**Still to do** (see the plan file for scope): N3 (`config.rs` dead-knob
-deletion, small); §2.2's full evidence-struct/ranking redesign (deliberately
-NOT attempted — see review_findings.md §2.2 for why the lower-risk
-bookkeeping-only consolidation was chosen instead); a deliberately-deferred
+**Still to do** (see the plan file for scope): §2.2's full
+evidence-struct/ranking redesign (deliberately NOT attempted — see
+review_findings.md §2.2 for why the lower-risk bookkeeping-only
+consolidation was chosen instead); a deliberately-deferred
 `CorsLayer::permissive()`/unauthenticated-`/metrics` posture decision
 (flagged, not changed, per E3's own instruction); then the larger
 executive items in dependency order — E1 (one `strata-protocol` crate,
@@ -156,4 +157,4 @@ override that pinned it is gone — but still needs field confirmation. Watch
 adaptive-redundancy duplication as a wire-overhead contributor when spare is large.
 
 ---
-_Last updated: 2026-07-02 (batch 1-3 + Batch 2 adaptation.rs + Batch 3.2/3.4 dashboard WS auth (E3) + platform hygiene (E9) landed on main; N3 + platform E1/E2/E4/E6/E8 items remain)_
+_Last updated: 2026-07-02 (all of batch 1-3 landed on main — control-loop audit fully done, N3 was the last item; platform E1/E2/E4/E6/E8 items remain for a future session)_

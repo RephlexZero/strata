@@ -5,6 +5,31 @@ the top. One dated entry per day — enough to reconstruct *why* later.
 
 Format: `## YYYY-MM-DD` heading per day, bullet per entry.
 
+## 2026-07-02 (cont'd — N3 landed: control-loop audit now fully done)
+
+- Deleted `SchedulerConfig::congestion_headroom_ratio`/
+  `congestion_trigger_ratio` (review_findings.md N3) — confirmed zero
+  reads outside `config.rs` itself via grep and
+  `mcp__gitnexus__impact` (0 upstream impact, LOW risk both candidates).
+  Removed the `SchedulerConfigInput` fields, `SchedulerConfig` fields,
+  defaults, resolve-mapping, and the two TOML-parsing test assertions.
+  No `deny_unknown_fields` on the input struct, so old TOML configs that
+  still set these keys keep parsing (the keys were already effectively
+  ignored). 24/24 config tests + full `strata-bonding` suite (359 lib +
+  8 integration) pass, clippy clean. Commit `ab58233`.
+  - This was the last open item in `review_findings.md`'s Part 0-2 —
+    the control-loop audit is now **fully implemented**, aside from
+    §2.2's deliberately-deferred full redesign (bookkeeping-only version
+    landed instead) and the §1b EWMA-naming pass (docs only, by design).
+  - Checked in with the user after Batch 1-3 completed in full; they
+    chose to finish this last small item (N3) and the CorsLayer/
+    `/metrics` posture flag, then stop here — Batches 4-6 (E1 protocol
+    crate, E2 state machine, E4 device identity, E6 port allocation, E8
+    telemetry) are left for a future session with fresh context.
+  - Updated review_findings.md's status banner, N3 entry, Part 3, and
+    the suggested-landing-order section; `hot.md` refreshed to reflect
+    the control-loop audit being fully done.
+
 ## 2026-07-02 (cont'd — Batch 3.4 landed: platform timing hygiene, E9)
 
 - Implemented [PLATFORM_REVIEW.md](PLATFORM_REVIEW.md) E9: named the

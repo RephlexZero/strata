@@ -5,17 +5,18 @@ structure in `strata-bonding` / `strata-transport`. Audit only — no code
 changes made. Every pre-found lead was independently re-verified against the
 source (and git history where the intent was ambiguous).
 
-> **Implementation status (2026-07-02, updated same day — Batch 2 landed):**
-> all of L1, L2, L3, L4, L5, L6, L7, L8, N1, N2, N4, N6, N7, N9, §2.3, and
-> §2.4.1 are **done and merged to `main`** (commits `b28d983`/`f7ee15c`
-> for Phase A, `97707f9` for Phase B — see `.claude/plans/
+> **Implementation status (2026-07-02, updated again same day — N3 landed):**
+> all of L1-L8, N1, N2, N3, N4, N6, N7, N9, §2.3, and §2.4.1 are **done and
+> merged to `main`** (commits `b28d983`/`f7ee15c` for Phase A, `97707f9`
+> for Phase B, `ab58233` for N3 — see `.claude/plans/
 > rosy-squishing-treasure.md` for exactly what landed and any caveats).
-> N3 and the FEC-sizing-sustain half of §2.4 are still **not started**.
-> N5 and §2.2 are **done, but not by conversion/full redesign** — see
-> their entries below for exactly what was done instead and why. The
-> magic-number naming pass (§1) is now done for `adaptation.rs` too
-> (aside from the EWMA α values, which are §1b/docs-only by design), on
-> top of `congestion.rs`, `oracle.rs`, `bonding.rs`, and `net/transport.rs`
+> Only the FEC-sizing-sustain half of §2.4 remains genuinely **not
+> started**. N5 and §2.2 are **done, but not by conversion/full
+> redesign** — see their entries below for exactly what was done instead
+> and why. The magic-number naming pass (§1) is now done for
+> `adaptation.rs` too (aside from the EWMA α values, which are
+> §1b/docs-only by design), on top of `congestion.rs`, `oracle.rs`,
+> `bonding.rs`, and `net/transport.rs`
 > — a few rows even in the touched files were skipped — see the ✅/⬜
 > marks below.
 
@@ -249,7 +250,7 @@ feature, not a fix. Kept the state machine (it's a deliberate future
 integration seam per `modem/health.rs`) and added a doc comment on
 `on_radio_metrics` stating plainly that it has no live caller today.
 
-### N3. ⬜ NOT STARTED — `config.rs:331-332` — `congestion_headroom_ratio` / `congestion_trigger_ratio` are **dead config knobs**
+### N3. ✅ DONE — `config.rs:331-332` — `congestion_headroom_ratio` / `congestion_trigger_ratio` are **dead config knobs**
 
 Zero reads outside `config.rs` (definition, default, resolve, tests). An
 operator can set them in TOML; nothing consumes them. Meanwhile the *live*
@@ -257,7 +258,10 @@ equivalents are `AdaptationConfig::headroom` (0.15) and
 `pressure_threshold` (0.9) — note `1 - 0.85` and `0.90`, the same numbers,
 strongly suggesting these SchedulerConfig fields are the abandoned older
 home of the pair. Worse than L8: at least L8's knob does *something*.
-Delete them (or wire them). *worth-a-fix*
+Delete them (or wire them). *worth-a-fix* — **done 2026-07-02**: deleted
+(not wired — confirmed dead, per `mcp__gitnexus__impact`, 0 upstream
+impact). No `deny_unknown_fields` on `SchedulerConfigInput`, so old TOML
+configs that still set these keys keep parsing fine.
 
 ### N4. ✅ DONE — `adaptation.rs:940` — `jitter_buffer_ms > 3000` hardcodes the receiver's *default* playout ceiling
 
@@ -586,7 +590,7 @@ Misleading pairs (config field + hardcoded sibling) — the actively harmful
 class:
 
 1. ✅ DONE — `failover_rtt_spike_factor` vs oracle.rs:295 hardcoded 3.0 (L8).
-2. ⬜ NOT STARTED — `congestion_headroom_ratio` / `congestion_trigger_ratio` — dead knobs, the
+2. ✅ DONE — `congestion_headroom_ratio` / `congestion_trigger_ratio` — dead knobs, the
    live pair lives in `AdaptationConfig` (N3).
 3. ✅ DONE — `ReceiverConfig::max_latency` vs adaptation.rs:940 hardcoded 3000 ms (N4).
 4. ✅ DONE (documented, not converted) — `stats_interval_ms` silently rescales all adapter tick-count sustains (N5).
@@ -614,11 +618,12 @@ itself was removed (2026-07-02, PLATFORM_REVIEW.md E5).
 
 ## Suggested landing order
 
-Status as of 2026-07-02 (updated same day — Batch 2 landed) — the actual
+Status as of 2026-07-02 (updated again same day — N3 landed) — the actual
 landing order ended up 1, 2, 4, then half of 5 (L6/L8, not N3/N4/N5)
 landing together (out of the original sequence, since they shared files
-with other in-flight work), then 3 and 6 landed together as Batch 2. Only
-N3 remains unstarted.
+with other in-flight work), then 3 and 6 landed together as Batch 2, then
+N3 on its own as a small final cleanup. Every item in this list is now
+done or partially done (§2.2, deliberately).
 
 1. ✅ DONE — **N1** RSRQ/RSRP bug + **N2** decision on the dead radio feed-forward
    (they're one work item: wire it fixed, or cut it).
@@ -628,10 +633,10 @@ N3 remains unstarted.
    evidence-struct/ranking redesign was deliberately not attempted — see
    §2.2 above for why.
 4. ✅ DONE — **2.4.1** failover sustain gate.
-5. **L6** ✅ DONE `lower_bound_peak` decay; **L8** ✅ DONE; **N4/N5** ✅ DONE;
-   **N3** ⬜ NOT STARTED — config-vs-hardcode reconciliation (L8 landed with
-   L6 since they share `oracle.rs`/`bonding.rs`; N4/N5 landed with Batch 2;
-   N3 is a `config.rs`-only dead-knob deletion, still open).
+5. **L6** ✅ DONE `lower_bound_peak` decay; **L8** ✅ DONE; **N3/N4/N5** ✅
+   DONE — config-vs-hardcode reconciliation (L8 landed with L6 since they
+   share `oracle.rs`/`bonding.rs`; N4/N5 landed with Batch 2; N3 landed
+   separately as a small final cleanup, commit `ab58233`).
 6. ✅ DONE — **L3/L4** context-gate and link-melt helper.
 7. Comment/naming pass: **L1** ✅, **L2** ✅, **L7** ✅, **N6** ✅, **N7** ✅,
    **§1b polarity doc** ✅ (docs half only — see §1b status above, naming
