@@ -194,10 +194,6 @@ pub struct SchedulerConfigInput {
     pub failover_duration_ms: Option<u64>,
     /// RTT multiple to trigger failover
     pub failover_rtt_spike_factor: Option<f64>,
-    /// Recommended bitrate as fraction of capacity (0.0-1.0)
-    pub congestion_headroom_ratio: Option<f64>,
-    /// Observed/capacity ratio that triggers congestion recommendation (0.0-1.0)
-    pub congestion_trigger_ratio: Option<f64>,
     /// EWMA smoothing factor for link stats (0.0-1.0)
     pub ewma_alpha: Option<f64>,
     /// How far ahead to predict link trends (seconds)
@@ -336,8 +332,6 @@ pub struct SchedulerConfig {
     /// different timescale. The two happen to share the number 3 by
     /// coincidence; changing this value does not change downshift behavior.
     pub failover_rtt_spike_factor: f64,
-    pub congestion_headroom_ratio: f64,
-    pub congestion_trigger_ratio: f64,
     pub ewma_alpha: f64,
     pub prediction_horizon_s: f64,
     pub capacity_floor_bps: f64,
@@ -379,8 +373,6 @@ impl Default for SchedulerConfig {
             failover_enabled: true,
             failover_duration_ms: 3000,
             failover_rtt_spike_factor: 3.0,
-            congestion_headroom_ratio: 0.85,
-            congestion_trigger_ratio: 0.90,
             ewma_alpha: 0.125,
             prediction_horizon_s: 0.5,
             capacity_floor_bps: 1_500_000.0,
@@ -495,12 +487,6 @@ impl SchedulerConfigInput {
             failover_rtt_spike_factor: self
                 .failover_rtt_spike_factor
                 .unwrap_or(defaults.failover_rtt_spike_factor),
-            congestion_headroom_ratio: self
-                .congestion_headroom_ratio
-                .unwrap_or(defaults.congestion_headroom_ratio),
-            congestion_trigger_ratio: self
-                .congestion_trigger_ratio
-                .unwrap_or(defaults.congestion_trigger_ratio),
             ewma_alpha: self
                 .ewma_alpha
                 .unwrap_or(defaults.ewma_alpha)
@@ -775,8 +761,6 @@ mod tests {
             failover_enabled = false
             failover_duration_ms = 5000
             failover_rtt_spike_factor = 4.0
-            congestion_headroom_ratio = 0.80
-            congestion_trigger_ratio = 0.85
             ewma_alpha = 0.2
             prediction_horizon_s = 1.0
             capacity_floor_bps = 2000000.0
@@ -797,8 +781,6 @@ mod tests {
         assert!(!cfg.scheduler.failover_enabled);
         assert_eq!(cfg.scheduler.failover_duration_ms, 5000);
         assert!((cfg.scheduler.failover_rtt_spike_factor - 4.0).abs() < 1e-6);
-        assert!((cfg.scheduler.congestion_headroom_ratio - 0.80).abs() < 1e-6);
-        assert!((cfg.scheduler.congestion_trigger_ratio - 0.85).abs() < 1e-6);
         assert!((cfg.scheduler.ewma_alpha - 0.2).abs() < 1e-6);
         assert!((cfg.scheduler.prediction_horizon_s - 1.0).abs() < 1e-6);
         assert!((cfg.scheduler.capacity_floor_bps - 2_000_000.0).abs() < 1e-6);
