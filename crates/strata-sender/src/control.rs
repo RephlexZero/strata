@@ -16,7 +16,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use strata_protocol::models::StreamState;
 use strata_protocol::{
-    AgentMessage, AuthLoginPayload, AuthLoginResponsePayload, ConfigExportResponsePayload,
+    AgentMessage, AuthChallengeResponsePayload, AuthLoginPayload, ConfigExportResponsePayload,
     ConfigImportResponsePayload, ConfigSetResponsePayload, ConfigUpdateResponsePayload,
     ControlMessage, DeviceStatusPayload, Envelope, FileEntry, FilesListResponsePayload,
     InterfaceCommandResponsePayload, InterfacesScanResponsePayload, JitterBufferResponsePayload,
@@ -126,9 +126,20 @@ async fn connect_and_run(
     tracing::info!("WebSocket connected");
 
     // ── Authenticate ────────────────────────────────────────────
+    // Enrolled devices (identity file carries a device id) authenticate by
+    // ed25519 challenge; otherwise enroll with the one-time token, sending
+    // the public key so the token is consumed server-side.
+    let identity = state.identity.lock().await.clone();
+    let enrolled_device_id = identity.device_id.clone();
+
     let auth_payload = AuthLoginPayload {
-        enrollment_token: enrollment_token.map(|s| s.to_string()),
-        device_key: None, // TODO: use saved device key for re-auth
+        enrollment_token: if enrolled_device_id.is_none() {
+            enrollment_token.map(|s| s.to_string())
+        } else {
+            None
+        },
+        device_id: enrolled_device_id.clone(),
+        device_public_key: Some(identity.public_key.clone()),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         hostname: hostname.to_string(),
         arch: std::env::consts::ARCH.to_string(),
@@ -138,17 +149,39 @@ async fn connect_and_run(
     let json = serde_json::to_string(&envelope)?;
     ws_tx.send(Message::Text(json.into())).await?;
 
-    // Wait for auth response
-    let auth_response = match ws_rx.next().await {
-        Some(Ok(Message::Text(text))) => {
-            let envelope: Envelope = serde_json::from_str(&text)?;
-            let resp: AuthLoginResponsePayload = envelope.parse_payload()?;
-            resp
+    // Response is either the login result (enrollment) or a challenge to
+    // sign (device-key reconnect).
+    let auth_response = loop {
+        let text = match ws_rx.next().await {
+            Some(Ok(Message::Text(text))) => text,
+            Some(Ok(Message::Close(_))) => anyhow::bail!("connection closed during auth"),
+            Some(Err(e)) => anyhow::bail!("WebSocket error during auth: {e}"),
+            None => anyhow::bail!("connection closed during auth"),
+            _ => anyhow::bail!("unexpected message type during auth"),
+        };
+        let envelope: Envelope = serde_json::from_str(&text)?;
+        match envelope.parse_message() {
+            Ok(ControlMessage::AuthChallenge(challenge)) => {
+                let Some(ref device_id) = enrolled_device_id else {
+                    anyhow::bail!("received auth.challenge without an enrolled identity");
+                };
+                let signature = strata_common::auth::sign_challenge(
+                    &identity.private_key,
+                    &challenge.challenge,
+                )
+                .map_err(|e| anyhow::anyhow!("failed to sign challenge: {e}"))?;
+                let response = AgentMessage::AuthChallengeResponse(AuthChallengeResponsePayload {
+                    device_id: device_id.clone(),
+                    signature,
+                });
+                let envelope = Envelope::from_message(&response)?;
+                ws_tx
+                    .send(Message::Text(serde_json::to_string(&envelope)?.into()))
+                    .await?;
+            }
+            Ok(ControlMessage::AuthLoginResponse(resp)) => break resp,
+            _ => anyhow::bail!("unexpected message during auth: {}", envelope.msg_type),
         }
-        Some(Ok(Message::Close(_))) => anyhow::bail!("connection closed during auth"),
-        Some(Err(e)) => anyhow::bail!("WebSocket error during auth: {e}"),
-        None => anyhow::bail!("connection closed during auth"),
-        _ => anyhow::bail!("unexpected message type during auth"),
     };
 
     if !auth_response.success {
@@ -162,10 +195,23 @@ async fn connect_and_run(
 
     tracing::info!(sender_id = %sender_id, "authenticated");
 
-    // Store sender_id and session token
+    // Store sender_id; persist it into the identity file on first
+    // enrollment (the token is spent — the key is now the credential).
     {
         *state.sender_id.lock().await = Some(sender_id.clone());
-        *state.session_token.lock().await = auth_response.session_token;
+        let mut identity = state.identity.lock().await;
+        if identity.device_id.as_deref() != Some(&sender_id) {
+            identity.device_id = Some(sender_id.clone());
+            if let Err(e) = identity.save(&state.identity_path) {
+                tracing::error!(
+                    error = %e,
+                    path = %state.identity_path.display(),
+                    "FAILED to persist device identity — this device cannot re-authenticate after restart"
+                );
+            }
+        }
+        // Consume the pending token so re-connect attempts use the key.
+        *state.pending_enrollment_token.lock().await = None;
     }
     state
         .control_connected
@@ -271,8 +317,8 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
     };
 
     match msg {
-        ControlMessage::AuthLoginResponse(_) => {
-            tracing::debug!("unexpected auth.login.response outside handshake");
+        ControlMessage::AuthLoginResponse(_) | ControlMessage::AuthChallenge(_) => {
+            tracing::debug!("unexpected auth message outside handshake");
         }
         ControlMessage::StreamStart(payload) => {
             tracing::info!(stream_id = %payload.stream_id, "received stream.start");

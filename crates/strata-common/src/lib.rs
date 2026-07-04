@@ -9,5 +9,6 @@
 //! live in `strata-protocol` — the wasm-safe single source of truth.
 
 pub mod auth;
+pub mod identity;
 pub mod ids;
 pub mod metrics;

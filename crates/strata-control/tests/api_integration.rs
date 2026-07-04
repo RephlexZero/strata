@@ -1160,3 +1160,189 @@ async fn transition_rejects_illegal_moves() {
         .unwrap();
     assert!(!readopted);
 }
+
+// ── Device identity: one-time tokens + challenge auth (E4) ───────────
+
+/// Perform a full agent enrollment WITH a device public key, consuming the
+/// one-time token. Returns (sender_id, composite_token).
+async fn enroll_agent_with_key(
+    app: &Router,
+    addr: std::net::SocketAddr,
+    user_token: &str,
+    public_key: &str,
+) -> (String, String) {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/senders",
+            user_token,
+            serde_json::json!({ "name": "Keyed Device" }),
+        ))
+        .await
+        .unwrap();
+    let body = json_body(resp).await;
+    let sender_id = body["sender_id"].as_str().unwrap().to_string();
+    let token = body["enrollment_token"].as_str().unwrap().to_string();
+    assert!(
+        token.starts_with(&format!("{sender_id}.")),
+        "expected composite <id>.<secret> token, got {token}"
+    );
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/agent/ws"))
+        .await
+        .unwrap();
+    let auth = serde_json::json!({
+        "id": "t", "type": "auth.login", "ts": chrono::Utc::now().to_rfc3339(),
+        "payload": {
+            "enrollment_token": token,
+            "device_public_key": public_key,
+            "agent_version": "test", "hostname": "keyed", "arch": "x86_64",
+        },
+    });
+    ws.send(Message::Text(auth.to_string().into())).await.unwrap();
+    let resp = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
+        .await
+        .expect("enrollment response");
+    assert_eq!(resp["payload"]["success"], true, "enrollment failed: {resp}");
+
+    (sender_id, token)
+}
+
+#[tokio::test]
+async fn enrollment_token_is_single_use_and_key_auth_works() {
+    let Some((app, _state)) = test_app_with_state().await else {
+        return;
+    };
+    let token = register_and_login(&app).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_app = app.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, serve_app).await.unwrap();
+    });
+
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (private_key, public_key) = strata_common::auth::generate_device_keypair();
+    let (sender_id, enrollment_token) =
+        enroll_agent_with_key(&app, addr, &token, &public_key).await;
+
+    // 1. The token is consumed — a second enrollment with it must fail.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/agent/ws"))
+        .await
+        .unwrap();
+    let auth = serde_json::json!({
+        "id": "t", "type": "auth.login", "ts": chrono::Utc::now().to_rfc3339(),
+        "payload": {
+            "enrollment_token": enrollment_token,
+            "agent_version": "test", "hostname": "replay", "arch": "x86_64",
+        },
+    });
+    ws.send(Message::Text(auth.to_string().into())).await.unwrap();
+    let resp = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
+        .await
+        .expect("replay response");
+    assert_eq!(
+        resp["payload"]["success"], false,
+        "a consumed enrollment token must be rejected: {resp}"
+    );
+
+    // 2. Challenge auth with the enrolled key succeeds.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/agent/ws"))
+        .await
+        .unwrap();
+    let auth = serde_json::json!({
+        "id": "t", "type": "auth.login", "ts": chrono::Utc::now().to_rfc3339(),
+        "payload": {
+            "enrollment_token": null,
+            "device_id": sender_id,
+            "device_public_key": public_key,
+            "agent_version": "test", "hostname": "keyed", "arch": "x86_64",
+        },
+    });
+    ws.send(Message::Text(auth.to_string().into())).await.unwrap();
+
+    let challenge_msg = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
+        .await
+        .expect("auth.challenge");
+    assert_eq!(challenge_msg["type"], "auth.challenge");
+    let challenge = challenge_msg["payload"]["challenge"].as_str().unwrap();
+
+    let signature = strata_common::auth::sign_challenge(&private_key, challenge).unwrap();
+    let response = serde_json::json!({
+        "id": "t", "type": "auth.challenge.response", "ts": chrono::Utc::now().to_rfc3339(),
+        "payload": { "device_id": sender_id, "signature": signature },
+    });
+    ws.send(Message::Text(response.to_string().into())).await.unwrap();
+
+    let result = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
+        .await
+        .expect("auth result");
+    assert_eq!(result["type"], "auth.login.response");
+    assert_eq!(
+        result["payload"]["success"], true,
+        "challenge auth with the enrolled key must succeed: {result}"
+    );
+    assert_eq!(result["payload"]["sender_id"], sender_id.as_str());
+}
+
+#[tokio::test]
+async fn challenge_auth_rejects_wrong_key() {
+    let Some((app, _state)) = test_app_with_state().await else {
+        return;
+    };
+    let token = register_and_login(&app).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_app = app.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, serve_app).await.unwrap();
+    });
+
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (_enrolled_private, enrolled_public) = strata_common::auth::generate_device_keypair();
+    let (sender_id, _) = enroll_agent_with_key(&app, addr, &token, &enrolled_public).await;
+
+    // Attacker knows the sender_id but holds a different keypair.
+    let (attacker_private, _) = strata_common::auth::generate_device_keypair();
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/agent/ws"))
+        .await
+        .unwrap();
+    let auth = serde_json::json!({
+        "id": "t", "type": "auth.login", "ts": chrono::Utc::now().to_rfc3339(),
+        "payload": {
+            "device_id": sender_id,
+            "agent_version": "test", "hostname": "mallory", "arch": "x86_64",
+        },
+    });
+    ws.send(Message::Text(auth.to_string().into())).await.unwrap();
+
+    let challenge_msg = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
+        .await
+        .expect("auth.challenge");
+    let challenge = challenge_msg["payload"]["challenge"].as_str().unwrap();
+
+    let signature = strata_common::auth::sign_challenge(&attacker_private, challenge).unwrap();
+    let response = serde_json::json!({
+        "id": "t", "type": "auth.challenge.response", "ts": chrono::Utc::now().to_rfc3339(),
+        "payload": { "device_id": sender_id, "signature": signature },
+    });
+    ws.send(Message::Text(response.to_string().into())).await.unwrap();
+
+    let result = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
+        .await
+        .expect("auth result");
+    assert_eq!(
+        result["payload"]["success"], false,
+        "a signature from the wrong key must be rejected: {result}"
+    );
+}

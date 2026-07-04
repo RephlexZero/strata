@@ -32,6 +32,12 @@ struct Cli {
     #[arg(long)]
     enrollment_token: Option<String>,
 
+    /// Path of the persistent device identity (ed25519 keypair + device id).
+    /// Enrollment tokens are single-use — this file is the reconnect
+    /// credential after first enrollment.
+    #[arg(long, default_value = "/var/lib/strata/receiver-identity.json")]
+    identity_file: String,
+
     /// Public IP or hostname that senders can reach this receiver at.
     #[arg(long, env = "BIND_HOST")]
     bind_host: String,
@@ -65,7 +71,10 @@ struct Cli {
 /// Shared receiver daemon state accessible from all tasks.
 pub struct ReceiverState {
     pub receiver_id: tokio::sync::Mutex<Option<String>>,
-    pub session_token: tokio::sync::Mutex<Option<String>>,
+    /// Persistent device identity (keypair + enrolled device id).
+    pub identity: tokio::sync::Mutex<strata_common::identity::DeviceIdentity>,
+    /// Where `identity` is persisted.
+    pub identity_path: std::path::PathBuf,
     pub pipelines: tokio::sync::Mutex<pipeline::PipelineRegistry>,
     pub control_tx: mpsc::Sender<String>,
     pub shutdown: watch::Receiver<bool>,
@@ -176,10 +185,17 @@ async fn main() -> anyhow::Result<()> {
     const CONTROL_OUTGOING_CHANNEL_CAPACITY: usize = 128;
     let (control_tx, control_rx) = mpsc::channel::<String>(CONTROL_OUTGOING_CHANNEL_CAPACITY);
 
+    // Device identity: load or generate the keypair before touching the
+    // network — enrolling with an unpersistable key would consume the
+    // one-time token and strand the device.
+    let identity_path = std::path::PathBuf::from(&cli.identity_file);
+    let identity = strata_common::identity::DeviceIdentity::load_or_generate(&identity_path)?;
+
     // Build shared state
     let state = Arc::new(ReceiverState {
         receiver_id: tokio::sync::Mutex::new(None),
-        session_token: tokio::sync::Mutex::new(None),
+        identity: tokio::sync::Mutex::new(identity),
+        identity_path,
         pipelines: tokio::sync::Mutex::new(pipeline::PipelineRegistry::new()),
         control_tx: control_tx.clone(),
         shutdown: shutdown_rx.clone(),

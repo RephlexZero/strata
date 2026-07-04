@@ -32,6 +32,10 @@ pub enum AgentMessage {
     #[serde(rename = "stream.ended")]
     StreamEnded(StreamEndedPayload),
 
+    /// Signature over the server's auth.challenge (reconnect handshake).
+    #[serde(rename = "auth.challenge.response")]
+    AuthChallengeResponse(AuthChallengeResponsePayload),
+
     // ── RPC responses (routed to the pending REST caller by request_id) ──
     #[serde(rename = "config.set.response")]
     ConfigSetResponse(ConfigSetResponsePayload),
@@ -78,8 +82,8 @@ impl AgentMessage {
     pub fn request_id(&self) -> Option<&str> {
         use AgentMessage::*;
         match self {
-            AuthLogin(_) | DeviceStatus(_) | StreamStats(_) | StreamEnded(_)
-            | InterfaceCommandResponse(_) => None,
+            AuthLogin(_) | AuthChallengeResponse(_) | DeviceStatus(_) | StreamStats(_)
+            | StreamEnded(_) | InterfaceCommandResponse(_) => None,
             ConfigSetResponse(p) => Some(&p.request_id),
             ConfigUpdateResponse(p) => p.request_id.as_deref(),
             TestRunResponse(p) => Some(&p.request_id),
@@ -110,6 +114,10 @@ pub enum ControlMessage {
     /// Response to agent auth.
     #[serde(rename = "auth.login.response")]
     AuthLoginResponse(AuthLoginResponsePayload),
+
+    /// Reconnect handshake: sign this nonce with the enrolled device key.
+    #[serde(rename = "auth.challenge")]
+    AuthChallenge(AuthChallengePayload),
 
     /// Start a broadcast.
     #[serde(rename = "stream.start")]
@@ -202,8 +210,8 @@ impl ControlMessage {
     pub fn request_id(&self) -> Option<&str> {
         use ControlMessage::*;
         match self {
-            AuthLoginResponse(_) | StreamStart(_) | StreamStop(_) | SourceSwitch(_)
-            | InterfaceCommand(_) => None,
+            AuthLoginResponse(_) | AuthChallenge(_) | StreamStart(_) | StreamStop(_)
+            | SourceSwitch(_) | InterfaceCommand(_) => None,
             ConfigUpdate(p) => p.request_id.as_deref(),
             ConfigSet(p) => Some(&p.request_id),
             TestRun(p) => Some(&p.request_id),
@@ -235,6 +243,10 @@ pub enum ReceiverMessage {
     #[serde(rename = "auth.login")]
     AuthLogin(ReceiverAuthLoginPayload),
 
+    /// Signature over the server's auth.challenge (reconnect handshake).
+    #[serde(rename = "auth.challenge.response")]
+    AuthChallengeResponse(AuthChallengeResponsePayload),
+
     /// Periodic heartbeat with capacity info.
     #[serde(rename = "receiver.status")]
     Status(ReceiverStatusPayload),
@@ -257,6 +269,10 @@ pub enum ReceiverControlMessage {
     /// Response to receiver auth.
     #[serde(rename = "auth.login.response")]
     AuthLoginResponse(ReceiverAuthLoginResponsePayload),
+
+    /// Reconnect handshake: sign this nonce with the enrolled device key.
+    #[serde(rename = "auth.challenge")]
+    AuthChallenge(AuthChallengePayload),
 
     /// Start receiving a stream.
     #[serde(rename = "receiver.stream.start")]
@@ -303,8 +319,9 @@ mod tests {
     #[test]
     fn envelope_round_trip() {
         let payload = AuthLoginPayload {
-            enrollment_token: Some("enr_test123".into()),
-            device_key: None,
+            enrollment_token: Some("snd_test.WXYZ2345".into()),
+            device_id: None,
+            device_public_key: None,
             agent_version: "0.5.0".into(),
             hostname: "test-sender".into(),
             arch: "x86_64".into(),
@@ -369,8 +386,9 @@ mod tests {
     #[test]
     fn agent_message_tagged_serialization() {
         let msg = AgentMessage::AuthLogin(AuthLoginPayload {
-            enrollment_token: Some("enr_abc".into()),
-            device_key: None,
+            enrollment_token: Some("snd_abc.WXYZ2345".into()),
+            device_id: None,
+            device_public_key: None,
             agent_version: "0.5.0".into(),
             hostname: "sender-1".into(),
             arch: "aarch64".into(),

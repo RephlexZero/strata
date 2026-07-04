@@ -171,6 +171,9 @@ async fn create_sender(
 
     tracing::info!(sender_id = %sender_id, owner = %user.user_id, "sender created");
 
+    // Composite <id>.<secret> token: the id half lets enrollment verify one
+    // argon2 hash instead of scanning every device (E4).
+    let enrollment_token = ids::composite_enrollment_token(&sender_id, &enrollment_token);
     Ok((
         StatusCode::CREATED,
         Json(CreateSenderResponse {
@@ -339,6 +342,7 @@ async fn unenroll_sender(
 
     tracing::info!(sender_id = %id, "sender unenrolled, new token issued");
 
+    let new_token = strata_common::ids::composite_enrollment_token(&id, &new_token);
     Ok(Json(UnenrollResponse {
         sender_id: id,
         enrollment_token: new_token,

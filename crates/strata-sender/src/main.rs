@@ -36,6 +36,12 @@ struct Cli {
     #[arg(long)]
     enrollment_token: Option<String>,
 
+    /// Path of the persistent device identity (ed25519 keypair + device id).
+    /// Enrollment tokens are single-use — this file is the reconnect
+    /// credential after first enrollment.
+    #[arg(long, default_value = "/var/lib/strata/sender-identity.json")]
+    identity_file: String,
+
     /// Onboarding portal listen address.
     #[arg(long, default_value = "0.0.0.0:3001")]
     portal_addr: String,
@@ -56,7 +62,10 @@ struct Cli {
 /// Shared agent state accessible from all tasks.
 pub struct AgentState {
     pub sender_id: tokio::sync::Mutex<Option<String>>,
-    pub session_token: tokio::sync::Mutex<Option<String>>,
+    /// Persistent device identity (keypair + enrolled device id).
+    pub identity: tokio::sync::Mutex<strata_common::identity::DeviceIdentity>,
+    /// Where `identity` is persisted.
+    pub identity_path: std::path::PathBuf,
     pub hardware: hardware::HardwareScanner,
     pub pipeline: tokio::sync::Mutex<pipeline::PipelineManager>,
     pub control_tx: mpsc::Sender<String>,
@@ -111,10 +120,17 @@ async fn main() -> anyhow::Result<()> {
     // Reconnect signal (portal can trigger reconnect after enrollment)
     let (reconnect_tx, _reconnect_rx) = watch::channel(());
 
+    // Device identity: load or generate the keypair before touching the
+    // network — enrolling with an unpersistable key would consume the
+    // one-time token and strand the device.
+    let identity_path = std::path::PathBuf::from(&cli.identity_file);
+    let identity = strata_common::identity::DeviceIdentity::load_or_generate(&identity_path)?;
+
     // Build shared state
     let state = Arc::new(AgentState {
         sender_id: tokio::sync::Mutex::new(None),
-        session_token: tokio::sync::Mutex::new(None),
+        identity: tokio::sync::Mutex::new(identity),
+        identity_path,
         hardware: hardware::HardwareScanner::new(),
         pipeline: tokio::sync::Mutex::new(pipeline::PipelineManager::new()),
         control_tx: control_tx.clone(),

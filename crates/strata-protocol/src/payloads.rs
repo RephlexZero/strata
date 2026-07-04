@@ -12,11 +12,34 @@ use crate::models::{LinkStats, MediaInput, NetworkInterface, StreamState};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthLoginPayload {
+    /// One-time composite enrollment token (`<device_id>.<SECRET>`).
+    /// Present only on first enrollment; consumed server-side.
     pub enrollment_token: Option<String>,
-    pub device_key: Option<String>,
+    /// Device id for reconnects — triggers an ed25519 challenge handshake
+    /// against the public key stored at enrollment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// The device's ed25519 public key (base64). Sent at enrollment so the
+    /// token can be single-use; reconnects authenticate by signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_public_key: Option<String>,
     pub agent_version: String,
     pub hostname: String,
     pub arch: String,
+}
+
+/// Server → device: prove possession of the enrolled private key by
+/// signing this base64 nonce.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthChallengePayload {
+    pub challenge: String,
+}
+
+/// Device → server: base64 ed25519 signature over the challenge string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthChallengeResponsePayload {
+    pub device_id: String,
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +103,6 @@ pub enum StreamEndReason {
 pub struct AuthLoginResponsePayload {
     pub success: bool,
     pub sender_id: Option<String>,
-    pub session_token: Option<String>,
     pub error: Option<String>,
 }
 
@@ -526,7 +548,14 @@ pub struct JitterBufferResponsePayload {
 /// Auth payload sent by a receiver daemon when connecting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiverAuthLoginPayload {
+    /// One-time composite enrollment token (`<device_id>.<SECRET>`).
     pub enrollment_token: Option<String>,
+    /// Device id for reconnects (ed25519 challenge handshake).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// The device's ed25519 public key (base64), sent at enrollment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_public_key: Option<String>,
     pub receiver_version: String,
     pub hostname: String,
     pub region: Option<String>,
@@ -543,7 +572,6 @@ pub struct ReceiverAuthLoginPayload {
 pub struct ReceiverAuthLoginResponsePayload {
     pub success: bool,
     pub receiver_id: Option<String>,
-    pub session_token: Option<String>,
     pub error: Option<String>,
 }
 

@@ -174,6 +174,55 @@ pub fn generate_device_keypair() -> (String, String) {
     (private_b64, public_b64)
 }
 
+/// Generate a random 32-byte auth challenge, base64-encoded.
+pub fn generate_challenge() -> String {
+    use rand_core::RngCore;
+    let mut nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut nonce);
+    BASE64.encode(nonce)
+}
+
+/// Sign a base64 challenge with a device private key (base64 seed).
+/// Returns the base64 signature.
+pub fn sign_challenge(private_key_b64: &str, challenge_b64: &str) -> Result<String, AuthError> {
+    use ed25519_dalek::Signer;
+    let seed = BASE64
+        .decode(private_key_b64)
+        .map_err(|_| AuthError::InvalidKey)?;
+    let seed: [u8; 32] = seed.as_slice().try_into().map_err(|_| AuthError::InvalidKey)?;
+    let signing_key = SigningKey::from_bytes(&seed);
+    let signature = signing_key.sign(challenge_b64.as_bytes());
+    Ok(BASE64.encode(signature.to_bytes()))
+}
+
+/// Verify a device's base64 signature over a base64 challenge against its
+/// stored public key. Returns `Ok(false)` on any well-formed-but-wrong
+/// input; `Err` only for malformed keys.
+pub fn verify_challenge(
+    public_key_b64: &str,
+    challenge_b64: &str,
+    signature_b64: &str,
+) -> Result<bool, AuthError> {
+    use ed25519_dalek::Verifier;
+    let pubkey = BASE64
+        .decode(public_key_b64)
+        .map_err(|_| AuthError::InvalidKey)?;
+    let pubkey: [u8; 32] = pubkey
+        .as_slice()
+        .try_into()
+        .map_err(|_| AuthError::InvalidKey)?;
+    let verifying_key = VerifyingKey::from_bytes(&pubkey).map_err(|_| AuthError::InvalidKey)?;
+
+    let Ok(sig_bytes) = BASE64.decode(signature_b64) else {
+        return Ok(false);
+    };
+    let Ok(sig_bytes): Result<[u8; 64], _> = sig_bytes.as_slice().try_into() else {
+        return Ok(false);
+    };
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    Ok(verifying_key.verify(challenge_b64.as_bytes(), &signature).is_ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +304,26 @@ mod tests {
         // Private key = 32 bytes, public key = 32 bytes
         assert_eq!(BASE64.decode(&private_key).unwrap().len(), 32);
         assert_eq!(BASE64.decode(&public_key).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn challenge_sign_and_verify() {
+        let (private_key, public_key) = generate_device_keypair();
+        let challenge = generate_challenge();
+
+        let signature = sign_challenge(&private_key, &challenge).unwrap();
+        assert!(verify_challenge(&public_key, &challenge, &signature).unwrap());
+
+        // Wrong key fails
+        let (_, other_public) = generate_device_keypair();
+        assert!(!verify_challenge(&other_public, &challenge, &signature).unwrap());
+
+        // Wrong challenge fails
+        let other_challenge = generate_challenge();
+        assert!(!verify_challenge(&public_key, &other_challenge, &signature).unwrap());
+
+        // Garbage signature is a clean false, not an error
+        assert!(!verify_challenge(&public_key, &challenge, "not-base64!").unwrap());
     }
 
     #[test]

@@ -157,10 +157,14 @@ async fn api_unenroll(
         ));
     }
 
-    // Clear session token
+    // Reset the device identity's enrollment (keypair is kept; a fresh
+    // enrollment token binds it again server-side).
     {
-        let mut token = state.session_token.lock().await;
-        *token = None;
+        let mut identity = state.identity.lock().await;
+        identity.device_id = None;
+        if let Err(e) = identity.save(&state.identity_path) {
+            tracing::warn!(error = %e, "failed to persist identity reset");
+        }
     }
 
     // Clear pending enrollment data

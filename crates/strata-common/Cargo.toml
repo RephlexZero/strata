@@ -12,6 +12,7 @@ serde_json = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.21", features = ["v7", "serde"] }
 thiserror = "2"
+anyhow = { workspace = true }
 
 # Auth
 argon2 = "0.5"

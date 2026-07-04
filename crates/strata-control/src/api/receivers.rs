@@ -142,6 +142,8 @@ async fn create_receiver(
 
     tracing::info!(receiver_id = %receiver_id, owner = %user.user_id, "receiver created");
 
+    // Composite <id>.<secret> token — see api/senders.rs::create_sender (E4).
+    let enrollment_token = ids::composite_enrollment_token(&receiver_id, &enrollment_token);
     Ok((
         StatusCode::CREATED,
         Json(CreateReceiverResponse {

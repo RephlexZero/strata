@@ -18,8 +18,8 @@ use tokio::sync::mpsc;
 
 use strata_common::auth;
 use strata_protocol::{
-    Envelope, PROTOCOL_VERSION, ReceiverAuthLoginPayload, ReceiverAuthLoginResponsePayload,
-    ReceiverControlMessage, ReceiverMessage,
+    AuthChallengePayload, Envelope, PROTOCOL_VERSION, ReceiverAuthLoginPayload,
+    ReceiverAuthLoginResponsePayload, ReceiverControlMessage, ReceiverMessage,
 };
 
 use crate::state::{AppState, ReceiverHandle};
@@ -32,26 +32,12 @@ pub async fn handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> imp
 async fn handle_socket(state: AppState, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Wait for the first message — must be auth.login
-    let (receiver_id, owner_id, hostname) = match ws_rx.next().await {
-        Some(Ok(Message::Text(text))) => match authenticate(&state, &text).await {
-            Ok((rid, owner_id, hostname, response_json)) => {
-                if ws_tx
-                    .send(Message::Text(response_json.into()))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                (rid, owner_id, hostname)
-            }
-            Err(err_json) => {
-                let _ = ws_tx.send(Message::Text(err_json.into())).await;
-                return;
-            }
-        },
-        _ => return,
-    };
+    // Handshake: enrollment (single message) or challenge/response (two).
+    let (receiver_id, owner_id, hostname) =
+        match authenticate(&state, &mut ws_tx, &mut ws_rx).await {
+            Some(identity) => identity,
+            None => return,
+        };
 
     tracing::info!(receiver_id = %receiver_id, "receiver connected");
 
@@ -121,13 +107,68 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     tracing::info!(receiver_id = %receiver_id, "receiver disconnected");
 }
 
-/// Authenticate the receiver from the first message.
+/// How long the receiver gets to answer an `auth.challenge`.
+const CHALLENGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+type WsSink = futures::stream::SplitSink<WebSocket, Message>;
+type WsStream = futures::stream::SplitStream<WebSocket>;
+
+/// Run the auth handshake (see ws_agent.rs for the flow — this mirrors it
+/// for receivers). Returns `Some((receiver_id, owner_id, hostname))`.
 async fn authenticate(
     state: &AppState,
-    raw: &str,
-) -> Result<(String, String, Option<String>, String), String> {
+    ws_tx: &mut WsSink,
+    ws_rx: &mut WsStream,
+) -> Option<(String, String, Option<String>)> {
+    let text = match ws_rx.next().await {
+        Some(Ok(Message::Text(text))) => text,
+        _ => return None,
+    };
+
+    let payload = match parse_auth_login(&text) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = ws_tx.send(Message::Text(error_response(&e).into())).await;
+            return None;
+        }
+    };
+
+    let result = if let Some(ref token) = payload.enrollment_token {
+        enroll(state, token, &payload).await
+    } else if payload.device_id.is_some() {
+        challenge_auth(state, ws_tx, ws_rx, &payload).await
+    } else {
+        Err("no enrollment_token or device_id provided for receiver auth".to_string())
+    };
+
+    match result {
+        Ok((receiver_id, owner_id, hostname)) => {
+            let response = ReceiverAuthLoginResponsePayload {
+                success: true,
+                receiver_id: Some(receiver_id.clone()),
+                error: None,
+            };
+            let envelope =
+                Envelope::from_message(&ReceiverControlMessage::AuthLoginResponse(response))
+                    .unwrap();
+            let json = serde_json::to_string(&envelope).unwrap();
+            if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                return None;
+            }
+            Some((receiver_id, owner_id, hostname))
+        }
+        Err(msg) => {
+            let _ = ws_tx
+                .send(Message::Text(error_response(&msg).into()))
+                .await;
+            None
+        }
+    }
+}
+
+fn parse_auth_login(raw: &str) -> Result<ReceiverAuthLoginPayload, String> {
     let envelope: Envelope =
-        serde_json::from_str(raw).map_err(|e| error_response(&format!("invalid message: {e}")))?;
+        serde_json::from_str(raw).map_err(|e| format!("invalid message: {e}"))?;
 
     if envelope.proto_version != PROTOCOL_VERSION {
         tracing::warn!(
@@ -137,104 +178,161 @@ async fn authenticate(
         );
     }
 
-    let payload: ReceiverAuthLoginPayload = match envelope.parse_message::<ReceiverMessage>() {
-        Ok(ReceiverMessage::AuthLogin(p)) => p,
-        Ok(_) => return Err(error_response("first message must be auth.login")),
-        Err(e) => return Err(error_response(&format!("invalid auth.login message: {e}"))),
-    };
-
-    if let Some(ref token) = payload.enrollment_token {
-        return authenticate_enrollment(state, token, &payload).await;
+    match envelope.parse_message::<ReceiverMessage>() {
+        Ok(ReceiverMessage::AuthLogin(p)) => Ok(p),
+        Ok(_) => Err("first message must be auth.login".into()),
+        Err(e) => Err(format!("invalid auth.login message: {e}")),
     }
-
-    Err(error_response(
-        "no enrollment_token provided for receiver auth",
-    ))
 }
 
-/// Authenticate via enrollment token.
-async fn authenticate_enrollment(
+/// Update the receiver row with the capacity info carried on every auth.
+async fn record_capacity(
+    state: &AppState,
+    receiver_id: &str,
+    payload: &ReceiverAuthLoginPayload,
+) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE receivers SET hostname = $1, bind_host = $2, link_ports = $3, \
+         max_streams = $4, region = $5, online = TRUE, last_seen_at = $6 WHERE id = $7",
+    )
+    .bind(&payload.hostname)
+    .bind(&payload.bind_host)
+    .bind(
+        payload
+            .link_ports
+            .iter()
+            .map(|&p| p as i32)
+            .collect::<Vec<i32>>(),
+    )
+    .bind(payload.max_streams as i32)
+    .bind(&payload.region)
+    .bind(Utc::now())
+    .bind(receiver_id)
+    .execute(state.pool())
+    .await
+    .map_err(|e| format!("db error: {e}"))?;
+    Ok(())
+}
+
+/// First-time enrollment via one-time composite token — one row lookup,
+/// one argon2 verify; token consumed when a device key is bound.
+async fn enroll(
     state: &AppState,
     token: &str,
     payload: &ReceiverAuthLoginPayload,
-) -> Result<(String, String, Option<String>, String), String> {
-    let rows = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT id, owner_id, enrollment_token FROM receivers WHERE enrollment_token IS NOT NULL",
-    )
-    .fetch_all(state.pool())
-    .await
-    .map_err(|e| error_response(&format!("db error: {e}")))?;
+) -> Result<(String, String, Option<String>), String> {
+    let Some((receiver_id, secret)) = strata_common::ids::split_enrollment_token(token) else {
+        return Err(
+            "invalid enrollment token format — expected <device-id>.<token> (re-create the \
+             device to get a current-format token)"
+                .into(),
+        );
+    };
 
-    let normalized = strata_common::ids::normalize_enrollment_token(token);
-    for (receiver_id, owner_id, token_hash) in &rows {
-        if let Ok(true) = auth::verify_password(&normalized, token_hash) {
-            // Update receiver record with capacity info
-            let _ = sqlx::query(
-                "UPDATE receivers SET enrolled = TRUE, hostname = $1, bind_host = $2, \
-                 link_ports = $3, max_streams = $4, region = $5, online = TRUE, last_seen_at = $6 \
-                 WHERE id = $7",
-            )
-            .bind(&payload.hostname)
-            .bind(&payload.bind_host)
-            .bind(
-                payload
-                    .link_ports
-                    .iter()
-                    .map(|&p| p as i32)
-                    .collect::<Vec<i32>>(),
-            )
-            .bind(payload.max_streams as i32)
-            .bind(&payload.region)
-            .bind(Utc::now())
-            .bind(receiver_id)
-            .execute(state.pool())
-            .await;
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT owner_id, enrollment_token FROM receivers WHERE id = $1")
+            .bind(&receiver_id)
+            .fetch_optional(state.pool())
+            .await
+            .map_err(|e| format!("db error: {e}"))?;
 
-            // Issue session JWT
-            let now = Utc::now().timestamp();
-            let claims = auth::Claims {
-                sub: receiver_id.clone(),
-                iss: "strata-control".into(),
-                exp: now + auth::SESSION_TOKEN_TTL_SECS,
-                iat: now,
-                role: "receiver".into(),
-                owner: Some(owner_id.clone()),
-            };
-            let session_token = state
-                .jwt()
-                .create_token(&claims)
-                .map_err(|e| error_response(&format!("JWT error: {e}")))?;
+    let Some((owner_id, token_hash)) = row else {
+        return Err("invalid enrollment token".into());
+    };
+    let Some(token_hash) = token_hash else {
+        return Err("enrollment token already used — reconnect with the device key".into());
+    };
 
-            let response = ReceiverAuthLoginResponsePayload {
-                success: true,
-                receiver_id: Some(receiver_id.clone()),
-                session_token: Some(session_token),
-                error: None,
-            };
-
-            let envelope =
-                Envelope::from_message(&ReceiverControlMessage::AuthLoginResponse(response))
-                    .unwrap();
-            let json = serde_json::to_string(&envelope).unwrap();
-
-            tracing::info!(
-                receiver_id = %receiver_id,
-                hostname = %payload.hostname,
-                region = ?payload.region,
-                max_streams = payload.max_streams,
-                "receiver enrolled"
-            );
-
-            return Ok((
-                receiver_id.clone(),
-                owner_id.clone(),
-                Some(payload.hostname.clone()),
-                json,
-            ));
-        }
+    if !auth::verify_password(&secret, &token_hash).unwrap_or(false) {
+        return Err("invalid enrollment token".into());
     }
 
-    Err(error_response("invalid enrollment token"))
+    if let Some(ref pubkey) = payload.device_public_key {
+        sqlx::query(
+            "UPDATE receivers SET enrolled = TRUE, device_public_key = $1, \
+             enrollment_token = NULL WHERE id = $2",
+        )
+        .bind(pubkey)
+        .bind(&receiver_id)
+        .execute(state.pool())
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
+        tracing::info!(receiver_id = %receiver_id, hostname = %payload.hostname, "receiver enrolled (device key bound, token consumed)");
+    } else {
+        sqlx::query("UPDATE receivers SET enrolled = TRUE WHERE id = $1")
+            .bind(&receiver_id)
+            .execute(state.pool())
+            .await
+            .map_err(|e| format!("db error: {e}"))?;
+        tracing::warn!(
+            receiver_id = %receiver_id,
+            "receiver enrolled WITHOUT a device key — enrollment token remains a reusable credential"
+        );
+    }
+
+    record_capacity(state, &receiver_id, payload).await?;
+    Ok((receiver_id, owner_id, Some(payload.hostname.clone())))
+}
+
+/// Reconnect auth: nonce challenge signed with the enrolled device key.
+async fn challenge_auth(
+    state: &AppState,
+    ws_tx: &mut WsSink,
+    ws_rx: &mut WsStream,
+    payload: &ReceiverAuthLoginPayload,
+) -> Result<(String, String, Option<String>), String> {
+    let device_id = payload.device_id.as_deref().unwrap_or_default().to_string();
+
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT owner_id, device_public_key FROM receivers WHERE id = $1 AND enrolled = TRUE",
+    )
+    .bind(&device_id)
+    .fetch_optional(state.pool())
+    .await
+    .map_err(|e| format!("db error: {e}"))?;
+
+    let Some((owner_id, pubkey)) = row else {
+        return Err("unknown or unenrolled device".into());
+    };
+    let Some(pubkey) = pubkey else {
+        return Err("device has no enrolled key — re-enroll with a current receiver".into());
+    };
+
+    let challenge = auth::generate_challenge();
+    let msg = ReceiverControlMessage::AuthChallenge(AuthChallengePayload {
+        challenge: challenge.clone(),
+    });
+    let envelope = Envelope::from_message(&msg).map_err(|e| format!("serialize error: {e}"))?;
+    let json = serde_json::to_string(&envelope).map_err(|e| format!("serialize error: {e}"))?;
+    ws_tx
+        .send(Message::Text(json.into()))
+        .await
+        .map_err(|_| "connection closed".to_string())?;
+
+    let reply = tokio::time::timeout(CHALLENGE_TIMEOUT, ws_rx.next())
+        .await
+        .map_err(|_| "challenge response timed out".to_string())?;
+    let Some(Ok(Message::Text(text))) = reply else {
+        return Err("connection closed during challenge".into());
+    };
+    let envelope: Envelope =
+        serde_json::from_str(&text).map_err(|e| format!("invalid message: {e}"))?;
+    let response = match envelope.parse_message::<ReceiverMessage>() {
+        Ok(ReceiverMessage::AuthChallengeResponse(r)) => r,
+        _ => return Err("expected auth.challenge.response".into()),
+    };
+
+    if response.device_id != device_id
+        || !auth::verify_challenge(&pubkey, &challenge, &response.signature).unwrap_or(false)
+    {
+        tracing::warn!(receiver_id = %device_id, "device key challenge failed");
+        return Err("challenge verification failed".into());
+    }
+
+    record_capacity(state, &device_id, payload).await?;
+
+    tracing::info!(receiver_id = %device_id, "receiver authenticated via device key");
+    Ok((device_id, owner_id, Some(payload.hostname.clone())))
 }
 
 /// Handle an incoming message from an authenticated receiver.
@@ -260,8 +358,8 @@ async fn handle_receiver_message(state: &AppState, receiver_id: &str, owner_id: 
     };
 
     match msg {
-        ReceiverMessage::AuthLogin(_) => {
-            tracing::debug!(receiver_id = %receiver_id, "duplicate auth.login ignored");
+        ReceiverMessage::AuthLogin(_) | ReceiverMessage::AuthChallengeResponse(_) => {
+            tracing::debug!(receiver_id = %receiver_id, "auth message outside handshake ignored");
         }
         ReceiverMessage::Status(payload) => {
             let _ = sqlx::query(
@@ -339,7 +437,6 @@ fn error_response(msg: &str) -> String {
     let response = ReceiverAuthLoginResponsePayload {
         success: false,
         receiver_id: None,
-        session_token: None,
         error: Some(msg.to_string()),
     };
     let envelope =

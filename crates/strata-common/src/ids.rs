@@ -58,6 +58,28 @@ pub fn enrollment_token() -> String {
     token
 }
 
+/// Build the composite enrollment token handed to the operator:
+/// `<device_id>.<SECRET>`. Embedding the device id lets the control plane
+/// look up exactly one row and run exactly one argon2 verification —
+/// instead of scanning every device (an unauthenticated CPU-DoS surface).
+pub fn composite_enrollment_token(device_id: &str, secret: &str) -> String {
+    format!("{device_id}.{secret}")
+}
+
+/// Split a composite enrollment token into `(device_id, normalized_secret)`.
+/// Returns `None` for tokens without the `<device_id>.<SECRET>` shape
+/// (including pre-split legacy tokens, which are no longer accepted).
+pub fn split_enrollment_token(raw: &str) -> Option<(String, String)> {
+    let (device_id, secret) = raw.trim().split_once('.')?;
+    if device_id.is_empty() || secret.is_empty() {
+        return None;
+    }
+    Some((
+        device_id.to_string(),
+        normalize_enrollment_token(secret),
+    ))
+}
+
 /// Normalize an enrollment token for comparison: uppercase, strip dashes/spaces.
 pub fn normalize_enrollment_token(raw: &str) -> String {
     raw.chars()
@@ -107,6 +129,18 @@ mod tests {
         assert_eq!(normalize_enrollment_token("abcd-1234"), "ABCD1234");
         assert_eq!(normalize_enrollment_token("ABCD 1234"), "ABCD1234");
         assert_eq!(normalize_enrollment_token("abcd1234"), "ABCD1234");
+    }
+
+    #[test]
+    fn composite_token_split_round_trip() {
+        let token = composite_enrollment_token("snd_abc123", "wxyz-2345");
+        let (id, secret) = split_enrollment_token(&token).unwrap();
+        assert_eq!(id, "snd_abc123");
+        assert_eq!(secret, "WXYZ2345");
+
+        assert!(split_enrollment_token("no-dot-here").is_none());
+        assert!(split_enrollment_token(".secret").is_none());
+        assert!(split_enrollment_token("id.").is_none());
     }
 
     #[test]
