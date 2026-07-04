@@ -1,40 +1,6 @@
 # syntax=docker/dockerfile:1.7-labs
 
-# ── Stage 1: Build portal WASM ───────────────────────────────
-FROM node:20-bookworm AS node-base
-FROM rust:bookworm AS portal
-
-# Node.js 20+ required for @tailwindcss/oxide native module
-COPY --from=node-base /usr/local/bin/node /usr/local/bin/node
-COPY --from=node-base /usr/local/lib/node_modules /usr/local/lib/node_modules
-RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
-    ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
-
-RUN rustup target add wasm32-unknown-unknown && \
-    cargo install trunk --version 0.21.14
-
-WORKDIR /src
-
-COPY crates/strata-portal/Cargo.toml crates/strata-portal/Cargo.toml
-COPY crates/strata-portal/src crates/strata-portal/src
-COPY crates/strata-portal/index.html crates/strata-portal/index.html
-COPY crates/strata-portal/style crates/strata-portal/style
-
-# Trunk needs a workspace-like layout — create a minimal one
-RUN cat > Cargo.toml <<'TOML'
-[workspace]
-resolver = "2"
-members = ["crates/strata-portal"]
-TOML
-
-# Install Tailwind CSS + DaisyUI and build CSS, then build WASM with trunk
-RUN --mount=type=cache,target=/root/.npm \
-    cd crates/strata-portal && \
-    npm init -y && npm install @tailwindcss/cli daisyui && \
-    npx @tailwindcss/cli -i style/input.css -o style/main.css --minify && \
-    trunk build --release
-
-# ── Stage 2: Build GStreamer pipeline (integration_node + bonding plugin) ─
+# ── Stage 1: Build GStreamer pipeline (integration_node + bonding plugin) ─
 # Debian sid ships GStreamer 1.28 which includes eflvmux for H.265 RTMP relay.
 FROM debian:sid AS pipeline
 
@@ -127,13 +93,14 @@ WORKDIR /src
 # Write a minimal workspace manifest (avoids needing GStreamer deps)
 COPY Cargo.lock ./
 COPY crates/strata-common/Cargo.toml crates/strata-common/Cargo.toml
+COPY crates/strata-protocol/Cargo.toml crates/strata-protocol/Cargo.toml
 COPY crates/strata-sender/Cargo.toml crates/strata-sender/Cargo.toml
 COPY crates/strata-receiver/Cargo.toml crates/strata-receiver/Cargo.toml
 
 RUN cat > Cargo.toml <<'TOML'
 [workspace]
 resolver = "2"
-members = ["crates/strata-common", "crates/strata-sender", "crates/strata-receiver"]
+members = ["crates/strata-common", "crates/strata-protocol", "crates/strata-sender", "crates/strata-receiver"]
 
 [workspace.dependencies]
 tracing = "0.1.44"
@@ -142,10 +109,12 @@ anyhow = "1.0.101"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 toml = "0.9.8"
+rand = "0.10.0"
 TOML
 
 # Stub out sources for dep caching
 RUN mkdir -p crates/strata-common/src && echo "" > crates/strata-common/src/lib.rs && \
+    mkdir -p crates/strata-protocol/src && echo "" > crates/strata-protocol/src/lib.rs && \
     mkdir -p crates/strata-sender/src && echo "fn main() {}" > crates/strata-sender/src/main.rs && \
     mkdir -p crates/strata-receiver/src && echo "fn main() {}" > crates/strata-receiver/src/main.rs
 
@@ -156,13 +125,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Copy real source
 COPY crates/strata-common/src crates/strata-common/src
+COPY crates/strata-protocol/src crates/strata-protocol/src
 COPY crates/strata-sender/src crates/strata-sender/src
 COPY crates/strata-receiver/src crates/strata-receiver/src
 
 # Build for real
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git/db \
-    touch crates/strata-common/src/lib.rs crates/strata-sender/src/main.rs crates/strata-receiver/src/main.rs && \
+    touch crates/strata-common/src/lib.rs crates/strata-protocol/src/lib.rs crates/strata-sender/src/main.rs crates/strata-receiver/src/main.rs && \
     cargo build --release -p strata-sender -p strata-receiver
 
 # ── Stage 4: Runtime ────────────────────────────────────────
@@ -216,10 +186,6 @@ COPY --from=pipeline /src/target/release/libgststrata.so /usr/lib/x86_64-linux-g
 # Entrypoint script (applies tc netem impairments before starting agent)
 COPY dev/entrypoint-sender.sh /usr/local/bin/entrypoint-sender.sh
 
-# Portal WASM app
-COPY --from=portal /src/crates/strata-portal/dist /app/portal
-
-ENV PORTAL_DIR=/app/portal
 ENV GST_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/gstreamer-1.0
 
 EXPOSE 3001

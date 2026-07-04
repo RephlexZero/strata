@@ -9,31 +9,23 @@
 //! - Network interface management (enable/disable/discover)
 //! - Connectivity testing
 //!
-//! The UI is a Leptos WASM SPA (`strata-portal` crate), built with trunk
-//! and served from a dist directory. Set `PORTAL_DIR` to override the path.
+//! The UI is a single inline HTML page (`PORTAL_PAGE`) served at `/` —
+//! the former Leptos WASM SPA (`strata-portal` crate) was retired 2026-07-01.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use tower_http::services::{ServeDir, ServeFile};
 
 use crate::AgentState;
 
 /// Start the onboarding portal HTTP server.
 pub async fn run(state: Arc<AgentState>, addr: SocketAddr) -> anyhow::Result<()> {
-    // Serve the trunk-built Leptos WASM SPA.
-    // PORTAL_DIR defaults to ../strata-portal/dist (dev) or /app/portal (Docker).
-    let portal_dir = std::env::var("PORTAL_DIR").unwrap_or_else(|_| "../strata-portal/dist".into());
-
-    let spa_fallback = ServeFile::new(format!("{portal_dir}/index.html"));
-    let portal_service = ServeDir::new(&portal_dir).not_found_service(spa_fallback);
-
     let app = Router::new()
         // API
         .route("/api/status", get(api_status))
@@ -53,9 +45,8 @@ pub async fn run(state: Arc<AgentState>, addr: SocketAddr) -> anyhow::Result<()>
         .route("/hotspot-detect.html", get(captive_redirect))
         .route("/generate_204", get(captive_redirect))
         .route("/connecttest.txt", get(captive_redirect))
-        // SPA: serve WASM assets, fallback to index.html for client-side routing
-        .fallback_service(portal_service)
-        .layer(tower_http::cors::CorsLayer::permissive())
+        // Minimal inline status/enrollment page
+        .fallback(get(portal_page))
         .with_state(state);
 
     tracing::info!("sender portal on http://{addr}");
@@ -69,6 +60,87 @@ pub async fn run(state: Arc<AgentState>, addr: SocketAddr) -> anyhow::Result<()>
 async fn captive_redirect() -> impl IntoResponse {
     axum::response::Redirect::temporary("/")
 }
+
+// ── GET / — minimal status/enrollment page ──────────────────────────
+
+async fn portal_page() -> Html<&'static str> {
+    Html(PORTAL_PAGE)
+}
+
+const PORTAL_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strata Sender</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.3rem; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: .3rem 1rem; }
+  dt { font-weight: 600; }
+  .ok { color: #1a7f37; } .bad { color: #b42318; }
+  form { margin-top: 1.5rem; display: grid; gap: .5rem; }
+  input { padding: .4rem; font-size: 1rem; }
+  button { padding: .5rem; font-size: 1rem; cursor: pointer; }
+  #msg { margin-top: .5rem; min-height: 1.2em; }
+  table { border-collapse: collapse; margin-top: 1rem; width: 100%; }
+  td, th { text-align: left; padding: .2rem .6rem .2rem 0; border-bottom: 1px solid #ddd; }
+</style>
+</head>
+<body>
+<h1>Strata Sender</h1>
+<dl>
+  <dt>Enrolled</dt><dd id="enrolled">…</dd>
+  <dt>Sender ID</dt><dd id="sender_id">…</dd>
+  <dt>Control plane</dt><dd id="cloud">…</dd>
+  <dt>Streaming</dt><dd id="streaming">…</dd>
+  <dt>CPU / Mem</dt><dd id="sys">…</dd>
+</dl>
+<table id="ifaces" hidden><thead><tr><th>Interface</th><th>State</th></tr></thead><tbody></tbody></table>
+<form id="enroll">
+  <input id="token" placeholder="Enrollment token" required>
+  <input id="control_url" placeholder="Control URL (optional, e.g. wss://control.example.com/agent/ws)">
+  <button>Enroll</button>
+</form>
+<button id="unenroll" hidden>Unenroll</button>
+<div id="msg"></div>
+<script>
+const $ = id => document.getElementById(id);
+async function refresh() {
+  try {
+    const s = await (await fetch('/api/status')).json();
+    $('enrolled').textContent = s.enrolled ? 'yes' : 'no';
+    $('enrolled').className = s.enrolled ? 'ok' : 'bad';
+    $('sender_id').textContent = s.sender_id || '—';
+    $('cloud').textContent = s.cloud_connected ? 'connected' : 'disconnected';
+    $('cloud').className = s.cloud_connected ? 'ok' : 'bad';
+    $('streaming').textContent = s.streaming ? ('live (' + (s.stream_id || '?') + ')') : 'idle';
+    $('sys').textContent = (s.cpu_percent ?? '?') + '% / ' + (s.mem_used_mb ?? '?') + ' MB';
+    $('enroll').hidden = s.enrolled;
+    $('unenroll').hidden = !s.enrolled;
+    const rows = (s.interfaces || []).map(i =>
+      '<tr><td>' + i.name + '</td><td>' + (i.enabled === false ? 'disabled' : (i.state || 'up')) + '</td></tr>').join('');
+    $('ifaces').hidden = !rows;
+    $('ifaces').querySelector('tbody').innerHTML = rows;
+  } catch (e) { $('msg').textContent = 'status fetch failed: ' + e; }
+}
+$('enroll').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const body = { enrollment_token: $('token').value };
+  if ($('control_url').value) body.control_url = $('control_url').value;
+  const r = await fetch('/api/enroll', { method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body) });
+  $('msg').textContent = (await r.json()).message || r.statusText;
+});
+$('unenroll').addEventListener('click', async () => {
+  if (!confirm('Unenroll this device?')) return;
+  const r = await fetch('/api/unenroll', { method: 'POST' });
+  $('msg').textContent = (await r.json()).message || r.statusText;
+});
+refresh(); setInterval(refresh, 2000);
+</script>
+</body>
+</html>
+"#;
 
 // ── GET /api/status ─────────────────────────────────────────────────
 

@@ -19,12 +19,18 @@ COPY crates/strata-dashboard/Cargo.toml crates/strata-dashboard/Cargo.toml
 COPY crates/strata-dashboard/src crates/strata-dashboard/src
 COPY crates/strata-dashboard/index.html crates/strata-dashboard/index.html
 COPY crates/strata-dashboard/style crates/strata-dashboard/style
+COPY crates/strata-protocol/Cargo.toml crates/strata-protocol/Cargo.toml
+COPY crates/strata-protocol/src crates/strata-protocol/src
 
 # Trunk needs a workspace-like layout — create a minimal one
 RUN cat > Cargo.toml <<'TOML'
 [workspace]
 resolver = "2"
-members = ["crates/strata-dashboard"]
+members = ["crates/strata-dashboard", "crates/strata-protocol"]
+
+[workspace.dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 TOML
 
 # Install Tailwind CSS + DaisyUI and build CSS, then build WASM with trunk
@@ -50,12 +56,13 @@ WORKDIR /src
 # Write a minimal workspace manifest (avoids needing GStreamer deps)
 COPY Cargo.lock ./
 COPY crates/strata-common/Cargo.toml crates/strata-common/Cargo.toml
+COPY crates/strata-protocol/Cargo.toml crates/strata-protocol/Cargo.toml
 COPY crates/strata-control/Cargo.toml crates/strata-control/Cargo.toml
 
 RUN cat > Cargo.toml <<'TOML'
 [workspace]
 resolver = "2"
-members = ["crates/strata-common", "crates/strata-control"]
+members = ["crates/strata-common", "crates/strata-protocol", "crates/strata-control"]
 
 [workspace.dependencies]
 tracing = "0.1.44"
@@ -68,6 +75,7 @@ TOML
 
 # Stub out sources for dependency caching layer
 RUN mkdir -p crates/strata-common/src && echo "" > crates/strata-common/src/lib.rs && \
+    mkdir -p crates/strata-protocol/src && echo "" > crates/strata-protocol/src/lib.rs && \
     mkdir -p crates/strata-control/src && echo "fn main() {}" > crates/strata-control/src/main.rs
 
 # Pre-build dependencies (cached unless Cargo.toml/lock changes)
@@ -77,13 +85,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Copy real source
 COPY crates/strata-common/src crates/strata-common/src
+COPY crates/strata-protocol/src crates/strata-protocol/src
 COPY crates/strata-control/src crates/strata-control/src
 COPY crates/strata-control/migrations crates/strata-control/migrations
 
 # Build for real
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git/db \
-    touch crates/strata-common/src/lib.rs crates/strata-control/src/main.rs && \
+    touch crates/strata-common/src/lib.rs crates/strata-protocol/src/lib.rs crates/strata-control/src/main.rs && \
     cargo build --release -p strata-control
 
 # ── Stage 3: Runtime ────────────────────────────────────────

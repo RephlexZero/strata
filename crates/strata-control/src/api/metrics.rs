@@ -3,11 +3,13 @@
 //! `GET /metrics` — aggregates link stats from all connected sender agents
 //! and renders them in Prometheus text exposition format.
 //!
-//! This endpoint requires no authentication (standard Prometheus practice).
+//! Open by default (standard Prometheus practice on private networks).
+//! Set `METRICS_TOKEN` to require `Authorization: Bearer <token>` — do this
+//! whenever the control plane is reachable beyond the scrape network.
 
 use axum::extract::State;
-use axum::http::header;
-use axum::response::IntoResponse;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 
 use strata_common::metrics::render_prometheus;
 
@@ -18,7 +20,17 @@ use crate::state::AppState;
 /// Collects the latest link stats from every connected sender agent
 /// and renders them as Prometheus text exposition format, with
 /// `sender_id` labels so a single scrape covers the whole fleet.
-pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Ok(token) = std::env::var("METRICS_TOKEN") {
+        let authorized = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(|t| t == token);
+        if !authorized {
+            return (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
+        }
+    }
     let mut out = String::with_capacity(4096);
 
     // Collect all cached stream stats from connected agents.
@@ -137,6 +149,7 @@ pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
         )],
         out,
     )
+        .into_response()
 }
 
 #[cfg(test)]

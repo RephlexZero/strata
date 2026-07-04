@@ -8,8 +8,9 @@
 
 use std::net::SocketAddr;
 
+use axum::http::{header, Method};
 use axum::Router;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -75,6 +76,31 @@ async fn main() -> anyhow::Result<()> {
     let spa_fallback = ServeFile::new(format!("{dashboard_dir}/index.html"));
     let dashboard_service = ServeDir::new(&dashboard_dir).not_found_service(spa_fallback);
 
+    // ── CORS ────────────────────────────────────────────────────
+    // The dashboard is served same-origin from this binary, so browsers need
+    // no CORS headers in production. CORS_ALLOWED_ORIGINS opts in for
+    // cross-origin dev setups (e.g. `trunk serve`): a comma-separated origin
+    // list, or "*" for the old permissive posture.
+    let cors = match std::env::var("CORS_ALLOWED_ORIGINS") {
+        Err(_) => CorsLayer::new(),
+        Ok(v) if v.trim() == "*" => {
+            tracing::warn!("CORS_ALLOWED_ORIGINS=* — permissive CORS, do not expose to the internet");
+            CorsLayer::permissive()
+        }
+        Ok(v) => {
+            let origins: Vec<_> = v
+                .split(',')
+                .map(str::trim)
+                .filter(|o| !o.is_empty())
+                .map(|o| o.parse().map_err(|e| anyhow::anyhow!("invalid origin {o:?} in CORS_ALLOWED_ORIGINS: {e}")))
+                .collect::<Result<_, _>>()?;
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(origins))
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        }
+    };
+
     let app = Router::new()
         .nest("/api", api::router())
         .route("/metrics", axum::routing::get(api::metrics::handler))
@@ -83,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/ws", axum::routing::get(ws_dashboard::handler))
         .fallback_service(dashboard_service)
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(state);
 
     // ── Listen ──────────────────────────────────────────────────
