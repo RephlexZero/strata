@@ -137,7 +137,13 @@ NUM_LINKS=${#PORTS[@]}
 # ── SSH helpers (separate option arrays per host so a deploy iface can
 #    pin the management path without touching the bonded modems) ───────
 ssh_opts() {  # $1 = optional local deploy iface
-    local arr=(-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+    # ForwardAgent/ForwardX11 off: this script never needs either, but a
+    # user's local ~/.ssh/config default of "yes" makes every session print
+    # "channel N: open failed: connect failed: Connection refused" (the
+    # forwarded channel can't complete) — harmless noise, silenced at the
+    # source instead of relying on every operator's dotfiles.
+    local arr=(-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new
+               -o ForwardAgent=no -o ForwardX11=no)
     if [[ -n "${1:-}" ]]; then
         local addr
         addr="$(ip -o -4 addr show dev "$1" 2>/dev/null | awk '{print $4}' | head -n1 | cut -d/ -f1 || true)"
