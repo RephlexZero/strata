@@ -535,7 +535,6 @@ mod tests {
                 bitrate_kbps: Some(2000),
                 ..Default::default()
             }),
-            fec: None,
         });
         let envelope = Envelope::from_message(&msg).unwrap();
         let recovered: ControlMessage = envelope.parse_message().unwrap();

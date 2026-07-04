@@ -740,7 +740,6 @@ pub fn LiveSettingsCard(
                 ..Default::default()
             }),
             scheduler: None,
-            fec: None,
         };
 
         leptos::task::spawn_local(async move {
@@ -891,7 +890,6 @@ pub fn TransportTuningCard(
                 "redundancy_enabled": scheduler_mode.get_untracked() == "redundancy_enabled",
                 "capacity_floor_bps": capacity_floor.get_untracked() * 1000,
             })),
-            fec: None,
         };
 
         leptos::task::spawn_local(async move {

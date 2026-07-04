@@ -379,12 +379,6 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
                 }
             }
 
-            // No pipeline command exists for FEC hot-update yet — report it
-            // rather than pretending it applied.
-            if payload.fec.is_some() {
-                errors.push("fec hot-update not supported by this agent".into());
-            }
-
             let resp = ConfigUpdateResponsePayload {
                 request_id: payload.request_id.clone(),
                 success: errors.is_empty(),

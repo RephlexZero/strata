@@ -184,9 +184,10 @@ pub struct ConfigUpdatePayload {
     pub scheduler: Option<serde_json::Value>,
     /// Encoder parameters to hot-update.
     pub encoder: Option<EncoderConfigUpdate>,
-    /// FEC / advanced transport parameters to hot-update.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fec: Option<FecConfigUpdate>,
+    // No `fec` field: the former FecConfigUpdate (layer switch, BLEST
+    // threshold) never had a producer — its dashboard knobs were deleted as
+    // placebo in E1 — and FEC overhead is closed-loop adaptive; a manual pin
+    // would fight the adaptation loop (see wiki/Control-Loop-Map.md).
 }
 
 /// Partial encoder config for hot-update (all fields optional).
@@ -195,17 +196,6 @@ pub struct EncoderConfigUpdate {
     pub bitrate_kbps: Option<u32>,
     pub tune: Option<String>,
     pub keyint_max: Option<u32>,
-}
-
-/// Partial FEC / advanced transport update.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FecConfigUpdate {
-    /// "rlnc" for Sliding-Window RLNC (Layer 1) or "raptorq" for UEP/RaptorQ (Layer 1b).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub layer: Option<String>,
-    /// BLEST Head-of-Line blocking threshold in ms.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blest_threshold_ms: Option<u32>,
 }
 
 /// Response to config.update.
