@@ -39,10 +39,6 @@ pub struct PlayoutProfile {
     pub start_ms: u64,
     pub min_ms: u64,
     pub max_ms: u64,
-    /// When true the playout window is pinned at `start_ms` — no jitter/spread
-    /// adaptation. Correct when a large downstream buffer makes a stable,
-    /// generous window strictly better than one that chases the mean.
-    pub fixed: bool,
 }
 
 impl StreamProfile {
@@ -66,7 +62,6 @@ impl StreamProfile {
                 start_ms: 1500,
                 min_ms: 1500,
                 max_ms: 3000,
-                fixed: true,
             },
             // Adaptive but with a real floor so it can't chase the mean below
             // the HARQ-retry tail. Grows on fades, drains slowly.
@@ -74,14 +69,12 @@ impl StreamProfile {
                 start_ms: 600,
                 min_ms: 400,
                 max_ms: 1500,
-                fixed: false,
             },
             // Tight, fully adaptive — for paths that genuinely need it.
             Self::Realtime => PlayoutProfile {
                 start_ms: 200,
                 min_ms: 50,
                 max_ms: 800,
-                fixed: false,
             },
         }
     }
@@ -240,13 +233,10 @@ pub struct ReceiverConfig {
     pub start_latency: Duration,
     pub buffer_capacity: usize,
     pub skip_after: Option<Duration>,
-    /// Floor for the adaptive playout window (ignored when `fixed_playout`).
+    /// Floor for the adaptive playout window.
     pub min_latency: Duration,
     /// Ceiling for the adaptive playout window.
     pub max_latency: Duration,
-    /// Pin the playout window at `start_latency` — no jitter/spread adaptation.
-    /// Set by the [`StreamProfile`] (true for broadcast).
-    pub fixed_playout: bool,
 }
 
 /// Resolved link lifecycle state-machine thresholds.
@@ -286,7 +276,6 @@ impl Default for ReceiverConfig {
             skip_after: None,
             min_latency: Duration::from_millis(1000),
             max_latency: Duration::from_millis(3000),
-            fixed_playout: false,
         }
     }
 }
@@ -574,7 +563,6 @@ impl BondingConfigInput {
             max_latency: Duration::from_millis(
                 self.scheduler.max_latency_ms.unwrap_or(playout.max_ms),
             ),
-            fixed_playout: playout.fixed,
         };
 
         let lifecycle = self.lifecycle.resolve();
@@ -894,17 +882,14 @@ mod tests {
             .unwrap()
         };
         let bc = mk("broadcast");
-        assert!(bc.receiver.fixed_playout);
         assert_eq!(bc.receiver.start_latency.as_millis(), 1500);
         assert!(!bc.scheduler.failover_enabled);
 
         let ll = mk("low-latency");
-        assert!(!ll.receiver.fixed_playout);
         assert_eq!(ll.receiver.start_latency.as_millis(), 600);
         assert!(ll.scheduler.failover_enabled);
 
         let rt = mk("realtime");
-        assert!(!rt.receiver.fixed_playout);
         assert_eq!(rt.receiver.start_latency.as_millis(), 200);
         assert!(rt.scheduler.saturation_probe_interval_s < 1e9);
 
