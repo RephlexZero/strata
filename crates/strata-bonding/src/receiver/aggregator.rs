@@ -418,6 +418,21 @@ impl ReassemblyBuffer {
             let current_ms = self.latency.as_secs_f64() * 1000.0;
             let target_ms = self.target_latency.as_secs_f64() * 1000.0;
 
+            // Downward wall-clock slew limit. Shrinking the window shifts the
+            // egress delivery timing, and the downstream MPEG-TS demuxer's
+            // PCR→running-time skew estimator tracks slow drift, not steps: a
+            // 2999→1752 ms collapse in ~2 s (2026-07-04 field run, link-1
+            // cold-start recovery) re-based output DTS 1.256 s backwards and
+            // mpegtsmux died with "Timestamping error on input streams".
+            // Shrinking is only an efficiency trim — never correctness — so it
+            // can afford to be slow; growing stays fast (lateness protection).
+            // 50 ms/s keeps the shift far below the 1000 ms/s media advance
+            // that would be needed to actually regress output DTS.
+            // iat is clamped so the first packet after an arrival stall can't
+            // cash in the whole gap as one retroactive step-shrink.
+            const MAX_SHRINK_MS_PER_S: f64 = 50.0;
+            let shrink_floor_ms = current_ms - MAX_SHRINK_MS_PER_S * iat.min(0.25);
+
             if target_ms > current_ms + 0.5 {
                 // Fast ramp-up
                 let new_ms = current_ms + self.ramp_up_alpha * (target_ms - current_ms);
@@ -429,15 +444,17 @@ impl ReassemblyBuffer {
                 // the same ramp-up alpha to avoid being stuck at a bloated
                 // latency for seconds after the underlying issue resolved.
                 if current_ms > target_ms * 2.0 {
-                    let new_ms = current_ms + self.ramp_up_alpha * (target_ms - current_ms);
+                    let new_ms = (current_ms + self.ramp_up_alpha * (target_ms - current_ms))
+                        .max(shrink_floor_ms);
                     self.latency = Duration::from_secs_f64(new_ms / 1000.0).max(self.min_latency);
                     self.stable_since = None;
                 } else {
                     // Normal slow ramp-down, only after stability period
                     match self.stable_since {
                         Some(since) if now.duration_since(since) >= self.stability_threshold => {
-                            let new_ms =
-                                current_ms + self.ramp_down_alpha * (target_ms - current_ms);
+                            let new_ms = (current_ms
+                                + self.ramp_down_alpha * (target_ms - current_ms))
+                                .max(shrink_floor_ms);
                             self.latency =
                                 Duration::from_secs_f64(new_ms / 1000.0).max(self.min_latency);
                         }
@@ -1154,18 +1171,15 @@ mod tests {
         );
     }
 
-    /// Regression: after a stall inflates latency via loss_penalty, clearing
-    /// the loss must ramp latency back down quickly (using ramp_up_alpha, not
-    /// the slow ramp_down_alpha) when current_ms > target_ms * 2.0.
-    ///
-    /// Before the fix the slow path was always taken, leaving latency stuck at
-    /// 200+ ms for many seconds after loss cleared — causing A/V sync issues
-    /// and head-of-line blocking on recovered links.
+    /// After a stall inflates latency via loss_penalty, clearing the loss
+    /// ramps latency back down — but never faster than the wall-clock slew
+    /// limit (MAX_SHRINK_MS_PER_S). An unbounded fast ramp-down halved a
+    /// bloated window within ~2 s in the 2026-07-04 field run; that timing
+    /// step made tsdemux re-base output DTS 1.256 s backwards and killed
+    /// mpegtsmux ("Timestamping error on input streams"). Shrinking is an
+    /// efficiency trim, so slow-and-smooth is correct; only growth is urgent.
     #[test]
-    fn stall_recovery_ramp_down_fast() {
-        // ramp_up_alpha=1.0 → instant ramp-up; ramp_down_alpha=0.02 (slow default)
-        // Without the fast-ramp-down path, after 5 push() calls latency would
-        // still be ~200ms when loss clears; with it, it should be ≤ start_latency.
+    fn stall_recovery_ramp_down_is_slew_limited() {
         let config = ReassemblyConfig {
             start_latency: Duration::from_millis(20),
             buffer_capacity: 256,
@@ -1202,10 +1216,12 @@ mod tests {
 
         // Phase 2: loss clears — push steady in-order packets so the buffer
         // computes a low target (start_latency + 0 loss_penalty = 20ms).
-        // current_ms(500) > target_ms(20) * 2 → fast ramp-down path fires.
+        // current_ms(500) > target_ms(20) * 2 → fast ramp-down path fires,
+        // clamped to the 50 ms/s wall-clock slew.
         let t_clear = t_gap + Duration::from_millis(200);
         buf.loss_rate_smoothed = 0.0; // loss cleared
-        for i in 0u64..20 {
+        // 2 s of simulated wall clock → at most ~100 ms of shrink allowed.
+        for i in 0u64..200 {
             buf.push(
                 201 + i,
                 Bytes::from(vec![i as u8]),
@@ -1213,11 +1229,14 @@ mod tests {
             );
         }
 
+        let shrunk_ms = (bloated_latency - buf.latency).as_millis();
         assert!(
-            buf.latency < bloated_latency / 2,
-            "fast ramp-down should halve bloated latency quickly: still at {:?} (started at {:?})",
-            buf.latency,
-            bloated_latency,
+            shrunk_ms > 50,
+            "ramp-down must still make progress after loss clears: only {shrunk_ms}ms in 2s",
+        );
+        assert!(
+            shrunk_ms <= 110,
+            "ramp-down must respect the 50 ms/s slew limit: shrank {shrunk_ms}ms in 2s of wall clock",
         );
     }
 

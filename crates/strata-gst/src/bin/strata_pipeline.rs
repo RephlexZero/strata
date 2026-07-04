@@ -291,7 +291,20 @@ fn install_delivered_stream_gate(
             // POC"). Drop it and wait for the next CLEAN keyframe instead.
             // Exception: the very first keyframe (startup DISCONT, no prior
             // reference to corrupt) is always accepted so the stream can lock.
-            let trustworthy_keyframe = is_keyframe && (!st.started || !is_discont);
+            // A resume must also never rewind the muxer's timeline: after an
+            // upstream re-base (tsdemux skew step when the playout window
+            // moved), the next IDRs can carry DTS below the last emitted one,
+            // and handing one to mpegtsmux is the exact fatal "Timestamping
+            // error" this gate exists to prevent (2026-07-04 field crash:
+            // resumed at 21.8 s after emitting 22.26 s). Keep dropping until
+            // an IDR at/past the watermark — media time advances in real
+            // time, so this resolves within the re-base magnitude + one GOP.
+            let monotonic = match (dts, st.last_dts) {
+                (Some(d), Some(last)) => d >= last,
+                _ => true,
+            };
+            let trustworthy_keyframe =
+                is_keyframe && (!st.started || (!is_discont && monotonic));
             if trustworthy_keyframe {
                 // A mid-stream resume (not the stream's very first keyframe) is
                 // a real splice: stamp DISCONT so the muxer/sink see it, and
