@@ -15,10 +15,21 @@ egress stall at 25 s that every transport metric slept through (fixed:
 `timeline_step()` WildJump bound, audio-gate logging, script egress
 heartbeat + STALLED/FAILED verdict, `04a2aa5`). Run 3 (validation): 117
 segments/77 s — 10× run 2 — then progressive timeline inflation (+60 s vs
-wall) stalled egress; caught live by the new detector. **Gates contain,
-can't repair. Open decision for next session:** GST_DEBUG diagnostic run
-on tsparse/tsdemux, drop `tsparse set-timestamps=true`?, and/or an egress
-watchdog that restarts the decode branch on prolonged stall. Playout is
+wall) stalled egress; caught live by the new detector. **Run 4
+(`orangepi-118293`): 4th occurrence — best stretch yet (128 segments/148 s
+under rough radio, gates absorbing ~14 splice storms) then a silent wedge
+for the final 98 s after a 39 %-residual loss burst: no latch, no
+inflation, media ≈ wall — tsdemux stopped emitting or hlssink3's muxer
+starved on audio; EOS flushed 3 held segments. Wedge sits where the gates
+can't see it.** Gates contain, can't repair. **Open decision:** GST_DEBUG
+diagnostic run (tsdemux + hlssink/splitmuxsink to split the two suspects),
+drop `tsparse set-timestamps=true`?, and/or an egress watchdog that
+restarts the decode branch on prolonged stall (run 4 = ~90 s of dead air
+it would have recovered; watchdog case keeps strengthening). Sender AQM
+self-holes seeded the trigger burst for the 3rd time — tuning question
+still open. Dev QoL: `STRATA_LOCAL_HLS_PORT` (default 8088) now tunnels
+the receiver HLS dir to http://localhost:8088/playlist.m3u8 for VLC/mpv;
+script verdict persists to `runs/<id>/verdict.txt`. Playout is
 **adaptive under every profile** (`fixed_playout` was fb487f7-reverted;
 dead config deleted `38c842a`).
 
@@ -185,4 +196,4 @@ override that pinned it is gone — but still needs field confirmation. Watch
 adaptive-redundancy duplication as a wire-overhead contributor when spare is large.
 
 ---
-_Last updated: 2026-07-04 (both reviews fully implemented — platform E1/E2/E4/E6/E7/E8 + control-loop §2.4.2/§1a/§1b landed in five commits; review docs archived/consolidated)_
+_Last updated: 2026-07-04 evening (run 4 analyzed — silent wedge recurred past the gates; local HLS preview + persisted verdict added to the field script)_

@@ -39,6 +39,10 @@
 #   STRATA_AUDIO_ENABLED   — 1/0 (default: 1; silent AAC track for YouTube)
 #   STRATA_DURATION_SECS   — stream duration before stopping (default: 120)
 #   STRATA_MONITOR_INTERVAL_S — monitor cadence (default: 5)
+#   STRATA_LOCAL_HLS_PORT  — also serve the receiver's HLS dir at
+#                            http://localhost:<port>/playlist.m3u8 via an SSH
+#                            tunnel, for watching in VLC/mpv without YouTube
+#                            (default: 8088; set 0 to disable)
 #   STRATA_MAX_LATENCY_MS  — receiver playout ceiling override (default: profile)
 #   STRATA_RECEIVER_BUFFER_CAPACITY — receiver reorder slots (default: 4096)
 #   STRATA_NO_BUILD=1      — skip the aarch64 cross-compile
@@ -108,6 +112,7 @@ STARTUP_FLOOR_KBPS="${STRATA_STARTUP_FLOOR_KBPS:-0}"
 AUDIO_ENABLED="${STRATA_AUDIO_ENABLED:-1}"
 DURATION="${STRATA_DURATION_SECS:-120}"
 MONITOR_INTERVAL="${STRATA_MONITOR_INTERVAL_S:-5}"
+LOCAL_HLS_PORT="${STRATA_LOCAL_HLS_PORT:-8088}"
 LOG_LEVEL="${STRATA_LOG_LEVEL:-info}"
 RECEIVER_BUFFER_CAPACITY="${STRATA_RECEIVER_BUFFER_CAPACITY:-4096}"
 MAX_LATENCY_MS="${STRATA_MAX_LATENCY_MS:-}"
@@ -300,6 +305,30 @@ HLS_DIR=$(ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "grep -m1 'HLS temp dir:' /t
 [[ -z "$HLS_DIR" ]] && HLS_DIR="/dev/shm/strata-hls-rx-${RECEIVER_PID}"
 info "Receiver HLS dir: $HLS_DIR"
 
+# ── Local HLS preview (dev): watch the stream without YouTube ────────
+# A python http.server on the receiver serves the segment dir bound to
+# 127.0.0.1 only (nothing exposed publicly); an SSH tunnel brings it to
+# localhost here. Latency in the player is the full glass-to-glass chain
+# minus YouTube's CDN: playout window (≤3 s) + 1 s segmentation + player
+# buffer — use mpv's low-latency profile to keep the player's share small.
+HLS_TUNNEL_PID=""
+if [[ -n "$LOCAL_HLS_PORT" && "$LOCAL_HLS_PORT" != "0" ]]; then
+    if ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "command -v python3" >/dev/null 2>&1; then
+        ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" \
+            "pkill -f 'http\.server $LOCAL_HLS_PORT' 2>/dev/null; \
+             setsid python3 -m http.server $LOCAL_HLS_PORT --bind 127.0.0.1 --directory '$HLS_DIR' \
+               >/dev/null 2>&1 < /dev/null &" >/dev/null 2>&1 || true
+        pkill -f -- "-L ${LOCAL_HLS_PORT}:127.0.0.1:${LOCAL_HLS_PORT}" 2>/dev/null || true
+        ssh "${RECEIVER_SSH[@]}" -N -L "${LOCAL_HLS_PORT}:127.0.0.1:${LOCAL_HLS_PORT}" "$RECEIVER_HOST" &
+        HLS_TUNNEL_PID=$!
+        info "Local HLS preview: http://localhost:${LOCAL_HLS_PORT}/playlist.m3u8"
+        echo "      mpv --profile=low-latency --cache=no http://localhost:${LOCAL_HLS_PORT}/playlist.m3u8"
+        echo "      vlc --network-caching=1000 http://localhost:${LOCAL_HLS_PORT}/playlist.m3u8"
+    else
+        warn "python3 not found on receiver — local HLS preview disabled"
+    fi
+fi
+
 # ── Start sender on the Orange Pi (camera + rkmpp HW encoder) ────────
 echo ""
 echo "── Starting sender on Orange Pi ($SENDER_HOST) ──"
@@ -358,6 +387,9 @@ MAX_STALL_TICKS=0
 cleanup() {
     [[ $CLEANED -eq 1 ]] && return; CLEANED=1
     echo ""; echo "── Shutting down ──"
+    [[ -n "$HLS_TUNNEL_PID" ]] && kill "$HLS_TUNNEL_PID" 2>/dev/null || true
+    [[ -n "$LOCAL_HLS_PORT" && "$LOCAL_HLS_PORT" != "0" ]] && \
+        ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "pkill -f 'http\.server $LOCAL_HLS_PORT' 2>/dev/null || true" >/dev/null 2>&1 || true
     ssh "${SENDER_SSH[@]}"   "$SENDER_HOST"   "pkill -INT strata-pipeline 2>/dev/null || true" >/dev/null 2>&1 || true
     ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "pkill -INT strata-pipeline 2>/dev/null || true" >/dev/null 2>&1 || true
     sleep 2
@@ -429,14 +461,17 @@ RX_FATAL=$(ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" \
     "grep -m1 -E 'Timestamping error on input streams|^Error:' /tmp/strata-receiver.log 2>/dev/null" \
     2>/dev/null || echo "")
 if [[ $RECEIVER_DIED -eq 1 || -n "$RX_FATAL" ]]; then
-    warn "FAILED: receiver died mid-run${RX_FATAL:+ — fatal: $RX_FATAL} ($MAX_SEGS segment(s) before death)"
+    VERDICT="FAILED: receiver died mid-run${RX_FATAL:+ — fatal: $RX_FATAL} ($MAX_SEGS segment(s) before death)"; warn "$VERDICT"
 elif [[ $MAX_STALL_TICKS -ge 4 ]]; then
-    warn "FAILED: HLS egress stalled for $((MAX_STALL_TICKS * MONITOR_INTERVAL))s (produced $PREV_PRODUCED segments total) — YouTube went dark mid-run even though both processes stayed up"
+    VERDICT="FAILED: HLS egress stalled for $((MAX_STALL_TICKS * MONITOR_INTERVAL))s (produced $PREV_PRODUCED segments total) — YouTube went dark mid-run even though both processes stayed up"; warn "$VERDICT"
 elif [[ $MAX_SEGS -ge 2 && "$PLAYLIST" == "yes" ]]; then
-    info "OK: $PREV_PRODUCED segments produced + playlist (lost=$LOST late=$LATE discont=$DISCONT)"
+    VERDICT="OK: $PREV_PRODUCED segments produced + playlist (lost=$LOST late=$LATE discont=$DISCONT)"; info "$VERDICT"
 elif [[ $MAX_SEGS -ge 1 ]]; then
-    warn "PARTIAL: only $MAX_SEGS segment(s) — check receiver.log for timestamping errors / single-segment stall"
+    VERDICT="PARTIAL: only $MAX_SEGS segment(s) — check receiver.log for timestamping errors / single-segment stall"; warn "$VERDICT"
 else
-    warn "NO SEGMENTS — YouTube saw nothing; inspect $ARTIFACT_DIR/{sender,receiver}.log"
+    VERDICT="NO SEGMENTS — YouTube saw nothing; inspect $ARTIFACT_DIR/{sender,receiver}.log"; warn "$VERDICT"
 fi
+# The verdict travels with the logs — forensics on a run dir shouldn't have
+# to reconstruct what the live monitor already concluded (2026-07-04 run 4).
+echo "$VERDICT" > "$ARTIFACT_DIR/verdict.txt"
 # cleanup() runs on EXIT

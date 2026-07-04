@@ -537,3 +537,30 @@ Conclusion in `runs/INVESTIGATION-2026-07-04.md`: three runs, three faces
 of one defect — tsparse/tsdemux retiming is unstable over bonded-loss
 input; gates contain, can't repair. Next: GST_DEBUG diagnostic run,
 reconsider `tsparse set-timestamps=true`, egress-watchdog restart.
+
+## 2026-07-04 (evening) — run 4 analyzed: silent wedge again (best run yet until it wasn't); local HLS preview added
+
+Run 4 (`runs/orangepi-118293`, ~250 s, rough radio: playout pinned at the
+3 s cap most of the run, ~5.8 % wire loss): **best live stretch to date —
+128 segments over ~148 s** with the 04a2aa5 gates visibly absorbing ~14
+splice storms (735 video + 256 audio buffers dropped, all logged, all
+correctly re-synced, discontinuity-tagged 1:1). Then a heavy loss burst at
+19:20:44–52 (post-FEC residual peaked 39 %, sender AQM self-holes on BOTH
+links — third run where AQM seeds the trigger burst) → 23-discont splice
+storm → video gate resynced cleanly to IDR at 160.9 s → **egress went
+silent for the final ~98 s**. No gate logs, no errors, video DTS frozen at
+160.94 s, while stratasrc delivered ~210 pkts/s throughout and the sender
+stayed healthy to the end. At EOS the wedge flushed 3 segments (156–161 s)
+— hlssink3 HAD the data but wasn't cutting. Fourth occurrence, and unlike
+run 2 there is NO timestamp latch (media ≈ wall at the wedge): either
+tsdemux stopped emitting a branch or hlssink3's internal muxer starved on
+audio (audio-gate logs stop at 144.7 s media) and backpressure parked
+everything in the leaky queues. Wedge is invisible to the gates — nothing
+reaches them. Strengthens the egress-watchdog option; a GST_DEBUG run
+(tsdemux + hlssink/splitmuxsink) would separate the two suspects.
+Script additions: `STRATA_LOCAL_HLS_PORT` (default 8088) serves the
+receiver HLS dir at http://localhost:8088/playlist.m3u8 via SSH tunnel
+(127.0.0.1-bound on the receiver, nothing public) for VLC/mpv latency
+checks without YouTube; verdict now persisted to `runs/<id>/verdict.txt`
+(run 4's FAILED verdict existed only on the terminal and had to be
+reconstructed from logs).
