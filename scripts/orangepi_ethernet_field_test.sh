@@ -332,6 +332,21 @@ if [[ -n "$LOCAL_HLS_PORT" && "$LOCAL_HLS_PORT" != "0" ]]; then
         # whole string, so an unbracketed pattern makes pkill kill the shell
         # before the server ever starts (run orangepi-123888: preview dead,
         # "connection refused" through the tunnel).
+        # Open the OS-level firewall for the preview port, best-effort — a
+        # default-deny box otherwise blackholes the SYN silently (no RST,
+        # curl just hangs on "Trying..."). Whichever tool is present/active;
+        # harmless no-ops on the others. Can't touch a cloud provider's
+        # *external* firewall/security group (e.g. Hetzner Cloud Firewall)
+        # from inside the box — that still needs opening in their console.
+        ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" \
+            "command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active' && \
+               ufw allow ${LOCAL_HLS_PORT}/tcp >/dev/null 2>&1; \
+             command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1 && \
+               firewall-cmd --add-port=${LOCAL_HLS_PORT}/tcp >/dev/null 2>&1; \
+             command -v iptables >/dev/null 2>&1 && \
+               iptables -C INPUT -p tcp --dport ${LOCAL_HLS_PORT} -j ACCEPT 2>/dev/null || \
+               iptables -I INPUT -p tcp --dport ${LOCAL_HLS_PORT} -j ACCEPT 2>/dev/null; \
+             true" >/dev/null 2>&1 || true
         ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" \
             "pkill -f '[h]ttp\.server $LOCAL_HLS_PORT' 2>/dev/null; \
              setsid python3 -m http.server $LOCAL_HLS_PORT --bind 0.0.0.0 --directory '$HLS_DIR' \
@@ -339,6 +354,7 @@ if [[ -n "$LOCAL_HLS_PORT" && "$LOCAL_HLS_PORT" != "0" ]]; then
         info "Public HLS preview: http://${PREVIEW_ADDR}:${LOCAL_HLS_PORT}/playlist.m3u8"
         echo "      mpv --profile=low-latency --cache=no http://${PREVIEW_ADDR}:${LOCAL_HLS_PORT}/playlist.m3u8"
         echo "      vlc --network-caching=1000 http://${PREVIEW_ADDR}:${LOCAL_HLS_PORT}/playlist.m3u8"
+        echo "      (if it still hangs on connect: your cloud provider's external firewall/security group needs ${LOCAL_HLS_PORT}/tcp opened too — that can't be done from inside the box)"
     else
         warn "python3 not found on receiver — local HLS preview disabled"
     fi
