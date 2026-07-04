@@ -5,16 +5,22 @@
 
 ## Current focus
 
-**2026-07-04 field-validated on real hardware.** Orange Pi → cloud → YouTube
-run surfaced a fatal receiver crash (playout-window step-shrink → tsdemux
-DTS re-base → mpegtsmux "Timestamping error"); fixed with a 50 ms/s
-downward slew limit in the aggregator + the DeliveredStream gate refusing
-to resume below its emitted-DTS watermark (`8317ed7`). Re-run: 120 s
-clean, 16 segments to YouTube, gate absorbed three DTS regressions as
-sub-second freezes. Playout is **adaptive under every profile** —
-`fixed_playout` was reverted in fb487f7 and its dead config is now
-deleted (`38c842a`); wiki Control-Loop-Map corrected. Known cosmetic gap:
-field scripts' `damaged=` readout greps a metric deleted in fb487f7.
+**2026-07-04: three field runs, three faces of ONE defect — the
+tsparse/tsdemux retiming layer is unstable over bonded-loss input.**
+Full forensics: `runs/INVESTIGATION-2026-07-04.md`. Run 1: playout
+step-shrink → DTS re-base → fatal mpegtsmux "Timestamping error" (fixed:
+50 ms/s window slew + gate DTS watermark, `8317ed7`). Run 2: corrupt-PES
+splice latched video +107 s → mpegtsmux interleave-deadlock → silent
+egress stall at 25 s that every transport metric slept through (fixed:
+`timeline_step()` WildJump bound, audio-gate logging, script egress
+heartbeat + STALLED/FAILED verdict, `04a2aa5`). Run 3 (validation): 117
+segments/77 s — 10× run 2 — then progressive timeline inflation (+60 s vs
+wall) stalled egress; caught live by the new detector. **Gates contain,
+can't repair. Open decision for next session:** GST_DEBUG diagnostic run
+on tsparse/tsdemux, drop `tsparse set-timestamps=true`?, and/or an egress
+watchdog that restarts the decode branch on prolonged stall. Playout is
+**adaptive under every profile** (`fixed_playout` was fb487f7-reverted;
+dead config deleted `38c842a`).
 
 `fix/adapt-goodput-not-residual` **merged to `main`** (2026-07-01): all four
 fixes below, plus HLS egress hardening. Clippy clean throughout.
