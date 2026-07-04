@@ -25,6 +25,7 @@ libc = "0.2"
 rtrb = { workspace = true }
 quanta = { workspace = true }
 quinn-udp = "0.5.14"
+socket2 = "0.6"
 raptorq = { workspace = true }
 rand = { workspace = true }
 ctrlc = "3.5.2"

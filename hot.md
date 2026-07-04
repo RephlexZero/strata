@@ -40,11 +40,21 @@ watchdog rebuilds retry up to 5×/1 s pause (gen 0 still fails fast), and
 Playing-failure now drains the bus so the real element error is printed.
 Local preview was double-broken (remote pkill self-match killed the
 http.server before it started; stale tunnel held local 8088 silently) —
-both fixed. **Awaiting field validation of a full heal cycle.** Sender AQM
-self-holes seeded the trigger burst for the 4th time — tuning question
-still open; `tsparse set-timestamps=true` removal sharpened now that the
-wedge is located at the muxer: stalled/inflated timestamps reaching it
-would explain it waiting forever for a segment boundary. Dev QoL:
+both fixed. **Run 6 (`orangepi-128932`): confirmed the SUSPECT again
+(q_v pegged 120 buf/9742 ms, q_ts/q_a empty) and confirmed the rebind-race
+root cause, but broke the retry fix — all 5 attempts over ~5 s still hit
+`Failed to bind link 0.0.0.0:5000: Address already in use` under real
+sustained load (~190k pkts across both links vs. the light local repro),
+so the retry budget was undersized, not wrong.** Real fix landed: receiver
+UDP sockets now bind with `SO_REUSEADDR` (`bind_udp_reuseaddr`, new
+`socket2` dep) so a same-process rebind no longer depends on winning a race
+against the kernel's deferred SQPOLL io_uring fd release — the retry loop
+stays as a backstop for genuine external port conflicts. **Awaiting field
+validation of a full heal cycle.** Sender AQM self-holes seeded the trigger
+burst for the 4th time — tuning question still open; `tsparse
+set-timestamps=true` removal sharpened now that the wedge is located at the
+muxer twice: stalled/inflated timestamps reaching it would explain it
+waiting forever for a segment boundary. Dev QoL:
 `STRATA_LOCAL_HLS_PORT` (default 8088) now
 tunnels the receiver HLS dir to http://localhost:8088/playlist.m3u8 for
 VLC/mpv; script verdict persists to `runs/<id>/verdict.txt`. Playout is
@@ -214,4 +224,4 @@ override that pinned it is gone — but still needs field confirmation. Watch
 adaptive-redundancy duplication as a wire-overhead contributor when spare is large.
 
 ---
-_Last updated: 2026-07-04 late night (run 5: watchdog trip named the wedge — hlssink3 muxer starved while fed — but the rebuild hit an SQPOLL rebind race; rebuild retry + bus-error surfacing + preview fixes landed, awaiting a full heal cycle)_
+_Last updated: 2026-07-04 late night (run 6: rebind race confirmed under load — retry budget wasn't enough, SO_REUSEADDR fixes it at the root — awaiting a full heal cycle)_

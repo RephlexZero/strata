@@ -27,6 +27,30 @@ use strata_transport::session::RttTracker;
 use strata_transport::wire::{ControlBody, Packet as WirePacket, PacketHeader};
 use tracing::{debug, info, warn};
 
+/// Bind a UDP socket with `SO_REUSEADDR`.
+///
+/// The egress watchdog rebuilds this receiver's pipeline in the same process,
+/// which rebinds the same ports moments after the old sockets are dropped.
+/// Under SQPOLL io_uring the kernel releases a closed socket's ring-registered
+/// fd asynchronously (`io_ring_exit_work`), so a plain rebind can transiently
+/// see the old port as still busy — worse under sustained load, where field
+/// run orangepi-128932 saw every one of 5 retries over ~5s hit EADDRINUSE.
+/// `SO_REUSEADDR` lets the new bind proceed regardless of that lingering
+/// kernel-side reference.
+fn bind_udp_reuseaddr(addr: SocketAddr) -> Result<UdpSocket> {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    Ok(unsafe { UdpSocket::from_raw_fd(socket.into_raw_fd()) })
+}
+
 /// Multi-link bonding receiver backed by `strata-transport`.
 ///
 /// Each link binds a UDP socket and spawns a reader thread that:
@@ -207,7 +231,7 @@ impl TransportBondingReceiver {
     /// decodes them through the transport receiver, and feeds results into
     /// the shared reassembly buffer.
     pub fn add_link(&self, bind_addr: SocketAddr) -> Result<()> {
-        let socket = UdpSocket::bind(bind_addr)?;
+        let socket = bind_udp_reuseaddr(bind_addr)?;
         self.add_link_socket(socket)
     }
 

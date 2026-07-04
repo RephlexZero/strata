@@ -640,3 +640,50 @@ occurrence 4), and now that the wedge is **located** — hlssink3 muxer starved
 while fed — the `tsparse set-timestamps=true` question sharpens: inflated/
 stalled timestamps reaching the muxer would explain it waiting forever for a
 segment boundary. Next wedge's trip dump can confirm from a healthy rebuild.
+
+## 2026-07-04 (later still) — run 6 (orangepi-128932): rebind race confirmed under load, retry budget wasn't enough — fixed at the root with SO_REUSEADDR
+
+Ran again with the run-5 fixes deployed. The watchdog tripped once more and
+**reproduced the run-5 diagnosis exactly**: `q_v: 120 buffers/9742 ms`
+(pegged), `q_ts`/`q_a` empty — hlssink3's muxer starved while fed, tsdemux
+exonerated again. EOS flush released 6 more held segments; verdict reports
+214 segments produced. The bus-error surfacing worked too: the log now
+clearly reads `Failed to bind link 0.0.0.0:5000: Address already in use`.
+
+But the rebuild retry (5×, 1 s pause) still lost: **every single attempt**
+failed with the same EADDRINUSE, over a ~5 s window, before giving up with
+`Error: StateChangeError`. This run had much heavier prior traffic than run
+5 or the local repro (~190k packets across both links, vs. a 50-packet
+burst) — the deferred SQPOLL io_uring fd release apparently scales with
+in-flight ring state, so it can outlast a 5 s retry budget under real load.
+The retry mechanism wasn't wrong, just undersized for the thing it was
+covering for.
+
+Fixed at the root instead of widening the budget: `Receiver::add_link`
+(`crates/strata-bonding/src/receiver/transport.rs`) now binds its UDP
+sockets through a new `bind_udp_reuseaddr()` helper that sets
+`SO_REUSEADDR` before `bind()` (via `socket2`, since `std::net::UdpSocket::
+bind` doesn't expose a hook to set options first). This lets a same-process
+rebind proceed even while the kernel is still finishing async cleanup of the
+old socket's io_uring registration — the old socket is genuinely gone from
+routing at that point, so this doesn't risk split delivery, it just stops
+the bind from tripping on a stale refcount. Added `socket2 = "0.6"` to
+`strata-bonding`'s Cargo.toml (already resolved transitively via
+`quinn-udp`, no new version pulled in). The rebuild retry loop in
+`strata_pipeline.rs` is left as-is — a backstop for a genuinely-held port,
+no longer the primary defense.
+
+Verification: `cargo check -p strata-bonding` clean; 11
+`receiver::transport` unit tests pass; 48 `strata-gst` lib tests pass
+(including `stratasrc_rebinds_same_ports_after_null`, still meaningful as
+the non-SQPOLL-path guard); clippy clean on both crates. Blast radius
+checked by inspection (GitNexus impact/detect_changes still down, v42/v41):
+`add_link`'s callers are `strata_receiver`/`strata_probe`/`strata-sim`'s
+CLI mains and `stratasrc::start()` — all pass a `SocketAddr` through
+unchanged, behavior is identical except for the new socket option.
+
+Still open: sender AQM self-holes (occurrence 4, unchanged); the
+`tsparse set-timestamps=true` question — the muxer is now confirmed twice as
+the wedge site, still waiting on a healthy full heal cycle (trip → rebuild
+succeeds → RECOVERED/OK verdict) to get a trip dump uncomplicated by a
+receiver death.

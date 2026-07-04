@@ -3785,6 +3785,7 @@ dependencies = [
  "rtrb",
  "serde",
  "serde_json",
+ "socket2 0.6.2",
  "strata-transport",
  "toml",
  "tracing",
