@@ -347,9 +347,18 @@ if [[ -n "$LOCAL_HLS_PORT" && "$LOCAL_HLS_PORT" != "0" ]]; then
                iptables -C INPUT -p tcp --dport ${LOCAL_HLS_PORT} -j ACCEPT 2>/dev/null || \
                iptables -I INPUT -p tcp --dport ${LOCAL_HLS_PORT} -j ACCEPT 2>/dev/null; \
              true" >/dev/null 2>&1 || true
+        # Two separate ssh calls, not one: the bracket trick above only
+        # protects pkill's own pattern argument from self-matching. Combined
+        # into one "pkill ...; setsid python3 -m http.server $PORT ... &"
+        # string, the wrapper shell's own cmdline still contains the LATER,
+        # unbracketed "http.server $PORT" text from the setsid invocation —
+        # pkill matches that and kills its own wrapper before setsid ever
+        # runs, every time. Splitting them means the pkill wrapper's cmdline
+        # never contains the real invocation text in the first place.
         ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" \
-            "pkill -f '[h]ttp\.server $LOCAL_HLS_PORT' 2>/dev/null; \
-             setsid python3 -m http.server $LOCAL_HLS_PORT --bind 0.0.0.0 --directory '$HLS_DIR' \
+            "pkill -f '[h]ttp\.server $LOCAL_HLS_PORT' 2>/dev/null; true" >/dev/null 2>&1 || true
+        ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" \
+            "setsid python3 -m http.server $LOCAL_HLS_PORT --bind 0.0.0.0 --directory '$HLS_DIR' \
                >/dev/null 2>&1 < /dev/null &" >/dev/null 2>&1 || true
         info "Public HLS preview: http://${PREVIEW_ADDR}:${LOCAL_HLS_PORT}/playlist.m3u8"
         echo "      mpv --profile=low-latency --cache=no http://${PREVIEW_ADDR}:${LOCAL_HLS_PORT}/playlist.m3u8"
