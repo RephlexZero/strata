@@ -346,6 +346,14 @@ mkdir -p "$ARTIFACT_DIR"
 MAX_SEGS=0
 CLEANED=0
 RECEIVER_DIED=0
+# Egress-stall tracking. File COUNT is not a progress signal (max-files
+# rotation holds it constant), so progress = cumulative 'segment added'
+# events in the receiver log. 2026-07-04 run 2: segment production froze at
+# t≈25s (corrupt-PES timeline latch stalled the muxer) while every
+# transport metric stayed green and the file count sat at 8 — invisible.
+PREV_PRODUCED=0
+STALL_TICKS=0
+MAX_STALL_TICKS=0
 
 cleanup() {
     [[ $CLEANED -eq 1 ]] && return; CLEANED=1
@@ -383,10 +391,23 @@ while [[ $ELAPSED -lt $DURATION ]]; do
     SEGS=$(num "$SEGS"); [[ $SEGS -gt $MAX_SEGS ]] && MAX_SEGS=$SEGS
     PLAYLIST=$(ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "test -f '$HLS_DIR/playlist.m3u8' && echo yes || echo no" 2>/dev/null || echo no)
 
+    # Cumulative segments ever produced — the real egress heartbeat.
+    PRODUCED=$(num "$(ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "grep -c 'segment added' /tmp/strata-receiver.log 2>/dev/null" 2>/dev/null || echo 0)")
+    if [[ $PRODUCED -gt $PREV_PRODUCED ]]; then
+        STALL_TICKS=0
+    elif [[ $PRODUCED -gt 0 ]]; then
+        STALL_TICKS=$((STALL_TICKS + 1))
+        [[ $STALL_TICKS -gt $MAX_STALL_TICKS ]] && MAX_STALL_TICKS=$STALL_TICKS
+        if [[ $STALL_TICKS -eq 4 ]]; then
+            warn "HLS egress STALLED: no new segment for $((STALL_TICKS * MONITOR_INTERVAL))s while both processes are alive (transport metrics can stay green through this — check the receiver gate logs)"
+        fi
+    fi
+    PREV_PRODUCED=$PRODUCED
+
     # Latest receiver stats line.
     STATS=$(ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "grep 'strata-stats' /tmp/strata-receiver.log 2>/dev/null | tail -1" 2>/dev/null || echo "")
     DELIVERED=$(num "$(grep -oP 'packets_delivered=\(guint64\)\K[0-9]+' <<<"$STATS" | tail -1)")
-    DAMAGED=$(num "$(grep -oP 'damaged_packets=\(guint64\)\K[0-9]+' <<<"$STATS" | tail -1)")
+    DISCONT=$(num "$(grep -oP 'discontinuities=\(guint64\)\K[0-9]+' <<<"$STATS" | tail -1)")
     LOST=$(num "$(grep -oP 'lost_packets=\(guint64\)\K[0-9]+' <<<"$STATS" | tail -1)")
     LATE=$(num "$(grep -oP 'late_packets=\(guint64\)\K[0-9]+' <<<"$STATS" | tail -1)")
     LAT=$(num "$(grep -oP 'current_latency_ms=\(guint64\)\K[0-9]+' <<<"$STATS" | tail -1)")
@@ -397,8 +418,9 @@ while [[ $ELAPSED -lt $DURATION ]]; do
         [[ -n "$s" ]] && YT=" yt_health=$s"
     fi
 
-    echo "╌╌╌ [${ELAPSED}s] segments=$SEGS (max=$MAX_SEGS) playlist=$PLAYLIST$YT ╌╌╌"
-    echo "  RX: delivered=$DELIVERED damaged=$DAMAGED (lost=$LOST late=$LATE) playout=${LAT}ms"
+    STALL_STR=""; [[ $STALL_TICKS -gt 0 ]] && STALL_STR=" STALLED=$((STALL_TICKS * MONITOR_INTERVAL))s"
+    echo "╌╌╌ [${ELAPSED}s] produced=$PRODUCED segs (dir=$SEGS) playlist=$PLAYLIST$STALL_STR$YT ╌╌╌"
+    echo "  RX: delivered=$DELIVERED lost=$LOST late=$LATE discont=$DISCONT playout=${LAT}ms"
 done
 
 # ── Verdict ──────────────────────────────────────────────────────────
@@ -408,8 +430,10 @@ RX_FATAL=$(ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" \
     2>/dev/null || echo "")
 if [[ $RECEIVER_DIED -eq 1 || -n "$RX_FATAL" ]]; then
     warn "FAILED: receiver died mid-run${RX_FATAL:+ — fatal: $RX_FATAL} ($MAX_SEGS segment(s) before death)"
+elif [[ $MAX_STALL_TICKS -ge 4 ]]; then
+    warn "FAILED: HLS egress stalled for $((MAX_STALL_TICKS * MONITOR_INTERVAL))s (produced $PREV_PRODUCED segments total) — YouTube went dark mid-run even though both processes stayed up"
 elif [[ $MAX_SEGS -ge 2 && "$PLAYLIST" == "yes" ]]; then
-    info "OK: $MAX_SEGS segments + playlist produced (damaged=$DAMAGED)"
+    info "OK: $PREV_PRODUCED segments produced + playlist (lost=$LOST late=$LATE discont=$DISCONT)"
 elif [[ $MAX_SEGS -ge 1 ]]; then
     warn "PARTIAL: only $MAX_SEGS segment(s) — check receiver.log for timestamping errors / single-segment stall"
 else

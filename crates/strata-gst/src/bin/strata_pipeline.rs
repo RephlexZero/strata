@@ -214,6 +214,31 @@ fn configure_hlssink3_muxer(hls: &gst::Element) {
 /// `pending_resumes` — the bus watch in `run_receiver` matches that against
 /// `hlssink3`'s `hls-segment-added` messages to mark the corresponding segment
 /// for `#EXT-X-DISCONTINUITY` in `hls_upload.rs`.
+/// Largest credible single-step forward DTS/PTS move mid-stream. Legitimate
+/// forward gaps are bounded by the playout window's gap-skips (≤ 3 s ceiling)
+/// plus a GOP; anything bigger is a demux timeline latch onto a corrupted PES
+/// header (2026-07-04 field run 2: a mid-PES splice under a loss burst made
+/// tsdemux re-base video +107 s while audio stayed sane — mpegtsmux then sat
+/// waiting to interleave forever, and HLS egress silently stopped at t≈25 s
+/// while every transport metric stayed green).
+const MAX_FORWARD_STEP_NS: u64 = 10_000_000_000;
+
+/// Classify a buffer's DTS against the last one emitted to the muxer.
+fn timeline_step(dts: Option<u64>, last_emitted: Option<u64>) -> TimelineStep {
+    match (dts, last_emitted) {
+        (Some(d), Some(last)) if d < last => TimelineStep::Regression,
+        (Some(d), Some(last)) if d - last > MAX_FORWARD_STEP_NS => TimelineStep::WildJump,
+        _ => TimelineStep::Ok,
+    }
+}
+
+#[derive(PartialEq)]
+enum TimelineStep {
+    Ok,
+    Regression,
+    WildJump,
+}
+
 fn install_delivered_stream_gate(
     pad: &gst::Pad,
     pending_resumes: Arc<Mutex<VecDeque<gst::ClockTime>>>,
@@ -291,20 +316,19 @@ fn install_delivered_stream_gate(
             // POC"). Drop it and wait for the next CLEAN keyframe instead.
             // Exception: the very first keyframe (startup DISCONT, no prior
             // reference to corrupt) is always accepted so the stream can lock.
-            // A resume must also never rewind the muxer's timeline: after an
-            // upstream re-base (tsdemux skew step when the playout window
-            // moved), the next IDRs can carry DTS below the last emitted one,
-            // and handing one to mpegtsmux is the exact fatal "Timestamping
-            // error" this gate exists to prevent (2026-07-04 field crash:
-            // resumed at 21.8 s after emitting 22.26 s). Keep dropping until
-            // an IDR at/past the watermark — media time advances in real
-            // time, so this resolves within the re-base magnitude + one GOP.
-            let monotonic = match (dts, st.last_dts) {
-                (Some(d), Some(last)) => d >= last,
-                _ => true,
-            };
+            // A resume must also stay on a credible timeline: never below the
+            // emitted-DTS watermark (a backwards step is the exact fatal
+            // "Timestamping error" this gate exists to prevent — 2026-07-04
+            // run 1 resumed at 21.8 s after emitting 22.26 s), and never a
+            // wild forward leap (run 2: a corrupt-PES +107 s latch would have
+            // poisoned the watermark and stalled interleaving downstream).
+            // Media time advances in real time, so a regression wait resolves
+            // within the re-base magnitude + one GOP; a wild-jump wait holds
+            // the last sane timeline and screams in the log instead of
+            // silently wedging the muxer.
+            let credible = timeline_step(dts, st.last_dts) == TimelineStep::Ok;
             let trustworthy_keyframe =
-                is_keyframe && (!st.started || (!is_discont && monotonic));
+                is_keyframe && (!st.started || (!is_discont && credible));
             if trustworthy_keyframe {
                 // A mid-stream resume (not the stream's very first keyframe) is
                 // a real splice: stamp DISCONT so the muxer/sink see it, and
@@ -344,22 +368,35 @@ fn install_delivered_stream_gate(
             }
             return gst::PadProbeReturn::Drop;
         }
-        // Monotonic-DTS guard: a backwards DTS is what kills mpegtsmux.
-        // Dropping ONLY the offending buffer is not enough — it may be a
-        // reference frame, and silently deleting one leaves every following
-        // P-frame decoding against a missing reference (full-frame grey at
-        // the far decoder, invisible to every metric here). Treat a DTS
-        // regression like a discontinuity: drop and RESYNC to the next
-        // clean keyframe.
-        if let (Some(d), Some(last)) = (dts, st.last_dts)
-            && d < last
-        {
-            st.waiting_for_keyframe = true;
-            st.dropped += 1;
-            eprintln!(
-                "DeliveredStream gate: DTS regression ({d} < {last}) — resyncing to next clean IDR"
-            );
-            return gst::PadProbeReturn::Drop;
+        // Timeline guard: a backwards DTS is what kills mpegtsmux, and a wild
+        // forward DTS (corrupt-PES demux latch) is what silently stalls it —
+        // the muxer buffers the leapt video waiting for the other stream to
+        // interleave up to it, which never happens. Dropping ONLY the
+        // offending buffer is not enough — it may be a reference frame, and
+        // silently deleting one leaves every following P-frame decoding
+        // against a missing reference (full-frame grey at the far decoder,
+        // invisible to every metric here). Treat both like a discontinuity:
+        // drop and RESYNC to the next clean, credible keyframe.
+        match timeline_step(dts, st.last_dts) {
+            TimelineStep::Regression => {
+                st.waiting_for_keyframe = true;
+                st.dropped += 1;
+                let (d, last) = (dts.unwrap(), st.last_dts.unwrap());
+                eprintln!(
+                    "DeliveredStream gate: DTS regression ({d} < {last}) — resyncing to next clean IDR"
+                );
+                return gst::PadProbeReturn::Drop;
+            }
+            TimelineStep::WildJump => {
+                st.waiting_for_keyframe = true;
+                st.dropped += 1;
+                let (d, last) = (dts.unwrap(), st.last_dts.unwrap());
+                eprintln!(
+                    "DeliveredStream gate: wild forward DTS jump ({d} >> {last}) — dropping corrupt timeline, awaiting credible IDR"
+                );
+                return gst::PadProbeReturn::Drop;
+            }
+            TimelineStep::Ok => {}
         }
         if dts.is_some() {
             st.last_dts = dts;
@@ -370,27 +407,36 @@ fn install_delivered_stream_gate(
 
 /// Monotonic-DTS guard for streams without keyframes (audio).
 ///
-/// A subset of [`install_delivered_stream_gate`]: it only drops buffers whose
-/// DTS regresses below the last emitted one — the exact condition that makes
-/// `mpegtsmux` abort with "Timestamping error on input streams". Audio frames
+/// A subset of [`install_delivered_stream_gate`]: it drops buffers whose DTS
+/// regresses below the last emitted one — the exact condition that makes
+/// `mpegtsmux` abort with "Timestamping error on input streams" — or leaps
+/// forward incredibly (corrupt-PES demux latch; the leapt buffer would make
+/// the muxer wait for the video stream to interleave up to it). Audio frames
 /// are all independent, so there is no keyframe to resync to after loss; we
-/// simply never hand the muxer a backwards DTS.
+/// drop offenders one-by-one without moving the watermark and log at
+/// power-of-two counts (this pad was previously fully silent, which is how a
+/// starved-muxer stall stayed invisible on 2026-07-04).
 fn install_monotonic_dts_gate(pad: &gst::Pad) {
     use std::sync::Mutex;
-    let last_dts = Mutex::new(None::<u64>);
+    let state = Mutex::new((None::<u64>, 0u64)); // (last_dts, dropped)
     pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
         let Some(gst::PadProbeData::Buffer(buf)) = &info.data else {
             return gst::PadProbeReturn::Ok;
         };
         let dts = buf.dts().map(|t| t.nseconds());
-        let mut last = last_dts.lock().unwrap();
-        if let (Some(d), Some(prev)) = (dts, *last)
-            && d < prev
-        {
+        let mut st = state.lock().unwrap();
+        if timeline_step(dts, st.0) != TimelineStep::Ok {
+            st.1 += 1;
+            if st.1.is_power_of_two() {
+                eprintln!(
+                    "Monotonic-DTS gate (audio): dropped {} non-credible buffer(s) (dts={:?}, last={:?})",
+                    st.1, dts, st.0
+                );
+            }
             return gst::PadProbeReturn::Drop;
         }
         if dts.is_some() {
-            *last = dts;
+            st.0 = dts;
         }
         gst::PadProbeReturn::Ok
     });
@@ -2126,4 +2172,31 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{timeline_step, TimelineStep, MAX_FORWARD_STEP_NS};
+
+    #[test]
+    fn timeline_step_classifies_all_regimes() {
+        // No baseline yet, or no DTS on the buffer → always credible.
+        assert!(timeline_step(None, None) == TimelineStep::Ok);
+        assert!(timeline_step(Some(5), None) == TimelineStep::Ok);
+        assert!(timeline_step(None, Some(5)) == TimelineStep::Ok);
+        // Normal forward motion, including a playout-window-sized gap-skip.
+        assert!(timeline_step(Some(1_000), Some(999)) == TimelineStep::Ok);
+        assert!(timeline_step(Some(3_000_000_000), Some(0)) == TimelineStep::Ok);
+        assert!(
+            timeline_step(Some(MAX_FORWARD_STEP_NS), Some(0)) == TimelineStep::Ok,
+            "exactly at the bound is still credible"
+        );
+        // Backwards → the mpegtsmux-fatal case (2026-07-04 run 1).
+        assert!(timeline_step(Some(21_007_913_971), Some(22_264_073_509)) == TimelineStep::Regression);
+        // The run-2 corrupt-PES latch: video leapt ~+107 s in one step.
+        assert!(
+            timeline_step(Some(227_320_000_000), Some(24_694_000_000)) == TimelineStep::WildJump
+        );
+        assert!(timeline_step(Some(MAX_FORWARD_STEP_NS + 1), Some(0)) == TimelineStep::WildJump);
+    }
 }
