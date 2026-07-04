@@ -345,6 +345,7 @@ ARTIFACT_DIR="$REPO_ROOT/runs/orangepi-${SENDER_PID}"
 mkdir -p "$ARTIFACT_DIR"
 MAX_SEGS=0
 CLEANED=0
+RECEIVER_DIED=0
 
 cleanup() {
     [[ $CLEANED -eq 1 ]] && return; CLEANED=1
@@ -367,6 +368,15 @@ while [[ $ELAPSED -lt $DURATION ]]; do
     # Sender still alive?
     if ! ssh "${SENDER_SSH[@]}" "$SENDER_HOST" "kill -0 $SENDER_PID 2>/dev/null"; then
         warn "Sender process exited early — see $SENDER_HOST:/tmp/strata-sender.log"; break
+    fi
+
+    # Receiver still alive? A fatal GStreamer error (e.g. "Timestamping error
+    # on input streams") kills it while the sender streams into the void — and
+    # grepping the dead process's log tail would keep reporting the last-known
+    # stats as if healthy (2026-07-04: 99 s of dead air passed as OK).
+    if ! ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "kill -0 $RECEIVER_PID 2>/dev/null"; then
+        warn "Receiver process exited early — see $RECEIVER_HOST:/tmp/strata-receiver.log"
+        RECEIVER_DIED=1; break
     fi
 
     SEGS=$(ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "ls '$HLS_DIR'/*.ts 2>/dev/null | wc -l" 2>/dev/null || echo 0)
@@ -393,7 +403,12 @@ done
 
 # ── Verdict ──────────────────────────────────────────────────────────
 echo ""
-if [[ $MAX_SEGS -ge 2 && "$PLAYLIST" == "yes" ]]; then
+RX_FATAL=$(ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" \
+    "grep -m1 -E 'Timestamping error on input streams|^Error:' /tmp/strata-receiver.log 2>/dev/null" \
+    2>/dev/null || echo "")
+if [[ $RECEIVER_DIED -eq 1 || -n "$RX_FATAL" ]]; then
+    warn "FAILED: receiver died mid-run${RX_FATAL:+ — fatal: $RX_FATAL} ($MAX_SEGS segment(s) before death)"
+elif [[ $MAX_SEGS -ge 2 && "$PLAYLIST" == "yes" ]]; then
     info "OK: $MAX_SEGS segments + playlist produced (damaged=$DAMAGED)"
 elif [[ $MAX_SEGS -ge 1 ]]; then
     warn "PARTIAL: only $MAX_SEGS segment(s) — check receiver.log for timestamping errors / single-segment stall"
