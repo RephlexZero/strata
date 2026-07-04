@@ -517,3 +517,23 @@ by the gate (61 buffers dropped total, sub-second freezes), measured max
 window shrink 56 ms/s, FEC steady 13–15 % under ~5 % channel loss,
 encoder ~2.6 Mbps. Known cosmetic gap: script's `damaged=` readout greps
 the `damaged_packets` metric deleted in fb487f7 — always 0.
+
+## 2026-07-04 (evening) — Runs 2/3 postmortem: the demux timeline is the real defect
+
+Run 2's "YouTube went dark at 20 s" was not YouTube: HLS egress silently
+stalled at media ≈25 s (corrupt-PES splice under a loss burst latched
+tsdemux +107 s on video only; mpegtsmux interleave-deadlocked; every
+transport metric stayed green; EOS flushed segments stamped past the
+pipeline's own age). Fixes (`04a2aa5`): `timeline_step()` gate classifier
+(Regression | WildJump>10 s), audio-gate logging (was fully silent),
+script egress heartbeat = cumulative 'segment added' (file count is
+rotation-flat) with STALLED warning + FAILED verdict; phantom `damaged=`
+readout removed; wiki Observability-Semantics row corrected. Validation
+run 3 (`runs/orangepi-111043`): 117 segments/77 s (10× run 2) under ~6 %
+loss, zero crashes/latches, then a THIRD timeline pathology — progressive
+inflation (stamps ~60 s ahead of wall) with periodic backward corrections
+— stalled egress at t≈77 s and was caught live by the new detector.
+Conclusion in `runs/INVESTIGATION-2026-07-04.md`: three runs, three faces
+of one defect — tsparse/tsdemux retiming is unstable over bonded-loss
+input; gates contain, can't repair. Next: GST_DEBUG diagnostic run,
+reconsider `tsparse set-timestamps=true`, egress-watchdog restart.
