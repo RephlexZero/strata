@@ -5,6 +5,17 @@
 
 ## Current focus
 
+**2026-07-04 field-validated on real hardware.** Orange Pi → cloud → YouTube
+run surfaced a fatal receiver crash (playout-window step-shrink → tsdemux
+DTS re-base → mpegtsmux "Timestamping error"); fixed with a 50 ms/s
+downward slew limit in the aggregator + the DeliveredStream gate refusing
+to resume below its emitted-DTS watermark (`8317ed7`). Re-run: 120 s
+clean, 16 segments to YouTube, gate absorbed three DTS regressions as
+sub-second freezes. Playout is **adaptive under every profile** —
+`fixed_playout` was reverted in fb487f7 and its dead config is now
+deleted (`38c842a`); wiki Control-Loop-Map corrected. Known cosmetic gap:
+field scripts' `damaged=` readout greps a metric deleted in fb487f7.
+
 `fix/adapt-goodput-not-residual` **merged to `main`** (2026-07-01): all four
 fixes below, plus HLS egress hardening. Clippy clean throughout.
 

@@ -493,3 +493,27 @@ Format: `## YYYY-MM-DD` heading per day, bullet per entry.
   config-update section, previously silently dropped by the control
   plane's typed parse, now round-trips and gets an honest "not supported"
   error from the agent.
+
+## 2026-07-04 (later) — Orange Pi field test: fatal DTS-step crash found and fixed
+
+Field run 1 (first after the review work): receiver died 21 s in with
+GStreamer-fatal "Timestamping error on input streams"; the field script
+watched only the sender PID, so 99 s of dead air passed as `OK`. Chain:
+link 1 dead ~10 s post-admission → playout window ballooned to the
+3000 ms ceiling → link recovered → window snapped down 1250 ms in ~2 s →
+tsdemux's PCR skew estimator (drift-tolerant, step-intolerant) re-based
+output DTS 1.256 s backwards → DeliveredStream gate resumed on an IDR
+*below* its emitted-DTS watermark (resume reset `last_dts`
+unconditionally) → mpegtsmux abort. Fixes (commits `8317ed7`, `38c842a`,
+`0e5c5d7`, wiki `63e7451`): aggregator downward slew limit 50 ms/s
+wall-clock (iat-clamped; growth stays fast), gate refuses to resume below
+the watermark, script now fails on receiver death / fatal-error string,
+stale `strata-portal` COPY dropped from Dockerfile.cross-aarch64 (broke
+every cross build), dead `fixed_playout`/`PlayoutProfile.fixed` config
+deleted (fb487f7 reverted the feature but left the lying plumbing).
+Field run 2 (fixes deployed): 120 s clean — receiver alive throughout, 16
+segments uploaded to YouTube, three mid-run DTS regressions each absorbed
+by the gate (61 buffers dropped total, sub-second freezes), measured max
+window shrink 56 ms/s, FEC steady 13–15 % under ~5 % channel loss,
+encoder ~2.6 Mbps. Known cosmetic gap: script's `damaged=` readout greps
+the `damaged_packets` metric deleted in fb487f7 — always 0.
