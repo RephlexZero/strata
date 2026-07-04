@@ -244,7 +244,11 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
         let id = link.id();
         self.scheduler.add_link(link);
         self.iods.add_link(IodsLinkState::new(id));
-        self.blest.update_link_owd(id, 0.025); // 25ms default OWD
+        // Neutral OWD seed for a link with no delay samples yet — a typical
+        // uncongested cellular one-way delay, so BLEST neither shuns nor
+        // favors a fresh link before real measurements arrive.
+        const DEFAULT_OWD_SEED_S: f64 = 0.025;
+        self.blest.update_link_owd(id, DEFAULT_OWD_SEED_S);
         self.kalman_rtt
             .insert(id, KalmanFilter::new(&KalmanConfig::for_rtt()));
     }
@@ -607,7 +611,12 @@ impl<L: LinkSender + ?Sized + 'static> BondingScheduler<L> {
             // Require a usable measurement window before honoring the knee
             // (expressed as a fraction of probe_duration — not a new
             // constant): at least a quarter of the configured window.
-            let min_window = probe_duration.mul_f64(0.25);
+            // Ignore knee retreats in the first quarter of the probe: the
+            // paced-queue has to visibly build before queue_building() means
+            // anything, and retreating on the first sample would make every
+            // probe a no-op.
+            const PROBE_MIN_WINDOW_FRACTION: f64 = 0.25;
+            let min_window = probe_duration.mul_f64(PROBE_MIN_WINDOW_FRACTION);
             let knee_terminate =
                 knee_reached && self.saturation_probe_snapshot_taken && elapsed >= min_window;
             if knee_terminate {

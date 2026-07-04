@@ -305,6 +305,12 @@ pub struct BitrateAdapter {
     /// ~60% post-FEC residual, FEC pinned at 41% while the encoder sat at the
     /// 500 kbps floor with 3.7 Mbps spare).
     max_link_loss: f64,
+    /// EWMA of `max_link_loss` — the value FEC parity sizing actually
+    /// reads. Per review_findings.md §2.4.2: the raw per-tick max let a
+    /// single bursty second lift overhead (and inject a parity burst) for
+    /// exactly one tick. Rises over ~3 ticks so only sustained channel
+    /// loss grows parity; falls fast so a cleaned-up channel sheds it.
+    max_link_loss_sustained: f64,
     /// EWMA-smoothed goodput (bps) from receiver feedback.
     /// Prevents single low-sample outliers (e.g. end-of-window artifacts)
     /// from triggering spurious goodput-shortfall reductions.
@@ -425,6 +431,7 @@ impl BitrateAdapter {
             last_increase_time: None,
             ewma_loss_fec: 0.0,
             max_link_loss: 0.0,
+            max_link_loss_sustained: 0.0,
             ewma_goodput_bps: 0.0,
             capacity_ewma: HashMap::new(),
             last_burst_time: None,
@@ -515,11 +522,11 @@ impl BitrateAdapter {
         let loss_scaled = if self.self_congested {
             BASE_OVERHEAD
         } else {
-            (BASE_OVERHEAD + self.max_link_loss * 0.50).min(MAX_OVERHEAD)
+            (BASE_OVERHEAD + self.max_link_loss_sustained * 0.50).min(MAX_OVERHEAD)
         };
 
         let mut overhead = spare_scaled.max(loss_scaled);
-        if self.max_link_loss >= 0.25 && !self.self_congested {
+        if self.max_link_loss_sustained >= 0.25 && !self.self_congested {
             overhead = overhead.max(MIN_LOSSY_OVERHEAD);
         }
 
@@ -664,6 +671,18 @@ impl BitrateAdapter {
             .filter(|l| l.alive)
             .map(|l| l.loss_rate)
             .fold(0.0_f64, f64::max);
+
+        // Sustain gate for FEC sizing (§2.4.2): believe a loss step over
+        // ~3 ticks (one HARQ burst can't spike parity for a tick), shed it
+        // fast once the channel is clean again (parity down is always safe).
+        const FEC_LOSS_ALPHA_UP: f64 = 0.3;
+        const FEC_LOSS_ALPHA_DOWN: f64 = 0.7;
+        let alpha = if self.max_link_loss > self.max_link_loss_sustained {
+            FEC_LOSS_ALPHA_UP
+        } else {
+            FEC_LOSS_ALPHA_DOWN
+        };
+        self.max_link_loss_sustained += alpha * (self.max_link_loss - self.max_link_loss_sustained);
 
         // Log per-link detail
         for l in links {
@@ -1026,12 +1045,18 @@ impl BitrateAdapter {
         // (stall), decay the EWMA toward 0 (×0.9) instead of freezing it, so a
         // stall can't latch the signal high and poison the contexts that read
         // it; this lets the system re-probe after ~10s of stall.
+        // α values follow the polarity rule in
+        // wiki/Adaptation-EWMA-Conventions.md (§1b): 0.3 is this codebase's
+        // recurring "believe a change over ~3 ticks" weight.
+        const LOSS_EWMA_ALPHA: f32 = 0.3;
+        const LOSS_EWMA_STALL_DECAY: f32 = 0.9;
         let ewma_loss_before = self.ewma_loss_fec;
         if feedback.goodput_bps > 0 {
-            self.ewma_loss_fec = 0.3 * feedback.loss_after_fec + 0.7 * self.ewma_loss_fec;
+            self.ewma_loss_fec = LOSS_EWMA_ALPHA * feedback.loss_after_fec
+                + (1.0 - LOSS_EWMA_ALPHA) * self.ewma_loss_fec;
         } else {
             // Stall: decay loss toward 0 so the system can eventually recover.
-            self.ewma_loss_fec *= 0.9;
+            self.ewma_loss_fec *= LOSS_EWMA_STALL_DECAY;
         }
         // The post-FEC residual (`ewma_loss_fec`) deliberately does NOT cut the
         // encoder.  It folds in cross-link reorder and late-arrival loss that
@@ -1106,11 +1131,12 @@ impl BitrateAdapter {
         // that can appear as a single near-zero reading followed by a burst.
         // Seed with the first real reading to avoid cold-start false shortfalls.
         if feedback.goodput_bps > 0 {
+            const GOODPUT_EWMA_ALPHA: f64 = 0.3;
             if self.ewma_goodput_bps == 0.0 {
                 self.ewma_goodput_bps = feedback.goodput_bps as f64;
             } else {
-                self.ewma_goodput_bps =
-                    0.3 * feedback.goodput_bps as f64 + 0.7 * self.ewma_goodput_bps;
+                self.ewma_goodput_bps = GOODPUT_EWMA_ALPHA * feedback.goodput_bps as f64
+                    + (1.0 - GOODPUT_EWMA_ALPHA) * self.ewma_goodput_bps;
             }
 
             // Windowed p75 of recent goodput.  Using the raw max let a single
@@ -1724,7 +1750,7 @@ mod tests {
     #[test]
     fn fec_overhead_pinned_under_self_congestion() {
         let mut adapter = BitrateAdapter {
-            max_link_loss: 0.8, // genuine channel loss: would drive overhead to 50%
+            max_link_loss_sustained: 0.8, // sustained channel loss: drives overhead to 50%
             ..Default::default()
         };
         adapter.self_congested = false;
@@ -1747,8 +1773,8 @@ mod tests {
     #[test]
     fn fec_overhead_not_inflated_by_reorder_residual() {
         let mut adapter = BitrateAdapter {
-            ewma_loss_fec: 0.6,  // high post-FEC residual (reorder/late)
-            max_link_loss: 0.02, // but the wire itself is clean
+            ewma_loss_fec: 0.6,            // high post-FEC residual (reorder/late)
+            max_link_loss_sustained: 0.02, // but the wire itself is clean
             ..Default::default()
         };
         adapter.self_congested = false;
@@ -1756,6 +1782,54 @@ mod tests {
         assert!(
             overhead <= 0.12,
             "reorder/late residual must not inflate FEC on a clean channel, got {overhead}"
+        );
+    }
+
+    /// §2.4.2: FEC sizing must not spike on a single bursty tick — one
+    /// second of HARQ-burst loss previously lifted overhead (and emitted a
+    /// parity burst) for exactly one tick. It must still grow under
+    /// sustained loss, and shed quickly once the channel is clean.
+    #[test]
+    fn fec_overhead_requires_sustained_loss() {
+        let mut adapter = BitrateAdapter::default();
+        let lossy = |loss: f64| {
+            vec![LinkCapacity {
+                link_id: 0,
+                capacity_kbps: 5_000.0,
+                alive: true,
+                loss_rate: loss,
+                rtt_ms: 30.0,
+                queue_depth: Some(0),
+                drain_rate_kbps: None,
+                aqm_dropped_total: None,
+            }]
+        };
+
+        // One bursty tick: overhead must stay near baseline.
+        adapter.update(&lossy(0.40));
+        let after_spike = adapter.recommended_fec_overhead();
+        assert!(
+            after_spike < 0.25,
+            "a single lossy tick must not spike FEC overhead, got {after_spike}"
+        );
+
+        // Sustained loss: overhead grows to the lossy floor.
+        for _ in 0..5 {
+            adapter.update(&lossy(0.40));
+        }
+        let sustained = adapter.recommended_fec_overhead();
+        assert!(
+            sustained >= 0.25,
+            "sustained channel loss must grow FEC overhead, got {sustained}"
+        );
+
+        // Clean channel: parity sheds within a couple of ticks.
+        adapter.update(&lossy(0.0));
+        adapter.update(&lossy(0.0));
+        let recovered = adapter.recommended_fec_overhead();
+        assert!(
+            recovered < 0.15,
+            "a clean channel must shed parity quickly, got {recovered}"
         );
     }
 

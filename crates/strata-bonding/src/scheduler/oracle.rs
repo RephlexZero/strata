@@ -34,6 +34,20 @@ const DOWNSHIFT_LOWER_BOUND_RETENTION: f64 = 0.5;
 /// Minimum interval between downshift resets, to prevent rapid re-triggering.
 const DOWNSHIFT_COOLDOWN_S: f64 = 10.0;
 
+/// The recurring rise-fast/fall-slow EWMA pair for floors (lower bound,
+/// upper bound): trust improvements quickly, forget capability slowly.
+/// Polarity rule: wiki/Adaptation-EWMA-Conventions.md (§1b).
+const FLOOR_EWMA_ALPHA_RISE: f64 = 0.3;
+const FLOOR_EWMA_ALPHA_FALL: f64 = 0.05;
+
+/// Slow baseline-RTT EWMA weight (same 0.05 "slow" leg as the floor pair).
+const BASELINE_RTT_EWMA_ALPHA: f64 = 0.05;
+
+/// Per-recompute decay for both slow peaks (`peak_estimate` and
+/// `lower_bound_peak`) — ~1%/s at the 2 Hz recompute cadence. One shared
+/// constant so the two decays (deliberately identical, L6) cannot drift.
+const PEAK_DECAY_PER_RECOMPUTE: f64 = 0.999;
+
 /// Multiple of the slow RTT baseline EWMA (α≈0.05, see `update_baseline_rtt`)
 /// that counts as a "dramatic" spike for `should_reset`. This is a
 /// *different* detector than `SchedulerConfig::failover_rtt_spike_factor`
@@ -190,7 +204,11 @@ impl CapacityOracle {
             // Asymmetric EWMA: rise quickly (α=0.3), fall slowly (α=0.05).
             // This tracks peak sustainable throughput without getting stuck
             // at a burst spike that exceeds the link's true capacity.
-            let alpha = if capped > self.lower_bound { 0.3 } else { 0.05 };
+            let alpha = if capped > self.lower_bound {
+                FLOOR_EWMA_ALPHA_RISE
+            } else {
+                FLOOR_EWMA_ALPHA_FALL
+            };
             self.lower_bound = (1.0 - alpha) * self.lower_bound + alpha * capped;
         }
 
@@ -346,7 +364,8 @@ impl CapacityOracle {
                 self.baseline_rtt_ms = rtt_ms;
             } else {
                 // Slow EWMA so normal jitter doesn't shift baseline quickly
-                self.baseline_rtt_ms = 0.95 * self.baseline_rtt_ms + 0.05 * rtt_ms;
+                self.baseline_rtt_ms = (1.0 - BASELINE_RTT_EWMA_ALPHA) * self.baseline_rtt_ms
+                    + BASELINE_RTT_EWMA_ALPHA * rtt_ms;
             }
         }
     }
@@ -377,7 +396,7 @@ impl CapacityOracle {
         if self.estimated_cap > self.peak_estimate {
             self.peak_estimate = self.estimated_cap;
         } else {
-            self.peak_estimate *= 0.999;
+            self.peak_estimate *= PEAK_DECAY_PER_RECOMPUTE;
         }
 
         // Same slow decay for lower_bound_peak (L6). Its only other reset
@@ -392,7 +411,7 @@ impl CapacityOracle {
         if self.lower_bound > self.lower_bound_peak {
             self.lower_bound_peak = self.lower_bound;
         } else {
-            self.lower_bound_peak *= 0.999;
+            self.lower_bound_peak *= PEAK_DECAY_PER_RECOMPUTE;
         }
     }
 
@@ -434,7 +453,8 @@ impl CapacityOracle {
 
         // Conservative blending: 30% new, 70% old
         if self.upper_bound > 0.0 {
-            self.upper_bound = 0.3 * capped_bps + 0.7 * self.upper_bound;
+            self.upper_bound =
+                FLOOR_EWMA_ALPHA_RISE * capped_bps + (1.0 - FLOOR_EWMA_ALPHA_RISE) * self.upper_bound;
         } else {
             self.upper_bound = capped_bps;
         }

@@ -254,6 +254,35 @@ pub struct BiscayController {
 
 // ─── Tuning Constants ───────────────────────────────────────────────────────
 
+/// Pre-calibration bootstrap pacing rate (bytes/s). Deliberately timid:
+/// the first real bandwidth sample replaces it within one RTT, and
+/// under-pacing for that instant is free while over-pacing a marginal
+/// cellular uplink at startup is the SO_SNDBUF-burst failure mode.
+const BOOTSTRAP_PACING_BYTES_PER_SEC: f64 = 100_000.0;
+
+/// Pre-calibration congestion window (~10 typical packets).
+const BOOTSTRAP_CWND_BYTES: f64 = 14_000.0;
+
+/// Per-call `drain_factor` step for modem TX-ring backpressure
+/// (`on_modem_flow_control`). NOTE: not rate-limited — the effective decay
+/// depends on how often the caller polls the modem; the 0.5 floor bounds
+/// the damage (review_findings.md §1a flagged this shape).
+const MODEM_BACKPRESSURE_DRAIN_STEP: f64 = 0.9;
+
+/// EWMA weight for the loss-regime classifier's smoothed loss rate (slow —
+/// regime shifts are minutes-scale radio conditions, not per-window noise).
+const REGIME_LOSS_EWMA_ALPHA: f64 = 0.1;
+
+/// EWMA weight for the RTT mean-absolute-successive-difference (the
+/// recurring 0.3 "believe over ~3 samples" weight — see
+/// wiki/Adaptation-EWMA-Conventions.md §1b).
+const RTT_MASD_EWMA_ALPHA: f64 = 0.3;
+
+/// EWMA weight for the receiver-report delay gradient and its jitter
+/// (rise = fall; see wiki/Adaptation-EWMA-Conventions.md for the polarity
+/// rule this file follows).
+const DELAY_GRAD_EWMA_ALPHA: f64 = 0.2;
+
 /// Floor for the delay-gradient/queue-building trip point, expressed as a
 /// fraction of the link's own windowed-min RTprop. Path-relative "meaningful
 /// standing queue" unit shared by `on_delay_gradient_us` and
@@ -315,8 +344,8 @@ impl BiscayController {
 
             btl_bw: 0.0,
             rt_prop_us: f64::MAX,
-            pacing_rate: 100_000.0, // 100 KB/s initial (conservative)
-            cwnd: 14_000.0,         // ~10 packets initial window
+            pacing_rate: BOOTSTRAP_PACING_BYTES_PER_SEC,
+            cwnd: BOOTSTRAP_CWND_BYTES,
 
             bw_samples: VecDeque::with_capacity(64),
             max_bw_samples: 64,
@@ -365,7 +394,7 @@ impl BiscayController {
         self.recent_loss_rate = if self.recent_loss_rate == 0.0 {
             l
         } else {
-            0.1 * l + 0.9 * self.recent_loss_rate
+            REGIME_LOSS_EWMA_ALPHA * l + (1.0 - REGIME_LOSS_EWMA_ALPHA) * self.recent_loss_rate
         };
     }
 
@@ -392,12 +421,12 @@ impl BiscayController {
         self.delay_grad_ewma = if self.grad_samples == 0 {
             g
         } else {
-            0.2 * g + 0.8 * self.delay_grad_ewma
+            DELAY_GRAD_EWMA_ALPHA * g + (1.0 - DELAY_GRAD_EWMA_ALPHA) * self.delay_grad_ewma
         };
         self.delay_grad_jitter = if self.grad_samples == 0 {
             0.0
         } else {
-            0.2 * dev + 0.8 * self.delay_grad_jitter
+            DELAY_GRAD_EWMA_ALPHA * dev + (1.0 - DELAY_GRAD_EWMA_ALPHA) * self.delay_grad_jitter
         };
         self.has_gradient_signal = true;
         self.grad_samples = self.grad_samples.saturating_add(1);
@@ -449,7 +478,7 @@ impl BiscayController {
             // The modem firmware itself says its TX ring is backing up —
             // an authoritative, earliest-possible congestion signal. Drain
             // gently toward the same safety floor the other signals use.
-            self.drain_factor = (self.drain_factor * 0.9).max(0.5);
+            self.drain_factor = (self.drain_factor * MODEM_BACKPRESSURE_DRAIN_STEP).max(0.5);
         } else {
             self.drain_factor = (self.drain_factor + 0.05).min(1.0);
         }
@@ -756,7 +785,7 @@ impl BiscayController {
             self.rtt_masd = if self.rtt_masd == 0.0 {
                 d
             } else {
-                0.3 * d + 0.7 * self.rtt_masd
+                RTT_MASD_EWMA_ALPHA * d + (1.0 - RTT_MASD_EWMA_ALPHA) * self.rtt_masd
             };
         }
         self.rtt_prev = Some(rtt_us);

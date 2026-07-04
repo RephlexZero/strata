@@ -348,6 +348,20 @@ const PER_LINK_ACK_RATE_MIN_INTERVAL_US: u64 = 500_000;
 /// it (per audit) — don't merge them into one constant.
 const BTLBW_VS_ACK_RATE_CAP_MULT: f64 = 1.5;
 
+/// EWMA weight for ACK-rate estimates (the recurring 0.2 "measurement
+/// smoothing" weight — wiki/Adaptation-EWMA-Conventions.md §1b).
+const ACK_RATE_EWMA_ALPHA: f64 = 0.2;
+
+/// EWMA weight for receiver-report goodput (balanced 0.5: the report is
+/// already a 1 s aggregate, so it needs little extra smoothing).
+const GOODPUT_REPORT_EWMA_ALPHA: f64 = 0.5;
+
+/// Absolute sanity ceiling on the BBR btl_bw capacity input (50 Mbps) —
+/// mirrors oracle.rs's `PPD_ABSOLUTE_CEILING_BPS` (deliberately per-file,
+/// like `MEANINGFUL_BASELINE_BPS`; keep the values in sync). Well above any
+/// bonded-cellular reality today; will need raising for wired/5G bonding.
+const BTLBW_ABSOLUTE_CEILING_BPS: f64 = 50_000_000.0;
+
 /// Headroom applied to the ACK delivery rate when it is used as the
 /// capacity fallback (no oracle estimate, no btl_bw yet), so the adapter
 /// doesn't fall back to the static capacity floor when actual achievable
@@ -932,7 +946,8 @@ impl TransportLink {
                                 if *ewma == 0.0 {
                                     *ewma = ack_rate_bps;
                                 } else {
-                                    *ewma = 0.2 * ack_rate_bps + 0.8 * *ewma;
+                                    *ewma = ACK_RATE_EWMA_ALPHA * ack_rate_bps
+                                        + (1.0 - ACK_RATE_EWMA_ALPHA) * *ewma;
                                 }
 
                                 let mut cc = self.congestion.lock().unwrap();
@@ -1033,7 +1048,8 @@ impl TransportLink {
                     if *ewma == 0.0 {
                         *ewma = goodput;
                     } else {
-                        *ewma = 0.5 * goodput + 0.5 * *ewma;
+                        *ewma = GOODPUT_REPORT_EWMA_ALPHA * goodput
+                            + (1.0 - GOODPUT_REPORT_EWMA_ALPHA) * *ewma;
                     }
                     tracing::debug!(target: "strata::transport", link_id = self.id, goodput = goodput, ewma = *ewma, bytes_delivered = report.bytes_delivered, "Received ReceiverReport");
                 }
@@ -1375,7 +1391,7 @@ impl LinkSender for TransportLink {
             } else {
                 btl_bw_bps
             };
-            capped.clamp(100_000.0, 50_000_000.0)
+            capped.clamp(MEANINGFUL_BASELINE_BPS, BTLBW_ABSOLUTE_CEILING_BPS)
         } else {
             0.0
         };
