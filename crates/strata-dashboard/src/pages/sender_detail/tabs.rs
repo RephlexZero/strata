@@ -203,6 +203,7 @@ pub fn StreamTab(
     stream_state: ReadSignal<String>,
     live_links: ReadSignal<Vec<LinkStats>>,
     live_receiver_links: ReadSignal<Vec<LinkStats>>,
+    live_egress: ReadSignal<Option<strata_protocol::models::EgressStats>>,
     live_bitrate: ReadSignal<u32>,
     stats_history: ReadSignal<std::collections::VecDeque<(f64, Vec<LinkStats>)>>,
     sender_metrics: ReadSignal<Option<strata_protocol::models::TransportSenderMetrics>>,
@@ -440,6 +441,53 @@ pub fn StreamTab(
                                         }
                                     }
                                 />
+                            </div>
+                        }.into_any()
+                    }}
+                </div>
+            </div>
+
+            // HLS egress health — the one signal transport stats can't fake:
+            // segment production. Stalled egress with green links is exactly
+            // the run-4 wedge the field script had to detect by log-grepping.
+            <div class="card bg-base-200 border border-base-300 mb-4">
+                <div class="card-body">
+                    <h3 class="card-title text-base">"HLS Egress"</h3>
+                    {move || {
+                        let st = stream_state.get();
+                        if st != "live" && st != "starting" {
+                            return view! {
+                                <p class="text-sm text-base-content/40">"Start a stream to see egress health"</p>
+                            }.into_any();
+                        }
+                        let Some(eg) = live_egress.get() else {
+                            return view! {
+                                <p class="text-sm text-base-content/40">"No egress telemetry (non-HLS relay or waiting for receiver)"</p>
+                            }.into_any();
+                        };
+                        let age_s = eg.last_segment_age_ms as f64 / 1000.0;
+                        let segments = eg.segments_produced;
+                        let wd_restarts = eg.wd_restarts;
+                        // Steady-state cadence is ~1 segment/s; the pipeline's
+                        // own watchdog rebuilds at 15 s. Amber from 5 s.
+                        let (badge_class, badge_text) = if age_s < 5.0 {
+                            ("badge badge-success", "flowing")
+                        } else if age_s < 15.0 {
+                            ("badge badge-warning", "stalling")
+                        } else {
+                            ("badge badge-error", "stalled")
+                        };
+                        let wd_class = if wd_restarts > 0 {
+                            "font-mono text-xs text-warning"
+                        } else {
+                            "font-mono text-xs"
+                        };
+                        view! {
+                            <div class="flex items-center gap-4 mt-2 text-sm">
+                                <span class=badge_class>{badge_text}</span>
+                                <span class="font-mono text-xs">{format!("{segments} segments")}</span>
+                                <span class="font-mono text-xs">{format!("last segment {age_s:.1}s ago")}</span>
+                                <span class=wd_class>{format!("{wd_restarts} watchdog restart(s)")}</span>
                             </div>
                         }.into_any()
                     }}

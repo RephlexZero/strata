@@ -120,6 +120,10 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
             if let Some(stats) = state.stream_stats().get(&sender_id) {
                 snapshot.push(DashboardEvent::StreamStats(stats.clone()));
             }
+            // ... and the receiver-side view of the same stream.
+            if let Some(stats) = state.receiver_stream_stats().get(&stream_id) {
+                snapshot.push(DashboardEvent::ReceiverStreamStats(stats.clone()));
+            }
         }
     }
 

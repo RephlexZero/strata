@@ -50,6 +50,10 @@ pub fn SenderDetailPage() -> impl IntoView {
     let (live_links, set_live_links) = signal(Vec::<LinkStats>::new());
     // Receiver-side per-link stats — the delivered-goodput ground truth (E8).
     let (live_receiver_links, set_live_receiver_links) = signal(Vec::<LinkStats>::new());
+    // HLS egress health — segment heartbeat + watchdog restarts. Transport
+    // can stay green while egress is wedged, so this gets its own signal.
+    let (live_egress, set_live_egress) =
+        signal(Option::<strata_protocol::models::EgressStats>::None);
     let (live_sender_metrics, set_live_sender_metrics) =
         signal(Option::<TransportSenderMetrics>::None);
     let (live_receiver_metrics, set_live_receiver_metrics) =
@@ -245,6 +249,7 @@ pub fn SenderDetailPage() -> impl IntoView {
                     if active_stream_id.get_untracked().as_deref() == Some(stats.stream_id.as_str())
                     {
                         set_live_receiver_links.set(stats.links);
+                        set_live_egress.set(stats.egress);
                     }
                 }
                 DashboardEvent::StreamStateChanged {
@@ -638,6 +643,7 @@ pub fn SenderDetailPage() -> impl IntoView {
                         stream_state=stream_state
                         live_links=live_links
                         live_receiver_links=live_receiver_links
+                        live_egress=live_egress
                         live_bitrate=live_bitrate
                         stats_history=stats_history
                         sender_metrics=live_sender_metrics

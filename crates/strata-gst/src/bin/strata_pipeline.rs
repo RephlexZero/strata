@@ -85,6 +85,8 @@ OPTIONS:
                         https://            → hls
   --codec <codec>     Codec of incoming stream: h265 (default) or h264
   --config <path>     Path to TOML config file (see Configuration Reference)
+  --stats-dest <addr> Relay per-second stats JSON via UDP to this address
+                      (links + HLS egress heartbeat; used by strata-receiver)
   --metrics-port <port> Start Prometheus metrics endpoint on this port
                         (serves /metrics on 0.0.0.0:<port>)
   --help              Show this help
@@ -1002,7 +1004,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     } else if s.name() == "strata-stats"
                         && let Some(sock) = &stats_socket
                     {
-                        let json = serialize_bonding_stats(s);
+                        let json = serialize_bonding_stats(s).to_string();
                         let _ = sock.send_to(json.as_bytes(), stats_dest);
                     }
                 }
@@ -1162,7 +1164,7 @@ fn run_sender_passthrough(
                     && let (Some(sock), Ok(addr)) =
                         (&stats_socket, stats_dest.parse::<std::net::SocketAddr>())
                 {
-                    let json = serialize_bonding_stats(s);
+                    let json = serialize_bonding_stats(s).to_string();
                     let _ = sock.send_to(json.as_bytes(), addr);
                 }
             }
@@ -1299,7 +1301,7 @@ fn handle_toggle_link(
 ///
 /// Includes ALL links (alive and dead) with full metadata so the
 /// dashboard can show link state transitions and technology type.
-fn serialize_bonding_stats(s: &gst::StructureRef) -> String {
+fn serialize_bonding_stats(s: &gst::StructureRef) -> serde_json::Value {
     let alive_links = s.get::<u64>("alive_links").unwrap_or(0);
     let wall_time_ms = s.get::<u64>("wall_time_ms").unwrap_or(0);
     let mut links = Vec::new();
@@ -1360,7 +1362,6 @@ fn serialize_bonding_stats(s: &gst::StructureRef) -> String {
         "links": links,
         "timestamp_ms": wall_time_ms,
     })
-    .to_string()
 }
 
 // ── Hot-swap helpers ────────────────────────────────────────────────
@@ -1785,6 +1786,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut relay_type_override: Option<RelayType> = None;
     let mut codec_str = "h265";
     let mut metrics_port: Option<u16> = None;
+    let mut stats_dest = "";
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1794,6 +1796,10 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--bind" if i + 1 < args.len() => {
                 bind_str = &args[i + 1];
+                i += 1;
+            }
+            "--stats-dest" if i + 1 < args.len() => {
+                stats_dest = &args[i + 1];
                 i += 1;
             }
             "--output" if i + 1 < args.len() => {
@@ -1948,6 +1954,16 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // ── Stats relay (same contract as the sender path) ──
+    // The receiver daemon spawns us with --stats-dest and drains this socket
+    // in telemetry.rs; link stats plus the egress heartbeat travel here.
+    let mut stats_socket = None;
+    if !stats_dest.is_empty() {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        stats_socket = Some(sock);
+        eprintln!("Stats relay → {}", stats_dest);
+    }
+
     let watchdog_stall = match env::var("STRATA_EGRESS_WATCHDOG_SEC")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1968,6 +1984,9 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut generation: u32 = 0;
     let mut rebuild_attempts: u32 = 0;
+    // Cumulative across generations — the daemon-facing egress heartbeat
+    // must not reset when the watchdog rebuilds the pipeline.
+    let mut segments_total: u64 = 0;
     loop {
         let pipeline_str = if use_hls_relay {
             let hls_dir = hls_tmp_dir.as_ref().unwrap();
@@ -2257,6 +2276,18 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             // Filter spammy stats if needed, or keep for visualization
                             if s.name() == "strata-stats" {
                                 eprintln!("Element Message: {}", s);
+                                if let Some(sock) = &stats_socket {
+                                    let mut v = serialize_bonding_stats(s);
+                                    if use_hls_relay {
+                                        v["egress"] = serde_json::json!({
+                                            "segments_produced": segments_total,
+                                            "wd_restarts": generation,
+                                            "last_segment_age_ms":
+                                                last_progress.elapsed().as_millis() as u64,
+                                        });
+                                    }
+                                    let _ = sock.send_to(v.to_string().as_bytes(), stats_dest);
+                                }
                             }
                             if s.name() == "hls-segment-added"
                                 && let (Ok(location), Ok(running_time)) = (
@@ -2264,6 +2295,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                     s.get::<gst::ClockTime>("running-time"),
                                 )
                             {
+                                segments_total += 1;
                                 last_progress = Instant::now();
                                 stall_allowance = watchdog_stall;
                                 if let Some((prev_start, prev_location)) = &last_segment {
@@ -2337,6 +2369,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             && s.name() == "hls-segment-added"
                             && let Ok(location) = s.get::<String>("location")
                         {
+                            segments_total += 1;
                             eprintln!("egress-watchdog: EOS flush released segment {location}");
                         }
                     }

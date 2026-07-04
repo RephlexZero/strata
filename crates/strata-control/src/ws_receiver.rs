@@ -403,6 +403,11 @@ async fn handle_receiver_message(state: &AppState, receiver_id: &str, owner_id: 
         ReceiverMessage::StreamStats(payload) => {
             // Receiver-side measurements are the delivered-goodput ground
             // truth — surface them instead of dropping at trace level (E8).
+            // Cache for late-joining dashboards (same contract as the
+            // sender-side stream_stats cache).
+            state
+                .receiver_stream_stats()
+                .insert(payload.stream_id.clone(), payload.clone());
             state.broadcast_dashboard(
                 owner_id,
                 strata_protocol::DashboardEvent::ReceiverStreamStats(payload),
@@ -415,6 +420,7 @@ async fn handle_receiver_message(state: &AppState, receiver_id: &str, owner_id: 
                 reason = ?payload.reason,
                 "receiver stream ended"
             );
+            state.receiver_stream_stats().remove(&payload.stream_id);
 
             // Only act if the stream is still assigned to this receiver.
             let assigned: bool = sqlx::query_scalar(

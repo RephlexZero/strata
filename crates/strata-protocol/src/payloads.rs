@@ -631,6 +631,9 @@ pub struct ReceiverStreamStatsPayload {
     pub uptime_s: u64,
     pub timestamp_ms: u64,
     pub links: Vec<crate::models::LinkStats>,
+    /// HLS egress health (None for non-HLS relays or older pipelines).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<crate::models::EgressStats>,
 }
 
 /// Receiver heartbeat with capacity info.

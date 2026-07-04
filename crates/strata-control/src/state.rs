@@ -8,7 +8,8 @@ use tokio::sync::{broadcast, oneshot};
 
 use strata_common::auth::JwtContext;
 use strata_protocol::{
-    DashboardEvent, DeviceStatusPayload, ReceiverStatusPayload, StreamStatsPayload,
+    DashboardEvent, DeviceStatusPayload, ReceiverStatusPayload, ReceiverStreamStatsPayload,
+    StreamStatsPayload,
 };
 
 /// State shared across all request handlers.
@@ -42,6 +43,10 @@ struct Inner {
     pub receivers: DashMap<String, ReceiverHandle>,
     /// Cached latest receiver status per receiver, updated on each heartbeat.
     pub receiver_status: DashMap<String, ReceiverStatusPayload>,
+    /// Cached latest receiver-side stream stats, keyed by stream_id — the
+    /// delivered-goodput + HLS egress health snapshot replayed to
+    /// late-joining dashboards (the sender-side twin is `stream_stats`).
+    pub receiver_stream_stats: DashMap<String, ReceiverStreamStatsPayload>,
 }
 
 /// Handle to a connected sender agent.
@@ -83,6 +88,7 @@ impl AppState {
                 alert_rules: DashMap::new(),
                 receivers: DashMap::new(),
                 receiver_status: DashMap::new(),
+                receiver_stream_stats: DashMap::new(),
             }),
         }
     }
@@ -117,6 +123,11 @@ impl AppState {
     /// Cached latest stream stats per sender (keyed by sender_id).
     pub fn stream_stats(&self) -> &DashMap<String, StreamStatsPayload> {
         &self.inner.stream_stats
+    }
+
+    /// Cached latest receiver-side stream stats (keyed by stream_id).
+    pub fn receiver_stream_stats(&self) -> &DashMap<String, ReceiverStreamStatsPayload> {
+        &self.inner.receiver_stream_stats
     }
 
     /// In-memory alert rules per sender.

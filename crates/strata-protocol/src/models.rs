@@ -281,6 +281,23 @@ pub struct TransportReceiverMetrics {
     pub jitter_buffer_depth: u32,
 }
 
+/// Receiver-side HLS egress health, reported by the receiver pipeline.
+///
+/// These are the signals the field-test script recovered by grepping the
+/// receiver log (segment heartbeat, watchdog restarts) — carried natively so
+/// a remote-managed receiver is observable without SSH. Transport stats can
+/// stay green while egress is wedged (2026-07-04 run 4: 98 s of dead air),
+/// so segment production is the only trustworthy egress liveness signal.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EgressStats {
+    /// Cumulative HLS segments produced across all pipeline generations.
+    pub segments_produced: u64,
+    /// Egress-watchdog pipeline rebuilds so far (0 = never wedged).
+    pub wd_restarts: u32,
+    /// Milliseconds since the last segment landed (or since pipeline start).
+    pub last_segment_age_ms: u64,
+}
+
 // ── Link Stats ──────────────────────────────────────────────────────
 
 /// Per-link statistics from the bonding engine, sent in `stream.stats`.

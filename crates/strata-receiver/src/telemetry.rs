@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use strata_protocol::models::LinkStats;
+use strata_protocol::models::{EgressStats, LinkStats};
 use strata_protocol::{Envelope, ReceiverMessage, ReceiverStreamStatsPayload};
 
 use crate::ReceiverState;
@@ -54,14 +54,14 @@ pub async fn run(state: Arc<ReceiverState>) {
             });
 
             // Drain incoming stats, keep the latest
-            let mut last_stats: Option<Vec<LinkStats>> = None;
+            let mut last_stats: Option<(Vec<LinkStats>, Option<EgressStats>)> = None;
             while let Ok((n, _)) = sock.recv_from(&mut recv_buf) {
                 if let Ok(parsed) = parse_bonding_stats(&recv_buf[..n]) {
                     last_stats = Some(parsed);
                 }
             }
 
-            if let Some(links) = last_stats {
+            if let Some((links, egress)) = last_stats {
                 // Update shared stats
                 {
                     let mut latest = state.latest_stats.write().await;
@@ -79,6 +79,7 @@ pub async fn run(state: Arc<ReceiverState>) {
                     uptime_s: 0, // Will be enriched by the pipeline entry
                     timestamp_ms,
                     links,
+                    egress,
                 };
 
                 let envelope = Envelope::from_message(&ReceiverMessage::StreamStats(payload));
@@ -95,13 +96,18 @@ pub async fn run(state: Arc<ReceiverState>) {
 }
 
 /// Parse bonding stats JSON from strata-pipeline.
-fn parse_bonding_stats(data: &[u8]) -> Result<Vec<LinkStats>, String> {
+fn parse_bonding_stats(data: &[u8]) -> Result<(Vec<LinkStats>, Option<EgressStats>), String> {
     let v: serde_json::Value =
         serde_json::from_slice(data).map_err(|e| format!("JSON parse error: {e}"))?;
     let links_arr = v
         .get("links")
         .and_then(|v| v.as_array())
         .ok_or_else(|| "missing 'links' array".to_string())?;
+
+    // HLS egress heartbeat (absent for RTMP relays and older pipelines).
+    let egress = v
+        .get("egress")
+        .and_then(|e| serde_json::from_value::<EgressStats>(e.clone()).ok());
 
     let mut stats = Vec::with_capacity(links_arr.len());
     for link in links_arr {
@@ -149,5 +155,5 @@ fn parse_bonding_stats(data: &[u8]) -> Result<Vec<LinkStats>, String> {
             rtprop_ms: None,
         });
     }
-    Ok(stats)
+    Ok((stats, egress))
 }
