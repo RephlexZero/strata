@@ -72,25 +72,24 @@ jobs:
           cp target/release/libgststrata.so \
             "staging/strata-${VERSION}-x86_64-linux-gnu.so"
           cp target/release/strata-pipeline \
-            "staging/strata-pipeline-${VERSION}-x86_64-linux-gnu" 2>/dev/null || true
+            "staging/strata-pipeline-${VERSION}-x86_64-linux-gnu"
           cp target/release/strata-control \
-            "staging/strata-control-${VERSION}-x86_64-linux-gnu" 2>/dev/null || true
+            "staging/strata-control-${VERSION}-x86_64-linux-gnu"
           cp target/release/strata-sender \
-            "staging/strata-sender-${VERSION}-x86_64-linux-gnu" 2>/dev/null || true
+            "staging/strata-sender-${VERSION}-x86_64-linux-gnu"
           cp target/release/strata-receiver \
-            "staging/strata-receiver-${VERSION}-x86_64-linux-gnu" 2>/dev/null || true
+            "staging/strata-receiver-${VERSION}-x86_64-linux-gnu"
 
       - uses: actions/upload-artifact@v4
         with:
           name: release-x86_64
           path: staging/*
 
-  # ── aarch64 cross-compile (optional — does not block release)
+  # ── aarch64 cross-compile (required — sender target) ───────
   build-aarch64:
     name: Build aarch64
     needs: verify-tag
     runs-on: ubuntu-24.04
-    continue-on-error: true # don't block the release if cross fails
     steps:
       - uses: actions/checkout@v4
         with:
@@ -120,13 +119,13 @@ jobs:
           mkdir -p staging
           VERSION="${{ github.ref_name }}"
           cp cross-output/libgststrata.so \
-            "staging/strata-${VERSION}-aarch64-linux-gnu.so" 2>/dev/null || true
+            "staging/strata-${VERSION}-aarch64-linux-gnu.so"
           cp cross-output/strata-pipeline \
-            "staging/strata-pipeline-${VERSION}-aarch64-linux-gnu" 2>/dev/null || true
+            "staging/strata-pipeline-${VERSION}-aarch64-linux-gnu"
           cp cross-output/strata-sender \
-            "staging/strata-sender-${VERSION}-aarch64-linux-gnu" 2>/dev/null || true
+            "staging/strata-sender-${VERSION}-aarch64-linux-gnu"
           cp cross-output/strata-receiver \
-            "staging/strata-receiver-${VERSION}-aarch64-linux-gnu" 2>/dev/null || true
+            "staging/strata-receiver-${VERSION}-aarch64-linux-gnu"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -137,7 +136,6 @@ jobs:
   release:
     name: Create GitHub Release
     needs: [build-x86_64, build-aarch64]
-    if: always() && needs.build-x86_64.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -164,6 +162,6 @@ jobs:
           files: |
             artifacts/release-x86_64/*
             artifacts/release-aarch64/*
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

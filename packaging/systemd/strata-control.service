@@ -1,0 +1,33 @@
+# Strata control plane — REST + WebSocket + dashboard.
+# Install: packaging/install.sh control
+# Config:  /etc/strata/control.env (see packaging/env/control.env.example)
+#
+# strata-control is configured entirely via environment variables
+# (DATABASE_URL, LISTEN_ADDR, JWT_SEED_B64, ...) — no CLI flags.
+
+[Unit]
+Description=Strata control plane
+Documentation=https://github.com/RephlexZero/strata
+After=network-online.target postgresql.service
+Wants=network-online.target
+# After only (not Requires): postgres may live on another box or in Docker.
+
+[Service]
+Type=simple
+User=strata
+Group=strata
+EnvironmentFile=-/etc/strata/control.env
+ExecStart=/usr/local/bin/strata-control
+
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

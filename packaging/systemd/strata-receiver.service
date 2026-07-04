@@ -1,0 +1,37 @@
+# Strata receiver daemon — cloud ingest (x86_64).
+# Install: packaging/install.sh receiver
+# Config:  /etc/strata/receiver.env (see packaging/env/receiver.env.example)
+#
+# No CAP_NET_RAW needed: the receiver binds unprivileged UDP ports (5000+)
+# and its spawned strata-pipeline does not bind to specific interfaces.
+
+[Unit]
+Description=Strata receiver daemon (bonded stream ingest)
+Documentation=https://github.com/RephlexZero/strata
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=strata
+Group=strata
+EnvironmentFile=-/etc/strata/receiver.env
+# Site-specific clap flags live in STRATA_RECEIVER_ARGS (unquoted $VAR is
+# word-split by systemd, so multiple flags work).
+ExecStart=/usr/local/bin/strata-receiver $STRATA_RECEIVER_ARGS
+
+# Creates /var/lib/strata (owner strata) — holds receiver-identity.json
+StateDirectory=strata
+
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

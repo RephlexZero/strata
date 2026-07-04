@@ -1,0 +1,20 @@
+# Caddy reverse proxy for the Strata control plane.
+#
+# Caddy obtains and renews Let's Encrypt certificates automatically for the
+# hostname below — no certbot, no cron. WebSocket upgrades (/agent/ws,
+# /receiver/ws, dashboard /ws) are proxied by default; no extra config needed.
+#
+# Install:  https://caddyserver.com/docs/install  (apt package works fine)
+# Deploy:   sudo cp Caddyfile.example /etc/caddy/Caddyfile   (edit hostname)
+#           sudo systemctl reload caddy
+#
+# nginx alternative: use certbot --nginx for certificates, then a standard
+# proxy_pass http://127.0.0.1:3000 block — but WebSockets need explicit
+#   proxy_http_version 1.1;
+#   proxy_set_header Upgrade $http_upgrade;
+#   proxy_set_header Connection "upgrade";
+# on the /agent/ws, /receiver/ws and /ws locations (or the whole server).
+
+control.example.com {
+	reverse_proxy 127.0.0.1:3000
+}

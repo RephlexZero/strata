@@ -1,0 +1,57 @@
+# Strata Platform — Production Control Plane
+#
+# Runs Postgres + strata-control only. Senders and receivers are real
+# machines installed via packaging/install.sh — they connect in over
+# WebSocket through your reverse proxy.
+#
+# Setup:
+#   1. Create a .env file next to this compose file:
+#        POSTGRES_PASSWORD=<url-safe password — it is spliced into DATABASE_URL>
+#        JWT_SEED_B64=<head -c32 /dev/urandom | base64>
+#   2. docker compose -f docker-compose.prod.yml up -d --build
+#   3. Put a TLS reverse proxy in front of 127.0.0.1:3000
+#      (see packaging/caddy/Caddyfile.example).
+#
+# No DEV_SEED here: create the first admin/enrollment via the documented
+# bootstrap path, not seeded dev credentials.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: strata
+      POSTGRES_USER: strata
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U strata"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  strata-control:
+    build:
+      context: .
+      dockerfile: dev/Dockerfile.control
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://strata:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres/strata"
+      LISTEN_ADDR: "0.0.0.0:3000"
+      JWT_SEED_B64: ${JWT_SEED_B64:?set JWT_SEED_B64 in .env (head -c32 /dev/urandom | base64)}
+      RUST_LOG: ${RUST_LOG:-info}
+      # Optional — uncomment to enable. Presence matters to strata-control:
+      # an empty-but-set value is treated as configured (and an empty
+      # CORS_ALLOWED_ORIGINS fails startup), so don't pass these unset.
+      #METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN in .env}
+      #CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?set CORS_ALLOWED_ORIGINS in .env}
+    ports:
+      # Loopback only — TLS terminates at the reverse proxy on this host.
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:

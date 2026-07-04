@@ -687,3 +687,15 @@ Still open: sender AQM self-holes (occurrence 4, unchanged); the
 the wedge site, still waiting on a healthy full heal cycle (trip → rebuild
 succeeds → RECOVERED/OK verdict) to get a trip dump uncomplicated by a
 receiver death.
+
+## 2026-07-04 (packaging) — v1.0 packaging layer created
+
+`packaging/` (systemd units for sender/receiver/control, env examples,
+role installer, Caddyfile example, README), `docker-compose.prod.yml`
+(postgres + control, required POSTGRES_PASSWORD/JWT_SEED_B64, loopback
+:3000), release.yml aarch64 build made blocking (+fail_on_unmatched_files).
+Key decision: sender unit grants CAP_NET_RAW via AmbientCapabilities and
+strata-pipeline is NOT setcap'd — NoNewPrivileges=true blocks file-cap
+elevation but is compatible with inherited ambient caps. Also: control's
+CORS_ALLOWED_ORIGINS/METRICS_TOKEN are presence-sensitive (empty ≠ unset),
+so compose passes them only as commented opt-ins.

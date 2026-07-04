@@ -1,0 +1,46 @@
+# Strata sender agent — field device (Orange Pi 5 / aarch64).
+# Install: packaging/install.sh sender
+# Config:  /etc/strata/sender.env (see packaging/env/sender.env.example)
+
+[Unit]
+Description=Strata sender agent (bonded cellular uplink)
+Documentation=https://github.com/RephlexZero/strata
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=strata
+Group=strata
+# Camera access for the spawned strata-pipeline (/dev/video*)
+SupplementaryGroups=video
+EnvironmentFile=-/etc/strata/sender.env
+# Site-specific clap flags live in STRATA_SENDER_ARGS (unquoted $VAR is
+# word-split by systemd, so multiple flags work).
+ExecStart=/usr/local/bin/strata-sender $STRATA_SENDER_ARGS
+
+# Creates /var/lib/strata (owner strata) — holds sender-identity.json
+StateDirectory=strata
+
+Restart=always
+RestartSec=5
+# Field device: never stop retrying — the uplink may be down for minutes.
+StartLimitIntervalSec=0
+
+# CAP_NET_RAW: the spawned strata-pipeline needs raw sockets for
+# SO_BINDTODEVICE onto each modem interface. Ambient capabilities are
+# inherited across fork+exec, so the child gets the cap from here.
+# Do NOT setcap strata-pipeline on this box: NoNewPrivileges is compatible
+# with ambient caps, but it blocks file-capability elevation — a setcap'd
+# binary would silently fail to gain caps under this unit.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=true
+
+# Hardening (kept loose enough for camera + modem device access)
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
