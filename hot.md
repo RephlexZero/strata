@@ -66,7 +66,7 @@ fixes below, plus HLS egress hardening. Clippy clean throughout.
 
 **Both outstanding reviews are now FULLY IMPLEMENTED (2026-07-04).**
 
-*Control-loop audit* (`review_findings.md`): everything was already done
+*Control-loop audit* (`raw/review_findings.md`): everything was already done
 except §2.4.2 — landed 2026-07-04 (commit `abee62b`): FEC parity sizing now
 reads `max_link_loss_sustained` (asymmetric EWMA, rise ~3 ticks / fall
 fast) so one HARQ-burst tick can't inject a parity burst; plus the
@@ -74,7 +74,7 @@ remaining §1a bare literals and §1b's EWMA-α naming pass (per-file consts
 pointing at [wiki/Adaptation-EWMA-Conventions.md](wiki/Adaptation-EWMA-Conventions.md)).
 360 bonding + 196 transport lib tests pass.
 
-*Platform review* (`PLATFORM_REVIEW.md`): E1/E2/E4/E6/E7-rest/E8 all landed
+*Platform review* (`raw/PLATFORM_REVIEW.md`): E1/E2/E4/E6/E7-rest/E8 all landed
 2026-07-04 in four commits:
 - **E1** (`3422861`) — new wasm-safe `strata-protocol` crate is the single
   source of truth for the wire format (envelope + `proto_version`, all ~30

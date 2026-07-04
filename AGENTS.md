@@ -38,7 +38,7 @@ only when relevant. Keep this file under ~200 lines.
 - `crates/strata-bonding/src/scheduler/oracle.rs` — `CapacityOracle` (PPD-based)
 - `crates/strata-transport/src/congestion.rs` — `BiscayController` (BBR-based)
 - `crates/strata-gst/src/bin/strata_pipeline.rs` — GStreamer sender pipeline construction
-- `crates/strata-bonding/src/config.rs` — `SchedulerConfig` (capacity_floor_bps default = 1.5 Mbps; the control plane no longer overrides this for platform-started streams — PLATFORM_REVIEW.md E5 fixed 2026-07-02)
+- `crates/strata-bonding/src/config.rs` — `SchedulerConfig` (capacity_floor_bps default = 1.5 Mbps; the control plane no longer overrides this for platform-started streams — raw/PLATFORM_REVIEW.md E5 fixed 2026-07-02)
 
 **Key patterns:**
 - Per-link alive detection: ≥50% loss for 3+ windows → dead
@@ -94,7 +94,7 @@ Pre-existing warnings in `strata-gst` (unused mut, unused var) — not our chang
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **strata** (5849 symbols, 17018 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **strata** (5867 symbols, 17050 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
