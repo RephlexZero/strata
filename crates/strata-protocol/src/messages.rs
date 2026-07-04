@@ -247,6 +247,10 @@ pub enum ReceiverMessage {
     #[serde(rename = "auth.challenge.response")]
     AuthChallengeResponse(AuthChallengeResponsePayload),
 
+    /// Ack for `receiver.stream.start` with the allocated ports.
+    #[serde(rename = "receiver.stream.started")]
+    StreamStarted(ReceiverStreamStartedPayload),
+
     /// Periodic heartbeat with capacity info.
     #[serde(rename = "receiver.status")]
     Status(ReceiverStatusPayload),
@@ -300,6 +304,12 @@ pub enum DashboardEvent {
     /// Live stream stats update (sender side).
     #[serde(rename = "stream.stats")]
     StreamStats(StreamStatsPayload),
+
+    /// Live stream stats update (receiver side — the ground truth for
+    /// delivered goodput/loss; disagreements with the sender view are the
+    /// diagnostic, E8).
+    #[serde(rename = "receiver.stream.stats")]
+    ReceiverStreamStats(ReceiverStreamStatsPayload),
 
     /// Stream state changed (started, stopped, failed).
     #[serde(rename = "stream.state")]
@@ -562,8 +572,9 @@ mod tests {
     #[test]
     fn receiver_control_message_round_trip() {
         let msg = ReceiverControlMessage::StreamStart(ReceiverStreamStartPayload {
+            request_id: "req_1".into(),
             stream_id: "str_r".into(),
-            bind_ports: vec![5000, 5002],
+            link_count: 2,
             relay_url: None,
             bonding_config: serde_json::Value::Null,
         });
@@ -571,9 +582,23 @@ mod tests {
         assert_eq!(envelope.msg_type, "receiver.stream.start");
         let recovered: ReceiverControlMessage = envelope.parse_message().unwrap();
         match recovered {
-            ReceiverControlMessage::StreamStart(p) => assert_eq!(p.bind_ports, vec![5000, 5002]),
+            ReceiverControlMessage::StreamStart(p) => {
+                assert_eq!(p.link_count, 2);
+                assert_eq!(p.request_id, "req_1");
+            }
             _ => panic!("wrong variant"),
         }
+
+        // The ack carries the receiver-allocated ports back.
+        let ack = ReceiverMessage::StreamStarted(ReceiverStreamStartedPayload {
+            request_id: "req_1".into(),
+            stream_id: "str_r".into(),
+            success: true,
+            bind_ports: vec![5000, 5002],
+            error: None,
+        });
+        let envelope = Envelope::from_message(&ack).unwrap();
+        assert_eq!(envelope.msg_type, "receiver.stream.started");
     }
 
     #[test]

@@ -202,6 +202,7 @@ pub fn DestinationModal(
 pub fn StreamTab(
     stream_state: ReadSignal<String>,
     live_links: ReadSignal<Vec<LinkStats>>,
+    live_receiver_links: ReadSignal<Vec<LinkStats>>,
     live_bitrate: ReadSignal<u32>,
     stats_history: ReadSignal<std::collections::VecDeque<(f64, Vec<LinkStats>)>>,
     sender_metrics: ReadSignal<Option<strata_protocol::models::TransportSenderMetrics>>,
@@ -439,6 +440,63 @@ pub fn StreamTab(
                                         }
                                     }
                                 />
+                            </div>
+                        }.into_any()
+                    }}
+                </div>
+            </div>
+
+            // Receiver-side link stats — what actually arrived. Divergence
+            // from the sender-side view above is the diagnostic (E8).
+            <div class="card bg-base-200 border border-base-300 mb-4">
+                <div class="card-body">
+                    <h3 class="card-title text-base">"Receiver-Side Links"</h3>
+                    {move || {
+                        let st = stream_state.get();
+                        if st != "live" && st != "starting" {
+                            return view! {
+                                <p class="text-sm text-base-content/40">"Start a stream to see receiver-side stats"</p>
+                            }.into_any();
+                        }
+                        let links = live_receiver_links.get();
+                        if links.is_empty() {
+                            return view! {
+                                <p class="text-sm text-base-content/40">"Waiting for receiver telemetry…"</p>
+                            }.into_any();
+                        }
+                        view! {
+                            <div class="overflow-x-auto mt-2">
+                                <table class="table table-sm">
+                                    <thead>
+                                        <tr>
+                                            <th>"Link"</th>
+                                            <th>"State"</th>
+                                            <th>"RTT"</th>
+                                            <th>"Loss"</th>
+                                            <th>"Throughput"</th>
+                                            <th>"Received"</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {links.into_iter().map(|l| {
+                                            let name = if l.interface.is_empty() || l.interface == "unknown" {
+                                                format!("Link {}", l.id)
+                                            } else {
+                                                l.interface.clone()
+                                            };
+                                            view! {
+                                                <tr>
+                                                    <td class="font-mono text-xs">{name}</td>
+                                                    <td class="text-xs">{l.state.clone()}</td>
+                                                    <td class="font-mono text-xs">{format!("{:.1} ms", l.rtt_ms)}</td>
+                                                    <td class="font-mono text-xs">{format!("{:.2}%", l.loss_rate * 100.0)}</td>
+                                                    <td class="font-mono text-xs">{format_bps(l.observed_bps)}</td>
+                                                    <td class="font-mono text-xs">{format_bytes(l.sent_bytes)}</td>
+                                                </tr>
+                                            }
+                                        }).collect::<Vec<_>>()}
+                                    </tbody>
+                                </table>
                             </div>
                         }.into_any()
                     }}

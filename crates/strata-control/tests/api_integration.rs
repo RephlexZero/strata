@@ -1346,3 +1346,80 @@ async fn challenge_auth_rejects_wrong_key() {
         "a signature from the wrong key must be rejected: {result}"
     );
 }
+
+// ── Receiver-owned port allocation (E6) ──────────────────────────────
+
+#[tokio::test]
+async fn receiver_stream_start_ack_routes_allocated_ports() {
+    let Some((app, state)) = test_app_with_state().await else {
+        return;
+    };
+    let token = register_and_login(&app).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_app = app.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, serve_app).await.unwrap();
+    });
+
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // Create + enroll a receiver over its WS.
+    let resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/receivers",
+            &token,
+            serde_json::json!({ "bind_host": "203.0.113.7", "name": "rcv-test" }),
+        ))
+        .await
+        .unwrap();
+    let body = json_body(resp).await;
+    let enrollment_token = body["enrollment_token"].as_str().unwrap().to_string();
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/receiver/ws"))
+        .await
+        .unwrap();
+    let auth = serde_json::json!({
+        "id": "t", "type": "auth.login", "ts": chrono::Utc::now().to_rfc3339(),
+        "payload": {
+            "enrollment_token": enrollment_token,
+            "receiver_version": "test", "hostname": "rcv-test", "region": null,
+            "bind_host": "203.0.113.7", "link_ports": [5000, 5002, 5004], "max_streams": 4,
+        },
+    });
+    ws.send(Message::Text(auth.to_string().into())).await.unwrap();
+    let resp = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
+        .await
+        .expect("receiver auth response");
+    assert_eq!(resp["payload"]["success"], true, "receiver auth failed: {resp}");
+
+    // Simulate the control plane's request/ack: register a pending request,
+    // have the "receiver" answer with its allocated ports, and check the
+    // ack lands on the waiting oneshot (the path api/streams.rs::
+    // request_receiver_start relies on).
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.pending_requests().insert("req_ports_1".into(), tx);
+
+    let ack = serde_json::json!({
+        "id": "t", "type": "receiver.stream.started", "ts": chrono::Utc::now().to_rfc3339(),
+        "payload": {
+            "request_id": "req_ports_1",
+            "stream_id": "str_x",
+            "success": true,
+            "bind_ports": [5002, 5004],
+        },
+    });
+    ws.send(Message::Text(ack.to_string().into())).await.unwrap();
+
+    let value = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+        .await
+        .expect("ack timed out")
+        .expect("oneshot dropped");
+    let ack: strata_protocol::ReceiverStreamStartedPayload =
+        serde_json::from_value(value).unwrap();
+    assert!(ack.success);
+    assert_eq!(ack.bind_ports, vec![5002, 5004]);
+}

@@ -114,15 +114,9 @@ async fn start_stream(
     let agent_tx = agent.tx.clone();
     drop(agent);
 
-    // Create stream record
-    let stream_id = ids::stream_id();
-
-    // Build stream.start command and send to agent.
-    //
-    // Try to pick a receiver from the DB (capacity-aware assignment).
-    // Falls back to RECEIVER_LINKS / RECEIVER_HOST env vars for
-    // backwards compatibility with manual deployments.
-    let (receiver_id_opt, receiver_links) = pick_receiver_links(&state, &user.user_id).await;
+    // How many links the stream needs — one per connected sender interface.
+    // The heartbeat cache can be briefly empty right after connect; fall
+    // back to the same width as the env-var port list.
     let enabled_count = state
         .device_status()
         .get(&sender_id)
@@ -134,20 +128,55 @@ async fn start_stream(
                 })
                 .count()
         })
-        .unwrap_or(receiver_links.len());
-    let link_count = enabled_count.min(receiver_links.len());
-    if link_count == 0 {
+        .unwrap_or(FALLBACK_RECEIVER_PORTS.len());
+    if enabled_count == 0 {
         return Err(ApiError::bad_request(
             "sender has no connected network interfaces",
         ));
     }
-    let strata_dests: Vec<String> = receiver_links[..link_count]
-        .iter()
-        .map(|addr| format!("strata://{addr}"))
-        .collect();
+
+    // Pick a receiver (capacity-aware, DB-derived) or fall back to env
+    // config; managed receivers allocate their own ports via request/ack.
+    let relay_url_opt = if relay_url.is_empty() {
+        None
+    } else {
+        Some(relay_url.clone())
+    };
+    let stream_id = ids::stream_id();
+    let (receiver_id_opt, strata_dests) =
+        match pick_receiver(&state, &user.user_id).await {
+            Some((rcv_id, bind_host)) => {
+                let ports = request_receiver_start(
+                    &state,
+                    &rcv_id,
+                    &stream_id,
+                    enabled_count as u32,
+                    relay_url_opt.clone(),
+                )
+                .await?;
+                let dests: Vec<String> = ports
+                    .iter()
+                    .map(|p| format!("strata://{bind_host}:{p}"))
+                    .collect();
+                (Some(rcv_id), dests)
+            }
+            None => {
+                // Env-var fallback for unmanaged deployments: fixed ports.
+                let links = build_receiver_links();
+                let count = enabled_count.min(links.len());
+                if count == 0 {
+                    return Err(ApiError::bad_request("no receiver links configured"));
+                }
+                let dests = links[..count]
+                    .iter()
+                    .map(|addr| format!("strata://{addr}"))
+                    .collect();
+                (None, dests)
+            }
+        };
 
     tracing::info!(
-        links = link_count,
+        links = strata_dests.len(),
         dests = ?strata_dests,
         "building Strata destinations for sender"
     );
@@ -222,11 +251,7 @@ async fn start_stream(
         // here instead of forcing a profile on every platform stream.
         bonding_config: serde_json::Value::Null,
         psk: None,
-        relay_url: if relay_url.is_empty() {
-            None
-        } else {
-            Some(relay_url.clone())
-        },
+        relay_url: relay_url_opt,
     };
 
     // Store the resolved payload (with defaults applied) so the dashboard
@@ -255,38 +280,6 @@ async fn start_stream(
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    // If we picked a managed receiver, send it a receiver.stream.start command
-    if let Some(ref rcv_id) = receiver_id_opt {
-        if let Some(rcv_handle) = state.receivers().get(rcv_id) {
-            let rcv_payload = strata_protocol::ReceiverStreamStartPayload {
-                stream_id: stream_id.clone(),
-                bind_ports: receiver_links
-                    .iter()
-                    .filter_map(|addr| addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()))
-                    .collect(),
-                relay_url: start_payload.relay_url.clone(),
-                bonding_config: start_payload.bonding_config.clone(),
-            };
-            let rcv_envelope =
-                Envelope::from_message(&ReceiverControlMessage::StreamStart(rcv_payload)).unwrap();
-            let rcv_json = serde_json::to_string(&rcv_envelope).unwrap();
-            if rcv_handle.tx.send(rcv_json).await.is_err() {
-                tracing::warn!(
-                    stream_id = %stream_id,
-                    receiver_id = %rcv_id,
-                    "receiver.stream.start command dropped: receiver channel closed"
-                );
-            }
-        }
-
-        // Increment active_streams counter
-        let _ =
-            sqlx::query("UPDATE receivers SET active_streams = active_streams + 1 WHERE id = $1")
-                .bind(rcv_id)
-                .execute(state.pool())
-                .await;
-    }
-
     let envelope =
         Envelope::from_message(&ControlMessage::StreamStart(Box::new(start_payload))).unwrap();
     let json = serde_json::to_string(&envelope).unwrap();
@@ -302,26 +295,20 @@ async fn start_stream(
             Some("failed to send stream.start to agent"),
         )
         .await;
-        if let Some(ref rcv_id) = receiver_id_opt {
-            if let Some(rcv_handle) = state.receivers().get(rcv_id) {
-                let stop = strata_protocol::ReceiverControlMessage::StreamStop(
-                    strata_protocol::ReceiverStreamStopPayload {
-                        stream_id: stream_id.clone(),
-                        reason: "start rollback".into(),
-                    },
-                );
-                if let Ok(env) = Envelope::from_message(&stop)
-                    && let Ok(j) = serde_json::to_string(&env)
-                {
-                    let _ = rcv_handle.tx.send(j).await;
-                }
+        if let Some(ref rcv_id) = receiver_id_opt
+            && let Some(rcv_handle) = state.receivers().get(rcv_id)
+        {
+            let stop = strata_protocol::ReceiverControlMessage::StreamStop(
+                strata_protocol::ReceiverStreamStopPayload {
+                    stream_id: stream_id.clone(),
+                    reason: "start rollback".into(),
+                },
+            );
+            if let Ok(env) = Envelope::from_message(&stop)
+                && let Ok(j) = serde_json::to_string(&env)
+            {
+                let _ = rcv_handle.tx.send(j).await;
             }
-            let _ = sqlx::query(
-                "UPDATE receivers SET active_streams = GREATEST(active_streams - 1, 0) WHERE id = $1",
-            )
-            .bind(rcv_id)
-            .execute(state.pool())
-            .await;
         }
         return Err(ApiError::internal("failed to send to agent"));
     }
@@ -546,40 +533,92 @@ async fn get_stream(
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-/// Pick a receiver and build the list of link addresses.
-///
-/// 1. Try to find an online receiver in the DB with spare capacity.
-/// 2. Fall back to `RECEIVER_LINKS` / `RECEIVER_HOST` env vars.
-///
-/// Returns `(Some(receiver_id), links)` when a managed receiver is chosen,
-/// or `(None, links)` when falling back to env var config.
-async fn pick_receiver_links(state: &AppState, owner_id: &str) -> (Option<String>, Vec<String>) {
-    // Try DB: pick the least-loaded online receiver for this owner
-    let row = sqlx::query_as::<_, (String, String, Vec<i32>)>(
-        "SELECT id, bind_host, link_ports FROM receivers \
-         WHERE owner_id = $1 AND online = TRUE AND active_streams < max_streams \
-         ORDER BY active_streams ASC, last_seen_at DESC \
+/// Pick the least-loaded online receiver for this owner, or `None` to fall
+/// back to env-var configuration. Load is derived from the streams table
+/// (COUNT of active assignments), not the hand-maintained `active_streams`
+/// counter — counters drift; the streams table is what reconciliation
+/// keeps honest (E7).
+async fn pick_receiver(state: &AppState, owner_id: &str) -> Option<(String, String)> {
+    let row = sqlx::query_as::<_, (String, String)>(
+        "SELECT r.id, r.bind_host FROM receivers r \
+         WHERE r.owner_id = $1 AND r.online = TRUE \
+           AND (SELECT COUNT(*) FROM streams s \
+                WHERE s.receiver_id = r.id AND s.state = ANY($2)) < r.max_streams \
+         ORDER BY (SELECT COUNT(*) FROM streams s \
+                   WHERE s.receiver_id = r.id AND s.state = ANY($2)) ASC, \
+                  r.last_seen_at DESC \
          LIMIT 1",
     )
     .bind(owner_id)
+    .bind(&crate::stream_state::ACTIVE_STATES[..])
     .fetch_optional(state.pool())
     .await
     .ok()
-    .flatten();
+    .flatten()?;
 
-    if let Some((receiver_id, bind_host, link_ports)) = row {
-        // Verify this receiver is actually connected right now
-        if state.receivers().contains_key(&receiver_id) {
-            let links: Vec<String> = link_ports
-                .iter()
-                .map(|&p| format!("{bind_host}:{p}"))
-                .collect();
-            return (Some(receiver_id), links);
-        }
+    // Verify this receiver is actually connected right now
+    if state.receivers().contains_key(&row.0) {
+        Some(row)
+    } else {
+        None
     }
+}
 
-    // Fall back to env var config
-    (None, build_receiver_links())
+/// Ask the receiver to allocate ports and start its pipeline for a stream.
+/// Request/ack: the receiver owns its port pool (E6). Returns the bound
+/// ports on success.
+async fn request_receiver_start(
+    state: &AppState,
+    receiver_id: &str,
+    stream_id: &str,
+    link_count: u32,
+    relay_url: Option<String>,
+) -> Result<Vec<u16>, ApiError> {
+    const RECEIVER_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let rcv_handle = state
+        .receivers()
+        .get(receiver_id)
+        .ok_or_else(|| ApiError::internal("receiver disconnected"))?;
+
+    let request_id = uuid::Uuid::now_v7().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.pending_requests().insert(request_id.clone(), tx);
+
+    let payload = strata_protocol::ReceiverStreamStartPayload {
+        request_id: request_id.clone(),
+        stream_id: stream_id.to_string(),
+        link_count,
+        relay_url,
+        bonding_config: serde_json::Value::Null,
+    };
+    let envelope = Envelope::from_message(&ReceiverControlMessage::StreamStart(payload))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let json = serde_json::to_string(&envelope).map_err(|e| ApiError::internal(e.to_string()))?;
+    if rcv_handle.tx.send(json).await.is_err() {
+        state.pending_requests().remove(&request_id);
+        return Err(ApiError::internal("receiver channel closed"));
+    }
+    drop(rcv_handle);
+
+    let ack = match tokio::time::timeout(RECEIVER_START_TIMEOUT, rx).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(_)) => return Err(ApiError::internal("receiver disconnected")),
+        Err(_) => {
+            state.pending_requests().remove(&request_id);
+            return Err(ApiError::internal("receiver did not answer stream start"));
+        }
+    };
+
+    let ack: strata_protocol::ReceiverStreamStartedPayload =
+        serde_json::from_value(ack).map_err(|e| ApiError::internal(e.to_string()))?;
+    if !ack.success {
+        return Err(ApiError::internal(format!(
+            "receiver refused stream: {}",
+            ack.error.unwrap_or_else(|| "unknown".into())
+        )));
+    }
+    Ok(ack.bind_ports)
 }
 
 /// Fallback link ports assumed for an unmanaged (env-var-configured)

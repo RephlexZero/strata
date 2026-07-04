@@ -362,6 +362,10 @@ async fn handle_receiver_message(state: &AppState, receiver_id: &str, owner_id: 
             tracing::debug!(receiver_id = %receiver_id, "auth message outside handshake ignored");
         }
         ReceiverMessage::Status(payload) => {
+            // active_streams is display-only: capacity decisions derive from
+            // COUNT(*) over the streams table (see api/streams.rs::
+            // pick_receiver); this column just mirrors the device's own
+            // report for the admin API.
             let _ = sqlx::query(
                 "UPDATE receivers SET last_seen_at = $1, active_streams = $2 WHERE id = $3",
             )
@@ -383,14 +387,25 @@ async fn handle_receiver_message(state: &AppState, receiver_id: &str, owner_id: 
                 .receiver_status()
                 .insert(receiver_id.to_string(), payload);
         }
+        ReceiverMessage::StreamStarted(payload) => {
+            // Ack for a pending stream-start request — route it back to the
+            // REST caller waiting in api/streams.rs.
+            if let Some((_, tx)) = state.pending_requests().remove(&payload.request_id) {
+                let _ = tx.send(envelope.payload.clone());
+            } else {
+                tracing::warn!(
+                    receiver_id = %receiver_id,
+                    stream_id = %payload.stream_id,
+                    "unmatched receiver.stream.started ack"
+                );
+            }
+        }
         ReceiverMessage::StreamStats(payload) => {
-            // Forward receiver stats to dashboard
-            // We could create a dedicated dashboard event for this later
-            tracing::trace!(
-                receiver_id = %receiver_id,
-                stream_id = %payload.stream_id,
-                links = payload.links.len(),
-                "receiver stream stats"
+            // Receiver-side measurements are the delivered-goodput ground
+            // truth — surface them instead of dropping at trace level (E8).
+            state.broadcast_dashboard(
+                owner_id,
+                strata_protocol::DashboardEvent::ReceiverStreamStats(payload),
             );
         }
         ReceiverMessage::StreamEnded(payload) => {
@@ -421,14 +436,6 @@ async fn handle_receiver_message(state: &AppState, receiver_id: &str, owner_id: 
             }
 
             state.live_streams().remove(&payload.stream_id);
-
-            // Decrement active_streams
-            let _ = sqlx::query(
-                "UPDATE receivers SET active_streams = GREATEST(active_streams - 1, 0) WHERE id = $1",
-            )
-            .bind(receiver_id)
-            .execute(state.pool())
-            .await;
         }
     }
 }

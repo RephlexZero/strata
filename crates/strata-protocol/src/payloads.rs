@@ -575,17 +575,36 @@ pub struct ReceiverAuthLoginResponsePayload {
     pub error: Option<String>,
 }
 
-/// Control plane tells the receiver to start receiving a stream.
+/// Control plane asks the receiver to start receiving a stream. The
+/// receiver owns its port pool: it allocates `link_count` UDP ports and
+/// answers with `receiver.stream.started` carrying the actual ports (E6) —
+/// two concurrent streams can no longer collide on one receiver.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiverStreamStartPayload {
+    /// Request-correlation ID — echoed back in `receiver.stream.started`.
+    pub request_id: String,
     pub stream_id: String,
-    /// UDP ports to bind for this stream's links.
-    pub bind_ports: Vec<u16>,
+    /// How many link ports the stream needs (one per sender link).
+    pub link_count: u32,
     /// Optional RTMP/HLS relay URL.
     pub relay_url: Option<String>,
     /// Optional bonding config (scheduler params, etc).
     #[serde(default)]
     pub bonding_config: serde_json::Value,
+}
+
+/// Receiver's answer to `receiver.stream.start`: the allocated ports, or
+/// why allocation/spawn failed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiverStreamStartedPayload {
+    pub request_id: String,
+    pub stream_id: String,
+    pub success: bool,
+    /// The UDP ports actually bound for this stream (empty on failure).
+    #[serde(default)]
+    pub bind_ports: Vec<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Control plane tells the receiver to stop a stream.

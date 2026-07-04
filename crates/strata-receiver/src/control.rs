@@ -16,7 +16,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use strata_protocol::{
     AuthChallengeResponsePayload, Envelope, ReceiverAuthLoginPayload, ReceiverControlMessage,
-    ReceiverMessage, ReceiverStatusPayload, ReceiverStreamEndedPayload, StreamEndReason,
+    ReceiverMessage, ReceiverStatusPayload, ReceiverStreamEndedPayload,
+    ReceiverStreamStartedPayload, StreamEndReason,
 };
 
 use crate::ReceiverState;
@@ -303,29 +304,65 @@ async fn handle_control_message(state: &ReceiverState, raw: &str) {
         ReceiverControlMessage::StreamStart(payload) => {
             tracing::info!(
                 stream_id = %payload.stream_id,
-                bind_ports = ?payload.bind_ports,
+                link_count = payload.link_count,
                 relay_url = ?payload.relay_url,
                 "received receiver.stream.start"
             );
 
-            let mut pipelines = state.pipelines.lock().await;
-            if let Err(e) = pipelines.start(
-                &payload.stream_id,
-                &state.bind_host,
-                &payload.bind_ports,
-                payload.relay_url.as_deref(),
-                &payload.bonding_config,
-            ) {
-                tracing::error!(error = %e, "failed to start receiver pipeline");
-                let ended = ReceiverStreamEndedPayload {
-                    stream_id: payload.stream_id,
-                    reason: StreamEndReason::Error,
-                    duration_s: 0,
-                    total_bytes: 0,
-                };
-                drop(pipelines);
-                send_message(state, &ReceiverMessage::StreamEnded(ended)).await;
+            let fail = |error: String| ReceiverStreamStartedPayload {
+                request_id: payload.request_id.clone(),
+                stream_id: payload.stream_id.clone(),
+                success: false,
+                bind_ports: vec![],
+                error: Some(error),
+            };
+
+            // Enforce capacity, then allocate this stream's ports from the
+            // pool — the receiver owns its ports (E6).
+            let active = state.pipelines.lock().await.active_count() as u32;
+            if active >= state.max_streams {
+                let ack = fail(format!("at capacity ({active}/{} streams)", state.max_streams));
+                send_message(state, &ReceiverMessage::StreamStarted(ack)).await;
+                return;
             }
+
+            let requested = payload.link_count.max(1) as usize;
+            let ports = {
+                let mut pool = state.port_pool.lock().await;
+                pool.allocate(requested)
+            };
+            let Some(ports) = ports else {
+                let ack = fail(format!("no {requested} free link ports"));
+                send_message(state, &ReceiverMessage::StreamStarted(ack)).await;
+                return;
+            };
+
+            let result = {
+                let mut pipelines = state.pipelines.lock().await;
+                pipelines.start(
+                    &payload.stream_id,
+                    &state.bind_host,
+                    &ports,
+                    payload.relay_url.as_deref(),
+                    &payload.bonding_config,
+                )
+            };
+
+            let ack = match result {
+                Ok(()) => ReceiverStreamStartedPayload {
+                    request_id: payload.request_id.clone(),
+                    stream_id: payload.stream_id.clone(),
+                    success: true,
+                    bind_ports: ports,
+                    error: None,
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to start receiver pipeline");
+                    state.port_pool.lock().await.release(&ports);
+                    fail(format!("pipeline start failed: {e}"))
+                }
+            };
+            send_message(state, &ReceiverMessage::StreamStarted(ack)).await;
         }
         ReceiverControlMessage::StreamStop(payload) => {
             tracing::info!(stream_id = %payload.stream_id, "received receiver.stream.stop");

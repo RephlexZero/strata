@@ -48,6 +48,8 @@ pub fn SenderDetailPage() -> impl IntoView {
     let (live_bitrate, set_live_bitrate) = signal(0u32);
     let (live_uptime, set_live_uptime) = signal(0u64);
     let (live_links, set_live_links) = signal(Vec::<LinkStats>::new());
+    // Receiver-side per-link stats — the delivered-goodput ground truth (E8).
+    let (live_receiver_links, set_live_receiver_links) = signal(Vec::<LinkStats>::new());
     let (live_sender_metrics, set_live_sender_metrics) =
         signal(Option::<TransportSenderMetrics>::None);
     let (live_receiver_metrics, set_live_receiver_metrics) =
@@ -237,6 +239,12 @@ pub fn SenderDetailPage() -> impl IntoView {
                         if st == "starting" {
                             set_stream_state.set("live".into());
                         }
+                    }
+                }
+                DashboardEvent::ReceiverStreamStats(stats) => {
+                    if active_stream_id.get_untracked().as_deref() == Some(stats.stream_id.as_str())
+                    {
+                        set_live_receiver_links.set(stats.links);
                     }
                 }
                 DashboardEvent::StreamStateChanged {
@@ -629,6 +637,7 @@ pub fn SenderDetailPage() -> impl IntoView {
                     <StreamTab
                         stream_state=stream_state
                         live_links=live_links
+                        live_receiver_links=live_receiver_links
                         live_bitrate=live_bitrate
                         stats_history=stats_history
                         sender_metrics=live_sender_metrics
