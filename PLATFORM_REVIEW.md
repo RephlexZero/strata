@@ -7,13 +7,13 @@
 [review_findings.md](review_findings.md); this document is about the plane
 that starts, stops, observes and configures it.
 
-> **Implementation status (2026-07-02, updated same day):** E5, E7, E10,
-> E3 (dashboard WS auth + scoping), and now E9 (timing/constants hygiene +
-> reconnect jitter) are **done and merged to `main`**. E1 (protocol
-> crate), E2 (state machine), E4 (device identity), E6 (port allocation),
-> E8 (receiver telemetry) are **not started**. See
-> `.claude/plans/rosy-squishing-treasure.md` for the intended order and
-> notes on why E1/E2/E4 in particular were held back rather than rushed.
+> **Implementation status (2026-07-04): ALL executive items are done and
+> merged to `main`.** 2026-07-02 landed E5, E7 (SQL bug + stop-orphan),
+> E10, E3, E9; 2026-07-04 landed E1 (protocol crate, commit 3422861), E2
+> (state machine + reconciliation, a2b2f67), E4 (device identity,
+> 8b6c04a), and E6 + the rest of E7 + E8 (e8eb5a9). The only deliberately
+> open flag is E3's `CorsLayer::permissive()`/unauthenticated-`/metrics`
+> production-posture decision.
 
 ---
 
@@ -24,20 +24,18 @@ sensible axum/sqlx/Leptos choices, readable code, good docs. What makes it
 lackluster is not any one file — it's that four architectural properties were
 never established, and every gap below is a symptom of one of them:
 
-1. **No single source of truth for the protocol.** The message schema exists
-   three times (typed enums in `strata-common`, stringly-typed dispatch in
-   every hub, and 41 hand-copied types in the dashboard), so the compiler
-   can't defend the wire format.
-2. **No reconciliation — events only.** Every state change is an edge-triggered
-   event with no snapshot/resync path. Any missed event (a WS blip, a control
-   restart) permanently desyncs the DB from reality, and the code "handles"
-   this by guessing (orphan-marking streams on disconnect).
-3. 🟡 PARTIALLY ADDRESSED 2026-07-02 (E3) — **Security is declared, not
-   enforced.** The wiki's security model (per-owner isolation, ed25519
-   device auth, one-time tokens) is substantially unimplemented: ~~the
-   dashboard WS is unauthenticated and unscoped~~ (fixed — E3), device-key
-   auth is still a TODO, enrollment tokens are still permanent reusable
-   passwords (both E4, not started).
+1. ✅ FIXED 2026-07-04 (E1) — **No single source of truth for the protocol.**
+   The message schema existed three times; now the wasm-safe
+   `strata-protocol` crate is the only definition site, and every
+   hub/daemon dispatches exhaustively on direction enums.
+2. ✅ FIXED 2026-07-04 (E2) — **No reconciliation — events only.**
+   Heartbeats now carry `running_streams`; the control plane reconciles on
+   every heartbeat, readopts inferred-dead streams, and a WS drop is
+   "unobserved", never "dead".
+3. ✅ FIXED 2026-07-02/04 (E3 + E4) — **Security is declared, not
+   enforced.** Dashboard WS auth + owner scoping (E3); one-time composite
+   enrollment tokens, single argon2 verify, and ed25519 challenge
+   reconnect auth (E4).
 4. ✅ FIXED 2026-07-02 (E5) — **The plane reaches into the transport's tuning.** The control plane
    hardcodes a bonding config that silently reverses field-validated
    transport defaults — the exact cross-layer override failure class the
@@ -52,7 +50,7 @@ Properties 1-2 (protocol, reconciliation) are still unaddressed; property 3
 
 ## 1. Executive change list (ranked)
 
-### E1. ⬜ NOT STARTED — One protocol crate, one dispatch path
+### E1. ✅ DONE 2026-07-04 — One protocol crate, one dispatch path
 
 Today the protocol lives in three places that can drift independently:
 
@@ -75,7 +73,16 @@ site handles it; dashboard/portal delete `types.rs` and import the crate. Add
 `agent_version`; nothing reads it) — the first schema evolution will otherwise
 be a fleet-wide flag day.
 
-### E2. ⬜ NOT STARTED — Reconciliation over guessing: a real stream state machine
+**Status (2026-07-04, commit 3422861):** done as specified. New wasm-safe
+`strata-protocol` crate (envelope + every payload + four direction enums +
+DashboardEvent + shared REST api types + models + profiles); all four
+dispatch sites match exhaustively; sends go through
+`Envelope::from_message`; `proto_version` added (default 1, hubs warn on
+mismatch); dashboard deleted `types.rs` (dead placebo UI removed with it:
+NAL counters card, FEC-layer/BLEST/fec_overhead_percent knobs — none ever
+had a server-side producer/consumer); verified for wasm32.
+
+### E2. ✅ DONE 2026-07-04 — Reconciliation over guessing: a real stream state machine
 
 Stream state is mutated by **seven** independent sites, all via raw SQL string
 states: REST start (`'starting'`), first-stats inference (`'starting'→'live'`,
@@ -100,6 +107,15 @@ receiver heartbeat carry the set of running stream IDs; on (re)connect the
 control plane reconciles — re-adopting streams that are still running,
 ending the ones that aren't — instead of orphan-marking on disconnect.
 WS-drop then only means "unobserved", never "dead".
+
+**Status (2026-07-04, commit a2b2f67):** done. `stream_state.rs` owns
+every `streams.state` write (validated `transition()`, reconcile-only
+`readopt()`); heartbeats carry `running_streams` and both hubs reconcile
+on every heartbeat (readopt only inferred ends — user-confirmed ends are
+enforced by re-sending stop); disconnect orphaning deleted; a 30 s sweeper
+ends streams whose sender is unobserved > 90 s and force-ends stale
+'stopping' rows. Four integration tests cover WS-drop survival,
+reconcile-end, readopt-vs-enforce, and transition validation.
 
 ### E3. ✅ DONE (core fix); CORS/`/metrics` flagged, not changed — Authenticate and scope the dashboard WebSocket
 
@@ -145,7 +161,7 @@ the unauthenticated `/metrics` endpoint (`main.rs`) were **not** touched —
 per this finding's own instruction to flag them for a deliberate posture
 decision rather than silently change deployment-facing behavior.
 
-### E4. ⬜ NOT STARTED — Real device identity (the current one is a placeholder in disguise)
+### E4. ✅ DONE 2026-07-04 — Real device identity (the current one is a placeholder in disguise)
 
 - Device-key auth is `TODO` on **both** sides ([ws_agent.rs:173](crates/strata-control/src/ws_agent.rs#L173),
   [sender control.rs:130](crates/strata-sender/src/control.rs#L130)); the
@@ -168,6 +184,15 @@ argon2 verify), make it genuinely one-time: on first enrollment the agent
 submits its ed25519 public key, and reconnects authenticate by signature
 challenge (the keygen code already exists in `strata-common::auth`). Delete
 the decorative session token or actually use it.
+
+**Status (2026-07-04, commit 8b6c04a):** done as specified, for both
+senders and receivers (migration 003 adds the receivers' pubkey column).
+Composite tokens issued by create/unenroll; token consumed when a key is
+bound (keyless legacy enrollment still works but warns loudly); daemons
+persist identity (keypair 0600 + device id) before spending the token and
+fail fast if the file is unwritable; the decorative session JWT is
+deleted end-to-end. Integration tests prove single-use and wrong-key
+rejection.
 
 ### E5. ✅ DONE — The control plane must stop overriding transport tuning
 
@@ -205,7 +230,7 @@ override per-stream) was **not** built — out of scope for a fix, since
 the REST API has no override mechanism to plug into today; that's a
 separate feature if/when it's wanted.
 
-### E6. ⬜ NOT STARTED — Per-stream port allocation (make `max_streams` true or delete it)
+### E6. ✅ DONE 2026-07-04 — Per-stream port allocation (make `max_streams` true or delete it)
 
 `pick_receiver_links` hands **every** stream the receiver's *entire*
 `link_ports` list, and `receiver.stream.start` tells the receiver to bind
@@ -218,7 +243,14 @@ receiver replies with the allocated ports, control forwards them to the
 sender. Until then, set `max_streams = 1` everywhere so the fiction is at
 least consistent.
 
-### E7. 🟡 PARTIALLY DONE — Make start/stop transactional sagas (and fix the stop-path orphan)
+**Status (2026-07-04, commit e8eb5a9):** done — request/ack exactly as
+described. `receiver.stream.start` carries {request_id, link_count}; the
+receiver allocates from its own PortPool (which previously only released),
+enforces max_streams, and answers `receiver.stream.started` with the
+bound ports; the control plane builds the sender's destinations from the
+ack.
+
+### E7. ✅ DONE (2026-07-02 + 2026-07-04) — Make start/stop transactional sagas (and fix the stop-path orphan)
 
 Concrete holes in the current sequences, all confirmed by reading:
 
@@ -228,11 +260,11 @@ Concrete holes in the current sequences, all confirmed by reading:
   (a UDP listener doesn't EOS when the sender stops) and `active_streams`
   is never decremented on the normal path — the capacity-aware assignment
   degrades monotonically until the receiver reconnects.
-- ⬜ NOT STARTED — **Start is non-atomic with a partial rollback**: DB insert → receiver
+- ✅ DONE 2026-07-04 — **Start is non-atomic with a partial rollback**: DB insert → receiver
   command → counter increment → agent send; if the agent send fails, the
   rollback marks the row ended but does not stop the receiver or decrement
   the counter.
-- 🟡 MITIGATED, NOT FIXED — **`active_streams` is a hand-maintained counter** (increment in streams.rs,
+- ✅ DONE 2026-07-04 (capacity now COUNT(*)-derived; column is display-only) — **`active_streams` is a hand-maintained counter** (increment in streams.rs,
   decrement in ws_receiver.rs, reset-to-0 on disconnect) — it will drift;
   it should be `COUNT(*)` over streams, or at least reconciled by E2.
   (Fixing the stop-notify bug above means the decrement handler now
@@ -249,7 +281,7 @@ Concrete holes in the current sequences, all confirmed by reading:
 - ✅ DONE (2026-07-02) — Minor: if a sender reports 0 connected interfaces, `link_count` becomes 0
   and the stream starts with an empty destination list — guard it.
 
-### E8. ⬜ NOT STARTED — Receiver-side telemetry is discarded — surface it
+### E8. ✅ DONE 2026-07-04 — Receiver-side telemetry is discarded — surface it
 
 `receiver.stream.stats` arrives at the control plane and is **dropped at
 trace level** ([ws_receiver.rs:275-285](crates/strata-control/src/ws_receiver.rs#L275)).
@@ -259,6 +291,11 @@ the platform throws them away — the dashboard shows only sender-side stats.
 Add a `DashboardEvent::ReceiverStreamStats` (trivial once E1 lands) and
 render both sides; disagreements between them are exactly the diagnostic the
 field runs keep needing.
+
+**Status (2026-07-04, commit e8eb5a9):** done — owner-scoped
+`DashboardEvent::ReceiverStreamStats` broadcast from the receiver hub, and
+the dashboard's Stream tab renders a "Receiver-Side Links" table beside
+the sender-side view.
 
 ### E9. ✅ DONE — Platform timing/constants hygiene pass
 
@@ -336,13 +373,11 @@ is silently swallowed — the state machine of E2 must not inherit that);
 `serde_json::to_string(...).unwrap()` on every outgoing message;
 `Envelope::new` panics on serialization failure while `try_new` sits unused.
 
-**The security model doc should be re-titled "target state" — partially
-resolved 2026-07-02.** Owner isolation is genuinely enforced in the REST
-layer (consistent `owner_id`-scoped queries — good); the dashboard WS
-surface (E3) now enforces it too. Device identity (E4) still doesn't
-implement the doc (enrollment tokens remain permanent, device-key auth is
-still a TODO). Until E4 lands, the wiki overstating the live system is the
-same credibility problem the 2026-05-29 transport review called out.
+**The security model doc is now substantially true — resolved 2026-07-04.**
+Owner isolation is enforced in the REST layer and on the dashboard WS
+(E3); device identity (E4) now implements the doc: one-time enrollment
+tokens, ed25519 device keys, challenge-response reconnect auth. Remaining
+gap: the deliberately-flagged CORS/`/metrics` production posture decision.
 
 **What's fine (leave it alone):** the crate boundaries themselves; axum +
 sqlx + migrations; DashMap-based hubs; UUIDv7 prefixed IDs; the enrollment
@@ -355,18 +390,17 @@ work.
 
 ## 3. Suggested sequencing
 
-Status column added 2026-07-02, updated same day — the actual order landed
-1 (partially, just the SQL bug + orphan, not the rest of E7's sagas), 2
-(E3, out of order — picked up same-day as a contained, well-scoped item),
-5, and 8's E9/E10 (E8 still open); 3, 4, and 6 are still unstarted.
+Status column updated 2026-07-04: **everything is done.** The remaining
+items landed in dependency order on 2026-07-04 — E1 first (unblocking
+E2/E8), then E2, E4, and E6+E7-rest+E8 together.
 
 | Status | Order | Item | Why first |
 |---|---|---|---|
-| ✅ DONE (SQL bug + orphan only; rest of E7 open) | 1 | E7's SQL bind bug + stop-path receiver orphan | small, likely user-visible today |
-| ✅ DONE | 2 | E3 dashboard WS auth + scoping | exposed surface, small fix |
-| ⬜ NOT STARTED | 3 | E1 protocol crate | unblocks E2/E8 cheaply, deletes 41-type copy |
-| ⬜ NOT STARTED | 4 | E2 state machine + reconciliation | biggest correctness win |
-| ✅ DONE | 5 | E5 bonding-profile ownership | protects the transport tuning investment |
-| ⬜ NOT STARTED | 6 | E4 device identity | before any real fleet exists |
-| ⬜ NOT STARTED | 7 | E6 port allocation | before multi-stream receivers are attempted |
-| 🟡 E9/E10 done, E8 not started | 8 | E8, E9, E10 | quality-of-life, in any order |
+| ✅ DONE 2026-07-02 | 1 | E7's SQL bind bug + stop-path receiver orphan | small, likely user-visible today |
+| ✅ DONE 2026-07-02 | 2 | E3 dashboard WS auth + scoping | exposed surface, small fix |
+| ✅ DONE 2026-07-04 | 3 | E1 protocol crate | unblocks E2/E8 cheaply, deletes 41-type copy |
+| ✅ DONE 2026-07-04 | 4 | E2 state machine + reconciliation | biggest correctness win |
+| ✅ DONE 2026-07-02 | 5 | E5 bonding-profile ownership | protects the transport tuning investment |
+| ✅ DONE 2026-07-04 | 6 | E4 device identity | before any real fleet exists |
+| ✅ DONE 2026-07-04 | 7 | E6 port allocation (+ rest of E7) | before multi-stream receivers are attempted |
+| ✅ DONE (E9/E10 2026-07-02, E8 2026-07-04) | 8 | E8, E9, E10 | quality-of-life, in any order |

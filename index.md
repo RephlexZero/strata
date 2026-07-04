@@ -26,6 +26,8 @@ Scan before opening any full page. Keep summaries to one line.
 | [wiki/Adaptation-Encoder-Cut-Signals.md](wiki/Adaptation-Encoder-Cut-Signals.md) | What may cut the encoder bitrate (capacity pressure, goodput shortfall, AQM, per-link melt) — and why the post-FEC residual may not | adaptation, congestion, invariant |
 | [wiki/Strata-Platform.md](wiki/Strata-Platform.md) | Control plane, dashboard, agent — full fleet management architecture (strata-portal retired 2026-07-01) | platform, fleet |
 | [wiki/Adaptation-EWMA-Conventions.md](wiki/Adaptation-EWMA-Conventions.md) | The dozen-plus independently-tuned EWMAs in the bonding/transport stack, and the rise-fast/fall-slow vs rise-slow/fall-fast polarity rule that governs them | adaptation, congestion, ewma, invariant |
+| [wiki/Control-Loop-Map.md](wiki/Control-Loop-Map.md) | The consolidated map of Strata's control loops, the broadcast-profile principle, and the historical whipsaw incidents behind it | architecture, adaptation, invariant |
+| [wiki/Observability-Semantics.md](wiki/Observability-Semantics.md) | What each loss/latency metric actually measures — and the three ways the prominent ones lied during field debugging | telemetry, gotcha, invariant |
 | [wiki/MPEG-TS-Mux-Overhead.md](wiki/MPEG-TS-Mux-Overhead.md) | mpegtsmux pat/pmt-interval are 90 kHz ticks, not packet counts — =1 tripled wire bandwidth and drove the AQM self-loss saga; use 9000 (100 ms) | gstreamer, mux, bandwidth, gotcha |
 | [wiki/HLS-Egress-Discontinuity-Tagging.md](wiki/HLS-Egress-Discontinuity-Tagging.md) | hlssink3 needs video/audio request pads (not a pre-muxed TS) and never auto-tags DISCONT — discontinuity tagging is reconstructed in hls_upload.rs from hls-segment-added messages | gstreamer, hls, receiver, gotcha |
 

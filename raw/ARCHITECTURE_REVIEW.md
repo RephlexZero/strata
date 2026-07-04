@@ -267,7 +267,10 @@ floor-raised settings that *actually work* aren't a named, defaulted thing.
 
 9. **Collapse the two diagnosis docs + this review into a single living
    ARCHITECTURE doc** once Tier A/B land, so the next contributor starts from
-   truth.
+   truth. ✅ DONE 2026-07-04 — durable content merged into
+   [wiki/Control-Loop-Map.md](../wiki/Control-Loop-Map.md) and
+   [wiki/Observability-Semantics.md](../wiki/Observability-Semantics.md);
+   all three source docs archived to `raw/`.
 
 ---
 

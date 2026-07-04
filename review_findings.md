@@ -5,20 +5,17 @@ structure in `strata-bonding` / `strata-transport`. Audit only — no code
 changes made. Every pre-found lead was independently re-verified against the
 source (and git history where the intent was ambiguous).
 
-> **Implementation status (2026-07-02, updated again same day — N3 landed):**
-> all of L1-L8, N1, N2, N3, N4, N6, N7, N9, §2.3, and §2.4.1 are **done and
-> merged to `main`** (commits `b28d983`/`f7ee15c` for Phase A, `97707f9`
-> for Phase B, `ab58233` for N3 — see `.claude/plans/
-> rosy-squishing-treasure.md` for exactly what landed and any caveats).
-> Only the FEC-sizing-sustain half of §2.4 remains genuinely **not
-> started**. N5 and §2.2 are **done, but not by conversion/full
-> redesign** — see their entries below for exactly what was done instead
-> and why. The magic-number naming pass (§1) is now done for
-> `adaptation.rs` too (aside from the EWMA α values, which are
-> §1b/docs-only by design), on top of `congestion.rs`, `oracle.rs`,
-> `bonding.rs`, and `net/transport.rs`
-> — a few rows even in the touched files were skipped — see the ✅/⬜
-> marks below.
+> **Implementation status (2026-07-04): every item in this audit is now
+> done.** 2026-07-02 landed L1-L8, N1-N9, §2.3, §2.4.1 (N5 and §2.2 by
+> their documented lower-risk alternatives — see their entries).
+> 2026-07-04 (commit abee62b) landed the last pieces: §2.4.2's
+> FEC-sizing sustain (asymmetric EWMA on the parity-sizing input,
+> regression-tested), the previously-skipped §1a bare literals
+> (congestion.rs bootstrap pacing/cwnd + modem drain step, oracle.rs's
+> twin 0.999 decays unified into one const, bonding.rs OWD seed + probe
+> min-window fraction, net/transport.rs's 50 Mbps clamp copy), and §1b's
+> naming half (the recurring EWMA α pairs are named per-file, pointing at
+> wiki/Adaptation-EWMA-Conventions.md).
 
 Severity scale: **nit** / **worth-a-comment** / **worth-a-fix**. Items marked
 **worth-a-fix (high)** are the ones I'd land first.
@@ -388,9 +385,9 @@ Status column added 2026-07-02. ✅ = named/fixed; ⬜ = still a bare literal.
 | ✅ | adaptation.rs:1263/1275 | `- 0.05` | ramp-up hysteresis gap | named `RAMP_UP_HYSTERESIS_GAP`, 2026-07-02 |
 | ✅ | adaptation.rs:1281 | `1.3` | ramp ceiling vs peak goodput | named `RAMP_UP_GOODPUT_PEAK_CEILING_MULT`, 2026-07-02 |
 | ✅ | adaptation.rs:1330-1332 | `0.5` / `0.8` | dynamic floor (peak-half / EWMA cap) | named `DYNAMIC_FLOOR_PEAK_HALF`/`DYNAMIC_FLOOR_EWMA_CAP_FRACTION`, 2026-07-02 |
-| ⬜ | congestion.rs:261-262 | `100_000.0`, `14_000.0` | bootstrap pacing / cwnd | skipped in the 2026-07-02 pass — not caught at the time |
+| ✅ | congestion.rs:261-262 | `100_000.0`, `14_000.0` | bootstrap pacing / cwnd | named `BOOTSTRAP_PACING_BYTES_PER_SEC`/`BOOTSTRAP_CWND_BYTES`, 2026-07-04 |
 | ✅ | congestion.rs:363-365 | `0.05`, `3.0`, `8.0` | gradient severity → drain decay | named `RTPROP_QUEUE_FRACTION_FLOOR`/`GRAD_SEVERITY_MAX_MULT`/`GRAD_DECAY_PER_SEVERITY`/`GRAD_SEVERITY_DECAY_CAP` |
-| ⬜ | congestion.rs:393 | `0.9` | modem flow-control drain step | still bare — **no rate-limit**, per-call decay depends on caller frequency; floor 0.5 bounds the damage |
+| ✅ | congestion.rs:393 | `0.9` | modem flow-control drain step | named `MODEM_BACKPRESSURE_DRAIN_STEP` with the no-rate-limit caveat documented, 2026-07-04 |
 | n/a | congestion.rs:774-779 | `5.0`, `3.0`, `1.5`, `0.85`, `0.95` | RTT-ratio fallback drains | explicitly doctrine-flagged in its own comment; fine as fallback, left alone by design |
 | ✅ | congestion.rs:929/934/940-941 | `1.25`, `0.5`, `0.7`, `0.1` | BBR gains / state dampening | named `PROBE_UP_GAIN`/`PROBE_RTT_PACING_GAIN`/`CAUTIOUS_PACING_GAIN`/`PRE_HANDOVER_PACING_GAIN` |
 | ✅ | congestion.rs:961 | `2800.0` | min cwnd "2 packets" | named `MIN_CWND_BYTES = 2.0 * TYPICAL_PACKET_BYTES` |
@@ -398,16 +395,16 @@ Status column added 2026-07-02. ✅ = named/fixed; ⬜ = still a bare literal.
 | ✅ | oracle.rs:145/239/375 + transport.rs:1153/1254/1285 | `100_000.0` | "have a meaningful baseline" cutover | each file got its own local `MEANINGFUL_BASELINE_BPS` (deliberately not cross-file-shared, to keep the two agents that did this work independent — cross-file consolidation still open) |
 | ✅ | oracle.rs:275 | `0.5` | downshift lower-bound haircut | named `DOWNSHIFT_LOWER_BOUND_RETENTION` |
 | ✅ | oracle.rs:291 | `10.0` s | downshift cooldown | named `DOWNSHIFT_COOLDOWN_S` |
-| ⬜ | oracle.rs:343 (+ new :395 twin) | `0.999` | peak decay (~1 %/s at 2 Hz) | L6 gave `lower_bound_peak` the same decay, but neither copy was promoted to a named const — now two bare `0.999`s instead of one |
-| ✅ | oracle.rs:375-380 | `3.0`, `50_000_000.0` | PPD sanity cap / absolute ceiling | named `PPD_SANITY_CAP_MULT`/`PPD_ABSOLUTE_CEILING_BPS`; the transport.rs:1259 copy of 50M was not addressed in this pass |
+| ✅ | oracle.rs:343 (+ new :395 twin) | `0.999` | peak decay (~1 %/s at 2 Hz) | both copies unified into one `PEAK_DECAY_PER_RECOMPUTE`, 2026-07-04 |
+| ✅ | oracle.rs:375-380 | `3.0`, `50_000_000.0` | PPD sanity cap / absolute ceiling | named `PPD_SANITY_CAP_MULT`/`PPD_ABSOLUTE_CEILING_BPS`; the transport.rs copy named `BTLBW_ABSOLUTE_CEILING_BPS` 2026-07-04 |
 | ✅ | transport.rs:516 | `0.2` | pacing floor vs oracle peak | named `PACING_FLOOR_VS_PEAK` |
 | ✅ | transport.rs:547 | `0.01`, `10_000.0` | token-bucket burst cap | named `TOKEN_BUCKET_BURST_SECS`/`TOKEN_BUCKET_MIN_BURST_BYTES` |
 | ✅ | transport.rs:791/802 | clamps `250-1000 ms`, `4×SRTT`, `500-2000 ms` | ACK-rate sampling windows | named `ACK_RATE_MIN/MAX_INTERVAL_US`, `ACK_RATE_IDLE_GAP_*` (+ const-asserted ordering) |
 | ✅ | transport.rs:1092 | `500_000` µs | per-link ack-rate window | named `PER_LINK_ACK_RATE_MIN_INTERVAL_US` |
 | ✅ | transport.rs:1255/1289 | `1.5` / `1.2` | btl_bw vs ack-rate cap / ack fallback headroom | named `BTLBW_VS_ACK_RATE_CAP_MULT`/`ACK_RATE_FALLBACK_HEADROOM_MULT`, with a comment noting they're not confirmed co-tuned |
-| ⬜ | bonding.rs:231 | `0.025` | default OWD seed 25 ms | skipped in the 2026-07-02 pass |
+| ✅ | bonding.rs:231 | `0.025` | default OWD seed 25 ms | named `DEFAULT_OWD_SEED_S`, 2026-07-04 |
 | ✅ | bonding.rs:339 | `1600` ms | probe recv-wait max | named `PROBE_RECV_WAIT_MAX` |
-| ⬜ | bonding.rs:594 | `0.25` | min probe window fraction | skipped in the 2026-07-02 pass |
+| ✅ | bonding.rs:594 | `0.25` | min probe window fraction | named `PROBE_MIN_WINDOW_FRACTION`, 2026-07-04 |
 
 ### 1b. The EWMA zoo
 
@@ -437,10 +434,16 @@ files depending on whether the signal is a capacity (trust drops) or a floor
 polarity convention + named constants for the recurring 0.3/0.05 and 0.2
 pairs would prevent the next L2-style comment drift. *worth-a-fix (docs +
 naming pass)* — **docs half done 2026-07-02**: the polarity rule and this
-inventory are now written up at
+inventory are written up at
 [wiki/Adaptation-EWMA-Conventions.md](wiki/Adaptation-EWMA-Conventions.md).
-The naming-pass half (shared constants for the recurring 0.3/0.05 and 0.2
-pairs) is **not done** — each EWMA still has its own local literal.
+**Naming half done 2026-07-04** (commit abee62b): the recurring pairs are
+named per-file (deliberately not cross-crate — matching the
+`MEANINGFUL_BASELINE_BPS` locality decision), each pointing back at the
+conventions page: `LOSS_EWMA_ALPHA`/`GOODPUT_EWMA_ALPHA` (adaptation.rs),
+`FLOOR_EWMA_ALPHA_RISE/FALL` + `BASELINE_RTT_EWMA_ALPHA` (oracle.rs),
+`ACK_RATE_EWMA_ALPHA`/`GOODPUT_REPORT_EWMA_ALPHA` (net/transport.rs),
+`REGIME_LOSS`/`RTT_MASD`/`DELAY_GRAD_EWMA_ALPHA` (congestion.rs). Values
+unchanged.
 
 ### 1c. 🟡 PARTIALLY DONE (comment only) — Stacked scaling layers on one quantity
 
@@ -570,7 +573,9 @@ Ordering is mostly correct (inner loops faster than outer). Two exceptions:
    *worth-a-fix (high)* — implemented as a required 2-consecutive-spike-tick
    streak, tracked against a frozen pre-spike baseline (see `rtt_spike_streak`
    in `bonding.rs`).
-2. ⬜ NOT STARTED — **FEC sizing has no sustain**: `max_link_loss` is a per-tick max of
+2. ✅ DONE 2026-07-04 (commit abee62b — `max_link_loss_sustained`
+   asymmetric EWMA, rise α=0.3 / fall α=0.7, regression test
+   `fec_overhead_requires_sustained_loss`) — **FEC sizing has no sustain**: `max_link_loss` is a per-tick max of
    per-interval loss; one bursty second lifts overhead (`loss × 0.5`, plus
    the `>= 0.25 → ≥25 %` step) for exactly one tick, injecting a parity
    burst. The self-congestion pin protects the congestive case; a plain

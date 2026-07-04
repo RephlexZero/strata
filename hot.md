@@ -6,40 +6,51 @@
 ## Current focus
 
 `fix/adapt-goodput-not-residual` **merged to `main`** (2026-07-01): all four
-fixes below, plus HLS egress hardening. 415 tests pass, clippy clean.
+fixes below, plus HLS egress hardening. Clippy clean throughout.
 
-**The control-loop audit (`review_findings.md`, 2026-07-01) is now FULLY
-IMPLEMENTED (2026-07-02)** — plan at `.claude/plans/
-rosy-squishing-treasure.md`. Landed on `main`: L1-L8, N1-N9, §2.3, §2.4.1
-(§2.2 done via a lower-risk bookkeeping-centralization, not the full
-evidence-struct/ranking redesign — deliberate, see §2.2's entry for why).
-N3 (dead `congestion_headroom_ratio`/`congestion_trigger_ratio` config
-knobs) was the last item, deleted clean (0 upstream impact per
-`mcp__gitnexus__impact`). From [PLATFORM_REVIEW.md](PLATFORM_REVIEW.md):
-E5/E7/E10/E3/**E9** (SQL bug, receiver-stop wiring, bonding-config
-override removal, portal retirement, dashboard WS auth + owner scoping,
-timing/constants hygiene) are done. E3: `ws_dashboard.rs` now requires the
-same `auth.login` JWT handshake as the agent/receiver WS, and
-`DashboardEvent`s are tagged with `owner_id` end-to-end so one operator
-can no longer see another's fleet. E9: named the platform's own
-magic-number sprawl per-crate (JWT TTL, backoff, channel capacities,
-timeouts) and added jitter to every reconnect loop (agent, receiver,
-dashboard) so a control-plane restart doesn't produce a thundering herd.
-See the 2026-07-02 log entries for the full per-item list, plus one real
-gap surfaced: `strata-sender`'s local onboarding portal (`portal.rs`,
-:3001) has nothing left to serve now that `strata-portal` is retired —
-needs a follow-up decision.
+**Both outstanding reviews are now FULLY IMPLEMENTED (2026-07-04).**
 
-**Still to do** (see the plan file for scope): §2.2's full
-evidence-struct/ranking redesign (deliberately NOT attempted — see
-review_findings.md §2.2 for why the lower-risk bookkeeping-only
-consolidation was chosen instead); a deliberately-deferred
-`CorsLayer::permissive()`/unauthenticated-`/metrics` posture decision
-(flagged, not changed, per E3's own instruction); then the larger
-executive items in dependency order — E1 (one `strata-protocol` crate,
-unblocks E2/E8), E2 (stream state machine + reconciliation), E4 (device
-identity, kills the O(n·argon2) reconnect-storm risk), E6 (real per-stream
-port allocation), E8 (surface receiver-side telemetry on the dashboard).
+*Control-loop audit* (`review_findings.md`): everything was already done
+except §2.4.2 — landed 2026-07-04 (commit `abee62b`): FEC parity sizing now
+reads `max_link_loss_sustained` (asymmetric EWMA, rise ~3 ticks / fall
+fast) so one HARQ-burst tick can't inject a parity burst; plus the
+remaining §1a bare literals and §1b's EWMA-α naming pass (per-file consts
+pointing at [wiki/Adaptation-EWMA-Conventions.md](wiki/Adaptation-EWMA-Conventions.md)).
+360 bonding + 196 transport lib tests pass.
+
+*Platform review* (`PLATFORM_REVIEW.md`): E1/E2/E4/E6/E7-rest/E8 all landed
+2026-07-04 in four commits:
+- **E1** (`3422861`) — new wasm-safe `strata-protocol` crate is the single
+  source of truth for the wire format (envelope + `proto_version`, all ~30
+  messages as direction-enum variants, shared REST types); all four
+  hubs/daemons dispatch exhaustively; the dashboard deleted its 41-type
+  hand-copy (and with it several dead placebo controls that never had a
+  server-side producer). `strata-common` is now auth/ids/identity/metrics
+  only.
+- **E2** (`a2b2f67`) — `stream_state.rs` owns every streams.state write;
+  heartbeats carry `running_streams`; hubs reconcile every heartbeat
+  (readopt inferred ends, enforce confirmed ones); WS drop = "unobserved",
+  never "dead"; 30 s sweeper backstops devices that never return.
+- **E4** (`8b6c04a`) — composite `<id>.<secret>` one-time enrollment tokens
+  (one argon2 verify — the O(n·argon2) scan and its CPU-DoS surface are
+  gone), ed25519 challenge reconnect auth, daemons persist identity before
+  spending the token, decorative session JWT deleted.
+- **E6/E7/E8** (`e8eb5a9`) — receiver owns its port pool
+  (`receiver.stream.start` is request/ack with real allocated ports;
+  `max_streams` is finally true); capacity is COUNT(*)-derived (counter
+  arithmetic deleted); receiver-side stream stats broadcast to the
+  dashboard and rendered beside the sender view.
+
+Control-plane integration suite is now 25 tests (real WS handshakes for
+agent/receiver/dashboard). Remaining deliberately-open platform flags: the
+`CorsLayer::permissive()`/unauthenticated-`/metrics` posture decision (E3),
+and `strata-sender`'s empty portal (`portal.rs`, :3001) still needing a
+follow-up decision after strata-portal's retirement (E10).
+
+*Docs*: ARCHITECTURE_REVIEW item 9 done — the three 2026-05 root-level
+review/diagnosis docs are archived to `raw/`, their durable content merged
+into [wiki/Control-Loop-Map.md](wiki/Control-Loop-Map.md) and
+[wiki/Observability-Semantics.md](wiki/Observability-Semantics.md).
 
 **Sandbox note:** this environment's `RLIMIT_MEMLOCK` is hard-capped at
 8 MB, which now persistently fails 8 `strata-bonding` monoio/io_uring tests
@@ -157,4 +168,4 @@ override that pinned it is gone — but still needs field confirmation. Watch
 adaptive-redundancy duplication as a wire-overhead contributor when spare is large.
 
 ---
-_Last updated: 2026-07-02 (all of batch 1-3 landed on main — control-loop audit fully done, N3 was the last item; platform E1/E2/E4/E6/E8 items remain for a future session)_
+_Last updated: 2026-07-04 (both reviews fully implemented — platform E1/E2/E4/E6/E7/E8 + control-loop §2.4.2/§1a/§1b landed in five commits; review docs archived/consolidated)_

@@ -461,3 +461,35 @@ Format: `## YYYY-MM-DD` heading per day, bullet per entry.
   demonstrated — real loss-driven collapse remains (lever 2 territory).
 - meta: inverted doc symlinks — AGENTS.md is now the canonical file;
   CLAUDE.md and GEMINI.md are symlinks → AGENTS.md.
+
+## 2026-07-04
+
+- **Platform review fully implemented** (PLATFORM_REVIEW.md — all executive
+  items now ✅). Four commits: `3422861` E1 strata-protocol crate (single
+  wire-schema source, exhaustive enum dispatch in all four hubs/daemons,
+  dashboard hand-copy deleted, `proto_version` added); `a2b2f67` E2 stream
+  state machine + heartbeat reconciliation (WS drop = unobserved; sweeper
+  backstop; readopt-vs-enforce split keyed on inferred-vs-confirmed ends);
+  `8b6c04a` E4 device identity (one-time `<id>.<secret>` tokens, single
+  argon2 verify, ed25519 challenge reconnect, persistent daemon identity,
+  decorative session JWT deleted); `e8eb5a9` E6+E7+E8 (receiver-owned port
+  allocation via request/ack, COUNT(*)-derived capacity, receiver-side
+  stats on the dashboard). Control integration suite grew 18 → 25 tests,
+  all against real WS handshakes.
+- **Control-loop audit closed out** (`abee62b`): §2.4.2 FEC-sizing sustain
+  (asymmetric EWMA `max_link_loss_sustained`, regression-tested), the
+  skipped §1a literals (bootstrap pacing/cwnd, modem drain step, twin
+  0.999 peak decays unified, OWD seed, probe min-window, 50 Mbps clamp
+  copy), and §1b's EWMA-α naming pass. review_findings.md: every item ✅.
+- **ARCHITECTURE_REVIEW item 9 done**: STRATA_DIAGNOSIS.md,
+  findings-report.md, ARCHITECTURE_REVIEW.md archived to `raw/`; durable
+  content merged into two new atomic notes, wiki/Control-Loop-Map.md and
+  wiki/Observability-Semantics.md (index.md updated).
+- Notable drift found & killed along the way: the dashboard's
+  TransportSenderMetrics carried 8 fields no producer ever sent (NAL
+  counters, fec_overhead_ratio, fec_layer); its FEC-layer/BLEST/
+  fec_overhead_percent controls were placebo (config keys with no
+  consumer) — all deleted rather than ported. The dashboard's `fec`
+  config-update section, previously silently dropped by the control
+  plane's typed parse, now round-trips and gets an honest "not supported"
+  error from the agent.
