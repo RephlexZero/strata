@@ -76,7 +76,7 @@ pub struct AgentState {
     /// Sender for triggering graceful shutdown.
     pub shutdown_tx: watch::Sender<bool>,
     /// Latest link stats from the bonding engine (updated by telemetry loop).
-    pub latest_link_stats: tokio::sync::RwLock<Vec<strata_common::models::LinkStats>>,
+    pub latest_link_stats: tokio::sync::RwLock<Vec<strata_protocol::models::LinkStats>>,
 }
 
 #[tokio::main]

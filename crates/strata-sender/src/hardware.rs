@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use strata_common::models::{
+use strata_protocol::models::{
     InterfaceState, InterfaceType, MediaInput, MediaInputStatus, MediaInputType, NetworkInterface,
 };
 

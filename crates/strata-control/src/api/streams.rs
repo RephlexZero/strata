@@ -10,11 +10,13 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 
 use strata_common::ids;
-use strata_common::profiles;
-use strata_common::protocol::{Envelope, StreamStartPayload, StreamStopPayload};
+use strata_protocol::api::{StartStreamRequest, StartStreamResponse, StreamDetail, StreamSummary};
+use strata_protocol::profiles;
+use strata_protocol::{
+    ControlMessage, Envelope, ReceiverControlMessage, StreamStartPayload, StreamStopPayload,
+};
 
 use crate::api::auth::ApiError;
 use crate::state::AppState;
@@ -32,19 +34,6 @@ pub fn router() -> Router<AppState> {
 }
 
 // ── Start Stream ────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct StartStreamRequest {
-    pub destination_id: Option<String>,
-    pub source: Option<strata_common::protocol::SourceConfig>,
-    pub encoder: Option<strata_common::protocol::EncoderConfig>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct StartStreamResponse {
-    pub stream_id: String,
-    pub state: String,
-}
 
 async fn start_stream(
     State(state): State<AppState>,
@@ -141,7 +130,7 @@ async fn start_stream(
             s.network_interfaces
                 .iter()
                 .filter(|i| {
-                    i.enabled && i.state == strata_common::models::InterfaceState::Connected
+                    i.enabled && i.state == strata_protocol::models::InterfaceState::Connected
                 })
                 .count()
         })
@@ -172,7 +161,7 @@ async fn start_stream(
     let body_source_framerate = body.source.as_ref().and_then(|s| s.framerate).or(Some(30));
 
     let default_source = match std::env::var("STRATA_DEFAULT_SOURCE").as_deref() {
-        Ok("file") | Ok("uri") => strata_common::protocol::SourceConfig {
+        Ok("file") | Ok("uri") => strata_protocol::SourceConfig {
             mode: "uri".into(),
             device: None,
             uri: Some("file:///opt/strata/test-media/sample.mp4".into()),
@@ -180,7 +169,7 @@ async fn start_stream(
             framerate: None,
             passthrough: Some(true),
         },
-        _ => strata_common::protocol::SourceConfig {
+        _ => strata_protocol::SourceConfig {
             mode: "test".into(),
             device: None,
             uri: None,
@@ -196,7 +185,7 @@ async fn start_stream(
         encoder: {
             let enc = body
                 .encoder
-                .unwrap_or(strata_common::protocol::EncoderConfig {
+                .unwrap_or(strata_protocol::EncoderConfig {
                     bitrate_kbps: 0, // placeholder — overridden below
                     tune: Some("zerolatency".into()),
                     keyint_max: Some(60),
@@ -217,7 +206,7 @@ async fn start_stream(
             } else {
                 enc.bitrate_kbps
             };
-            strata_common::protocol::EncoderConfig {
+            strata_protocol::EncoderConfig {
                 bitrate_kbps: bitrate,
                 tune: enc.tune,
                 keyint_max: enc.keyint_max,
@@ -269,7 +258,7 @@ async fn start_stream(
     // If we picked a managed receiver, send it a receiver.stream.start command
     if let Some(ref rcv_id) = receiver_id_opt {
         if let Some(rcv_handle) = state.receivers().get(rcv_id) {
-            let rcv_payload = strata_common::protocol::ReceiverStreamStartPayload {
+            let rcv_payload = strata_protocol::ReceiverStreamStartPayload {
                 stream_id: stream_id.clone(),
                 bind_ports: receiver_links
                     .iter()
@@ -278,7 +267,8 @@ async fn start_stream(
                 relay_url: start_payload.relay_url.clone(),
                 bonding_config: start_payload.bonding_config.clone(),
             };
-            let rcv_envelope = Envelope::new("receiver.stream.start", &rcv_payload);
+            let rcv_envelope =
+                Envelope::from_message(&ReceiverControlMessage::StreamStart(rcv_payload)).unwrap();
             let rcv_json = serde_json::to_string(&rcv_envelope).unwrap();
             if rcv_handle.tx.send(rcv_json).await.is_err() {
                 tracing::warn!(
@@ -297,7 +287,8 @@ async fn start_stream(
                 .await;
     }
 
-    let envelope = Envelope::new("stream.start", &start_payload);
+    let envelope =
+        Envelope::from_message(&ControlMessage::StreamStart(Box::new(start_payload))).unwrap();
     let json = serde_json::to_string(&envelope).unwrap();
 
     if agent_tx.send(json).await.is_err() {
@@ -313,10 +304,10 @@ async fn start_stream(
     // Notify dashboard
     state.broadcast_dashboard(
         user.user_id.clone(),
-        strata_common::protocol::DashboardEvent::StreamStateChanged {
+        strata_protocol::DashboardEvent::StreamStateChanged {
             stream_id: stream_id.clone(),
             sender_id: sender_id.clone(),
-            state: strata_common::models::StreamState::Starting,
+            state: strata_protocol::models::StreamState::Starting,
             error: None,
         },
     );
@@ -367,7 +358,7 @@ async fn stop_stream(
             stream_id: stream_id.clone(),
             reason: "user_request".into(),
         };
-        let envelope = Envelope::new("stream.stop", &stop_payload);
+        let envelope = Envelope::from_message(&ControlMessage::StreamStop(stop_payload)).unwrap();
         let json = serde_json::to_string(&envelope).unwrap();
         if agent.tx.send(json).await.is_err() {
             tracing::warn!(
@@ -386,11 +377,12 @@ async fn stop_stream(
     if let Some(ref rcv_id) = receiver_id
         && let Some(rcv_handle) = state.receivers().get(rcv_id)
     {
-        let rcv_stop_payload = strata_common::protocol::ReceiverStreamStopPayload {
+        let rcv_stop_payload = strata_protocol::ReceiverStreamStopPayload {
             stream_id: stream_id.clone(),
             reason: "user_request".into(),
         };
-        let rcv_envelope = Envelope::new("receiver.stream.stop", &rcv_stop_payload);
+        let rcv_envelope =
+            Envelope::from_message(&ReceiverControlMessage::StreamStop(rcv_stop_payload)).unwrap();
         let rcv_json = serde_json::to_string(&rcv_envelope).unwrap();
         if rcv_handle.tx.send(rcv_json).await.is_err() {
             tracing::warn!(
@@ -404,10 +396,10 @@ async fn stop_stream(
     // Notify dashboard
     state.broadcast_dashboard(
         user.user_id.clone(),
-        strata_common::protocol::DashboardEvent::StreamStateChanged {
+        strata_protocol::DashboardEvent::StreamStateChanged {
             stream_id: stream_id.clone(),
             sender_id: sender_id.clone(),
-            state: strata_common::models::StreamState::Stopping,
+            state: strata_protocol::models::StreamState::Stopping,
             error: None,
         },
     );
@@ -433,10 +425,10 @@ async fn stop_stream(
                 state.live_streams().remove(&stream_id);
                 state.broadcast_dashboard(
                     owner_id,
-                    strata_common::protocol::DashboardEvent::StreamStateChanged {
+                    strata_protocol::DashboardEvent::StreamStateChanged {
                         stream_id,
                         sender_id,
-                        state: strata_common::models::StreamState::Ended,
+                        state: strata_protocol::models::StreamState::Ended,
                         error: Some("stop timeout".into()),
                     },
                 );
@@ -449,14 +441,6 @@ async fn stop_stream(
 }
 
 // ── List Streams ────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct StreamSummary {
-    pub id: String,
-    pub sender_id: String,
-    pub state: String,
-    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
-}
 
 async fn list_streams(
     State(state): State<AppState>,
@@ -495,19 +479,6 @@ async fn list_streams(
 }
 
 // ── Get Stream ──────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct StreamDetail {
-    pub id: String,
-    pub sender_id: String,
-    pub destination_id: Option<String>,
-    pub state: String,
-    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub config_json: Option<String>,
-    pub total_bytes: i64,
-    pub error_message: Option<String>,
-}
 
 async fn get_stream(
     State(state): State<AppState>,

@@ -14,23 +14,21 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use strata_common::protocol::{
-    Envelope, ReceiverAuthLoginPayload, ReceiverAuthLoginResponsePayload, ReceiverStatusPayload,
-    ReceiverStreamEndedPayload, ReceiverStreamStartPayload, ReceiverStreamStopPayload,
-    StreamEndReason,
+use strata_protocol::{
+    Envelope, ReceiverAuthLoginPayload, ReceiverAuthLoginResponsePayload, ReceiverControlMessage,
+    ReceiverMessage, ReceiverStatusPayload, ReceiverStreamEndedPayload, StreamEndReason,
 };
 
 use crate::ReceiverState;
 
-/// Send a typed envelope to the control plane.
-async fn send_envelope(state: &ReceiverState, msg_type: &str, payload: &impl serde::Serialize) {
-    let envelope = Envelope::new(msg_type, payload);
-    match serde_json::to_string(&envelope) {
+/// Send a typed message to the control plane.
+async fn send_message(state: &ReceiverState, msg: &ReceiverMessage) {
+    match Envelope::from_message(msg).and_then(|e| serde_json::to_string(&e)) {
         Ok(json) => {
             let _ = state.control_tx.send(json).await;
         }
         Err(e) => {
-            tracing::error!(msg_type, error = %e, "failed to serialize envelope");
+            tracing::error!(error = %e, "failed to serialize message");
         }
     }
 }
@@ -134,7 +132,7 @@ async fn connect_and_run(
         max_streams,
     };
 
-    let envelope = Envelope::new("auth.login", &auth_payload);
+    let envelope = Envelope::from_message(&ReceiverMessage::AuthLogin(auth_payload))?;
     let json = serde_json::to_string(&envelope)?;
     ws_tx.send(Message::Text(json.into())).await?;
 
@@ -178,7 +176,7 @@ async fn connect_and_run(
         tokio::select! {
             _ = heartbeat.tick() => {
                 let status = build_heartbeat(state).await;
-                let envelope = Envelope::new("receiver.status", &status);
+                let envelope = Envelope::from_message(&ReceiverMessage::Status(status))?;
                 let json = serde_json::to_string(&envelope)?;
                 ws_tx.send(Message::Text(json.into())).await?;
             }
@@ -221,17 +219,18 @@ async fn connect_and_run(
 
 async fn build_heartbeat(state: &ReceiverState) -> ReceiverStatusPayload {
     let pipelines = state.pipelines.lock().await;
-    let active = pipelines.active_count() as u32;
+    let running_streams = pipelines.running_ids();
     drop(pipelines);
 
     let sys = sysinfo::System::new_all();
 
     ReceiverStatusPayload {
-        active_streams: active,
+        active_streams: running_streams.len() as u32,
         max_streams: state.max_streams,
         cpu_percent: sys.global_cpu_usage(),
         mem_used_mb: sys.used_memory() / (1024 * 1024),
         uptime_s: sysinfo::System::uptime(),
+        running_streams,
     }
 }
 
@@ -244,64 +243,65 @@ async fn handle_control_message(state: &ReceiverState, raw: &str) {
         }
     };
 
-    match envelope.msg_type.as_str() {
-        "receiver.stream.start" => match envelope.parse_payload::<ReceiverStreamStartPayload>() {
-            Ok(payload) => {
-                tracing::info!(
-                    stream_id = %payload.stream_id,
-                    bind_ports = ?payload.bind_ports,
-                    relay_url = ?payload.relay_url,
-                    "received receiver.stream.start"
-                );
+    let msg: ReceiverControlMessage = match envelope.parse_message() {
+        Ok(m) => m,
+        Err(_) => {
+            tracing::debug!(msg_type = %envelope.msg_type, "unhandled control message");
+            return;
+        }
+    };
 
-                let mut pipelines = state.pipelines.lock().await;
-                if let Err(e) = pipelines.start(
-                    &payload.stream_id,
-                    &state.bind_host,
-                    &payload.bind_ports,
-                    payload.relay_url.as_deref(),
-                    &payload.bonding_config,
-                ) {
-                    tracing::error!(error = %e, "failed to start receiver pipeline");
-                    let ended = ReceiverStreamEndedPayload {
-                        stream_id: payload.stream_id,
-                        reason: StreamEndReason::Error,
-                        duration_s: 0,
-                        total_bytes: 0,
-                    };
-                    drop(pipelines);
-                    send_envelope(state, "receiver.stream.ended", &ended).await;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to parse receiver.stream.start payload");
-            }
-        },
-        "receiver.stream.stop" => {
-            if let Ok(payload) = envelope.parse_payload::<ReceiverStreamStopPayload>() {
-                tracing::info!(stream_id = %payload.stream_id, "received receiver.stream.stop");
-                let mut pipelines = state.pipelines.lock().await;
-                let stats = pipelines.stop(&payload.stream_id);
+    match msg {
+        ReceiverControlMessage::AuthLoginResponse(_) => {
+            tracing::debug!("unexpected auth.login.response outside handshake");
+        }
+        ReceiverControlMessage::StreamStart(payload) => {
+            tracing::info!(
+                stream_id = %payload.stream_id,
+                bind_ports = ?payload.bind_ports,
+                relay_url = ?payload.relay_url,
+                "received receiver.stream.start"
+            );
+
+            let mut pipelines = state.pipelines.lock().await;
+            if let Err(e) = pipelines.start(
+                &payload.stream_id,
+                &state.bind_host,
+                &payload.bind_ports,
+                payload.relay_url.as_deref(),
+                &payload.bonding_config,
+            ) {
+                tracing::error!(error = %e, "failed to start receiver pipeline");
+                let ended = ReceiverStreamEndedPayload {
+                    stream_id: payload.stream_id,
+                    reason: StreamEndReason::Error,
+                    duration_s: 0,
+                    total_bytes: 0,
+                };
                 drop(pipelines);
-
-                if let Some(stats) = stats {
-                    // Release ports back to pool
-                    let mut pool = state.port_pool.lock().await;
-                    pool.release(&stats.bind_ports);
-                    drop(pool);
-
-                    let ended = ReceiverStreamEndedPayload {
-                        stream_id: payload.stream_id,
-                        reason: StreamEndReason::ControlPlaneStop,
-                        duration_s: stats.duration_s,
-                        total_bytes: stats.total_bytes,
-                    };
-                    send_envelope(state, "receiver.stream.ended", &ended).await;
-                }
+                send_message(state, &ReceiverMessage::StreamEnded(ended)).await;
             }
         }
-        other => {
-            tracing::debug!(msg_type = %other, "unhandled control message");
+        ReceiverControlMessage::StreamStop(payload) => {
+            tracing::info!(stream_id = %payload.stream_id, "received receiver.stream.stop");
+            let mut pipelines = state.pipelines.lock().await;
+            let stats = pipelines.stop(&payload.stream_id);
+            drop(pipelines);
+
+            if let Some(stats) = stats {
+                // Release ports back to pool
+                let mut pool = state.port_pool.lock().await;
+                pool.release(&stats.bind_ports);
+                drop(pool);
+
+                let ended = ReceiverStreamEndedPayload {
+                    stream_id: payload.stream_id,
+                    reason: StreamEndReason::ControlPlaneStop,
+                    duration_s: stats.duration_s,
+                    total_bytes: stats.total_bytes,
+                };
+                send_message(state, &ReceiverMessage::StreamEnded(ended)).await;
+            }
         }
     }
 }

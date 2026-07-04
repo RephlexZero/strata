@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use strata_common::protocol::{Envelope, StreamEndReason, StreamEndedPayload};
+use strata_protocol::{AgentMessage, Envelope, StreamEndReason, StreamEndedPayload};
 
 use crate::AgentState;
 
@@ -51,8 +51,8 @@ pub async fn run(state: Arc<AgentState>) {
             // Release the lock before sending
             drop(pipeline);
 
-            let envelope = Envelope::new("stream.ended", &ended);
-            if let Ok(json) = serde_json::to_string(&envelope) {
+            let envelope = Envelope::from_message(&AgentMessage::StreamEnded(ended));
+            if let Ok(json) = envelope.and_then(|e| serde_json::to_string(&e)) {
                 let _ = state.control_tx.send(json).await;
             }
         }

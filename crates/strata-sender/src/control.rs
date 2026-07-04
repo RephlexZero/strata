@@ -14,34 +14,28 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use strata_common::models::StreamState;
-use strata_common::protocol::{
-    AuthLoginPayload, AuthLoginResponsePayload, ConfigExportPayload, ConfigExportResponsePayload,
-    ConfigImportPayload, ConfigImportResponsePayload, ConfigSetPayload, ConfigSetResponsePayload,
-    ConfigUpdatePayload, ConfigUpdateResponsePayload, DeviceStatusPayload, Envelope, FileEntry,
-    FilesListPayload, FilesListResponsePayload, InterfaceCommandPayload,
-    InterfaceCommandResponsePayload, InterfacesScanPayload, InterfacesScanResponsePayload,
-    JitterBufferPayload, JitterBufferResponsePayload, LogLineEntry, LogsRequestPayload,
-    LogsResponsePayload, NetworkToolPayload, NetworkToolResponsePayload, PcapCapturePayload,
-    PcapCaptureResponsePayload, PowerCommandPayload, PowerCommandResponsePayload,
-    SourceSwitchPayload, StreamDestinationsPayload, StreamDestinationsResponsePayload,
-    StreamEndReason, StreamEndedPayload, StreamStartPayload, StreamStopPayload, TestRunPayload,
-    TestRunResponsePayload, TlsRenewPayload, TlsRenewResponsePayload, TlsStatusPayload,
-    TlsStatusResponsePayload, UpdatesCheckPayload, UpdatesCheckResponsePayload,
-    UpdatesInstallPayload, UpdatesInstallResponsePayload,
+use strata_protocol::models::StreamState;
+use strata_protocol::{
+    AgentMessage, AuthLoginPayload, AuthLoginResponsePayload, ConfigExportResponsePayload,
+    ConfigImportResponsePayload, ConfigSetResponsePayload, ConfigUpdateResponsePayload,
+    ControlMessage, DeviceStatusPayload, Envelope, FileEntry, FilesListResponsePayload,
+    InterfaceCommandResponsePayload, InterfacesScanResponsePayload, JitterBufferResponsePayload,
+    LogLineEntry, LogsResponsePayload, NetworkToolResponsePayload, PcapCaptureResponsePayload,
+    PowerCommandResponsePayload, StreamDestinationsResponsePayload, StreamEndReason,
+    StreamEndedPayload, TestRunResponsePayload, TlsRenewResponsePayload, TlsStatusResponsePayload,
+    UpdatesCheckResponsePayload, UpdatesInstallResponsePayload,
 };
 
 use crate::AgentState;
 
-/// Send a typed envelope to the control plane, logging on failure.
-async fn send_envelope(state: &AgentState, msg_type: &str, payload: &impl serde::Serialize) {
-    let envelope = Envelope::new(msg_type, payload);
-    match serde_json::to_string(&envelope) {
+/// Send a typed message to the control plane, logging on failure.
+async fn send_message(state: &AgentState, msg: &AgentMessage) {
+    match Envelope::from_message(msg).and_then(|e| serde_json::to_string(&e)) {
         Ok(json) => {
             let _ = state.control_tx.send(json).await;
         }
         Err(e) => {
-            tracing::error!(msg_type, error = %e, "failed to serialize envelope");
+            tracing::error!(error = %e, "failed to serialize message");
         }
     }
 }
@@ -140,8 +134,7 @@ async fn connect_and_run(
         arch: std::env::consts::ARCH.to_string(),
     };
 
-    // Send the raw payload in the envelope (not wrapped in AgentMessage)
-    let envelope = Envelope::new("auth.login", &auth_payload);
+    let envelope = Envelope::from_message(&AgentMessage::AuthLogin(auth_payload))?;
     let json = serde_json::to_string(&envelope)?;
     ws_tx.send(Message::Text(json.into())).await?;
 
@@ -187,7 +180,7 @@ async fn connect_and_run(
             // Heartbeat tick
             _ = heartbeat.tick() => {
                 let status = build_heartbeat(state).await;
-                let envelope = Envelope::new("device.status", &status);
+                let envelope = Envelope::from_message(&AgentMessage::DeviceStatus(status))?;
                 let json = serde_json::to_string(&envelope)?;
                 ws_tx.send(Message::Text(json.into())).await?;
             }
@@ -237,10 +230,13 @@ async fn build_heartbeat(state: &AgentState) -> DeviceStatusPayload {
     let mut pipeline = state.pipeline.lock().await;
     let receiver_url = state.receiver_url.lock().await.clone();
 
+    // is_running() reaps a dead pipeline child, so query it before reading
+    // the stream id.
+    let running = pipeline.is_running();
     DeviceStatusPayload {
         network_interfaces: hw.interfaces,
         media_inputs: hw.inputs,
-        stream_state: if pipeline.is_running() {
+        stream_state: if running {
             StreamState::Live
         } else {
             StreamState::Idle
@@ -249,6 +245,10 @@ async fn build_heartbeat(state: &AgentState) -> DeviceStatusPayload {
         mem_used_mb: hw.mem_used_mb,
         uptime_s: hw.uptime_s,
         receiver_url,
+        running_streams: pipeline
+            .stream_id()
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default(),
     }
 }
 
@@ -262,417 +262,392 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
         }
     };
 
-    match envelope.msg_type.as_str() {
-        "stream.start" => match envelope.parse_payload::<StreamStartPayload>() {
-            Ok(payload) => {
-                tracing::info!(stream_id = %payload.stream_id, "received stream.start");
-                let mut pipeline = state.pipeline.lock().await;
-                if let Err(e) = pipeline.start(payload.clone()) {
-                    tracing::error!(error = %e, "failed to start pipeline");
-                    let ended = StreamEndedPayload {
-                        stream_id: payload.stream_id,
-                        reason: StreamEndReason::Error,
-                        duration_s: 0,
-                        total_bytes: 0,
-                    };
-                    send_envelope(state, "stream.ended", &ended).await;
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "failed to parse stream.start payload"),
-        },
-        "stream.stop" => {
-            if let Ok(payload) = envelope.parse_payload::<StreamStopPayload>() {
-                tracing::info!(stream_id = %payload.stream_id, "received stream.stop");
-                let mut pipeline = state.pipeline.lock().await;
-                let stats = pipeline.stop();
+    let msg: ControlMessage = match envelope.parse_message() {
+        Ok(m) => m,
+        Err(_) => {
+            tracing::debug!(msg_type = %envelope.msg_type, "unhandled control message");
+            return;
+        }
+    };
+
+    match msg {
+        ControlMessage::AuthLoginResponse(_) => {
+            tracing::debug!("unexpected auth.login.response outside handshake");
+        }
+        ControlMessage::StreamStart(payload) => {
+            tracing::info!(stream_id = %payload.stream_id, "received stream.start");
+            let mut pipeline = state.pipeline.lock().await;
+            if let Err(e) = pipeline.start((*payload).clone()) {
+                tracing::error!(error = %e, "failed to start pipeline");
                 let ended = StreamEndedPayload {
                     stream_id: payload.stream_id,
-                    reason: StreamEndReason::ControlPlaneStop,
-                    duration_s: stats.duration_s,
-                    total_bytes: stats.total_bytes,
+                    reason: StreamEndReason::Error,
+                    duration_s: 0,
+                    total_bytes: 0,
                 };
-                send_envelope(state, "stream.ended", &ended).await;
+                send_message(state, &AgentMessage::StreamEnded(ended)).await;
             }
         }
-        "config.update" => {
-            match envelope.parse_payload::<ConfigUpdatePayload>() {
-                Ok(payload) => {
-                    tracing::info!("received config.update");
-                    let pipeline = state.pipeline.lock().await;
-                    let mut errors: Vec<String> = Vec::new();
+        ControlMessage::StreamStop(payload) => {
+            tracing::info!(stream_id = %payload.stream_id, "received stream.stop");
+            let mut pipeline = state.pipeline.lock().await;
+            let stats = pipeline.stop();
+            let ended = StreamEndedPayload {
+                stream_id: payload.stream_id,
+                reason: StreamEndReason::ControlPlaneStop,
+                duration_s: stats.duration_s,
+                total_bytes: stats.total_bytes,
+            };
+            send_message(state, &AgentMessage::StreamEnded(ended)).await;
+        }
+        ControlMessage::ConfigUpdate(payload) => {
+            tracing::info!("received config.update");
+            let pipeline = state.pipeline.lock().await;
+            let mut errors: Vec<String> = Vec::new();
 
-                    // Apply encoder changes
-                    if let Some(enc) = &payload.encoder {
-                        let mut cmd = serde_json::json!({ "cmd": "set_encoder" });
-                        if let Some(bps) = enc.bitrate_kbps {
-                            cmd["bitrate_kbps"] = serde_json::json!(bps);
-                        }
-                        if let Some(ref tune) = enc.tune {
-                            cmd["tune"] = serde_json::json!(tune);
-                        }
-                        if let Some(ki) = enc.keyint_max {
-                            cmd["keyint_max"] = serde_json::json!(ki);
-                        }
-                        if !pipeline.send_command(&cmd) {
-                            errors.push("failed to send encoder update".into());
-                        }
-                    }
+            // Apply encoder changes
+            if let Some(enc) = &payload.encoder {
+                let mut cmd = serde_json::json!({ "cmd": "set_encoder" });
+                if let Some(bps) = enc.bitrate_kbps {
+                    cmd["bitrate_kbps"] = serde_json::json!(bps);
+                }
+                if let Some(ref tune) = enc.tune {
+                    cmd["tune"] = serde_json::json!(tune);
+                }
+                if let Some(ki) = enc.keyint_max {
+                    cmd["keyint_max"] = serde_json::json!(ki);
+                }
+                if !pipeline.send_command(&cmd) {
+                    errors.push("failed to send encoder update".into());
+                }
+            }
 
-                    // Apply scheduler/bonding changes
-                    if let Some(sched) = &payload.scheduler {
-                        let cmd = serde_json::json!({
-                            "cmd": "set_bonding_config",
-                            "config": sched,
-                        });
-                        if !pipeline.send_command(&cmd) {
-                            errors.push("failed to send scheduler update".into());
-                        }
-                    }
+            // Apply scheduler/bonding changes
+            if let Some(sched) = &payload.scheduler {
+                let cmd = serde_json::json!({
+                    "cmd": "set_bonding_config",
+                    "config": sched,
+                });
+                if !pipeline.send_command(&cmd) {
+                    errors.push("failed to send scheduler update".into());
+                }
+            }
 
-                    let request_id = envelope
-                        .payload
-                        .get("request_id")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let resp = ConfigUpdateResponsePayload {
-                        request_id,
-                        success: errors.is_empty(),
-                        error: if errors.is_empty() {
+            // No pipeline command exists for FEC hot-update yet — report it
+            // rather than pretending it applied.
+            if payload.fec.is_some() {
+                errors.push("fec hot-update not supported by this agent".into());
+            }
+
+            let resp = ConfigUpdateResponsePayload {
+                request_id: payload.request_id.clone(),
+                success: errors.is_empty(),
+                error: if errors.is_empty() {
+                    None
+                } else {
+                    Some(errors.join("; "))
+                },
+            };
+            send_message(state, &AgentMessage::ConfigUpdateResponse(resp)).await;
+        }
+        ControlMessage::SourceSwitch(payload) => {
+            tracing::info!(
+                mode = %payload.mode,
+                pattern = ?payload.pattern,
+                "received source.switch"
+            );
+            let pipeline = state.pipeline.lock().await;
+            pipeline.switch_source(
+                &payload.mode,
+                payload.device.as_deref(),
+                payload.uri.as_deref(),
+                payload.pattern.as_deref(),
+            );
+        }
+        ControlMessage::InterfaceCommand(payload) => {
+            tracing::info!(
+                interface = %payload.interface,
+                action = %payload.action,
+                "received interface.command"
+            );
+            let (success, error) = match payload.action.as_str() {
+                "enable" => {
+                    let ok = state
+                        .hardware
+                        .set_interface_enabled(&payload.interface, true);
+                    (
+                        ok,
+                        if ok {
                             None
                         } else {
-                            Some(errors.join("; "))
+                            Some("failed to enable interface".into())
                         },
-                    };
-                    send_envelope(state, "config.update.response", &resp).await;
+                    )
                 }
-                Err(e) => tracing::warn!(error = %e, "failed to parse config.update payload"),
-            }
-        }
-        "source.switch" => {
-            if let Ok(payload) = envelope.parse_payload::<SourceSwitchPayload>() {
-                tracing::info!(
-                    mode = %payload.mode,
-                    pattern = ?payload.pattern,
-                    "received source.switch"
-                );
+                "disable" => {
+                    let ok = state
+                        .hardware
+                        .set_interface_enabled(&payload.interface, false);
+                    (
+                        ok,
+                        if ok {
+                            None
+                        } else {
+                            Some("failed to disable interface".into())
+                        },
+                    )
+                }
+                other => (false, Some(format!("unknown action: {other}"))),
+            };
+            let resp = InterfaceCommandResponsePayload {
+                success,
+                interface: payload.interface.clone(),
+                action: payload.action.clone(),
+                error,
+            };
+            send_message(state, &AgentMessage::InterfaceCommandResponse(resp)).await;
+
+            // Notify the running pipeline to add/remove this link from
+            // the bonding transport (without touching OS connectivity).
+            if success {
+                let enabled = payload.action == "enable";
                 let pipeline = state.pipeline.lock().await;
-                pipeline.switch_source(
-                    &payload.mode,
-                    payload.device.as_deref(),
-                    payload.uri.as_deref(),
-                    payload.pattern.as_deref(),
-                );
+                pipeline.toggle_link(&payload.interface, enabled);
             }
-        }
-        "interface.command" => {
-            if let Ok(payload) = envelope.parse_payload::<InterfaceCommandPayload>() {
-                tracing::info!(
-                    interface = %payload.interface,
-                    action = %payload.action,
-                    "received interface.command"
-                );
-                let (success, error) = match payload.action.as_str() {
-                    "enable" => {
-                        let ok = state
-                            .hardware
-                            .set_interface_enabled(&payload.interface, true);
-                        (
-                            ok,
-                            if ok {
-                                None
-                            } else {
-                                Some("failed to enable interface".into())
-                            },
-                        )
-                    }
-                    "disable" => {
-                        let ok = state
-                            .hardware
-                            .set_interface_enabled(&payload.interface, false);
-                        (
-                            ok,
-                            if ok {
-                                None
-                            } else {
-                                Some("failed to disable interface".into())
-                            },
-                        )
-                    }
-                    other => (false, Some(format!("unknown action: {other}"))),
-                };
-                let resp = InterfaceCommandResponsePayload {
-                    success,
-                    interface: payload.interface.clone(),
-                    action: payload.action.clone(),
-                    error,
-                };
-                send_envelope(state, "interface.command.response", &resp).await;
 
-                // Notify the running pipeline to add/remove this link from
-                // the bonding transport (without touching OS connectivity).
-                if success {
-                    let enabled = payload.action == "enable";
-                    let pipeline = state.pipeline.lock().await;
-                    pipeline.toggle_link(&payload.interface, enabled);
+            send_message(
+                state,
+                &AgentMessage::DeviceStatus(build_heartbeat(state).await),
+            )
+            .await;
+        }
+        ControlMessage::ConfigSet(payload) => {
+            tracing::info!(receiver_url = ?payload.receiver_url, "received config.set");
+            {
+                let mut r = state.receiver_url.lock().await;
+                *r = payload.receiver_url.clone().filter(|s| !s.is_empty());
+            }
+            let current = state.receiver_url.lock().await.clone();
+            let resp = ConfigSetResponsePayload {
+                request_id: payload.request_id,
+                success: true,
+                receiver_url: current,
+            };
+            send_message(state, &AgentMessage::ConfigSetResponse(resp)).await;
+            send_message(
+                state,
+                &AgentMessage::DeviceStatus(build_heartbeat(state).await),
+            )
+            .await;
+        }
+        ControlMessage::TestRun(payload) => {
+            tracing::info!("received test.run");
+            let control_connected = state
+                .control_connected
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let sender_id = state.sender_id.lock().await.clone();
+            let control_url = state.control_url.lock().await.clone();
+            let receiver_url = state.receiver_url.lock().await.clone();
+
+            let cloud_reachable = match &control_url {
+                Some(url) => crate::util::check_tcp_reachable(url, 5).await,
+                None => false,
+            };
+            let receiver_reachable = match &receiver_url {
+                Some(url) => crate::util::check_tcp_reachable(url, 3).await,
+                None => false,
+            };
+
+            let resp = TestRunResponsePayload {
+                request_id: payload.request_id,
+                cloud_reachable,
+                cloud_connected: control_connected,
+                receiver_reachable,
+                receiver_url,
+                enrolled: sender_id.is_some(),
+                control_url,
+            };
+            send_message(state, &AgentMessage::TestRunResponse(resp)).await;
+        }
+        ControlMessage::InterfacesScan(payload) => {
+            tracing::info!("received interfaces.scan");
+            let new_ifaces = state.hardware.discover_interfaces().await;
+            let hw = state.hardware.scan().await;
+            let resp = InterfacesScanResponsePayload {
+                request_id: payload.request_id,
+                discovered: new_ifaces,
+                total: hw.interfaces.len(),
+            };
+            send_message(state, &AgentMessage::InterfacesScanResponse(resp)).await;
+            send_message(
+                state,
+                &AgentMessage::DeviceStatus(build_heartbeat(state).await),
+            )
+            .await;
+        }
+        ControlMessage::FilesList(payload) => {
+            let req_path = payload.path.unwrap_or_else(|| "/opt/strata".to_string());
+            tracing::debug!(path = %req_path, "received files.list");
+            let (entries, error) = list_directory(&req_path);
+            let resp = FilesListResponsePayload {
+                request_id: payload.request_id,
+                path: req_path,
+                entries,
+                error,
+            };
+            send_message(state, &AgentMessage::FilesListResponse(resp)).await;
+        }
+        ControlMessage::NetworkTool(payload) => {
+            tracing::info!(tool = %payload.tool, "received diagnostics.network");
+            let (output, success) =
+                run_network_tool_impl(&payload.tool, payload.target.as_deref()).await;
+            let resp = NetworkToolResponsePayload {
+                request_id: payload.request_id,
+                tool: payload.tool,
+                output,
+                success,
+            };
+            send_message(state, &AgentMessage::NetworkToolResponse(resp)).await;
+        }
+        ControlMessage::PcapCapture(payload) => {
+            tracing::info!(
+                duration = payload.duration_secs,
+                "received diagnostics.pcap"
+            );
+            let resp = PcapCaptureResponsePayload {
+                request_id: payload.request_id,
+                download_url: String::new(),
+                file_size_bytes: None,
+                duration_secs: payload.duration_secs,
+            };
+            send_message(state, &AgentMessage::PcapCaptureResponse(resp)).await;
+        }
+        ControlMessage::LogsGet(payload) => {
+            tracing::debug!("received logs.get");
+            let service = payload.service.as_deref().unwrap_or("strata-agent");
+            let max_lines = payload.lines.unwrap_or(100).min(500);
+            let lines = collect_logs(service, max_lines).await;
+            let resp = LogsResponsePayload {
+                request_id: payload.request_id,
+                service: service.to_string(),
+                lines,
+            };
+            send_message(state, &AgentMessage::LogsResponse(resp)).await;
+        }
+        ControlMessage::PowerCommand(payload) => {
+            tracing::info!(action = %payload.action, "received power.command");
+            let (success, error) = match payload.action.as_str() {
+                "restart_agent" => {
+                    // Trigger a graceful shutdown — the process supervisor will restart us
+                    let _ = state.shutdown_tx.send(true);
+                    (true, None)
                 }
-
-                send_envelope(state, "device.status", &build_heartbeat(state).await).await;
-            }
-        }
-        "config.set" => {
-            if let Ok(payload) = envelope.parse_payload::<ConfigSetPayload>() {
-                tracing::info!(receiver_url = ?payload.receiver_url, "received config.set");
-                {
-                    let mut r = state.receiver_url.lock().await;
-                    *r = payload.receiver_url.clone().filter(|s| !s.is_empty());
+                "reboot" | "shutdown" => {
+                    // Not safe in Docker dev — report success but don't actually execute
+                    (true, None)
                 }
-                let current = state.receiver_url.lock().await.clone();
-                let resp = ConfigSetResponsePayload {
-                    request_id: payload.request_id,
-                    success: true,
-                    receiver_url: current,
-                };
-                send_envelope(state, "config.set.response", &resp).await;
-                send_envelope(state, "device.status", &build_heartbeat(state).await).await;
-            }
+                other => (false, Some(format!("unknown power action: {other}"))),
+            };
+            let resp = PowerCommandResponsePayload {
+                request_id: payload.request_id,
+                success,
+                error,
+            };
+            send_message(state, &AgentMessage::PowerCommandResponse(resp)).await;
         }
-        "test.run" => {
-            if let Ok(payload) = envelope.parse_payload::<TestRunPayload>() {
-                tracing::info!("received test.run");
-                let control_connected = state
-                    .control_connected
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let sender_id = state.sender_id.lock().await.clone();
-                let control_url = state.control_url.lock().await.clone();
-                let receiver_url = state.receiver_url.lock().await.clone();
-
-                let cloud_reachable = match &control_url {
-                    Some(url) => crate::util::check_tcp_reachable(url, 5).await,
-                    None => false,
-                };
-                let receiver_reachable = match &receiver_url {
-                    Some(url) => crate::util::check_tcp_reachable(url, 3).await,
-                    None => false,
-                };
-
-                let resp = TestRunResponsePayload {
-                    request_id: payload.request_id,
-                    cloud_reachable,
-                    cloud_connected: control_connected,
-                    receiver_reachable,
-                    receiver_url,
-                    enrolled: sender_id.is_some(),
-                    control_url,
-                };
-                send_envelope(state, "test.run.response", &resp).await;
-            }
+        ControlMessage::TlsStatus(payload) => {
+            tracing::debug!("received tls.status");
+            let resp = TlsStatusResponsePayload {
+                request_id: payload.request_id,
+                enabled: true,
+                cert_subject: Some("CN=strata-agent".to_string()),
+                cert_issuer: Some("CN=strata-agent".to_string()),
+                expiry: Some("2026-01-01T00:00:00Z".to_string()),
+                self_signed: true,
+            };
+            send_message(state, &AgentMessage::TlsStatusResponse(resp)).await;
         }
-        "interfaces.scan" => {
-            if let Ok(payload) = envelope.parse_payload::<InterfacesScanPayload>() {
-                tracing::info!("received interfaces.scan");
-                let new_ifaces = state.hardware.discover_interfaces().await;
-                let hw = state.hardware.scan().await;
-                let resp = InterfacesScanResponsePayload {
-                    request_id: payload.request_id,
-                    discovered: new_ifaces,
-                    total: hw.interfaces.len(),
-                };
-                send_envelope(state, "interfaces.scan.response", &resp).await;
-                send_envelope(state, "device.status", &build_heartbeat(state).await).await;
-            }
+        ControlMessage::TlsRenew(payload) => {
+            tracing::info!("received tls.renew");
+            let resp = TlsRenewResponsePayload {
+                request_id: payload.request_id,
+                success: true,
+                error: None,
+            };
+            send_message(state, &AgentMessage::TlsRenewResponse(resp)).await;
         }
-        "files.list" => {
-            if let Ok(payload) = envelope.parse_payload::<FilesListPayload>() {
-                let req_path = payload.path.unwrap_or_else(|| "/opt/strata".to_string());
-                tracing::debug!(path = %req_path, "received files.list");
-                let (entries, error) = list_directory(&req_path);
-                let resp = FilesListResponsePayload {
-                    request_id: payload.request_id,
-                    path: req_path,
-                    entries,
-                    error,
-                };
-                send_envelope(state, "files.list.response", &resp).await;
-            }
+        ControlMessage::ConfigExport(payload) => {
+            tracing::debug!("received config.export");
+            let receiver_url = state.receiver_url.lock().await.clone();
+            let config = serde_json::json!({
+                "agent_version": env!("CARGO_PKG_VERSION"),
+                "receiver_url": receiver_url,
+            });
+            let resp = ConfigExportResponsePayload {
+                request_id: payload.request_id,
+                config,
+            };
+            send_message(state, &AgentMessage::ConfigExportResponse(resp)).await;
         }
-        "diagnostics.network" => {
-            if let Ok(payload) = envelope.parse_payload::<NetworkToolPayload>() {
-                tracing::info!(tool = %payload.tool, "received diagnostics.network");
-                let (output, success) =
-                    run_network_tool_impl(&payload.tool, payload.target.as_deref()).await;
-                let resp = NetworkToolResponsePayload {
-                    request_id: payload.request_id,
-                    tool: payload.tool,
-                    output,
-                    success,
+        ControlMessage::ConfigImport(payload) => {
+            tracing::info!("received config.import");
+            // Apply receiver_url if present in the imported config
+            if let Some(url) = payload.config.get("receiver_url").and_then(|v| v.as_str()) {
+                let mut r = state.receiver_url.lock().await;
+                *r = if url.is_empty() {
+                    None
+                } else {
+                    Some(url.to_string())
                 };
-                send_envelope(state, "diagnostics.network.response", &resp).await;
             }
+            let resp = ConfigImportResponsePayload {
+                request_id: payload.request_id,
+                success: true,
+                error: None,
+            };
+            send_message(state, &AgentMessage::ConfigImportResponse(resp)).await;
         }
-        "diagnostics.pcap" => {
-            if let Ok(payload) = envelope.parse_payload::<PcapCapturePayload>() {
-                tracing::info!(
-                    duration = payload.duration_secs,
-                    "received diagnostics.pcap"
-                );
-                let resp = PcapCaptureResponsePayload {
-                    request_id: payload.request_id,
-                    download_url: String::new(),
-                    file_size_bytes: None,
-                    duration_secs: payload.duration_secs,
-                };
-                send_envelope(state, "diagnostics.pcap.response", &resp).await;
-            }
+        ControlMessage::UpdatesCheck(payload) => {
+            tracing::debug!("received updates.check");
+            let resp = UpdatesCheckResponsePayload {
+                request_id: payload.request_id,
+                current_version: env!("CARGO_PKG_VERSION").to_string(),
+                latest_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                update_available: false,
+                release_notes: None,
+                update_size_bytes: None,
+            };
+            send_message(state, &AgentMessage::UpdatesCheckResponse(resp)).await;
         }
-        "logs.get" => {
-            if let Ok(payload) = envelope.parse_payload::<LogsRequestPayload>() {
-                tracing::debug!("received logs.get");
-                let service = payload.service.as_deref().unwrap_or("strata-agent");
-                let max_lines = payload.lines.unwrap_or(100).min(500);
-                let lines = collect_logs(service, max_lines).await;
-                let resp = LogsResponsePayload {
-                    request_id: payload.request_id,
-                    service: service.to_string(),
-                    lines,
-                };
-                send_envelope(state, "logs.get.response", &resp).await;
-            }
+        ControlMessage::UpdatesInstall(payload) => {
+            tracing::info!("received updates.install");
+            let resp = UpdatesInstallResponsePayload {
+                request_id: payload.request_id,
+                success: true,
+                error: None,
+            };
+            send_message(state, &AgentMessage::UpdatesInstallResponse(resp)).await;
         }
-        "power.command" => {
-            if let Ok(payload) = envelope.parse_payload::<PowerCommandPayload>() {
-                tracing::info!(action = %payload.action, "received power.command");
-                let (success, error) = match payload.action.as_str() {
-                    "restart_agent" => {
-                        // Trigger a graceful shutdown — the process supervisor will restart us
-                        let _ = state.shutdown_tx.send(true);
-                        (true, None)
-                    }
-                    "reboot" | "shutdown" => {
-                        // Not safe in Docker dev — report success but don't actually execute
-                        (true, None)
-                    }
-                    other => (false, Some(format!("unknown power action: {other}"))),
-                };
-                let resp = PowerCommandResponsePayload {
-                    request_id: payload.request_id,
-                    success,
-                    error,
-                };
-                send_envelope(state, "power.command.response", &resp).await;
-            }
+        ControlMessage::StreamDestinations(payload) => {
+            tracing::info!(
+                count = payload.destination_ids.len(),
+                "received stream.destinations"
+            );
+            let resp = StreamDestinationsResponsePayload {
+                request_id: payload.request_id,
+                success: true,
+                error: None,
+            };
+            send_message(state, &AgentMessage::StreamDestinationsResponse(resp)).await;
         }
-        "tls.status" => {
-            if let Ok(payload) = envelope.parse_payload::<TlsStatusPayload>() {
-                tracing::debug!("received tls.status");
-                let resp = TlsStatusResponsePayload {
-                    request_id: payload.request_id,
-                    enabled: true,
-                    cert_subject: Some("CN=strata-agent".to_string()),
-                    cert_issuer: Some("CN=strata-agent".to_string()),
-                    expiry: Some("2026-01-01T00:00:00Z".to_string()),
-                    self_signed: true,
-                };
-                send_envelope(state, "tls.status.response", &resp).await;
-            }
-        }
-        "tls.renew" => {
-            if let Ok(payload) = envelope.parse_payload::<TlsRenewPayload>() {
-                tracing::info!("received tls.renew");
-                let resp = TlsRenewResponsePayload {
-                    request_id: payload.request_id,
-                    success: true,
-                    error: None,
-                };
-                send_envelope(state, "tls.renew.response", &resp).await;
-            }
-        }
-        "config.export" => {
-            if let Ok(payload) = envelope.parse_payload::<ConfigExportPayload>() {
-                tracing::debug!("received config.export");
-                let receiver_url = state.receiver_url.lock().await.clone();
-                let config = serde_json::json!({
-                    "agent_version": env!("CARGO_PKG_VERSION"),
-                    "receiver_url": receiver_url,
-                });
-                let resp = ConfigExportResponsePayload {
-                    request_id: payload.request_id,
-                    config,
-                };
-                send_envelope(state, "config.export.response", &resp).await;
-            }
-        }
-        "config.import" => {
-            if let Ok(payload) = envelope.parse_payload::<ConfigImportPayload>() {
-                tracing::info!("received config.import");
-                // Apply receiver_url if present in the imported config
-                if let Some(url) = payload.config.get("receiver_url").and_then(|v| v.as_str()) {
-                    let mut r = state.receiver_url.lock().await;
-                    *r = if url.is_empty() {
-                        None
-                    } else {
-                        Some(url.to_string())
-                    };
-                }
-                let resp = ConfigImportResponsePayload {
-                    request_id: payload.request_id,
-                    success: true,
-                    error: None,
-                };
-                send_envelope(state, "config.import.response", &resp).await;
-            }
-        }
-        "updates.check" => {
-            if let Ok(payload) = envelope.parse_payload::<UpdatesCheckPayload>() {
-                tracing::debug!("received updates.check");
-                let resp = UpdatesCheckResponsePayload {
-                    request_id: payload.request_id,
-                    current_version: env!("CARGO_PKG_VERSION").to_string(),
-                    latest_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                    update_available: false,
-                    release_notes: None,
-                    update_size_bytes: None,
-                };
-                send_envelope(state, "updates.check.response", &resp).await;
-            }
-        }
-        "updates.install" => {
-            if let Ok(payload) = envelope.parse_payload::<UpdatesInstallPayload>() {
-                tracing::info!("received updates.install");
-                let resp = UpdatesInstallResponsePayload {
-                    request_id: payload.request_id,
-                    success: true,
-                    error: None,
-                };
-                send_envelope(state, "updates.install.response", &resp).await;
-            }
-        }
-        "stream.destinations" => {
-            if let Ok(payload) = envelope.parse_payload::<StreamDestinationsPayload>() {
-                tracing::info!(
-                    count = payload.destination_ids.len(),
-                    "received stream.destinations"
-                );
-                let resp = StreamDestinationsResponsePayload {
-                    request_id: payload.request_id,
-                    success: true,
-                    error: None,
-                };
-                send_envelope(state, "stream.destinations.response", &resp).await;
-            }
-        }
-        "stream.jitter_buffer" => {
-            if let Ok(payload) = envelope.parse_payload::<JitterBufferPayload>() {
-                tracing::info!(mode = %payload.mode, "received stream.jitter_buffer");
-                let resp = JitterBufferResponsePayload {
-                    request_id: payload.request_id,
-                    success: true,
-                    error: None,
-                };
-                send_envelope(state, "stream.jitter_buffer.response", &resp).await;
-            }
-        }
-        other => {
-            tracing::debug!(msg_type = %other, "unhandled control message");
+        ControlMessage::JitterBuffer(payload) => {
+            tracing::info!(mode = %payload.mode, "received stream.jitter_buffer");
+            let resp = JitterBufferResponsePayload {
+                request_id: payload.request_id,
+                success: true,
+                error: None,
+            };
+            send_message(state, &AgentMessage::JitterBufferResponse(resp)).await;
         }
     }
 }

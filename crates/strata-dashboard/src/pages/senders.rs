@@ -4,7 +4,7 @@ use leptos::prelude::*;
 
 use crate::AuthState;
 use crate::api;
-use crate::types::SenderSummary;
+use strata_protocol::api::SenderSummary;
 
 /// Displays all senders belonging to the authenticated user.
 #[component]

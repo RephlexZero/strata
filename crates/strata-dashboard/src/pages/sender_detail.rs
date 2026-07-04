@@ -17,10 +17,12 @@ mod tabs;
 
 use crate::AuthState;
 use crate::api;
-use crate::types::{
-    DashboardEvent, LinkStats, MediaInput, NetworkInterface, SenderDetail, StreamSummary,
-    TestRunResponse,
+use strata_protocol::api::{SenderDetail, SenderFullStatus, StreamSummary};
+use strata_protocol::models::{
+    LinkStats, MediaInput, NetworkInterface, StreamState, TransportReceiverMetrics,
+    TransportSenderMetrics,
 };
+use strata_protocol::{DashboardEvent, TestRunResponsePayload};
 use crate::ws::WsClient;
 
 use helpers::{apply_full_status, format_duration};
@@ -47,12 +49,12 @@ pub fn SenderDetailPage() -> impl IntoView {
     let (live_uptime, set_live_uptime) = signal(0u64);
     let (live_links, set_live_links) = signal(Vec::<LinkStats>::new());
     let (live_sender_metrics, set_live_sender_metrics) =
-        signal(Option::<crate::types::TransportSenderMetrics>::None);
+        signal(Option::<TransportSenderMetrics>::None);
     let (live_receiver_metrics, set_live_receiver_metrics) =
-        signal(Option::<crate::types::TransportReceiverMetrics>::None);
+        signal(Option::<TransportReceiverMetrics>::None);
     let (stream_state, set_stream_state) = signal(String::from("idle"));
     let (active_stream_id, set_active_stream_id) = signal(Option::<String>::None);
-    let (stream_detail, set_stream_detail) = signal(Option::<crate::types::StreamDetail>::None);
+    let (stream_detail, set_stream_detail) = signal(Option::<strata_protocol::api::StreamDetail>::None);
 
     // History for graph
     let (stats_history, set_stats_history) =
@@ -106,12 +108,12 @@ pub fn SenderDetailPage() -> impl IntoView {
     let (scan_msg, set_scan_msg) = signal(Option::<(String, &'static str)>::None);
 
     // Connectivity test
-    let (test_result, set_test_result) = signal(Option::<TestRunResponse>::None);
+    let (test_result, set_test_result) = signal(Option::<TestRunResponsePayload>::None);
     let (test_loading, set_test_loading) = signal(false);
 
     // Destination picker modal
     let (show_start_modal, set_show_start_modal) = signal(false);
-    let (destinations, set_destinations) = signal(Vec::<crate::types::DestinationSummary>::new());
+    let (destinations, set_destinations) = signal(Vec::<strata_protocol::api::DestinationSummary>::new());
     let (selected_dest, set_selected_dest) = signal(Option::<String>::None);
     let (selected_codec, set_selected_codec) = signal(String::from("h265"));
     let (dests_loading, set_dests_loading) = signal(false);
@@ -211,28 +213,20 @@ pub fn SenderDetailPage() -> impl IntoView {
         if let Some(event) = ws.last_event.get() {
             let sender_id = params.get().get("id").unwrap_or_default();
             match event {
-                DashboardEvent::StreamStats {
-                    sender_id: stats_sender_id,
-                    uptime_s,
-                    encoder_bitrate_kbps,
-                    links,
-                    sender_metrics,
-                    receiver_metrics,
-                    ..
-                } => {
-                    if stats_sender_id == sender_id {
-                        set_live_bitrate.set(encoder_bitrate_kbps);
-                        set_live_uptime.set(uptime_s);
-                        set_live_links.set(links.clone());
-                        set_live_sender_metrics.set(sender_metrics);
-                        set_live_receiver_metrics.set(receiver_metrics);
+                DashboardEvent::StreamStats(stats) => {
+                    if stats.sender_id == sender_id {
+                        set_live_bitrate.set(stats.encoder_bitrate_kbps);
+                        set_live_uptime.set(stats.uptime_s);
+                        set_live_links.set(stats.links.clone());
+                        set_live_sender_metrics.set(stats.sender_metrics.clone());
+                        set_live_receiver_metrics.set(stats.receiver_metrics.clone());
 
                         let now = js_sys::Date::now();
                         set_last_stats_ms.set(now);
                         set_signal_lost.set(false);
 
                         set_stats_history.update(|h| {
-                            h.push_back((now, links));
+                            h.push_back((now, stats.links));
                             if h.len() > 60 {
                                 // Keep last 60 seconds
                                 h.pop_front();
@@ -252,8 +246,8 @@ pub fn SenderDetailPage() -> impl IntoView {
                     ..
                 } => {
                     if sid == sender_id {
-                        set_stream_state.set(state.clone());
-                        if state == "starting" || state == "live" {
+                        set_stream_state.set(state.to_string());
+                        if matches!(state, StreamState::Starting | StreamState::Live) {
                             set_active_stream_id.set(Some(stream_id));
                         }
                     }
@@ -270,6 +264,16 @@ pub fn SenderDetailPage() -> impl IntoView {
                             }
                         });
                         if let Some(status) = status {
+                            let status = SenderFullStatus {
+                                network_interfaces: Some(status.network_interfaces),
+                                media_inputs: Some(status.media_inputs),
+                                stream_state: Some(status.stream_state),
+                                cpu_percent: Some(status.cpu_percent),
+                                mem_used_mb: Some(status.mem_used_mb),
+                                uptime_s: Some(status.uptime_s),
+                                receiver_url: status.receiver_url,
+                                ..Default::default()
+                            };
                             apply_full_status(
                                 &status,
                                 &set_hw_interfaces,
@@ -309,7 +313,7 @@ pub fn SenderDetailPage() -> impl IntoView {
         let token = auth_start2.token.get_untracked().unwrap_or_default();
         let dest_id = selected_dest.get_untracked();
         let codec = selected_codec.get_untracked();
-        let encoder = Some(crate::types::EncoderConfig {
+        let encoder = Some(strata_protocol::EncoderConfig {
             bitrate_kbps: 0,
             tune: None,
             keyint_max: None,

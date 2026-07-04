@@ -2,10 +2,11 @@
 name = "strata-common"
 version = "0.6.0"
 edition = "2024"
-description = "Shared types, protocol messages, auth, and database models for the Strata platform"
+description = "Server-side shared helpers for the Strata platform — auth, ID generation, metrics rendering"
 publish = false
 
 [dependencies]
+strata-protocol = { path = "../strata-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }

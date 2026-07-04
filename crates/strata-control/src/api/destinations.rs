@@ -9,9 +9,12 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, put};
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
 
 use strata_common::ids;
+use strata_protocol::api::{
+    CreateDestinationRequest, CreateDestinationResponse, DestinationSummary,
+    UpdateDestinationRequest,
+};
 
 use crate::api::auth::ApiError;
 use crate::state::AppState;
@@ -25,15 +28,6 @@ pub fn router() -> Router<AppState> {
 }
 
 // ── List Destinations ───────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct DestinationSummary {
-    pub id: String,
-    pub platform: String,
-    pub name: String,
-    pub url: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-}
 
 async fn list_destinations(
     State(state): State<AppState>,
@@ -62,19 +56,6 @@ async fn list_destinations(
 }
 
 // ── Create Destination ──────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct CreateDestinationRequest {
-    pub platform: String,
-    pub name: String,
-    pub url: String,
-    pub stream_key: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CreateDestinationResponse {
-    pub id: String,
-}
 
 async fn create_destination(
     State(state): State<AppState>,
@@ -105,13 +86,6 @@ async fn create_destination(
 }
 
 // ── Update Destination ──────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateDestinationRequest {
-    pub name: Option<String>,
-    pub url: Option<String>,
-    pub stream_key: Option<String>,
-}
 
 async fn update_destination(
     State(state): State<AppState>,

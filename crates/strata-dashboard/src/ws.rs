@@ -13,7 +13,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{MessageEvent, WebSocket};
 
-use crate::types::DashboardEvent;
+use strata_protocol::DashboardEvent;
 
 /// Holds the live event stream from the dashboard WebSocket.
 #[derive(Clone)]
@@ -67,7 +67,7 @@ fn build_ws_url() -> String {
 }
 
 /// Build the `auth.login` envelope JSON sent as the first WebSocket message.
-/// Matches `strata_common::protocol::Envelope` / `DashboardAuthPayload`'s
+/// Matches `strata_protocol::Envelope` / `DashboardAuthPayload`'s
 /// wire shape; `id`/`ts` aren't validated server-side beyond `payload` and
 /// `type`, so lightweight WASM-local values are fine here.
 fn build_auth_message(token: &str) -> String {
@@ -79,6 +79,7 @@ fn build_auth_message(token: &str) -> String {
         "id": format!("dashboard-{}", js_sys::Date::now()),
         "type": "auth.login",
         "ts": ts,
+        "proto_version": strata_protocol::PROTOCOL_VERSION,
         "payload": { "token": token },
     })
     .to_string()

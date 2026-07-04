@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use strata_common::protocol::{Envelope, ReceiverStreamEndedPayload, StreamEndReason};
+use strata_protocol::{Envelope, ReceiverMessage, ReceiverStreamEndedPayload, StreamEndReason};
 
 use crate::ReceiverState;
 
@@ -62,8 +62,8 @@ pub async fn run(state: Arc<ReceiverState>) {
                 total_bytes: exit_info.total_bytes,
             };
 
-            let envelope = Envelope::new("receiver.stream.ended", &ended);
-            if let Ok(json) = serde_json::to_string(&envelope) {
+            let envelope = Envelope::from_message(&ReceiverMessage::StreamEnded(ended));
+            if let Ok(json) = envelope.and_then(|e| serde_json::to_string(&e)) {
                 let _ = state.control_tx.send(json).await;
             }
         }

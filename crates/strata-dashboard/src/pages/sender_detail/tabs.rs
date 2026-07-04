@@ -3,10 +3,11 @@ use wasm_bindgen::JsCast;
 
 use crate::AuthState;
 use crate::api;
-use crate::types::{
-    FileEntry, LinkStats, MediaInput, NetworkInterface, SenderDetail, SourceSwitchRequest,
-    TestRunResponse,
+use strata_protocol::api::SenderDetail;
+use strata_protocol::models::{
+    InterfaceState, InterfaceType, LinkStats, MediaInput, MediaInputStatus, NetworkInterface,
 };
+use strata_protocol::{FileEntry, SourceSwitchPayload, TestRunResponsePayload};
 
 use super::cards::{
     AlertingRulesCard, BandwidthGraph, ConfigManagementCard, JitterBufferCard, LiveLogViewerCard,
@@ -31,7 +32,7 @@ fn platform_display_label(p: &str) -> &str {
 pub fn DestinationModal(
     show: ReadSignal<bool>,
     set_show: WriteSignal<bool>,
-    destinations: ReadSignal<Vec<crate::types::DestinationSummary>>,
+    destinations: ReadSignal<Vec<strata_protocol::api::DestinationSummary>>,
     selected_dest: ReadSignal<Option<String>>,
     set_selected_dest: WriteSignal<Option<String>>,
     selected_codec: ReadSignal<String>,
@@ -203,10 +204,10 @@ pub fn StreamTab(
     live_links: ReadSignal<Vec<LinkStats>>,
     live_bitrate: ReadSignal<u32>,
     stats_history: ReadSignal<std::collections::VecDeque<(f64, Vec<LinkStats>)>>,
-    sender_metrics: ReadSignal<Option<crate::types::TransportSenderMetrics>>,
-    receiver_metrics: ReadSignal<Option<crate::types::TransportReceiverMetrics>>,
+    sender_metrics: ReadSignal<Option<strata_protocol::models::TransportSenderMetrics>>,
+    receiver_metrics: ReadSignal<Option<strata_protocol::models::TransportReceiverMetrics>>,
     sender_id: Memo<String>,
-    stream_detail: ReadSignal<Option<crate::types::StreamDetail>>,
+    stream_detail: ReadSignal<Option<strata_protocol::api::StreamDetail>>,
 ) -> impl IntoView {
     view! {
         <div>
@@ -447,74 +448,8 @@ pub fn StreamTab(
             // Encoder controls
             <LiveSettingsCard sender_id=sender_id stream_state=stream_state live_bitrate=live_bitrate />
 
-            // Media Awareness Stats — NAL unit classification counters
-            <div
-                class="card bg-base-200 border border-base-300 mt-4"
-                style:display=move || {
-                    let st = stream_state.get();
-                    if st == "live" || st == "starting" { "block" } else { "none" }
-                }
-            >
-                <div class="card-body">
-                    <h3 class="card-title text-base">"Media Awareness"</h3>
-                    {move || {
-                        let sm = sender_metrics.get();
-                        let has_nal = sm.as_ref().map(|m| m.nal_critical_sent.is_some()).unwrap_or(false);
-                        if !has_nal {
-                            return view! {
-                                <p class="text-sm text-base-content/40">"Waiting for NAL unit telemetry…"</p>
-                            }.into_any();
-                        }
-                        let m = sm.unwrap();
-                        let critical = m.nal_critical_sent.unwrap_or(0);
-                        let reference = m.nal_reference_sent.unwrap_or(0);
-                        let standard = m.nal_standard_sent.unwrap_or(0);
-                        let disposable_sent = m.nal_disposable_sent.unwrap_or(0);
-                        let disposable_dropped = m.nal_disposable_dropped.unwrap_or(0);
-                        let total = critical + reference + standard + disposable_sent + disposable_dropped;
-
-                        view! {
-                            <div class="grid grid-cols-2 md:grid-cols-5 gap-2 mt-2">
-                                <div class="bg-base-300 rounded-lg p-3">
-                                    <div class="text-xs text-base-content/40 uppercase">"Critical (IDR/SPS/PPS)"</div>
-                                    <div class="font-mono font-semibold">{critical.to_string()}</div>
-                                    {(total > 0).then(|| {
-                                        let pct = (critical as f64 / total as f64) * 100.0;
-                                        view! { <div class="text-xs text-base-content/40">{format!("{:.1}%", pct)}</div> }
-                                    })}
-                                </div>
-                                <div class="bg-base-300 rounded-lg p-3">
-                                    <div class="text-xs text-base-content/40 uppercase">"Reference"</div>
-                                    <div class="font-mono font-semibold">{reference.to_string()}</div>
-                                    {(total > 0).then(|| {
-                                        let pct = (reference as f64 / total as f64) * 100.0;
-                                        view! { <div class="text-xs text-base-content/40">{format!("{:.1}%", pct)}</div> }
-                                    })}
-                                </div>
-                                <div class="bg-base-300 rounded-lg p-3">
-                                    <div class="text-xs text-base-content/40 uppercase">"Standard"</div>
-                                    <div class="font-mono font-semibold">{standard.to_string()}</div>
-                                    {(total > 0).then(|| {
-                                        let pct = (standard as f64 / total as f64) * 100.0;
-                                        view! { <div class="text-xs text-base-content/40">{format!("{:.1}%", pct)}</div> }
-                                    })}
-                                </div>
-                                <div class="bg-base-300 rounded-lg p-3">
-                                    <div class="text-xs text-base-content/40 uppercase">"Disposable Sent"</div>
-                                    <div class="font-mono font-semibold">{disposable_sent.to_string()}</div>
-                                </div>
-                                <div class="bg-base-300 rounded-lg p-3">
-                                    <div class="text-xs text-base-content/40 uppercase">"Disposable Dropped"</div>
-                                    <div class="font-mono font-semibold text-warning">{disposable_dropped.to_string()}</div>
-                                </div>
-                            </div>
-                        }.into_any()
-                    }}
-                </div>
-            </div>
-
             // Transport Tuning controls
-            <TransportTuningCard sender_id=sender_id stream_state=stream_state sender_metrics=sender_metrics />
+            <TransportTuningCard sender_id=sender_id stream_state=stream_state />
 
             // Multi-Destination Routing
             <MultiDestRoutingCard sender_id=sender_id stream_state=stream_state />
@@ -591,7 +526,7 @@ pub fn SourceTab(
                     set_switching.set(false);
                     return;
                 }
-                SourceSwitchRequest {
+                SourceSwitchPayload {
                     mode: "v4l2".into(),
                     device: Some(dev),
                     pattern: None,
@@ -605,14 +540,14 @@ pub fn SourceTab(
                     set_switching.set(false);
                     return;
                 }
-                SourceSwitchRequest {
+                SourceSwitchPayload {
                     mode: "uri".into(),
                     uri: Some(uri),
                     pattern: None,
                     device: None,
                 }
             }
-            _ => SourceSwitchRequest {
+            _ => SourceSwitchPayload {
                 mode: "test".into(),
                 pattern: Some(test_pattern.get_untracked()),
                 uri: None,
@@ -746,10 +681,10 @@ pub fn SourceTab(
                                                 let dev2 = input.device.clone();
                                                 let dev3 = input.device.clone();
                                                 let caps = input.capabilities.join(", ");
-                                                let status_badge = match input.status.as_str() {
-                                                    "available" => "badge badge-success badge-xs",
-                                                    "in_use" => "badge badge-warning badge-xs",
-                                                    _ => "badge badge-ghost badge-xs",
+                                                let (status_badge, status_label) = match input.status {
+                                                    MediaInputStatus::Available => ("badge badge-success badge-xs", "available"),
+                                                    MediaInputStatus::InUse => ("badge badge-warning badge-xs", "in_use"),
+                                                    MediaInputStatus::Error => ("badge badge-ghost badge-xs", "error"),
                                                 };
                                                 view! {
                                                     <label
@@ -766,7 +701,7 @@ pub fn SourceTab(
                                                         <div class="flex-1">
                                                             <div class="flex items-center gap-2">
                                                                 <span class="font-mono text-sm font-medium">{input.device.clone()}</span>
-                                                                <span class=status_badge>{input.status.clone()}</span>
+                                                                <span class=status_badge>{status_label}</span>
                                                             </div>
                                                             <div class="text-xs text-base-content/60">
                                                                 {input.label}
@@ -1080,7 +1015,7 @@ pub fn NetworkTab(
                             let name_toggle = iface.name.clone();
                             let auth = auth.clone();
                             let enabled = iface.enabled;
-                            let connected = iface.state == "connected";
+                            let connected = iface.state == InterfaceState::Connected;
 
                             let (badge_cls, label) = if !enabled {
                                 ("badge badge-error badge-sm", "Disabled")
@@ -1090,13 +1025,13 @@ pub fn NetworkTab(
                                 ("badge badge-ghost badge-sm", "Down")
                             };
 
-                            let type_icon = match iface.iface_type.as_str() {
-                                "cellular" => "📶",
-                                "wifi" => "📡",
-                                _ => "🔌",
+                            let (type_icon, type_label) = match iface.iface_type {
+                                InterfaceType::Cellular => ("📶", "cellular"),
+                                InterfaceType::Wifi => ("📡", "wifi"),
+                                InterfaceType::Ethernet => ("🔌", "ethernet"),
                             };
 
-                            let mut meta = vec![format!("{type_icon} {}", iface.iface_type)];
+                            let mut meta = vec![format!("{type_icon} {type_label}")];
                             if let Some(t) = &iface.technology { meta.push(t.clone()); }
                             if let Some(c) = &iface.carrier { meta.push(c.clone()); }
                             if let Some(b) = &iface.band { meta.push(format!("Band {b}")); }
@@ -1122,7 +1057,7 @@ pub fn NetworkTab(
                                 });
                             };
 
-                            let is_cellular = iface.iface_type == "cellular";
+                            let is_cellular = iface.iface_type == InterfaceType::Cellular;
                             let current_band = iface.band.clone();
                             let current_priority = iface.priority;
                             let name_lock = iface.name.clone();
@@ -1365,7 +1300,7 @@ pub fn SettingsTab(
     config_msg: ReadSignal<Option<(String, &'static str)>>,
     save_config: impl Fn(web_sys::MouseEvent) + 'static + Copy + Send,
     test_loading: ReadSignal<bool>,
-    test_result: ReadSignal<Option<TestRunResponse>>,
+    test_result: ReadSignal<Option<TestRunResponsePayload>>,
     run_test: impl Fn(web_sys::MouseEvent) + 'static + Copy + Send,
     unenroll_token: ReadSignal<Option<String>>,
     show_unenroll_confirm: ReadSignal<bool>,
@@ -1516,11 +1451,11 @@ pub fn SettingsTab(
                                 </tr>
                                 <tr>
                                     <td class="text-base-content/60">"Created"</td>
-                                    <td>{move || sender.get().map(|s| s.created_at.clone()).unwrap_or_default()}</td>
+                                    <td>{move || sender.get().map(|s| s.created_at.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default()}</td>
                                 </tr>
                                 <tr>
                                     <td class="text-base-content/60">"Last seen"</td>
-                                    <td>{move || sender.get().and_then(|s| s.last_seen_at.clone()).unwrap_or_else(|| "Never".into())}</td>
+                                    <td>{move || sender.get().and_then(|s| s.last_seen_at).map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(|| "Never".into())}</td>
                                 </tr>
                             </tbody>
                         </table>

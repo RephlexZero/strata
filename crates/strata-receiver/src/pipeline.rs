@@ -92,6 +92,11 @@ impl PipelineRegistry {
     }
 
     /// Number of currently running pipelines.
+    /// IDs of all currently-registered pipelines (for heartbeat reporting).
+    pub fn running_ids(&self) -> Vec<String> {
+        self.pipelines.keys().cloned().collect()
+    }
+
     pub fn active_count(&self) -> usize {
         self.pipelines.len()
     }

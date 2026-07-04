@@ -5,6 +5,7 @@ members = [
     "crates/strata-bonding",
     "crates/strata-gst",
     "crates/strata-sim",
+    "crates/strata-protocol",
     "crates/strata-common",
     "crates/strata-control",
     "crates/strata-sender",

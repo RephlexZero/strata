@@ -1,14 +1,13 @@
-//! Shared types for the Strata platform.
+//! Shared server-side helpers for the Strata platform.
 //!
 //! This crate contains:
-//! - **Protocol messages** — WebSocket message types between agent and control plane
 //! - **Auth primitives** — JWT creation/validation, Argon2id password hashing
-//! - **Data models** — User, Sender, Destination, Stream types
 //! - **ID generation** — Prefixed nanoid helpers (`usr_`, `snd_`, `str_`, `dst_`)
+//! - **Metrics rendering** — Prometheus text exposition
+//!
+//! Wire types (protocol messages, data models, REST API types, profiles)
+//! live in `strata-protocol` — the wasm-safe single source of truth.
 
 pub mod auth;
 pub mod ids;
 pub mod metrics;
-pub mod models;
-pub mod profiles;
-pub mod protocol;

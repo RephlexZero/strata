@@ -8,10 +8,10 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 
 use strata_common::auth;
 use strata_common::ids;
+use strata_protocol::api::{LoginRequest, LoginResponse, RegisterRequest, RegisterResponse};
 
 use crate::state::AppState;
 
@@ -22,18 +22,6 @@ pub fn router() -> Router<AppState> {
 }
 
 // ── Register ────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct RegisterRequest {
-    pub email: String,
-    pub password: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RegisterResponse {
-    pub user_id: String,
-    pub email: String,
-}
 
 async fn register(
     State(state): State<AppState>,
@@ -84,19 +72,6 @@ async fn register(
 }
 
 // ── Login ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct LoginRequest {
-    pub email: String,
-    pub password: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct LoginResponse {
-    pub token: String,
-    pub user_id: String,
-    pub role: String,
-}
 
 async fn login(
     State(state): State<AppState>,

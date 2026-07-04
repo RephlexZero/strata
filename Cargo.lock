@@ -3804,6 +3804,7 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "serde_json",
+ "strata-protocol",
  "thiserror 2.0.18",
  "uuid",
 ]
@@ -3822,6 +3823,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "strata-common",
+ "strata-protocol",
  "tokio",
  "tokio-tungstenite",
  "tower",
@@ -3835,6 +3837,7 @@ dependencies = [
 name = "strata-dashboard"
 version = "0.6.0"
 dependencies = [
+ "chrono",
  "console_error_panic_hook",
  "console_log",
  "gloo-net",
@@ -3845,6 +3848,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "strata-protocol",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -3867,9 +3871,20 @@ dependencies = [
  "serde_json",
  "strata-bonding",
  "strata-common",
+ "strata-protocol",
  "toml",
  "tracing",
  "ureq",
+]
+
+[[package]]
+name = "strata-protocol"
+version = "0.6.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -3885,6 +3900,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strata-common",
+ "strata-protocol",
  "sysinfo",
  "tokio",
  "tokio-tungstenite",
@@ -3906,6 +3922,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strata-common",
+ "strata-protocol",
  "sysinfo",
  "tokio",
  "tokio-tungstenite",

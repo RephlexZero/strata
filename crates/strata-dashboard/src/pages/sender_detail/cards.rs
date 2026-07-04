@@ -4,7 +4,8 @@ use wasm_bindgen::prelude::*;
 
 use crate::AuthState;
 use crate::api;
-use crate::types::{EncoderConfigUpdate, LinkStats, StreamConfigUpdateRequest};
+use strata_protocol::models::LinkStats;
+use strata_protocol::{ConfigUpdatePayload, EncoderConfigUpdate};
 
 use super::helpers::format_bytes;
 
@@ -119,7 +120,7 @@ pub fn BandwidthGraph(
 pub fn OtaUpdatesCard(sender_id: Memo<String>, is_online: Memo<bool>) -> impl IntoView {
     let auth = expect_context::<AuthState>();
 
-    let (update_info, set_update_info) = signal(Option::<crate::types::UpdateInfo>::None);
+    let (update_info, set_update_info) = signal(Option::<strata_protocol::UpdatesCheckResponsePayload>::None);
     let (checking, set_checking) = signal(false);
     let (installing, set_installing) = signal(false);
     let (ota_msg, set_ota_msg) = signal(Option::<(String, &'static str)>::None);
@@ -229,7 +230,7 @@ pub fn LiveLogViewerCard(sender_id: Memo<String>, is_online: Memo<bool>) -> impl
     let auth = expect_context::<AuthState>();
 
     let (log_service, set_log_service) = signal(String::from("strata-bonding"));
-    let (log_lines, set_log_lines) = signal(Vec::<crate::types::LogLine>::new());
+    let (log_lines, set_log_lines) = signal(Vec::<strata_protocol::LogLineEntry>::new());
     let (loading, set_loading) = signal(false);
     let (log_count, set_log_count) = signal(100u32);
     let (filter_text, set_filter_text) = signal(String::new());
@@ -336,7 +337,7 @@ pub fn NetworkToolsCard(sender_id: Memo<String>, is_online: Memo<bool>) -> impl 
     let (tool, set_tool) = signal(String::from("ping"));
     let (target, set_target) = signal(String::from("8.8.8.8"));
     let (running, set_running) = signal(false);
-    let (result, set_result) = signal(Option::<crate::types::NetworkToolResult>::None);
+    let (result, set_result) = signal(Option::<strata_protocol::NetworkToolResponsePayload>::None);
 
     let do_run = move |_: web_sys::MouseEvent| {
         let token = auth.token.get_untracked().unwrap_or_default();
@@ -349,7 +350,8 @@ pub fn NetworkToolsCard(sender_id: Memo<String>, is_online: Memo<bool>) -> impl 
         leptos::task::spawn_local(async move {
             match api::run_network_tool(&token, &id, &t, tgt_opt.as_deref()).await {
                 Ok(r) => set_result.set(Some(r)),
-                Err(e) => set_result.set(Some(crate::types::NetworkToolResult {
+                Err(e) => set_result.set(Some(strata_protocol::NetworkToolResponsePayload {
+                    request_id: String::new(),
                     tool: t,
                     output: format!("Error: {e}"),
                     success: false,
@@ -412,7 +414,7 @@ pub fn PcapCaptureCard(sender_id: Memo<String>, is_online: Memo<bool>) -> impl I
 
     let (duration, set_duration) = signal(10u32);
     let (capturing, set_capturing) = signal(false);
-    let (pcap_result, set_pcap_result) = signal(Option::<crate::types::PcapResponse>::None);
+    let (pcap_result, set_pcap_result) = signal(Option::<strata_protocol::PcapCaptureResponsePayload>::None);
     let (pcap_msg, set_pcap_msg) = signal(Option::<(String, &'static str)>::None);
 
     let do_capture = move |_: web_sys::MouseEvent| {
@@ -494,7 +496,7 @@ pub fn PcapCaptureCard(sender_id: Memo<String>, is_online: Memo<bool>) -> impl I
 pub fn AlertingRulesCard(sender_id: Memo<String>, is_online: Memo<bool>) -> impl IntoView {
     let auth = expect_context::<AuthState>();
 
-    let (rules, set_rules) = signal(Vec::<crate::types::AlertRule>::new());
+    let (rules, set_rules) = signal(Vec::<strata_protocol::api::AlertRule>::new());
     let (loading, set_loading) = signal(false);
     let (show_create, set_show_create) = signal(false);
     let (alert_msg, set_alert_msg) = signal(Option::<(String, &'static str)>::None);
@@ -536,7 +538,7 @@ pub fn AlertingRulesCard(sender_id: Memo<String>, is_online: Memo<bool>) -> impl
         let metric = new_metric.get_untracked();
         let condition = new_condition.get_untracked();
         let threshold: f64 = new_threshold.get_untracked().parse().unwrap_or(0.0);
-        let rule = crate::types::AlertRule {
+        let rule = strata_protocol::api::AlertRule {
             id: None,
             name,
             metric,
@@ -730,7 +732,8 @@ pub fn LiveSettingsCard(
             None
         };
 
-        let req = StreamConfigUpdateRequest {
+        let req = ConfigUpdatePayload {
+            request_id: None,
             encoder: Some(EncoderConfigUpdate {
                 bitrate_kbps: br,
                 tune: Some(tune.get_untracked()),
@@ -866,15 +869,11 @@ pub fn LiveSettingsCard(
 pub fn TransportTuningCard(
     sender_id: Memo<String>,
     stream_state: ReadSignal<String>,
-    sender_metrics: ReadSignal<Option<crate::types::TransportSenderMetrics>>,
 ) -> impl IntoView {
     let auth = expect_context::<AuthState>();
 
     let (scheduler_mode, set_scheduler_mode) = signal(String::from("redundancy_enabled"));
     let (capacity_floor, set_capacity_floor) = signal(5000u32); // kbps
-    let (fec_overhead, set_fec_overhead) = signal(20u32); // %
-    let (fec_layer, set_fec_layer) = signal(String::from("rlnc"));
-    let (blest_threshold, set_blest_threshold) = signal(50u32); // ms
     let (applying, set_applying) = signal(false);
     let (apply_msg, set_apply_msg) = signal(Option::<(String, &'static str)>::None);
 
@@ -884,18 +883,15 @@ pub fn TransportTuningCard(
         set_applying.set(true);
         set_apply_msg.set(None);
 
-        let req = StreamConfigUpdateRequest {
+        let req = ConfigUpdatePayload {
+            request_id: None,
             encoder: None,
             scheduler: Some(serde_json::json!({
                 "critical_broadcast": scheduler_mode.get_untracked() == "critical_broadcast",
                 "redundancy_enabled": scheduler_mode.get_untracked() == "redundancy_enabled",
                 "capacity_floor_bps": capacity_floor.get_untracked() * 1000,
-                "fec_overhead_percent": fec_overhead.get_untracked(),
             })),
-            fec: Some(crate::types::FecConfigUpdate {
-                layer: Some(fec_layer.get_untracked()),
-                blest_threshold_ms: Some(blest_threshold.get_untracked()),
-            }),
+            fec: None,
         };
 
         leptos::task::spawn_local(async move {
@@ -928,26 +924,6 @@ pub fn TransportTuningCard(
                     };
                     view! { <div class={cls}>{msg}</div> }
                 })}
-
-                // ── Live FEC Overhead display ──
-                {move || {
-                    let sm = sender_metrics.get();
-                    sm.as_ref().and_then(|m| m.fec_overhead_ratio).map(|ratio| {
-                        let layer_str = sm.as_ref().and_then(|m| m.fec_layer.clone()).unwrap_or_else(|| "—".into());
-                        view! {
-                            <div class="bg-base-300 rounded-lg p-3 mt-2 flex items-center justify-between">
-                                <div>
-                                    <div class="text-xs text-base-content/40 uppercase">"Current FEC Overhead"</div>
-                                    <div class="font-mono font-semibold text-lg">{format!("{:.1}%", ratio * 100.0)}</div>
-                                </div>
-                                <div>
-                                    <div class="text-xs text-base-content/40 uppercase">"Active Layer"</div>
-                                    <div class="font-mono text-sm">{layer_str}</div>
-                                </div>
-                            </div>
-                        }
-                    })
-                }}
 
                 <div class="mt-3 grid grid-cols-1 md:grid-cols-2 gap-4">
                     // Scheduler Mode
@@ -996,80 +972,6 @@ pub fn TransportTuningCard(
                         </p>
                     </fieldset>
 
-                    // TAROT FEC Overhead
-                    <fieldset class="fieldset">
-                        <label class="fieldset-label">"TAROT FEC Target Overhead (%)"</label>
-                        <div class="flex items-center gap-3">
-                            <input
-                                type="range" class="range range-sm range-primary flex-1"
-                                min="0" max="100" step="5"
-                                prop:value=move || fec_overhead.get().to_string()
-                                on:input=move |ev| {
-                                    if let Ok(v) = event_target_value(&ev).parse::<u32>() {
-                                        set_fec_overhead.set(v);
-                                    }
-                                }
-                            />
-                            <input
-                                type="number" class="input input-bordered input-sm w-24 font-mono text-right"
-                                min="0" max="100" step="5"
-                                prop:value=move || fec_overhead.get().to_string()
-                                on:input=move |ev| {
-                                    if let Ok(v) = event_target_value(&ev).parse::<u32>() {
-                                        set_fec_overhead.set(v.clamp(0, 100));
-                                    }
-                                }
-                            />
-                        </div>
-                        <p class="text-xs text-base-content/40 mt-1">
-                            "Target FEC overhead. Higher values increase reliability at the cost of bandwidth."
-                        </p>
-                    </fieldset>
-
-                    // FEC Layer Toggle
-                    <fieldset class="fieldset">
-                        <label class="fieldset-label">"FEC Layer"</label>
-                        <select
-                            class="select select-bordered select-sm w-full"
-                            on:change=move |ev| set_fec_layer.set(event_target_value(&ev))
-                        >
-                            <option value="rlnc" selected=move || fec_layer.get() == "rlnc">"Layer 1 — Sliding-Window RLNC"</option>
-                            <option value="raptorq" selected=move || fec_layer.get() == "raptorq">"Layer 1b — UEP / RaptorQ"</option>
-                        </select>
-                        <p class="text-xs text-base-content/40 mt-1">
-                            "RLNC for low-latency streaming; RaptorQ for higher-loss environments."
-                        </p>
-                    </fieldset>
-
-                    // BLEST Head-of-Line Blocking Threshold
-                    <fieldset class="fieldset">
-                        <label class="fieldset-label">"BLEST HoL Threshold (ms)"</label>
-                        <div class="flex items-center gap-3">
-                            <input
-                                type="range" class="range range-sm range-primary flex-1"
-                                min="10" max="500" step="10"
-                                prop:value=move || blest_threshold.get().to_string()
-                                on:input=move |ev| {
-                                    if let Ok(v) = event_target_value(&ev).parse::<u32>() {
-                                        set_blest_threshold.set(v);
-                                    }
-                                }
-                            />
-                            <input
-                                type="number" class="input input-bordered input-sm w-24 font-mono text-right"
-                                min="10" max="500" step="10"
-                                prop:value=move || blest_threshold.get().to_string()
-                                on:input=move |ev| {
-                                    if let Ok(v) = event_target_value(&ev).parse::<u32>() {
-                                        set_blest_threshold.set(v.clamp(10, 500));
-                                    }
-                                }
-                            />
-                        </div>
-                        <p class="text-xs text-base-content/40 mt-1">
-                            "BLEST Head-of-Line blocking threshold. Prevents scheduling to slow links."
-                        </p>
-                    </fieldset>
                 </div>
 
                 <div class="card-actions justify-end mt-3">
@@ -1097,7 +999,7 @@ pub fn MultiDestRoutingCard(
 ) -> impl IntoView {
     let auth = expect_context::<AuthState>();
 
-    let (destinations, set_destinations) = signal(Vec::<crate::types::DestinationSummary>::new());
+    let (destinations, set_destinations) = signal(Vec::<strata_protocol::api::DestinationSummary>::new());
     let (active_ids, set_active_ids) = signal(Vec::<String>::new());
     let (applying, set_applying) = signal(false);
     let (msg, set_msg) = signal(Option::<(String, &'static str)>::None);
@@ -1218,7 +1120,7 @@ pub fn MultiDestRoutingCard(
 pub fn JitterBufferCard(
     sender_id: Memo<String>,
     stream_state: ReadSignal<String>,
-    receiver_metrics: ReadSignal<Option<crate::types::TransportReceiverMetrics>>,
+    receiver_metrics: ReadSignal<Option<strata_protocol::models::TransportReceiverMetrics>>,
 ) -> impl IntoView {
     let auth = expect_context::<AuthState>();
 
@@ -1573,7 +1475,7 @@ pub fn ConfigManagementCard(sender_id: Memo<String>, is_online: Memo<bool>) -> i
 pub fn TlsManagementCard(sender_id: Memo<String>, is_online: Memo<bool>) -> impl IntoView {
     let auth = expect_context::<AuthState>();
 
-    let (tls_status, set_tls_status) = signal(Option::<crate::types::TlsStatus>::None);
+    let (tls_status, set_tls_status) = signal(Option::<strata_protocol::TlsStatusResponsePayload>::None);
     let (loading, set_loading) = signal(false);
     let (renewing, set_renewing) = signal(false);
     let (tls_msg, set_tls_msg) = signal(Option::<(String, &'static str)>::None);

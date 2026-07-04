@@ -8,7 +8,7 @@
 //! - Stream state changes (starting, live, ended, failed)
 //!
 //! The first message on the socket must be an `auth.login` envelope
-//! carrying the user's session JWT (see `strata_common::protocol::
+//! carrying the user's session JWT (see `strata_protocol::
 //! DashboardAuthPayload`) — mirroring the agent/receiver WS handshake
 //! rather than a `?token=` query param, since tokens in URLs end up in
 //! proxy/access logs. Every event delivered afterwards is scoped to the
@@ -20,8 +20,8 @@ use axum::response::IntoResponse;
 use futures::SinkExt;
 use futures::stream::StreamExt;
 
-use strata_common::protocol::{
-    DashboardAuthPayload, DashboardAuthResponsePayload, DashboardEvent, Envelope,
+use strata_protocol::{
+    DashboardAuthPayload, DashboardAuthResponsePayload, DashboardEvent, Envelope, PROTOCOL_VERSION,
 };
 
 use crate::state::AppState;
@@ -104,9 +104,9 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     {
         for (stream_id, sender_id, state_str) in rows {
             let stream_state = match state_str.as_str() {
-                "starting" => strata_common::models::StreamState::Starting,
-                "live" => strata_common::models::StreamState::Live,
-                "stopping" => strata_common::models::StreamState::Stopping,
+                "starting" => strata_protocol::models::StreamState::Starting,
+                "live" => strata_protocol::models::StreamState::Live,
+                "stopping" => strata_protocol::models::StreamState::Stopping,
                 _ => continue,
             };
             snapshot.push(DashboardEvent::StreamStateChanged {
@@ -181,6 +181,14 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
 async fn authenticate(state: &AppState, raw: &str) -> Result<(String, String), String> {
     let envelope: Envelope =
         serde_json::from_str(raw).map_err(|e| error_response(&format!("invalid message: {e}")))?;
+
+    if envelope.proto_version != PROTOCOL_VERSION {
+        tracing::warn!(
+            client_proto = envelope.proto_version,
+            ours = PROTOCOL_VERSION,
+            "dashboard client speaks a different protocol version"
+        );
+    }
 
     if envelope.msg_type != "auth.login" {
         return Err(error_response("first message must be auth.login"));

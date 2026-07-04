@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 strata-common = { path = "../strata-common" }
+strata-protocol = { path = "../strata-protocol" }
 
 # Web framework
 axum = { version = "0.8", features = ["ws", "macros"] }

@@ -4,7 +4,7 @@ use leptos::prelude::*;
 
 use crate::AuthState;
 use crate::api;
-use crate::types::StreamSummary;
+use strata_protocol::api::StreamSummary;
 
 /// Lists active and recent streams.
 #[component]
@@ -95,7 +95,7 @@ pub fn StreamsPage() -> impl IntoView {
                                                             {stream.state.clone().to_uppercase()}
                                                         </span>
                                                     </td>
-                                                    <td class="text-xs">{stream.started_at.clone().unwrap_or_else(|| "—".into())}</td>
+                                                    <td class="text-xs">{stream.started_at.map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string()).unwrap_or_else(|| "—".into())}</td>
                                                 </tr>
                                             }
                                         }

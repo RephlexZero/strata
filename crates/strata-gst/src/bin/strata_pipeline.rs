@@ -578,7 +578,7 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     // Resolve min/max from CLI or profile defaults
     let profile =
-        strata_common::profiles::lookup_profile(Some(resolution), Some(framerate), Some(codec_str));
+        strata_protocol::profiles::lookup_profile(Some(resolution), Some(framerate), Some(codec_str));
     let min_bitrate_kbps_val = min_bitrate_kbps.unwrap_or(profile.min_kbps);
     let max_bitrate_kbps_val = max_bitrate_kbps.unwrap_or(profile.max_kbps);
 

@@ -18,9 +18,9 @@ use futures::stream::StreamExt;
 use tokio::sync::mpsc;
 
 use strata_common::auth;
-use strata_common::protocol::{
-    AuthLoginPayload, AuthLoginResponsePayload, DashboardEvent, DeviceStatusPayload, Envelope,
-    StreamEndedPayload, StreamStatsPayload,
+use strata_protocol::{
+    AgentMessage, AuthLoginPayload, AuthLoginResponsePayload, ControlMessage, DashboardEvent,
+    Envelope, PROTOCOL_VERSION,
 };
 
 use crate::state::{AgentHandle, AppState};
@@ -141,7 +141,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
             DashboardEvent::StreamStateChanged {
                 stream_id: stream_id.clone(),
                 sender_id: sender_id.clone(),
-                state: strata_common::models::StreamState::Ended,
+                state: strata_protocol::models::StreamState::Ended,
                 error: Some("agent disconnected".into()),
             },
         );
@@ -170,13 +170,19 @@ async fn authenticate(
     let envelope: Envelope =
         serde_json::from_str(raw).map_err(|e| error_response(&format!("invalid message: {e}")))?;
 
-    if envelope.msg_type != "auth.login" {
-        return Err(error_response("first message must be auth.login"));
+    if envelope.proto_version != PROTOCOL_VERSION {
+        tracing::warn!(
+            agent_proto = envelope.proto_version,
+            ours = PROTOCOL_VERSION,
+            "agent speaks a different protocol version"
+        );
     }
 
-    let payload: AuthLoginPayload = envelope
-        .parse_payload()
-        .map_err(|e| error_response(&format!("invalid auth.login payload: {e}")))?;
+    let payload: AuthLoginPayload = match envelope.parse_message::<AgentMessage>() {
+        Ok(AgentMessage::AuthLogin(p)) => p,
+        Ok(_) => return Err(error_response("first message must be auth.login")),
+        Err(e) => return Err(error_response(&format!("invalid auth.login message: {e}"))),
+    };
 
     // Try enrollment token first, then device key
     if let Some(ref token) = payload.enrollment_token {
@@ -241,7 +247,8 @@ async fn authenticate_enrollment(
                 error: None,
             };
 
-            let envelope = Envelope::new("auth.login.response", &response);
+            let envelope =
+                Envelope::from_message(&ControlMessage::AuthLoginResponse(response)).unwrap();
             let json = serde_json::to_string(&envelope).unwrap();
 
             tracing::info!(sender_id = %sender_id, hostname = %payload.hostname, "sender enrolled");
@@ -268,124 +275,133 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, owner_id: &str,
         }
     };
 
-    match envelope.msg_type.as_str() {
-        "device.status" => {
-            if let Ok(payload) = envelope.parse_payload::<DeviceStatusPayload>() {
-                // Update last_seen_at
-                let _ = sqlx::query("UPDATE senders SET last_seen_at = $1 WHERE id = $2")
-                    .bind(Utc::now())
-                    .bind(sender_id)
-                    .execute(state.pool())
-                    .await;
-
-                // Cache latest status for REST API consumers
-                state
-                    .device_status()
-                    .insert(sender_id.to_string(), payload.clone());
-
-                // Broadcast to dashboard
-                state.broadcast_dashboard(
-                    owner_id,
-                    DashboardEvent::SenderStatus {
-                        sender_id: sender_id.to_string(),
-                        online: true,
-                        status: Some(payload),
-                    },
-                );
-            }
+    let msg: AgentMessage = match envelope.parse_message() {
+        Ok(m) => m,
+        Err(_) => {
+            tracing::debug!(
+                sender_id = %sender_id,
+                msg_type = %envelope.msg_type,
+                "unhandled agent message type"
+            );
+            return;
         }
-        "stream.stats" => {
-            if let Ok(mut payload) = envelope.parse_payload::<StreamStatsPayload>() {
-                // Stamp sender_id and timestamp at the trust boundary
-                payload.sender_id = sender_id.to_string();
-                payload.timestamp_ms = chrono::Utc::now().timestamp_millis() as u64;
+    };
 
-                // Transition stream from 'starting' → 'live' on first stats message.
-                // Only run the UPDATE if we haven't already transitioned this stream.
-                if !state.live_streams().contains(&payload.stream_id) {
-                    let rows = sqlx::query(
-                        "UPDATE streams SET state = 'live' WHERE id = $1 AND state = 'starting'",
-                    )
-                    .bind(&payload.stream_id)
-                    .execute(state.pool())
-                    .await;
-
-                    // Track the stream as live so we don't re-query every second
-                    state.live_streams().insert(payload.stream_id.clone());
-
-                    // Only broadcast state change on the actual transition
-                    if rows.as_ref().map(|r| r.rows_affected()).unwrap_or(0) > 0 {
-                        state.broadcast_dashboard(
-                            owner_id,
-                            DashboardEvent::StreamStateChanged {
-                                stream_id: payload.stream_id.clone(),
-                                sender_id: sender_id.to_string(),
-                                state: strata_common::models::StreamState::Live,
-                                error: None,
-                            },
-                        );
-                    }
-                }
-
-                state.broadcast_dashboard(owner_id, DashboardEvent::StreamStats(payload.clone()));
-
-                // Cache latest stats for the /metrics endpoint
-                state.stream_stats().insert(sender_id.to_string(), payload);
-            }
+    match msg {
+        AgentMessage::AuthLogin(_) => {
+            tracing::debug!(sender_id = %sender_id, "duplicate auth.login ignored");
         }
-        "stream.ended" => {
-            if let Ok(payload) = envelope.parse_payload::<StreamEndedPayload>() {
-                // Remove from live_streams tracking
-                state.live_streams().remove(&payload.stream_id);
-
-                // Update stream record
-                let _ = sqlx::query(
-                    "UPDATE streams SET state = 'ended', ended_at = $1, total_bytes = $2 WHERE id = $3",
-                )
+        AgentMessage::DeviceStatus(payload) => {
+            // Update last_seen_at
+            let _ = sqlx::query("UPDATE senders SET last_seen_at = $1 WHERE id = $2")
                 .bind(Utc::now())
-                .bind(payload.total_bytes as i64)
+                .bind(sender_id)
+                .execute(state.pool())
+                .await;
+
+            // Cache latest status for REST API consumers
+            state
+                .device_status()
+                .insert(sender_id.to_string(), payload.clone());
+
+            // Broadcast to dashboard
+            state.broadcast_dashboard(
+                owner_id,
+                DashboardEvent::SenderStatus {
+                    sender_id: sender_id.to_string(),
+                    online: true,
+                    status: Some(payload),
+                },
+            );
+        }
+        AgentMessage::StreamStats(mut payload) => {
+            // Stamp sender_id and timestamp at the trust boundary
+            payload.sender_id = sender_id.to_string();
+            payload.timestamp_ms = chrono::Utc::now().timestamp_millis() as u64;
+
+            // Transition stream from 'starting' → 'live' on first stats message.
+            // Only run the UPDATE if we haven't already transitioned this stream.
+            if !state.live_streams().contains(&payload.stream_id) {
+                let rows = sqlx::query(
+                    "UPDATE streams SET state = 'live' WHERE id = $1 AND state = 'starting'",
+                )
                 .bind(&payload.stream_id)
                 .execute(state.pool())
                 .await;
 
-                state.broadcast_dashboard(
-                    owner_id,
-                    DashboardEvent::StreamStateChanged {
-                        stream_id: payload.stream_id,
-                        sender_id: sender_id.to_string(),
-                        state: strata_common::models::StreamState::Ended,
-                        error: None,
-                    },
-                );
+                // Track the stream as live so we don't re-query every second
+                state.live_streams().insert(payload.stream_id.clone());
+
+                // Only broadcast state change on the actual transition
+                if rows.as_ref().map(|r| r.rows_affected()).unwrap_or(0) > 0 {
+                    state.broadcast_dashboard(
+                        owner_id,
+                        DashboardEvent::StreamStateChanged {
+                            stream_id: payload.stream_id.clone(),
+                            sender_id: sender_id.to_string(),
+                            state: strata_protocol::models::StreamState::Live,
+                            error: None,
+                        },
+                    );
+                }
             }
+
+            state.broadcast_dashboard(owner_id, DashboardEvent::StreamStats(payload.clone()));
+
+            // Cache latest stats for the /metrics endpoint
+            state.stream_stats().insert(sender_id.to_string(), payload);
         }
-        // Route request-response messages back to pending callers
-        "config.set.response"
-        | "config.update.response"
-        | "test.run.response"
-        | "interfaces.scan.response"
-        | "interface.command.response"
-        | "files.list.response"
-        | "diagnostics.network.response"
-        | "diagnostics.pcap.response"
-        | "logs.get.response"
-        | "power.command.response"
-        | "tls.status.response"
-        | "tls.renew.response"
-        | "config.export.response"
-        | "config.import.response"
-        | "updates.check.response"
-        | "updates.install.response"
-        | "stream.destinations.response"
-        | "stream.jitter_buffer.response" => {
-            if let Some(request_id) = envelope.payload.get("request_id").and_then(|v| v.as_str())
+        AgentMessage::StreamEnded(payload) => {
+            // Remove from live_streams tracking
+            state.live_streams().remove(&payload.stream_id);
+
+            // Update stream record
+            let _ = sqlx::query(
+                "UPDATE streams SET state = 'ended', ended_at = $1, total_bytes = $2 WHERE id = $3",
+            )
+            .bind(Utc::now())
+            .bind(payload.total_bytes as i64)
+            .bind(&payload.stream_id)
+            .execute(state.pool())
+            .await;
+
+            state.broadcast_dashboard(
+                owner_id,
+                DashboardEvent::StreamStateChanged {
+                    stream_id: payload.stream_id,
+                    sender_id: sender_id.to_string(),
+                    state: strata_protocol::models::StreamState::Ended,
+                    error: None,
+                },
+            );
+        }
+        // RPC responses — route the raw payload back to the pending REST
+        // caller by request_id. Listed explicitly (no catch-all) so a new
+        // message type is a compile error until this hub decides what to do
+        // with it.
+        msg @ (AgentMessage::ConfigSetResponse(_)
+        | AgentMessage::ConfigUpdateResponse(_)
+        | AgentMessage::TestRunResponse(_)
+        | AgentMessage::InterfacesScanResponse(_)
+        | AgentMessage::InterfaceCommandResponse(_)
+        | AgentMessage::FilesListResponse(_)
+        | AgentMessage::NetworkToolResponse(_)
+        | AgentMessage::PcapCaptureResponse(_)
+        | AgentMessage::LogsResponse(_)
+        | AgentMessage::PowerCommandResponse(_)
+        | AgentMessage::TlsStatusResponse(_)
+        | AgentMessage::TlsRenewResponse(_)
+        | AgentMessage::ConfigExportResponse(_)
+        | AgentMessage::ConfigImportResponse(_)
+        | AgentMessage::UpdatesCheckResponse(_)
+        | AgentMessage::UpdatesInstallResponse(_)
+        | AgentMessage::StreamDestinationsResponse(_)
+        | AgentMessage::JitterBufferResponse(_)) => {
+            if let Some(request_id) = msg.request_id()
                 && let Some((_, tx)) = state.pending_requests().remove(request_id)
             {
                 let _ = tx.send(envelope.payload.clone());
             }
-        }
-        other => {
-            tracing::debug!(sender_id = %sender_id, msg_type = %other, "unhandled agent message type");
         }
     }
 }
@@ -398,6 +414,6 @@ fn error_response(msg: &str) -> String {
         session_token: None,
         error: Some(msg.to_string()),
     };
-    let envelope = Envelope::new("auth.login.response", &response);
+    let envelope = Envelope::from_message(&ControlMessage::AuthLoginResponse(response)).unwrap();
     serde_json::to_string(&envelope).unwrap()
 }

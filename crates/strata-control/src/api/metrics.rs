@@ -141,8 +141,8 @@ pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use strata_common::models::LinkStats;
-    use strata_common::protocol::StreamStatsPayload;
+    use strata_protocol::models::LinkStats;
+    use strata_protocol::StreamStatsPayload;
 
     #[test]
     fn fleet_metrics_rendering() {

@@ -7,7 +7,7 @@ use sqlx::PgPool;
 use tokio::sync::{broadcast, oneshot};
 
 use strata_common::auth::JwtContext;
-use strata_common::protocol::{
+use strata_protocol::{
     DashboardEvent, DeviceStatusPayload, ReceiverStatusPayload, StreamStatsPayload,
 };
 

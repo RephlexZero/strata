@@ -3,7 +3,7 @@
 //! Renders `LinkStats` in Prometheus text exposition format, suitable
 //! for scraping by Prometheus or compatible collectors.
 
-use crate::models::{LinkStats, TransportReceiverMetrics, TransportSenderMetrics};
+use strata_protocol::models::{LinkStats, TransportReceiverMetrics, TransportSenderMetrics};
 use std::fmt::Write;
 
 /// Render a slice of `LinkStats` as Prometheus text exposition format.

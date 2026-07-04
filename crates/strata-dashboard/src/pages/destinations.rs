@@ -4,7 +4,7 @@ use leptos::prelude::*;
 
 use crate::AuthState;
 use crate::api;
-use crate::types::DestinationSummary;
+use strata_protocol::api::DestinationSummary;
 
 /// CRUD page for streaming destinations.
 #[component]

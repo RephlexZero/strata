@@ -785,7 +785,7 @@ async fn dashboard_ws_scopes_events_to_owner() {
     // An event owned by user B must never reach user A's socket.
     state.broadcast_dashboard(
         user_b_id.clone(),
-        strata_common::protocol::DashboardEvent::SenderStatus {
+        strata_protocol::DashboardEvent::SenderStatus {
             sender_id: "sender-b".into(),
             online: true,
             status: None,
@@ -794,7 +794,7 @@ async fn dashboard_ws_scopes_events_to_owner() {
     // An event owned by user A must reach it.
     state.broadcast_dashboard(
         user_a_id.clone(),
-        strata_common::protocol::DashboardEvent::SenderStatus {
+        strata_protocol::DashboardEvent::SenderStatus {
             sender_id: "sender-a".into(),
             online: true,
             status: None,

@@ -6,8 +6,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use strata_common::models::LinkStats;
-use strata_common::protocol::{Envelope, StreamStatsPayload};
+use strata_protocol::models::LinkStats;
+use strata_protocol::{AgentMessage, Envelope, StreamStatsPayload};
 
 use crate::AgentState;
 use crate::pipeline;
@@ -104,8 +104,8 @@ pub async fn run(state: Arc<AgentState>) {
             receiver_metrics: None,
         };
 
-        let envelope = Envelope::new("stream.stats", &stats);
-        if let Ok(json) = serde_json::to_string(&envelope)
+        let envelope = Envelope::from_message(&AgentMessage::StreamStats(stats));
+        if let Ok(json) = envelope.and_then(|e| serde_json::to_string(&e))
             && let Err(e) = state.control_tx.send(json).await
         {
             tracing::warn!(error = %e, "failed to send stats to control channel");

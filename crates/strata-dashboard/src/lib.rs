@@ -5,7 +5,6 @@
 
 pub mod api;
 pub mod pages;
-pub mod types;
 pub mod ws;
 
 use gloo_storage::{LocalStorage, Storage};

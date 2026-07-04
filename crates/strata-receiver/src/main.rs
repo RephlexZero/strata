@@ -79,7 +79,7 @@ pub struct ReceiverState {
     pub bind_host: String,
     /// Latest link stats per stream (stream_id → stats).
     pub latest_stats: tokio::sync::RwLock<
-        std::collections::HashMap<String, Vec<strata_common::models::LinkStats>>,
+        std::collections::HashMap<String, Vec<strata_protocol::models::LinkStats>>,
     >,
 }
 

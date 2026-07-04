@@ -11,7 +11,7 @@
 use std::process::{Child, ExitStatus};
 use std::time::{Duration, Instant};
 
-use strata_common::protocol::StreamStartPayload;
+use strata_protocol::StreamStartPayload;
 
 /// UDP address where strata-node sends stats JSON.
 pub const STATS_LISTEN_ADDR: &str = "127.0.0.1:9100";
@@ -431,7 +431,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use strata_common::protocol::{EncoderConfig, SourceConfig};
+    use strata_protocol::{EncoderConfig, SourceConfig};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 

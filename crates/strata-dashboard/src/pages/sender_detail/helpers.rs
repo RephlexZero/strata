@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 
-use crate::types::{MediaInput, NetworkInterface, SenderFullStatus};
+use strata_protocol::api::SenderFullStatus;
+use strata_protocol::models::{MediaInput, NetworkInterface};
 
 pub fn apply_full_status(
     status: &SenderFullStatus,

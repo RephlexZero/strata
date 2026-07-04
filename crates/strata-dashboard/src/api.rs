@@ -3,8 +3,13 @@
 //! All functions use gloo-net to call the REST API with JSON bodies
 //! and Bearer token auth. Base URL is relative (same origin).
 
-use crate::types::*;
 use gloo_net::http::Request;
+use strata_protocol::api::{
+    AlertRule, ApiErrorResponse, CreateDestinationRequest, CreateDestinationResponse,
+    CreateSenderRequest, CreateSenderResponse, DestinationSummary, LoginRequest, LoginResponse,
+    SenderDetail, SenderFullStatus, SenderSummary, StartStreamRequest, StartStreamResponse,
+    StreamDetail, StreamSummary, UnenrollResponse,
+};
 
 /// Ergonomic result alias.
 pub type ApiResult<T> = Result<T, String>;
@@ -138,8 +143,8 @@ pub async fn start_stream(
     token: &str,
     sender_id: &str,
     destination_id: Option<String>,
-    source: Option<crate::types::SourceConfig>,
-    encoder: Option<crate::types::EncoderConfig>,
+    source: Option<strata_protocol::SourceConfig>,
+    encoder: Option<strata_protocol::EncoderConfig>,
 ) -> ApiResult<StartStreamResponse> {
     let body = StartStreamRequest {
         destination_id,
@@ -403,7 +408,7 @@ pub async fn set_sender_config(
     token: &str,
     sender_id: &str,
     receiver_url: Option<String>,
-) -> ApiResult<crate::types::ConfigSetResponse> {
+) -> ApiResult<strata_protocol::ConfigSetResponsePayload> {
     #[derive(serde::Serialize)]
     struct Body {
         receiver_url: Option<String>,
@@ -427,7 +432,7 @@ pub async fn set_sender_config(
 pub async fn run_sender_test(
     token: &str,
     sender_id: &str,
-) -> ApiResult<crate::types::TestRunResponse> {
+) -> ApiResult<strata_protocol::TestRunResponsePayload> {
     let resp = Request::post(&format!("/api/senders/{sender_id}/test"))
         .header("Authorization", &auth_header(token))
         .header("Content-Type", "application/json")
@@ -448,7 +453,7 @@ pub async fn run_sender_test(
 pub async fn scan_sender_interfaces(
     token: &str,
     sender_id: &str,
-) -> ApiResult<crate::types::InterfaceScanResponse> {
+) -> ApiResult<strata_protocol::InterfacesScanResponsePayload> {
     let resp = Request::post(&format!("/api/senders/{sender_id}/interfaces/scan"))
         .header("Authorization", &auth_header(token))
         .header("Content-Type", "application/json")
@@ -471,7 +476,7 @@ pub async fn scan_sender_interfaces(
 pub async fn update_stream_config(
     token: &str,
     sender_id: &str,
-    body: &crate::types::StreamConfigUpdateRequest,
+    body: &strata_protocol::ConfigUpdatePayload,
 ) -> ApiResult<()> {
     let resp = Request::post(&format!("/api/senders/{sender_id}/stream/config"))
         .header("Authorization", &auth_header(token))
@@ -492,7 +497,7 @@ pub async fn update_stream_config(
 pub async fn switch_source(
     token: &str,
     sender_id: &str,
-    body: &crate::types::SourceSwitchRequest,
+    body: &strata_protocol::SourceSwitchPayload,
 ) -> ApiResult<()> {
     let resp = Request::post(&format!("/api/senders/{sender_id}/source"))
         .header("Authorization", &auth_header(token))
@@ -514,7 +519,7 @@ pub async fn list_files(
     token: &str,
     sender_id: &str,
     path: Option<&str>,
-) -> ApiResult<crate::types::FileBrowserResponse> {
+) -> ApiResult<strata_protocol::FilesListResponsePayload> {
     let url = match path {
         Some(p) => format!(
             "/api/senders/{sender_id}/files?path={}",
@@ -529,7 +534,7 @@ pub async fn list_files(
         .map_err(|e| e.to_string())?;
 
     if resp.ok() {
-        resp.json::<crate::types::FileBrowserResponse>()
+        resp.json::<strata_protocol::FilesListResponsePayload>()
             .await
             .map_err(|e| e.to_string())
     } else {
@@ -687,7 +692,7 @@ pub async fn set_jitter_buffer(
 // ── OTA Updates ─────────────────────────────────────────────────────
 
 /// Check for available firmware/software updates.
-pub async fn check_updates(token: &str, sender_id: &str) -> ApiResult<crate::types::UpdateInfo> {
+pub async fn check_updates(token: &str, sender_id: &str) -> ApiResult<strata_protocol::UpdatesCheckResponsePayload> {
     let resp = Request::get(&format!("/api/senders/{sender_id}/updates/check"))
         .header("Authorization", &auth_header(token))
         .send()
@@ -727,7 +732,7 @@ pub async fn get_logs(
     sender_id: &str,
     service: Option<&str>,
     lines: Option<u32>,
-) -> ApiResult<crate::types::LogsResponse> {
+) -> ApiResult<strata_protocol::LogsResponsePayload> {
     let mut url = format!("/api/senders/{sender_id}/logs?");
     if let Some(svc) = service {
         url.push_str(&format!("service={svc}&"));
@@ -754,7 +759,7 @@ pub async fn run_network_tool(
     sender_id: &str,
     tool: &str,
     target: Option<&str>,
-) -> ApiResult<crate::types::NetworkToolResult> {
+) -> ApiResult<strata_protocol::NetworkToolResponsePayload> {
     #[derive(serde::Serialize)]
     struct Body<'a> {
         tool: &'a str,
@@ -780,7 +785,7 @@ pub async fn capture_pcap(
     token: &str,
     sender_id: &str,
     duration_secs: u32,
-) -> ApiResult<crate::types::PcapResponse> {
+) -> ApiResult<strata_protocol::PcapCaptureResponsePayload> {
     #[derive(serde::Serialize)]
     struct Body {
         duration_secs: u32,
@@ -806,7 +811,7 @@ pub async fn capture_pcap(
 pub async fn get_alert_rules(
     token: &str,
     sender_id: &str,
-) -> ApiResult<Vec<crate::types::AlertRule>> {
+) -> ApiResult<Vec<AlertRule>> {
     let resp = Request::get(&format!("/api/senders/{sender_id}/alerts"))
         .header("Authorization", &auth_header(token))
         .send()
@@ -824,7 +829,7 @@ pub async fn get_alert_rules(
 pub async fn set_alert_rule(
     token: &str,
     sender_id: &str,
-    rule: &crate::types::AlertRule,
+    rule: &AlertRule,
 ) -> ApiResult<()> {
     let resp = Request::post(&format!("/api/senders/{sender_id}/alerts"))
         .header("Authorization", &auth_header(token))
@@ -859,7 +864,7 @@ pub async fn delete_alert_rule(token: &str, sender_id: &str, rule_id: &str) -> A
 // ── TLS Certificate Management ──────────────────────────────────────
 
 /// Get TLS certificate status for a sender's local portal.
-pub async fn get_tls_status(token: &str, sender_id: &str) -> ApiResult<crate::types::TlsStatus> {
+pub async fn get_tls_status(token: &str, sender_id: &str) -> ApiResult<strata_protocol::TlsStatusResponsePayload> {
     let resp = Request::get(&format!("/api/senders/{sender_id}/tls"))
         .header("Authorization", &auth_header(token))
         .send()

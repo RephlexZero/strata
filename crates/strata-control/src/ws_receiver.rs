@@ -17,9 +17,9 @@ use futures::stream::StreamExt;
 use tokio::sync::mpsc;
 
 use strata_common::auth;
-use strata_common::protocol::{
-    DashboardEvent, Envelope, ReceiverAuthLoginPayload, ReceiverAuthLoginResponsePayload,
-    ReceiverStatusPayload, ReceiverStreamEndedPayload, ReceiverStreamStatsPayload,
+use strata_protocol::{
+    DashboardEvent, Envelope, PROTOCOL_VERSION, ReceiverAuthLoginPayload,
+    ReceiverAuthLoginResponsePayload, ReceiverControlMessage, ReceiverMessage,
 };
 
 use crate::state::{AppState, ReceiverHandle};
@@ -136,7 +136,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
             DashboardEvent::StreamStateChanged {
                 stream_id: stream_id.clone(),
                 sender_id: sender_id.clone(),
-                state: strata_common::models::StreamState::Ended,
+                state: strata_protocol::models::StreamState::Ended,
                 error: Some("receiver disconnected".into()),
             },
         );
@@ -160,13 +160,19 @@ async fn authenticate(
     let envelope: Envelope =
         serde_json::from_str(raw).map_err(|e| error_response(&format!("invalid message: {e}")))?;
 
-    if envelope.msg_type != "auth.login" {
-        return Err(error_response("first message must be auth.login"));
+    if envelope.proto_version != PROTOCOL_VERSION {
+        tracing::warn!(
+            receiver_proto = envelope.proto_version,
+            ours = PROTOCOL_VERSION,
+            "receiver speaks a different protocol version"
+        );
     }
 
-    let payload: ReceiverAuthLoginPayload = envelope
-        .parse_payload()
-        .map_err(|e| error_response(&format!("invalid auth.login payload: {e}")))?;
+    let payload: ReceiverAuthLoginPayload = match envelope.parse_message::<ReceiverMessage>() {
+        Ok(ReceiverMessage::AuthLogin(p)) => p,
+        Ok(_) => return Err(error_response("first message must be auth.login")),
+        Err(e) => return Err(error_response(&format!("invalid auth.login message: {e}"))),
+    };
 
     if let Some(ref token) = payload.enrollment_token {
         return authenticate_enrollment(state, token, &payload).await;
@@ -237,7 +243,9 @@ async fn authenticate_enrollment(
                 error: None,
             };
 
-            let envelope = Envelope::new("auth.login.response", &response);
+            let envelope =
+                Envelope::from_message(&ReceiverControlMessage::AuthLoginResponse(response))
+                    .unwrap();
             let json = serde_json::to_string(&envelope).unwrap();
 
             tracing::info!(
@@ -270,72 +278,74 @@ async fn handle_receiver_message(state: &AppState, receiver_id: &str, raw: &str)
         }
     };
 
-    match envelope.msg_type.as_str() {
-        "receiver.status" => {
-            if let Ok(payload) = envelope.parse_payload::<ReceiverStatusPayload>() {
-                let _ = sqlx::query(
-                    "UPDATE receivers SET last_seen_at = $1, active_streams = $2 WHERE id = $3",
-                )
-                .bind(Utc::now())
-                .bind(payload.active_streams as i32)
-                .bind(receiver_id)
-                .execute(state.pool())
-                .await;
-
-                state
-                    .receiver_status()
-                    .insert(receiver_id.to_string(), payload);
-            }
-        }
-        "receiver.stream.stats" => {
-            if let Ok(payload) = envelope.parse_payload::<ReceiverStreamStatsPayload>() {
-                // Forward receiver stats to dashboard
-                // We could create a dedicated dashboard event for this later
-                tracing::trace!(
-                    receiver_id = %receiver_id,
-                    stream_id = %payload.stream_id,
-                    links = payload.links.len(),
-                    "receiver stream stats"
-                );
-            }
-        }
-        "receiver.stream.ended" => {
-            if let Ok(payload) = envelope.parse_payload::<ReceiverStreamEndedPayload>() {
-                tracing::info!(
-                    receiver_id = %receiver_id,
-                    stream_id = %payload.stream_id,
-                    reason = ?payload.reason,
-                    "receiver stream ended"
-                );
-
-                // Update stream record if still assigned to this receiver
-                let _ = sqlx::query(
-                    "UPDATE streams SET state = 'ended', ended_at = $1 \
-                     WHERE id = $2 AND receiver_id = $3 AND state IN ('starting', 'live')",
-                )
-                .bind(Utc::now())
-                .bind(&payload.stream_id)
-                .bind(receiver_id)
-                .execute(state.pool())
-                .await;
-
-                state.live_streams().remove(&payload.stream_id);
-
-                // Decrement active_streams
-                let _ = sqlx::query(
-                    "UPDATE receivers SET active_streams = GREATEST(active_streams - 1, 0) WHERE id = $1",
-                )
-                .bind(receiver_id)
-                .execute(state.pool())
-                .await;
-            }
-        }
-        other => {
+    let msg: ReceiverMessage = match envelope.parse_message() {
+        Ok(m) => m,
+        Err(_) => {
             tracing::debug!(
                 receiver_id = %receiver_id,
-                msg_type = %other,
+                msg_type = %envelope.msg_type,
                 "unhandled receiver message type"
             );
+            return;
+        }
+    };
+
+    match msg {
+        ReceiverMessage::AuthLogin(_) => {
+            tracing::debug!(receiver_id = %receiver_id, "duplicate auth.login ignored");
+        }
+        ReceiverMessage::Status(payload) => {
+            let _ = sqlx::query(
+                "UPDATE receivers SET last_seen_at = $1, active_streams = $2 WHERE id = $3",
+            )
+            .bind(Utc::now())
+            .bind(payload.active_streams as i32)
+            .bind(receiver_id)
+            .execute(state.pool())
+            .await;
+
+            state
+                .receiver_status()
+                .insert(receiver_id.to_string(), payload);
+        }
+        ReceiverMessage::StreamStats(payload) => {
+            // Forward receiver stats to dashboard
+            // We could create a dedicated dashboard event for this later
+            tracing::trace!(
+                receiver_id = %receiver_id,
+                stream_id = %payload.stream_id,
+                links = payload.links.len(),
+                "receiver stream stats"
+            );
+        }
+        ReceiverMessage::StreamEnded(payload) => {
+            tracing::info!(
+                receiver_id = %receiver_id,
+                stream_id = %payload.stream_id,
+                reason = ?payload.reason,
+                "receiver stream ended"
+            );
+
+            // Update stream record if still assigned to this receiver
+            let _ = sqlx::query(
+                "UPDATE streams SET state = 'ended', ended_at = $1 \
+                 WHERE id = $2 AND receiver_id = $3 AND state IN ('starting', 'live')",
+            )
+            .bind(Utc::now())
+            .bind(&payload.stream_id)
+            .bind(receiver_id)
+            .execute(state.pool())
+            .await;
+
+            state.live_streams().remove(&payload.stream_id);
+
+            // Decrement active_streams
+            let _ = sqlx::query(
+                "UPDATE receivers SET active_streams = GREATEST(active_streams - 1, 0) WHERE id = $1",
+            )
+            .bind(receiver_id)
+            .execute(state.pool())
+            .await;
         }
     }
 }
@@ -347,6 +357,7 @@ fn error_response(msg: &str) -> String {
         session_token: None,
         error: Some(msg.to_string()),
     };
-    let envelope = Envelope::new("auth.login.response", &response);
+    let envelope =
+        Envelope::from_message(&ReceiverControlMessage::AuthLoginResponse(response)).unwrap();
     serde_json::to_string(&envelope).unwrap()
 }

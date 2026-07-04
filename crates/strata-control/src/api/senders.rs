@@ -18,16 +18,20 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 
 use strata_common::ids;
-use strata_common::protocol::{
-    ConfigExportPayload, ConfigImportPayload, ConfigSetPayload, ConfigUpdatePayload, Envelope,
-    FilesListPayload, InterfaceCommandPayload, InterfacesScanPayload, JitterBufferPayload,
-    LogsRequestPayload, NetworkToolPayload, PcapCapturePayload, PowerCommandPayload,
-    SourceSwitchPayload, StreamDestinationsPayload, TestRunPayload, TlsRenewPayload,
-    TlsStatusPayload, UpdatesCheckPayload, UpdatesInstallPayload,
+use strata_protocol::api::{
+    CreateSenderRequest, CreateSenderResponse, SenderDetail, SenderFullStatus, SenderSummary,
+    UnenrollResponse,
+};
+use strata_protocol::{
+    ConfigExportPayload, ConfigImportPayload, ConfigSetPayload, ConfigUpdatePayload,
+    ControlMessage, Envelope, FilesListPayload, InterfaceCommandPayload, InterfacesScanPayload,
+    JitterBufferPayload, LogsRequestPayload, NetworkToolPayload, PcapCapturePayload,
+    PowerCommandPayload, SourceSwitchPayload, StreamDestinationsPayload, TestRunPayload,
+    TlsRenewPayload, TlsStatusPayload, UpdatesCheckPayload, UpdatesInstallPayload,
 };
 
 use crate::api::auth::ApiError;
@@ -107,16 +111,6 @@ pub fn router() -> Router<AppState> {
 
 // ── List Senders ────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
-pub struct SenderSummary {
-    pub id: String,
-    pub name: Option<String>,
-    pub hostname: Option<String>,
-    pub online: bool,
-    pub last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
 async fn list_senders(
     State(state): State<AppState>,
     user: AuthUser,
@@ -148,17 +142,6 @@ async fn list_senders(
 }
 
 // ── Create Sender ───────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct CreateSenderRequest {
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CreateSenderResponse {
-    pub sender_id: String,
-    pub enrollment_token: String,
-}
 
 async fn create_sender(
     State(state): State<AppState>,
@@ -198,18 +181,6 @@ async fn create_sender(
 }
 
 // ── Get Sender ──────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct SenderDetail {
-    pub id: String,
-    pub owner_id: String,
-    pub name: Option<String>,
-    pub hostname: Option<String>,
-    pub enrolled: bool,
-    pub online: bool,
-    pub last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-}
 
 async fn get_sender(
     State(state): State<AppState>,
@@ -275,7 +246,7 @@ async fn get_sender_status(
     State(state): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<SenderFullStatus>, ApiError> {
     // Verify ownership
     let exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM senders WHERE id = $1 AND owner_id = $2)",
@@ -292,31 +263,28 @@ async fn get_sender_status(
 
     let online = state.agents().contains_key(&id);
 
-    // Return cached DeviceStatusPayload if available (from last heartbeat)
-    if let Some(status) = state.device_status().get(&id) {
-        let mut val =
-            serde_json::to_value(status.clone()).map_err(|e| ApiError::internal(e.to_string()))?;
-        if let Some(obj) = val.as_object_mut() {
-            obj.insert("sender_id".into(), serde_json::json!(id));
-            obj.insert("online".into(), serde_json::json!(online));
-        }
-        return Ok(Json(val));
-    }
+    // Include the cached device.status heartbeat if we have one
+    let status = state.device_status().get(&id).map(|v| v.clone());
+    let mut full = match status {
+        Some(s) => SenderFullStatus {
+            network_interfaces: Some(s.network_interfaces),
+            media_inputs: Some(s.media_inputs),
+            stream_state: Some(s.stream_state),
+            cpu_percent: Some(s.cpu_percent),
+            mem_used_mb: Some(s.mem_used_mb),
+            uptime_s: Some(s.uptime_s),
+            receiver_url: s.receiver_url,
+            ..Default::default()
+        },
+        None => SenderFullStatus::default(),
+    };
+    full.sender_id = Some(id);
+    full.online = Some(online);
 
-    Ok(Json(serde_json::json!({
-        "sender_id": id,
-        "online": online,
-    })))
+    Ok(Json(full))
 }
 
 // ── Unenroll Sender ─────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct UnenrollResponse {
-    pub sender_id: String,
-    pub enrollment_token: String,
-    pub message: String,
-}
 
 async fn unenroll_sender(
     State(state): State<AppState>,
@@ -539,7 +507,8 @@ async fn interface_command(
         sim_pin: opts.sim_pin,
         roaming: opts.roaming,
     };
-    let envelope = Envelope::new("interface.command", &payload);
+    let envelope = Envelope::from_message(&ControlMessage::InterfaceCommand(payload))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let json = serde_json::to_string(&envelope).map_err(|e| ApiError::internal(e.to_string()))?;
 
     agent
@@ -592,7 +561,8 @@ async fn set_sender_config(
         request_id: request_id.clone(),
         receiver_url: body.receiver_url,
     };
-    let envelope = Envelope::new("config.set", &payload);
+    let envelope = Envelope::from_message(&ControlMessage::ConfigSet(payload))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let json = serde_json::to_string(&envelope).map_err(|e| ApiError::internal(e.to_string()))?;
 
     agent
@@ -636,7 +606,8 @@ async fn run_sender_test(
     let payload = TestRunPayload {
         request_id: request_id.clone(),
     };
-    let envelope = Envelope::new("test.run", &payload);
+    let envelope = Envelope::from_message(&ControlMessage::TestRun(payload))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let json = serde_json::to_string(&envelope).map_err(|e| ApiError::internal(e.to_string()))?;
 
     agent
@@ -680,7 +651,8 @@ async fn scan_interfaces(
     let payload = InterfacesScanPayload {
         request_id: request_id.clone(),
     };
-    let envelope = Envelope::new("interfaces.scan", &payload);
+    let envelope = Envelope::from_message(&ControlMessage::InterfacesScan(payload))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let json = serde_json::to_string(&envelope).map_err(|e| ApiError::internal(e.to_string()))?;
 
     agent
@@ -729,10 +701,10 @@ async fn update_stream_config(
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     state.pending_requests().insert(request_id.clone(), resp_tx);
 
-    // Wrap the payload with the request_id
-    let mut payload_val = serde_json::to_value(&body).unwrap_or_default();
-    payload_val["request_id"] = serde_json::json!(request_id);
-    let envelope = Envelope::new("config.update", &payload_val);
+    let mut body = body;
+    body.request_id = Some(request_id.clone());
+    let envelope = Envelope::from_message(&ControlMessage::ConfigUpdate(body))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let json = serde_json::to_string(&envelope).unwrap();
 
     agent_tx
@@ -787,7 +759,8 @@ async fn switch_source(
     let agent_tx = agent.tx.clone();
     drop(agent);
 
-    let envelope = Envelope::new("source.switch", &body);
+    let envelope = Envelope::from_message(&ControlMessage::SourceSwitch(body))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let json = serde_json::to_string(&envelope).map_err(|e| ApiError::internal(e.to_string()))?;
 
     agent_tx
@@ -828,7 +801,8 @@ async fn list_sender_files(
         request_id: request_id.clone(),
         path: q.path,
     };
-    let envelope = Envelope::new("files.list", &payload);
+    let envelope = Envelope::from_message(&ControlMessage::FilesList(payload))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let json = serde_json::to_string(&envelope).map_err(|e| ApiError::internal(e.to_string()))?;
 
     agent
@@ -871,7 +845,7 @@ async fn run_network_tool(
         tool: body.tool,
         target: body.target,
     };
-    proxy_to_agent(&state, &id, "diagnostics.network", &payload, 30).await
+    proxy_to_agent(&state, &id, &ControlMessage::NetworkTool(payload), 30).await
 }
 
 // ── Diagnostics: PCAP ───────────────────────────────────────────────
@@ -895,7 +869,7 @@ async fn capture_pcap(
         request_id,
         duration_secs: body.duration_secs.min(60),
     };
-    proxy_to_agent(&state, &id, "diagnostics.pcap", &payload, 70).await
+    proxy_to_agent(&state, &id, &ControlMessage::PcapCapture(payload), 70).await
 }
 
 // ── Diagnostics: Logs ───────────────────────────────────────────────
@@ -921,7 +895,7 @@ async fn get_logs(
         service: q.service,
         lines: q.lines,
     };
-    proxy_to_agent(&state, &id, "logs.get", &payload, 10).await
+    proxy_to_agent(&state, &id, &ControlMessage::LogsGet(payload), 10).await
 }
 
 // ── Power ───────────────────────────────────────────────────────────
@@ -945,7 +919,7 @@ async fn power_command(
         request_id,
         action: body.action,
     };
-    proxy_to_agent(&state, &id, "power.command", &payload, 10).await
+    proxy_to_agent(&state, &id, &ControlMessage::PowerCommand(payload), 10).await
 }
 
 // ── TLS ─────────────────────────────────────────────────────────────
@@ -960,7 +934,7 @@ async fn get_tls_status(
 
     let request_id = Uuid::now_v7().to_string();
     let payload = TlsStatusPayload { request_id };
-    proxy_to_agent(&state, &id, "tls.status", &payload, 10).await
+    proxy_to_agent(&state, &id, &ControlMessage::TlsStatus(payload), 10).await
 }
 
 async fn renew_tls_cert(
@@ -973,7 +947,7 @@ async fn renew_tls_cert(
 
     let request_id = Uuid::now_v7().to_string();
     let payload = TlsRenewPayload { request_id };
-    proxy_to_agent(&state, &id, "tls.renew", &payload, 15).await
+    proxy_to_agent(&state, &id, &ControlMessage::TlsRenew(payload), 15).await
 }
 
 // ── Config Export/Import ────────────────────────────────────────────
@@ -988,7 +962,7 @@ async fn export_config(
 
     let request_id = Uuid::now_v7().to_string();
     let payload = ConfigExportPayload { request_id };
-    proxy_to_agent(&state, &id, "config.export", &payload, 10).await
+    proxy_to_agent(&state, &id, &ControlMessage::ConfigExport(payload), 10).await
 }
 
 async fn import_config(
@@ -1005,7 +979,7 @@ async fn import_config(
         request_id,
         config: body,
     };
-    proxy_to_agent(&state, &id, "config.import", &payload, 10).await
+    proxy_to_agent(&state, &id, &ControlMessage::ConfigImport(payload), 10).await
 }
 
 // ── OTA Updates ─────────────────────────────────────────────────────
@@ -1020,7 +994,7 @@ async fn check_updates(
 
     let request_id = Uuid::now_v7().to_string();
     let payload = UpdatesCheckPayload { request_id };
-    proxy_to_agent(&state, &id, "updates.check", &payload, 15).await
+    proxy_to_agent(&state, &id, &ControlMessage::UpdatesCheck(payload), 15).await
 }
 
 async fn install_update(
@@ -1033,7 +1007,7 @@ async fn install_update(
 
     let request_id = Uuid::now_v7().to_string();
     let payload = UpdatesInstallPayload { request_id };
-    proxy_to_agent(&state, &id, "updates.install", &payload, 30).await
+    proxy_to_agent(&state, &id, &ControlMessage::UpdatesInstall(payload), 30).await
 }
 
 // ── Stream Destinations ─────────────────────────────────────────────
@@ -1057,7 +1031,7 @@ async fn set_stream_destinations(
         request_id,
         destination_ids: body.destination_ids,
     };
-    proxy_to_agent(&state, &id, "stream.destinations", &payload, 10).await
+    proxy_to_agent(&state, &id, &ControlMessage::StreamDestinations(payload), 10).await
 }
 
 // ── Jitter Buffer ───────────────────────────────────────────────────
@@ -1083,7 +1057,7 @@ async fn set_jitter_buffer(
         mode: body.mode,
         static_ms: body.static_ms,
     };
-    proxy_to_agent(&state, &id, "stream.jitter_buffer", &payload, 10).await
+    proxy_to_agent(&state, &id, &ControlMessage::JitterBuffer(payload), 10).await
 }
 
 // ── Alerting ────────────────────────────────────────────────────────
@@ -1147,8 +1121,7 @@ async fn delete_alert_rule(
 async fn proxy_to_agent(
     state: &AppState,
     sender_id: &str,
-    msg_type: &str,
-    payload: &impl serde::Serialize,
+    msg: &ControlMessage,
     timeout_secs: u64,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let agent = state
@@ -1156,13 +1129,13 @@ async fn proxy_to_agent(
         .get(sender_id)
         .ok_or_else(|| ApiError::bad_request("sender is not connected"))?;
 
-    let envelope = Envelope::new(msg_type, payload);
+    let envelope =
+        Envelope::from_message(msg).map_err(|e| ApiError::internal(e.to_string()))?;
     let json = serde_json::to_string(&envelope).map_err(|e| ApiError::internal(e.to_string()))?;
 
-    // Extract request_id from the payload (convention: all request payloads have one)
-    let request_id = serde_json::to_value(payload)
-        .ok()
-        .and_then(|v| v.get("request_id")?.as_str().map(String::from))
+    let request_id = msg
+        .request_id()
+        .map(String::from)
         .unwrap_or_else(|| envelope.id.clone());
 
     let (tx, rx) = tokio::sync::oneshot::channel();
