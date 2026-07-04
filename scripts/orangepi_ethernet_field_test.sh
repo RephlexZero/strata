@@ -43,6 +43,10 @@
 #                            http://localhost:<port>/playlist.m3u8 via an SSH
 #                            tunnel, for watching in VLC/mpv without YouTube
 #                            (default: 8088; set 0 to disable)
+#   STRATA_EGRESS_WATCHDOG_SEC — receiver self-heal: rebuild its pipeline after
+#                            this many seconds without a new HLS segment
+#                            (default: 15; 0 disables — e.g. for a GST_DEBUG
+#                            run that should observe a wedge, not heal it)
 #   STRATA_MAX_LATENCY_MS  — receiver playout ceiling override (default: profile)
 #   STRATA_RECEIVER_BUFFER_CAPACITY — receiver reorder slots (default: 4096)
 #   STRATA_NO_BUILD=1      — skip the aarch64 cross-compile
@@ -275,6 +279,8 @@ done
 # — output lands in /tmp/strata-receiver.log; keep runs short, it is verbose.
 GST_DEBUG_ENV=""
 [[ -n "${STRATA_GST_DEBUG:-}" ]] && GST_DEBUG_ENV="GST_DEBUG=${STRATA_GST_DEBUG} "
+WATCHDOG_ENV=""
+[[ -n "${STRATA_EGRESS_WATCHDOG_SEC:-}" ]] && WATCHDOG_ENV="STRATA_EGRESS_WATCHDOG_SEC=${STRATA_EGRESS_WATCHDOG_SEC} "
 echo ""
 echo "── Starting receiver on $RECEIVER_HOST ──"
 ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "pkill -INT strata-pipeline 2>/dev/null || true; sleep 2; pkill -KILL strata-pipeline 2>/dev/null || true; echo ok" >/dev/null 2>&1 || true
@@ -287,7 +293,7 @@ export GST_PLUGIN_PATH=\$HOME/.local/share/gstreamer-1.0/plugins
 # still dies when the launching SSH session closes; setsid detaches it into
 # its own session so it survives. (Verified: nohup → sender gone in <5s;
 # setsid → alive for the full run.)
-setsid env RUST_LOG="$LOG_LEVEL" ${GST_DEBUG_ENV}/usr/local/bin/strata-pipeline receiver \\
+setsid env RUST_LOG="$LOG_LEVEL" ${GST_DEBUG_ENV}${WATCHDOG_ENV}/usr/local/bin/strata-pipeline receiver \\
   --bind "$BIND_STR" \\
   --relay-url "$STRATA_RELAY_URL" \\
   --codec "$CODEC" \\
@@ -383,6 +389,7 @@ RECEIVER_DIED=0
 PREV_PRODUCED=0
 STALL_TICKS=0
 MAX_STALL_TICKS=0
+RESTARTS=0
 
 cleanup() {
     [[ $CLEANED -eq 1 ]] && return; CLEANED=1
@@ -436,6 +443,10 @@ while [[ $ELAPSED -lt $DURATION ]]; do
     fi
     PREV_PRODUCED=$PRODUCED
 
+    # Egress-watchdog self-heals: the receiver rebuilds its own pipeline when
+    # segment production wedges (run 4 would have been ~90 s of dead air).
+    RESTARTS=$(num "$(ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "grep -c 'egress-watchdog: no HLS segment' /tmp/strata-receiver.log 2>/dev/null" 2>/dev/null || echo 0)")
+
     # Latest receiver stats line.
     STATS=$(ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "grep 'strata-stats' /tmp/strata-receiver.log 2>/dev/null | tail -1" 2>/dev/null || echo "")
     DELIVERED=$(num "$(grep -oP 'packets_delivered=\(guint64\)\K[0-9]+' <<<"$STATS" | tail -1)")
@@ -451,7 +462,8 @@ while [[ $ELAPSED -lt $DURATION ]]; do
     fi
 
     STALL_STR=""; [[ $STALL_TICKS -gt 0 ]] && STALL_STR=" STALLED=$((STALL_TICKS * MONITOR_INTERVAL))s"
-    echo "╌╌╌ [${ELAPSED}s] produced=$PRODUCED segs (dir=$SEGS) playlist=$PLAYLIST$STALL_STR$YT ╌╌╌"
+    RESTART_STR=""; [[ $RESTARTS -gt 0 ]] && RESTART_STR=" wd_restarts=$RESTARTS"
+    echo "╌╌╌ [${ELAPSED}s] produced=$PRODUCED segs (dir=$SEGS) playlist=$PLAYLIST$STALL_STR$RESTART_STR$YT ╌╌╌"
     echo "  RX: delivered=$DELIVERED lost=$LOST late=$LATE discont=$DISCONT playout=${LAT}ms"
 done
 
@@ -460,12 +472,15 @@ echo ""
 RX_FATAL=$(ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" \
     "grep -m1 -E 'Timestamping error on input streams|^Error:' /tmp/strata-receiver.log 2>/dev/null" \
     2>/dev/null || echo "")
+RESTART_STR=""; [[ $RESTARTS -gt 0 ]] && RESTART_STR=" — $RESTARTS egress-watchdog restart(s)"
 if [[ $RECEIVER_DIED -eq 1 || -n "$RX_FATAL" ]]; then
     VERDICT="FAILED: receiver died mid-run${RX_FATAL:+ — fatal: $RX_FATAL} ($MAX_SEGS segment(s) before death)"; warn "$VERDICT"
+elif [[ $STALL_TICKS -ge 4 ]]; then
+    VERDICT="FAILED: HLS egress stalled and never recovered ($((STALL_TICKS * MONITOR_INTERVAL))s at run end; produced $PREV_PRODUCED segments total$RESTART_STR) — YouTube went dark even though both processes stayed up"; warn "$VERDICT"
 elif [[ $MAX_STALL_TICKS -ge 4 ]]; then
-    VERDICT="FAILED: HLS egress stalled for $((MAX_STALL_TICKS * MONITOR_INTERVAL))s (produced $PREV_PRODUCED segments total) — YouTube went dark mid-run even though both processes stayed up"; warn "$VERDICT"
+    VERDICT="RECOVERED: egress stalled mid-run (max $((MAX_STALL_TICKS * MONITOR_INTERVAL))s) but resumed$RESTART_STR — $PREV_PRODUCED segments total; check receiver.log watchdog/gate lines"; warn "$VERDICT"
 elif [[ $MAX_SEGS -ge 2 && "$PLAYLIST" == "yes" ]]; then
-    VERDICT="OK: $PREV_PRODUCED segments produced + playlist (lost=$LOST late=$LATE discont=$DISCONT)"; info "$VERDICT"
+    VERDICT="OK: $PREV_PRODUCED segments produced + playlist (lost=$LOST late=$LATE discont=$DISCONT)$RESTART_STR"; info "$VERDICT"
 elif [[ $MAX_SEGS -ge 1 ]]; then
     VERDICT="PARTIAL: only $MAX_SEGS segment(s) — check receiver.log for timestamping errors / single-segment stall"; warn "$VERDICT"
 else

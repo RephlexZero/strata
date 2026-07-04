@@ -21,15 +21,22 @@ under rough radio, gates absorbing ~14 splice storms) then a silent wedge
 for the final 98 s after a 39 %-residual loss burst: no latch, no
 inflation, media ≈ wall — tsdemux stopped emitting or hlssink3's muxer
 starved on audio; EOS flushed 3 held segments. Wedge sits where the gates
-can't see it.** Gates contain, can't repair. **Open decision:** GST_DEBUG
-diagnostic run (tsdemux + hlssink/splitmuxsink to split the two suspects),
-drop `tsparse set-timestamps=true`?, and/or an egress watchdog that
-restarts the decode branch on prolonged stall (run 4 = ~90 s of dead air
-it would have recovered; watchdog case keeps strengthening). Sender AQM
-self-holes seeded the trigger burst for the 3rd time — tuning question
-still open. Dev QoL: `STRATA_LOCAL_HLS_PORT` (default 8088) now tunnels
-the receiver HLS dir to http://localhost:8088/playlist.m3u8 for VLC/mpv;
-script verdict persists to `runs/<id>/verdict.txt`. Playout is
+can't see it.** Gates contain, can't repair. **Decision resolved
+(2026-07-04 night): egress watchdog implemented** — `run_receiver` runs
+the pipeline in generations; 15 s without a segment
+(`STRATA_EGRESS_WATCHDOG_SEC`, 0=off) → dump q_ts/q_v/q_a fill levels
+(queues-full = hlssink3 muxer starved, queues-empty = tsdemux dead — the
+trip itself now splits the two suspects), EOS-flush held segments (5 s
+bound), rebuild at NULL. Generation-prefixed segment names
+(`seg-gNNNN-%05d.ts`, uploader is filename-keyed) + first new segment
+pre-tagged `#EXT-X-DISCONTINUITY`. Script shows `wd_restarts=N`, verdict
+gained a RECOVERED tier. **Awaiting field validation — next run tells us
+whether the wedge heals and which suspect it is.** Sender AQM self-holes
+seeded the trigger burst for the 3rd time — tuning question still open;
+`tsparse set-timestamps=true` removal deferred until a watchdog trip names
+the guilty layer. Dev QoL: `STRATA_LOCAL_HLS_PORT` (default 8088) now
+tunnels the receiver HLS dir to http://localhost:8088/playlist.m3u8 for
+VLC/mpv; script verdict persists to `runs/<id>/verdict.txt`. Playout is
 **adaptive under every profile** (`fixed_playout` was fb487f7-reverted;
 dead config deleted `38c842a`).
 
@@ -196,4 +203,4 @@ override that pinned it is gone — but still needs field confirmation. Watch
 adaptive-redundancy duplication as a wire-overhead contributor when spare is large.
 
 ---
-_Last updated: 2026-07-04 evening (run 4 analyzed — silent wedge recurred past the gates; local HLS preview + persisted verdict added to the field script)_
+_Last updated: 2026-07-04 night (egress watchdog implemented — receiver self-heals silent wedges, trip dumps queue levels to split the two suspects; awaiting field validation)_

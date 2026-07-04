@@ -564,3 +564,37 @@ receiver HLS dir at http://localhost:8088/playlist.m3u8 via SSH tunnel
 checks without YouTube; verdict now persisted to `runs/<id>/verdict.txt`
 (run 4's FAILED verdict existed only on the terminal and had to be
 reconstructed from logs).
+
+## 2026-07-04 (night) — egress watchdog implemented: the receiver now self-heals the silent wedge
+
+The pending demux-timeline decision is resolved in favor of the watchdog
+(run 4 made the case: ~90 s of dead air it would have recovered), with the
+GST_DEBUG diagnostic folded in as trip-time forensics instead of a separate
+run. `run_receiver` (strata_pipeline.rs) now runs the pipeline in
+**generations**: when hlssink3 adds no segment for 15 s
+(`STRATA_EGRESS_WATCHDOG_SEC`, 0 disables; 30 s allowance before a
+generation's first segment) it (1) logs the fill level of the three
+now-named egress queues q_ts/q_v/q_a — **this splits the two run-4
+suspects**: video/audio queues holding data = hlssink3's muxer
+starved/blocked, all near-empty = tsdemux stopped emitting; (2) sends EOS
+with a 5 s bounded drain so segments the wedged muxer still holds get
+flushed and uploaded (run 4's EOS released three); (3) drops the pipeline
+to NULL and rebuilds it. Segment names carry the generation
+(`seg-gNNNN-%05d.ts`) because the uploader tracks uploads by filename and
+holds back the lexicographically-newest file — reused names would never
+re-upload; the rebuilt generation's first segment is pre-tagged
+`#EXT-X-DISCONTINUITY` (deterministic name, hlssink3 restarts %05d at 0).
+The uploader, gate→playlist plumbing, and Ctrl+C handler now span
+generations (Ctrl+C EOS-es the *current* pipeline via a shared slot).
+Watchdog progress is segments only — strata-stats stayed green through
+run 4's 98 s of dead air, so nothing else counts as a heartbeat. Field
+script: forwards `STRATA_EGRESS_WATCHDOG_SEC`, shows `wd_restarts=N` per
+tick, and the verdict now separates FAILED (still stalled at run end) from
+RECOVERED (stalled ≥20 s mid-run but resumed); OK carries a restart count
+when the watchdog healed within the warning threshold. clippy clean,
+47+1 strata-gst tests pass. GitNexus impact/detect_changes still down
+(DB v42 vs MCP server v41 — server binary predates the index format);
+blast radius verified by inspection (run_receiver's only caller is main).
+Still open: sender AQM self-holes seeding trigger bursts (3 occurrences),
+and whether `tsparse set-timestamps=true` should go — the watchdog's
+trip-time queue dump should tell us which layer to blame first.
