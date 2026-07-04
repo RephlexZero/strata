@@ -39,10 +39,11 @@
 #   STRATA_AUDIO_ENABLED   — 1/0 (default: 1; silent AAC track for YouTube)
 #   STRATA_DURATION_SECS   — stream duration before stopping (default: 120)
 #   STRATA_MONITOR_INTERVAL_S — monitor cadence (default: 5)
-#   STRATA_LOCAL_HLS_PORT  — also serve the receiver's HLS dir at
-#                            http://localhost:<port>/playlist.m3u8 via an SSH
-#                            tunnel, for watching in VLC/mpv without YouTube
-#                            (default: 8088; set 0 to disable)
+#   STRATA_LOCAL_HLS_PORT  — also serve the receiver's HLS dir publicly at
+#                            http://<receiver-host>:<port>/playlist.m3u8
+#                            (read-only static files), for watching in
+#                            VLC/mpv without YouTube (default: 8088; set 0
+#                            to disable)
 #   STRATA_EGRESS_WATCHDOG_SEC — receiver self-heal: rebuild its pipeline after
 #                            this many seconds without a new HLS segment
 #                            (default: 15; 0 disables — e.g. for a GST_DEBUG
@@ -317,13 +318,14 @@ HLS_DIR=$(ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "grep -m1 'HLS temp dir:' /t
 [[ -z "$HLS_DIR" ]] && HLS_DIR="/dev/shm/strata-hls-rx-${RECEIVER_PID}"
 info "Receiver HLS dir: $HLS_DIR"
 
-# ── Local HLS preview (dev): watch the stream without YouTube ────────
+# ── Public HLS preview (dev): watch the stream without YouTube ───────
 # A python http.server on the receiver serves the segment dir bound to
-# 127.0.0.1 only (nothing exposed publicly); an SSH tunnel brings it to
-# localhost here. Latency in the player is the full glass-to-glass chain
-# minus YouTube's CDN: playout window (≤3 s) + 1 s segmentation + player
-# buffer — use mpv's low-latency profile to keep the player's share small.
-HLS_TUNNEL_PID=""
+# 0.0.0.0 — read-only static files, reachable directly at the receiver's
+# address, no SSH tunnel. Latency in the player is the full glass-to-glass
+# chain minus YouTube's CDN: playout window (≤3 s) + 1 s segmentation +
+# player buffer — use mpv's low-latency profile to keep the player's share
+# small.
+PREVIEW_ADDR="${RECEIVER_HOST##*@}"
 if [[ -n "$LOCAL_HLS_PORT" && "$LOCAL_HLS_PORT" != "0" ]]; then
     if ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "command -v python3" >/dev/null 2>&1; then
         # [h]ttp bracket trick: the wrapper shell's own cmdline contains this
@@ -332,23 +334,11 @@ if [[ -n "$LOCAL_HLS_PORT" && "$LOCAL_HLS_PORT" != "0" ]]; then
         # "connection refused" through the tunnel).
         ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" \
             "pkill -f '[h]ttp\.server $LOCAL_HLS_PORT' 2>/dev/null; \
-             setsid python3 -m http.server $LOCAL_HLS_PORT --bind 127.0.0.1 --directory '$HLS_DIR' \
+             setsid python3 -m http.server $LOCAL_HLS_PORT --bind 0.0.0.0 --directory '$HLS_DIR' \
                >/dev/null 2>&1 < /dev/null &" >/dev/null 2>&1 || true
-        # Kill any stale tunnel holding the local port, whatever its target
-        # form ("-L 8088:127.0.0.1:8088" vs "-L 8088:localhost:8088", …).
-        pkill -f -- "-L ${LOCAL_HLS_PORT}:" 2>/dev/null || true
-        ssh "${RECEIVER_SSH[@]}" -N -o ExitOnForwardFailure=yes \
-            -L "${LOCAL_HLS_PORT}:127.0.0.1:${LOCAL_HLS_PORT}" "$RECEIVER_HOST" &
-        HLS_TUNNEL_PID=$!
-        sleep 1
-        if kill -0 "$HLS_TUNNEL_PID" 2>/dev/null; then
-            info "Local HLS preview: http://localhost:${LOCAL_HLS_PORT}/playlist.m3u8"
-            echo "      mpv --profile=low-latency --cache=no http://localhost:${LOCAL_HLS_PORT}/playlist.m3u8"
-            echo "      vlc --network-caching=1000 http://localhost:${LOCAL_HLS_PORT}/playlist.m3u8"
-        else
-            HLS_TUNNEL_PID=""
-            warn "local HLS preview tunnel failed — port ${LOCAL_HLS_PORT} still busy? (STRATA_LOCAL_HLS_PORT to change)"
-        fi
+        info "Public HLS preview: http://${PREVIEW_ADDR}:${LOCAL_HLS_PORT}/playlist.m3u8"
+        echo "      mpv --profile=low-latency --cache=no http://${PREVIEW_ADDR}:${LOCAL_HLS_PORT}/playlist.m3u8"
+        echo "      vlc --network-caching=1000 http://${PREVIEW_ADDR}:${LOCAL_HLS_PORT}/playlist.m3u8"
     else
         warn "python3 not found on receiver — local HLS preview disabled"
     fi
@@ -413,7 +403,6 @@ RESTARTS=0
 cleanup() {
     [[ $CLEANED -eq 1 ]] && return; CLEANED=1
     echo ""; echo "── Shutting down ──"
-    [[ -n "$HLS_TUNNEL_PID" ]] && kill "$HLS_TUNNEL_PID" 2>/dev/null || true
     [[ -n "$LOCAL_HLS_PORT" && "$LOCAL_HLS_PORT" != "0" ]] && \
         ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "pkill -f 'http\.server $LOCAL_HLS_PORT' 2>/dev/null || true" >/dev/null 2>&1 || true
     ssh "${SENDER_SSH[@]}"   "$SENDER_HOST"   "pkill -INT strata-pipeline 2>/dev/null || true" >/dev/null 2>&1 || true
