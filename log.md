@@ -598,3 +598,45 @@ blast radius verified by inspection (run_receiver's only caller is main).
 Still open: sender AQM self-holes seeding trigger bursts (3 occurrences),
 and whether `tsparse set-timestamps=true` should go — the watchdog's
 trip-time queue dump should tell us which layer to blame first.
+
+## 2026-07-04 (later) — run 5 (orangepi-123888): watchdog diagnosed the wedge, then died rebuilding — SQPOLL rebind race fixed
+
+Run 5 was the watchdog's first live trip and it **answered the run-4 suspect
+question**: at trip time `q_ts: 0`, `q_v: 275 buffers / 10,025 ms` (pegged at
+its 10 s cap, leaky and discarding), `q_a: 695 ms` — tsdemux was alive and
+emitting; **hlssink3's internal muxer had stopped consuming**. The EOS-flush
+salvage recovered 12 held segments (g0000-00193…00204, all uploaded; 203
+total). Then the generation-1 rebuild died: `Error: StateChangeError`, run
+FAILED at ~95 s with 193 segments produced.
+
+Root cause of the rebuild death: **rebind race against deferred io_uring
+teardown**. The link readers run monoio with `setup_sqpoll(1000)`; the kernel
+releases ring-referenced socket fds asynchronously (io_ring_exit_work) after
+the reader threads join, so a same-process rebind of 5000/5002 can
+transiently hit EADDRINUSE. Evidence: gen-0 logged both links'
+"monoio runtime with SQPOLL enabled" 1 ms apart; gen-1 logged only link 0's
+before dying — link 1's bind failed inside `stratasrc::start()`. A local
+repro test (`stratasrc_rebinds_same_ports_after_null`) passes because the
+sandbox falls back to non-SQPOLL where teardown is synchronous.
+
+Fixes (strata_pipeline.rs): (1) on `set_state(Playing)` failure the bus is
+drained and the failing element's real error is printed — previously the `?`
+return skipped the bus entirely, which is why the log never named the bind
+error; (2) watchdog rebuilds retry up to 5× with a 1 s pause
+(MAX_REBUILD_ATTEMPTS/REBUILD_RETRY_PAUSE) — generation 0 still fails fast
+(that's a misconfiguration, not a race). Script fixes: local HLS preview was
+double-broken — the remote `pkill -f 'http\.server …'` matched the wrapper
+shell's own cmdline and killed it before `setsid python3 -m http.server` ever
+ran (the "connection refused" in run 5), and a stale tunnel holding local
+8088 made the new tunnel's bind fail silently. Now: `[h]ttp` bracket trick,
+broader stale-tunnel kill (`-L <port>:` any form), `ExitOnForwardFailure=yes`
+plus a liveness check that warns loudly. FAILED verdict now reports produced
+segments, not the ~11-file directory window. clippy clean, 48 strata-gst lib
+tests pass (47 + new rebind regression test). GitNexus impact still down
+(v42/v41); blast radius by inspection unchanged.
+
+Still open: sender AQM self-holes (the loss burst that seeded this wedge is
+occurrence 4), and now that the wedge is **located** — hlssink3 muxer starved
+while fed — the `tsparse set-timestamps=true` question sharpens: inflated/
+stalled timestamps reaching the muxer would explain it waiting forever for a
+segment boundary. Next wedge's trip dump can confirm from a healthy rebuild.

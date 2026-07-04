@@ -1751,6 +1751,14 @@ const EGRESS_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// IDR + a full target-duration takes longer than the steady-state cadence,
 /// and after a rebuild stratasrc must rejoin the live transport mid-stream.
 const EGRESS_FIRST_SEGMENT_ALLOWANCE: Duration = Duration::from_secs(30);
+/// A watchdog rebuild can race the kernel's deferred io_uring teardown: with
+/// SQPOLL the old generation's UDP sockets are released asynchronously after
+/// their reader threads join, so the rebind can transiently hit EADDRINUSE
+/// (field run orangepi-123888: generation 1 died on StateChangeError while
+/// generation 0's link threads had cleanly exited). Retry with a pause
+/// instead of dying; give up if the port genuinely stays taken.
+const MAX_REBUILD_ATTEMPTS: u32 = 5;
+const REBUILD_RETRY_PAUSE: Duration = Duration::from_secs(1);
 
 /// Fill levels of the three named egress queues, logged when the watchdog
 /// trips. This splits the two run-4 suspects: q_v/q_a holding data while no
@@ -1959,6 +1967,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut generation: u32 = 0;
+    let mut rebuild_attempts: u32 = 0;
     loop {
         let pipeline_str = if use_hls_relay {
             let hls_dir = hls_tmp_dir.as_ref().unwrap();
@@ -2124,7 +2133,38 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
         *current_pipeline.lock().unwrap() = Some(pipeline.clone());
 
-        pipeline.set_state(gst::State::Playing)?;
+        if let Err(e) = pipeline.set_state(gst::State::Playing) {
+            // StateChangeError itself is opaque — the failing element posted
+            // the real reason (e.g. "Failed to bind link") on the bus, which
+            // nothing was draining yet. Surface it before deciding anything.
+            let bus = pipeline.bus().unwrap();
+            while let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error]) {
+                if let MessageView::Error(err) = msg.view() {
+                    eprintln!(
+                        "pipeline failed to start: {} ({})",
+                        err.error(),
+                        err.debug().unwrap_or_default()
+                    );
+                }
+            }
+            let _ = pipeline.set_state(gst::State::Null);
+            *current_pipeline.lock().unwrap() = None;
+            rebuild_attempts += 1;
+            if generation == 0
+                || rebuild_attempts >= MAX_REBUILD_ATTEMPTS
+                || shutdown.load(Ordering::SeqCst)
+            {
+                // Generation 0 failing is a misconfiguration — fail fast.
+                return Err(Box::new(e));
+            }
+            eprintln!(
+                "egress-watchdog: pipeline restart failed (attempt {rebuild_attempts}/{MAX_REBUILD_ATTEMPTS}) — retrying in {}s",
+                REBUILD_RETRY_PAUSE.as_secs()
+            );
+            std::thread::sleep(REBUILD_RETRY_PAUSE);
+            continue;
+        }
+        rebuild_attempts = 0;
         if shutdown.load(Ordering::SeqCst) {
             // Ctrl+C raced pipeline startup: its EOS hit the previous (or a
             // NULL) pipeline and was lost — re-send it to this one.

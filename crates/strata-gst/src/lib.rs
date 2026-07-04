@@ -250,6 +250,60 @@ mod tests {
         pipeline_b.set_state(gst::State::Null).unwrap();
     }
 
+    /// Regression: the egress watchdog rebuilds the receiver pipeline in the
+    /// same process, so after `set_state(Null)` a fresh `stratasrc` must be
+    /// able to bind the very same UDP ports again. Field run orangepi-123888
+    /// (2026-07-04): the generation-1 rebuild died with StateChangeError right
+    /// after the generation-0 teardown — a rebind race against the kernel's
+    /// deferred SQPOLL io_uring teardown. This test only exercises the
+    /// synchronous-teardown (non-SQPOLL) path the sandbox falls back to; the
+    /// SQPOLL race is covered by strata_pipeline's bounded rebuild retry.
+    #[test]
+    fn stratasrc_rebinds_same_ports_after_null() {
+        gst::init().unwrap();
+        gst::Element::register(
+            None,
+            "stratasrc",
+            gst::Rank::NONE,
+            src::StrataSrc::static_type(),
+        )
+        .unwrap();
+
+        let build = || {
+            let pipeline = gst::Pipeline::new();
+            let src = gst::ElementFactory::make("stratasrc")
+                .property("links", "0.0.0.0:15100,0.0.0.0:15102")
+                .build()
+                .unwrap();
+            let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+            pipeline.add(&src).unwrap();
+            pipeline.add(&sink).unwrap();
+            src.link(&sink).unwrap();
+            pipeline
+        };
+
+        let first = build();
+        first.set_state(gst::State::Playing).unwrap();
+
+        // Keep the link reader threads busy receiving, like a live field run,
+        // so teardown lands mid-traffic rather than on idle sockets.
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..50 {
+            let _ = tx.send_to(&[0u8; 188], "127.0.0.1:15100");
+            let _ = tx.send_to(&[0u8; 188], "127.0.0.1:15102");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        first.set_state(gst::State::Null).unwrap();
+
+        let second = build();
+        let ret = second.set_state(gst::State::Playing);
+        second.set_state(gst::State::Null).unwrap();
+        assert!(
+            ret.is_ok(),
+            "stratasrc could not rebind its ports after a same-process teardown: {ret:?}"
+        );
+    }
+
     #[test]
     fn test_request_pads() {
         gst::init().unwrap();

@@ -30,11 +30,22 @@ trip itself now splits the two suspects), EOS-flush held segments (5 s
 bound), rebuild at NULL. Generation-prefixed segment names
 (`seg-gNNNN-%05d.ts`, uploader is filename-keyed) + first new segment
 pre-tagged `#EXT-X-DISCONTINUITY`. Script shows `wd_restarts=N`, verdict
-gained a RECOVERED tier. **Awaiting field validation — next run tells us
-whether the wedge heals and which suspect it is.** Sender AQM self-holes
-seeded the trigger burst for the 3rd time — tuning question still open;
-`tsparse set-timestamps=true` removal deferred until a watchdog trip names
-the guilty layer. Dev QoL: `STRATA_LOCAL_HLS_PORT` (default 8088) now
+gained a RECOVERED tier. **Run 5 (`orangepi-123888`): first live trip —
+SUSPECT NAMED: q_v pegged at 10 s, q_ts empty → tsdemux alive, hlssink3's
+muxer stopped consuming.** EOS salvage recovered 12 held segments. But the
+generation-1 rebuild died on StateChangeError: a rebind race against the
+kernel's deferred SQPOLL io_uring teardown (old sockets released async
+after the reader threads join → transient EADDRINUSE on 5002). Fixed:
+watchdog rebuilds retry up to 5×/1 s pause (gen 0 still fails fast), and
+Playing-failure now drains the bus so the real element error is printed.
+Local preview was double-broken (remote pkill self-match killed the
+http.server before it started; stale tunnel held local 8088 silently) —
+both fixed. **Awaiting field validation of a full heal cycle.** Sender AQM
+self-holes seeded the trigger burst for the 4th time — tuning question
+still open; `tsparse set-timestamps=true` removal sharpened now that the
+wedge is located at the muxer: stalled/inflated timestamps reaching it
+would explain it waiting forever for a segment boundary. Dev QoL:
+`STRATA_LOCAL_HLS_PORT` (default 8088) now
 tunnels the receiver HLS dir to http://localhost:8088/playlist.m3u8 for
 VLC/mpv; script verdict persists to `runs/<id>/verdict.txt`. Playout is
 **adaptive under every profile** (`fixed_playout` was fb487f7-reverted;
@@ -203,4 +214,4 @@ override that pinned it is gone — but still needs field confirmation. Watch
 adaptive-redundancy duplication as a wire-overhead contributor when spare is large.
 
 ---
-_Last updated: 2026-07-04 night (egress watchdog implemented — receiver self-heals silent wedges, trip dumps queue levels to split the two suspects; awaiting field validation)_
+_Last updated: 2026-07-04 late night (run 5: watchdog trip named the wedge — hlssink3 muxer starved while fed — but the rebuild hit an SQPOLL rebind race; rebuild retry + bus-error surfacing + preview fixes landed, awaiting a full heal cycle)_

@@ -320,16 +320,29 @@ info "Receiver HLS dir: $HLS_DIR"
 HLS_TUNNEL_PID=""
 if [[ -n "$LOCAL_HLS_PORT" && "$LOCAL_HLS_PORT" != "0" ]]; then
     if ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" "command -v python3" >/dev/null 2>&1; then
+        # [h]ttp bracket trick: the wrapper shell's own cmdline contains this
+        # whole string, so an unbracketed pattern makes pkill kill the shell
+        # before the server ever starts (run orangepi-123888: preview dead,
+        # "connection refused" through the tunnel).
         ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" \
-            "pkill -f 'http\.server $LOCAL_HLS_PORT' 2>/dev/null; \
+            "pkill -f '[h]ttp\.server $LOCAL_HLS_PORT' 2>/dev/null; \
              setsid python3 -m http.server $LOCAL_HLS_PORT --bind 127.0.0.1 --directory '$HLS_DIR' \
                >/dev/null 2>&1 < /dev/null &" >/dev/null 2>&1 || true
-        pkill -f -- "-L ${LOCAL_HLS_PORT}:127.0.0.1:${LOCAL_HLS_PORT}" 2>/dev/null || true
-        ssh "${RECEIVER_SSH[@]}" -N -L "${LOCAL_HLS_PORT}:127.0.0.1:${LOCAL_HLS_PORT}" "$RECEIVER_HOST" &
+        # Kill any stale tunnel holding the local port, whatever its target
+        # form ("-L 8088:127.0.0.1:8088" vs "-L 8088:localhost:8088", …).
+        pkill -f -- "-L ${LOCAL_HLS_PORT}:" 2>/dev/null || true
+        ssh "${RECEIVER_SSH[@]}" -N -o ExitOnForwardFailure=yes \
+            -L "${LOCAL_HLS_PORT}:127.0.0.1:${LOCAL_HLS_PORT}" "$RECEIVER_HOST" &
         HLS_TUNNEL_PID=$!
-        info "Local HLS preview: http://localhost:${LOCAL_HLS_PORT}/playlist.m3u8"
-        echo "      mpv --profile=low-latency --cache=no http://localhost:${LOCAL_HLS_PORT}/playlist.m3u8"
-        echo "      vlc --network-caching=1000 http://localhost:${LOCAL_HLS_PORT}/playlist.m3u8"
+        sleep 1
+        if kill -0 "$HLS_TUNNEL_PID" 2>/dev/null; then
+            info "Local HLS preview: http://localhost:${LOCAL_HLS_PORT}/playlist.m3u8"
+            echo "      mpv --profile=low-latency --cache=no http://localhost:${LOCAL_HLS_PORT}/playlist.m3u8"
+            echo "      vlc --network-caching=1000 http://localhost:${LOCAL_HLS_PORT}/playlist.m3u8"
+        else
+            HLS_TUNNEL_PID=""
+            warn "local HLS preview tunnel failed — port ${LOCAL_HLS_PORT} still busy? (STRATA_LOCAL_HLS_PORT to change)"
+        fi
     else
         warn "python3 not found on receiver — local HLS preview disabled"
     fi
@@ -474,7 +487,7 @@ RX_FATAL=$(ssh "${RECEIVER_SSH[@]}" "$RECEIVER_HOST" \
     2>/dev/null || echo "")
 RESTART_STR=""; [[ $RESTARTS -gt 0 ]] && RESTART_STR=" — $RESTARTS egress-watchdog restart(s)"
 if [[ $RECEIVER_DIED -eq 1 || -n "$RX_FATAL" ]]; then
-    VERDICT="FAILED: receiver died mid-run${RX_FATAL:+ — fatal: $RX_FATAL} ($MAX_SEGS segment(s) before death)"; warn "$VERDICT"
+    VERDICT="FAILED: receiver died mid-run${RX_FATAL:+ — fatal: $RX_FATAL} (produced $PREV_PRODUCED segment(s) before death)"; warn "$VERDICT"
 elif [[ $STALL_TICKS -ge 4 ]]; then
     VERDICT="FAILED: HLS egress stalled and never recovered ($((STALL_TICKS * MONITOR_INTERVAL))s at run end; produced $PREV_PRODUCED segments total$RESTART_STR) — YouTube went dark even though both processes stayed up"; warn "$VERDICT"
 elif [[ $MAX_STALL_TICKS -ge 4 ]]; then
