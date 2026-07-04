@@ -121,33 +121,25 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
         },
     );
 
-    // Transition any active streams to 'ended' — the agent is gone so they
-    // are definitely not running any more.
-    let orphaned: Vec<(String,)> = sqlx::query_as(
-        "UPDATE streams SET state = 'ended', ended_at = $1 \
-         WHERE sender_id = $2 AND state IN ('starting', 'live', 'stopping') \
-         RETURNING id",
+    // A WS drop is "unobserved", not "dead" — the media pipeline doesn't
+    // touch the control plane and keeps running through a blip or a control
+    // restart. Active streams are left alone here; the next heartbeat
+    // reconciles them, and the sweeper ends them if the agent stays away
+    // past UNOBSERVED_GRACE (see stream_state.rs).
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM streams WHERE sender_id = $1 AND state = ANY($2)",
     )
-    .bind(Utc::now())
     .bind(&sender_id)
-    .fetch_all(state.pool())
+    .bind(&crate::stream_state::ACTIVE_STATES[..])
+    .fetch_one(state.pool())
     .await
-    .unwrap_or_default();
-
-    for (stream_id,) in &orphaned {
-        state.live_streams().remove(stream_id);
-        state.broadcast_dashboard(
-            owner_id.clone(),
-            DashboardEvent::StreamStateChanged {
-                stream_id: stream_id.clone(),
-                sender_id: sender_id.clone(),
-                state: strata_protocol::models::StreamState::Ended,
-                error: Some("agent disconnected".into()),
-            },
+    .unwrap_or(0);
+    if active > 0 {
+        tracing::info!(
+            sender_id = %sender_id,
+            count = active,
+            "agent disconnected with active streams — left for reconciliation/sweep"
         );
-    }
-    if !orphaned.is_empty() {
-        tracing::warn!(sender_id = %sender_id, count = orphaned.len(), "cleaned up orphaned streams");
     }
 
     // Update last_seen_at
@@ -304,6 +296,16 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, owner_id: &str,
                 .device_status()
                 .insert(sender_id.to_string(), payload.clone());
 
+            // Reconcile the DB against what the device says it's running —
+            // this, not WS liveness, is the ground truth for stream state.
+            crate::stream_state::reconcile_sender(
+                state,
+                sender_id,
+                owner_id,
+                &payload.running_streams,
+            )
+            .await;
+
             // Broadcast to dashboard
             state.broadcast_dashboard(
                 owner_id,
@@ -322,18 +324,19 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, owner_id: &str,
             // Transition stream from 'starting' → 'live' on first stats message.
             // Only run the UPDATE if we haven't already transitioned this stream.
             if !state.live_streams().contains(&payload.stream_id) {
-                let rows = sqlx::query(
-                    "UPDATE streams SET state = 'live' WHERE id = $1 AND state = 'starting'",
+                let moved = crate::stream_state::transition(
+                    state.pool(),
+                    &payload.stream_id,
+                    strata_protocol::models::StreamState::Live,
+                    None,
                 )
-                .bind(&payload.stream_id)
-                .execute(state.pool())
                 .await;
 
                 // Track the stream as live so we don't re-query every second
                 state.live_streams().insert(payload.stream_id.clone());
 
                 // Only broadcast state change on the actual transition
-                if rows.as_ref().map(|r| r.rows_affected()).unwrap_or(0) > 0 {
+                if moved.unwrap_or(false) {
                     state.broadcast_dashboard(
                         owner_id,
                         DashboardEvent::StreamStateChanged {
@@ -355,15 +358,23 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, owner_id: &str,
             // Remove from live_streams tracking
             state.live_streams().remove(&payload.stream_id);
 
-            // Update stream record
-            let _ = sqlx::query(
-                "UPDATE streams SET state = 'ended', ended_at = $1, total_bytes = $2 WHERE id = $3",
+            // Device-confirmed end: no error attribution (that's what makes
+            // it ineligible for readoption).
+            if let Err(e) = crate::stream_state::transition(
+                state.pool(),
+                &payload.stream_id,
+                strata_protocol::models::StreamState::Ended,
+                None,
             )
-            .bind(Utc::now())
-            .bind(payload.total_bytes as i64)
-            .bind(&payload.stream_id)
-            .execute(state.pool())
-            .await;
+            .await
+            {
+                tracing::warn!(stream_id = %payload.stream_id, error = %e, "stream.ended transition failed");
+            }
+            let _ = sqlx::query("UPDATE streams SET total_bytes = $1 WHERE id = $2")
+                .bind(payload.total_bytes as i64)
+                .bind(&payload.stream_id)
+                .execute(state.pool())
+                .await;
 
             state.broadcast_dashboard(
                 owner_id,

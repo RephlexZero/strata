@@ -845,3 +845,318 @@ async fn dashboard_ws_rejects_invalid_token() {
         "expected the socket to close after auth rejection"
     );
 }
+
+// ── Stream state machine + reconciliation (E2) ──────────────────────
+
+/// Create a sender via the API and connect an agent WebSocket for it,
+/// completing the enrollment handshake. Returns the authenticated socket
+/// and the sender id.
+async fn connect_agent_ws(
+    app: &Router,
+    addr: std::net::SocketAddr,
+    user_token: &str,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    String,
+) {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let resp = app
+        .clone()
+        .oneshot(auth_post(
+            "/api/senders",
+            user_token,
+            serde_json::json!({ "name": "Reconcile Test" }),
+        ))
+        .await
+        .unwrap();
+    let body = json_body(resp).await;
+    let sender_id = body["sender_id"].as_str().unwrap().to_string();
+    let enrollment_token = body["enrollment_token"].as_str().unwrap().to_string();
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/agent/ws"))
+        .await
+        .expect("connect agent WS");
+    let auth = serde_json::json!({
+        "id": "test-agent-auth",
+        "type": "auth.login",
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "payload": {
+            "enrollment_token": enrollment_token,
+            "device_key": null,
+            "agent_version": "test",
+            "hostname": "test-agent",
+            "arch": "x86_64",
+        },
+    });
+    ws.send(Message::Text(auth.to_string().into()))
+        .await
+        .unwrap();
+    let resp = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
+        .await
+        .expect("agent auth response");
+    assert_eq!(resp["payload"]["success"], true, "agent auth failed: {resp}");
+
+    (ws, sender_id)
+}
+
+/// Send a device.status heartbeat listing `running` stream ids.
+async fn send_heartbeat(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    running: &[&str],
+) {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let hb = serde_json::json!({
+        "id": "test-heartbeat",
+        "type": "device.status",
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "payload": {
+            "network_interfaces": [],
+            "media_inputs": [],
+            "stream_state": if running.is_empty() { "idle" } else { "live" },
+            "cpu_percent": 1.0,
+            "mem_used_mb": 64,
+            "uptime_s": 10,
+            "running_streams": running,
+        },
+    });
+    ws.send(Message::Text(hb.to_string().into())).await.unwrap();
+}
+
+/// Poll the DB until the stream reaches `expected` or the timeout expires.
+async fn wait_for_state(
+    state: &strata_control::state::AppState,
+    stream_id: &str,
+    expected: &str,
+) -> String {
+    for _ in 0..40 {
+        let current: String = sqlx::query_scalar("SELECT state FROM streams WHERE id = $1")
+            .bind(stream_id)
+            .fetch_one(state.pool())
+            .await
+            .unwrap();
+        if current == expected {
+            return current;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    sqlx::query_scalar("SELECT state FROM streams WHERE id = $1")
+        .bind(stream_id)
+        .fetch_one(state.pool())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn ws_drop_no_longer_ends_streams() {
+    let Some((app, state)) = test_app_with_state().await else {
+        return;
+    };
+    let token = register_and_login(&app).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_app = app.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, serve_app).await.unwrap();
+    });
+
+    let (ws, sender_id) = connect_agent_ws(&app, addr, &token).await;
+
+    sqlx::query(
+        "INSERT INTO streams (id, sender_id, state, started_at) VALUES ($1, $2, 'live', $3)",
+    )
+    .bind("str_wsdrop")
+    .bind(&sender_id)
+    .bind(chrono::Utc::now())
+    .execute(state.pool())
+    .await
+    .unwrap();
+
+    // Drop the socket — the old behavior orphan-marked every active stream
+    // 'ended' here. Reconciliation semantics: a WS drop is "unobserved".
+    drop(ws);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let current: String = sqlx::query_scalar("SELECT state FROM streams WHERE id = $1")
+        .bind("str_wsdrop")
+        .fetch_one(state.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        current, "live",
+        "a WS drop must not end streams — only reconciliation/sweep may"
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_reconciles_stream_not_running_on_sender() {
+    let Some((app, state)) = test_app_with_state().await else {
+        return;
+    };
+    let token = register_and_login(&app).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_app = app.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, serve_app).await.unwrap();
+    });
+
+    let (mut ws, sender_id) = connect_agent_ws(&app, addr, &token).await;
+
+    // A 'live' stream the agent does not report → ended on the next
+    // heartbeat (no grace: only 'starting' rows get STARTING_GRACE).
+    sqlx::query(
+        "INSERT INTO streams (id, sender_id, state, started_at) VALUES ($1, $2, 'live', $3)",
+    )
+    .bind("str_gone")
+    .bind(&sender_id)
+    .bind(chrono::Utc::now())
+    .execute(state.pool())
+    .await
+    .unwrap();
+
+    send_heartbeat(&mut ws, &[]).await;
+
+    let current = wait_for_state(&state, "str_gone", "ended").await;
+    assert_eq!(current, "ended");
+    let err: Option<String> =
+        sqlx::query_scalar("SELECT error_message FROM streams WHERE id = $1")
+            .bind("str_gone")
+            .fetch_one(state.pool())
+            .await
+            .unwrap();
+    assert_eq!(err.as_deref(), Some("not running on sender (reconciled)"));
+}
+
+#[tokio::test]
+async fn heartbeat_readopts_inferred_end_but_not_confirmed_end() {
+    let Some((app, state)) = test_app_with_state().await else {
+        return;
+    };
+    let token = register_and_login(&app).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_app = app.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, serve_app).await.unwrap();
+    });
+
+    let (mut ws, sender_id) = connect_agent_ws(&app, addr, &token).await;
+
+    // Inferred end (error_message set by the control plane) → readopted.
+    sqlx::query(
+        "INSERT INTO streams (id, sender_id, state, started_at, ended_at, error_message) \
+         VALUES ($1, $2, 'ended', $3, $3, 'sender unobserved (connection lost)')",
+    )
+    .bind("str_inferred")
+    .bind(&sender_id)
+    .bind(chrono::Utc::now())
+    .execute(state.pool())
+    .await
+    .unwrap();
+
+    // Confirmed end (no error_message) → stays ended; intent is enforced.
+    sqlx::query(
+        "INSERT INTO streams (id, sender_id, state, started_at, ended_at) \
+         VALUES ($1, $2, 'ended', $3, $3)",
+    )
+    .bind("str_confirmed")
+    .bind(&sender_id)
+    .bind(chrono::Utc::now())
+    .execute(state.pool())
+    .await
+    .unwrap();
+
+    send_heartbeat(&mut ws, &["str_inferred", "str_confirmed"]).await;
+
+    let readopted = wait_for_state(&state, "str_inferred", "live").await;
+    assert_eq!(readopted, "live", "inferred end must be readopted");
+    let err: Option<String> =
+        sqlx::query_scalar("SELECT error_message FROM streams WHERE id = $1")
+            .bind("str_inferred")
+            .fetch_one(state.pool())
+            .await
+            .unwrap();
+    assert_eq!(err, None, "readoption must clear the inferred-end attribution");
+
+    let confirmed: String = sqlx::query_scalar("SELECT state FROM streams WHERE id = $1")
+        .bind("str_confirmed")
+        .fetch_one(state.pool())
+        .await
+        .unwrap();
+    assert_eq!(confirmed, "ended", "confirmed end must not be resurrected");
+
+    // The enforcement path re-sends stream.stop for the confirmed end.
+    let stop = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
+        .await
+        .expect("expected a re-sent stream.stop for the confirmed end");
+    assert_eq!(stop["type"], "stream.stop");
+    assert_eq!(stop["payload"]["stream_id"], "str_confirmed");
+}
+
+#[tokio::test]
+async fn transition_rejects_illegal_moves() {
+    let Some(state) = test_state().await else {
+        return;
+    };
+    let token_suffix = "trans";
+
+    // Seed a user + sender + ended stream directly.
+    sqlx::query("INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, 'x', 'operator')")
+        .bind(format!("usr_{token_suffix}"))
+        .bind(format!("{token_suffix}@test.com"))
+        .execute(state.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO senders (id, owner_id) VALUES ($1, $2)")
+        .bind(format!("snd_{token_suffix}"))
+        .bind(format!("usr_{token_suffix}"))
+        .execute(state.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO streams (id, sender_id, state, started_at, ended_at) \
+         VALUES ($1, $2, 'ended', $3, $3)",
+    )
+    .bind("str_terminal")
+    .bind(format!("snd_{token_suffix}"))
+    .bind(chrono::Utc::now())
+    .execute(state.pool())
+    .await
+    .unwrap();
+
+    use strata_protocol::models::StreamState;
+
+    // Terminal states are sticky against every non-readopt transition.
+    for to in [StreamState::Live, StreamState::Stopping, StreamState::Ended] {
+        let moved =
+            strata_control::stream_state::transition(state.pool(), "str_terminal", to, None)
+                .await
+                .unwrap();
+        assert!(!moved, "ended → {to} must be rejected");
+    }
+
+    // 'starting' is never a transition target (creation is INSERT-only).
+    let moved = strata_control::stream_state::transition(
+        state.pool(),
+        "str_terminal",
+        StreamState::Starting,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!moved);
+
+    // A confirmed end (no error_message) is not readoptable.
+    let readopted = strata_control::stream_state::readopt(state.pool(), "str_terminal")
+        .await
+        .unwrap();
+    assert!(!readopted);
+}

@@ -14,7 +14,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
-use strata_control::{api, db, state, ws_agent, ws_dashboard, ws_receiver};
+use strata_control::{api, db, state, stream_state, ws_agent, ws_dashboard, ws_receiver};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -50,6 +50,21 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Shared state ────────────────────────────────────────────
     let state = state::AppState::new(pool, jwt);
+
+    // ── Stream-state sweeper ────────────────────────────────────
+    // Backstop for devices that never reconnect: a WS drop no longer
+    // orphan-marks streams, so something must end them when the device is
+    // genuinely gone (see stream_state.rs).
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(stream_state::SWEEP_INTERVAL);
+            loop {
+                tick.tick().await;
+                stream_state::sweep(&state).await;
+            }
+        });
+    }
 
     // ── Router ──────────────────────────────────────────────────
     // Dashboard: serve the trunk-built WASM SPA from a directory.

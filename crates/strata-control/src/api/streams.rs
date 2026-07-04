@@ -292,12 +292,37 @@ async fn start_stream(
     let json = serde_json::to_string(&envelope).unwrap();
 
     if agent_tx.send(json).await.is_err() {
-        // Agent channel closed — roll back the DB row
-        let _ = sqlx::query("UPDATE streams SET state = 'ended', ended_at = $1 WHERE id = $2")
-            .bind(Utc::now())
-            .bind(&stream_id)
+        // Agent channel closed — roll back: mark the row failed, tell the
+        // receiver to tear down the pipeline it just started, and release
+        // its capacity slot (E7: the old rollback leaked both).
+        let _ = crate::stream_state::transition(
+            state.pool(),
+            &stream_id,
+            strata_protocol::models::StreamState::Failed,
+            Some("failed to send stream.start to agent"),
+        )
+        .await;
+        if let Some(ref rcv_id) = receiver_id_opt {
+            if let Some(rcv_handle) = state.receivers().get(rcv_id) {
+                let stop = strata_protocol::ReceiverControlMessage::StreamStop(
+                    strata_protocol::ReceiverStreamStopPayload {
+                        stream_id: stream_id.clone(),
+                        reason: "start rollback".into(),
+                    },
+                );
+                if let Ok(env) = Envelope::from_message(&stop)
+                    && let Ok(j) = serde_json::to_string(&env)
+                {
+                    let _ = rcv_handle.tx.send(j).await;
+                }
+            }
+            let _ = sqlx::query(
+                "UPDATE receivers SET active_streams = GREATEST(active_streams - 1, 0) WHERE id = $1",
+            )
+            .bind(rcv_id)
             .execute(state.pool())
             .await;
+        }
         return Err(ApiError::internal("failed to send to agent"));
     }
 
@@ -346,11 +371,14 @@ async fn stop_stream(
     .ok_or_else(|| ApiError::not_found("no active stream for this sender"))?;
 
     // Update state
-    sqlx::query("UPDATE streams SET state = 'stopping' WHERE id = $1")
-        .bind(&stream_id)
-        .execute(state.pool())
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    crate::stream_state::transition(
+        state.pool(),
+        &stream_id,
+        strata_protocol::models::StreamState::Stopping,
+        None,
+    )
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
 
     // Send stop command to agent
     if let Some(agent) = state.agents().get(&sender_id) {
@@ -414,14 +442,8 @@ async fn stop_stream(
         let owner_id = user.user_id.clone();
         tokio::spawn(async move {
             tokio::time::sleep(STOP_FORCE_END_TIMEOUT).await;
-            let result = sqlx::query(
-                "UPDATE streams SET state = 'ended', ended_at = $1 WHERE id = $2 AND state = 'stopping'",
-            )
-            .bind(Utc::now())
-            .bind(&stream_id)
-            .execute(state.pool())
-            .await;
-            if result.as_ref().map(|r| r.rows_affected()).unwrap_or(0) > 0 {
+            let forced = crate::stream_state::force_end_stopping(state.pool(), &stream_id).await;
+            if forced.unwrap_or(false) {
                 state.live_streams().remove(&stream_id);
                 state.broadcast_dashboard(
                     owner_id,

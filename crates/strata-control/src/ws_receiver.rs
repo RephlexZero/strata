@@ -18,8 +18,8 @@ use tokio::sync::mpsc;
 
 use strata_common::auth;
 use strata_protocol::{
-    DashboardEvent, Envelope, PROTOCOL_VERSION, ReceiverAuthLoginPayload,
-    ReceiverAuthLoginResponsePayload, ReceiverControlMessage, ReceiverMessage,
+    Envelope, PROTOCOL_VERSION, ReceiverAuthLoginPayload, ReceiverAuthLoginResponsePayload,
+    ReceiverControlMessage, ReceiverMessage,
 };
 
 use crate::state::{AppState, ReceiverHandle};
@@ -80,7 +80,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_receiver_message(&state, &receiver_id, &text).await;
+                        handle_receiver_message(&state, &receiver_id, &owner_id, &text).await;
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(_)) => break,
@@ -114,41 +114,10 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     .execute(state.pool())
     .await;
 
-    // Transition any streams assigned to this receiver to 'ended'
-    let orphaned: Vec<(String, String)> = sqlx::query_as(
-        "UPDATE streams SET state = 'ended', ended_at = $1 \
-         WHERE receiver_id = $2 AND state IN ('starting', 'live', 'stopping') \
-         RETURNING id, sender_id",
-    )
-    .bind(Utc::now())
-    .bind(&receiver_id)
-    .fetch_all(state.pool())
-    .await
-    .unwrap_or_default();
-
-    for (stream_id, sender_id) in &orphaned {
-        state.live_streams().remove(stream_id);
-        // A stream's receiver is only ever picked from the same owner as its
-        // sender (see `pick_receiver_links` in api/streams.rs), so this
-        // receiver's own owner_id is the correct scope for its streams.
-        state.broadcast_dashboard(
-            owner_id.clone(),
-            DashboardEvent::StreamStateChanged {
-                stream_id: stream_id.clone(),
-                sender_id: sender_id.clone(),
-                state: strata_protocol::models::StreamState::Ended,
-                error: Some("receiver disconnected".into()),
-            },
-        );
-    }
-    if !orphaned.is_empty() {
-        tracing::warn!(
-            receiver_id = %receiver_id,
-            count = orphaned.len(),
-            "cleaned up orphaned streams from disconnected receiver"
-        );
-    }
-
+    // A WS drop is "unobserved", not "dead" — the receiver's pipelines keep
+    // running through a blip. Streams are left for heartbeat reconciliation
+    // (or the sweeper via the sender side) instead of being orphan-marked
+    // here; see stream_state.rs.
     tracing::info!(receiver_id = %receiver_id, "receiver disconnected");
 }
 
@@ -269,7 +238,7 @@ async fn authenticate_enrollment(
 }
 
 /// Handle an incoming message from an authenticated receiver.
-async fn handle_receiver_message(state: &AppState, receiver_id: &str, raw: &str) {
+async fn handle_receiver_message(state: &AppState, receiver_id: &str, owner_id: &str, raw: &str) {
     let envelope: Envelope = match serde_json::from_str(raw) {
         Ok(e) => e,
         Err(e) => {
@@ -304,6 +273,14 @@ async fn handle_receiver_message(state: &AppState, receiver_id: &str, raw: &str)
             .execute(state.pool())
             .await;
 
+            crate::stream_state::reconcile_receiver(
+                state,
+                receiver_id,
+                owner_id,
+                &payload.running_streams,
+            )
+            .await;
+
             state
                 .receiver_status()
                 .insert(receiver_id.to_string(), payload);
@@ -326,16 +303,24 @@ async fn handle_receiver_message(state: &AppState, receiver_id: &str, raw: &str)
                 "receiver stream ended"
             );
 
-            // Update stream record if still assigned to this receiver
-            let _ = sqlx::query(
-                "UPDATE streams SET state = 'ended', ended_at = $1 \
-                 WHERE id = $2 AND receiver_id = $3 AND state IN ('starting', 'live')",
+            // Only act if the stream is still assigned to this receiver.
+            let assigned: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM streams WHERE id = $1 AND receiver_id = $2)",
             )
-            .bind(Utc::now())
             .bind(&payload.stream_id)
             .bind(receiver_id)
-            .execute(state.pool())
-            .await;
+            .fetch_one(state.pool())
+            .await
+            .unwrap_or(false);
+            if assigned {
+                let _ = crate::stream_state::transition(
+                    state.pool(),
+                    &payload.stream_id,
+                    strata_protocol::models::StreamState::Ended,
+                    None,
+                )
+                .await;
+            }
 
             state.live_streams().remove(&payload.stream_id);
 
