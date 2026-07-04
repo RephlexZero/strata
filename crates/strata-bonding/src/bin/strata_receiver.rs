@@ -6,19 +6,19 @@
 //!
 //! This is a **testing and diagnostic tool** — it operates at the raw transport
 //! layer without a GStreamer pipeline.  For production relay (RTMP, HLS, etc.)
-//! use `strata-node receiver --relay-url <url>` instead.
+//! use `strata-pipeline receiver --relay-url <url>` instead.
 //!
 //! ## Usage
 //!
 //! ```bash
 //! # Monitor mode (log stats, discard output)
-//! strata-receiver --bind 0.0.0.0:5000,0.0.0.0:5002,0.0.0.0:5004
+//! strata-probe-recv --bind 0.0.0.0:5000,0.0.0.0:5002,0.0.0.0:5004
 //!
 //! # Write MPEG-TS to file (pipe it yourself from there)
-//! strata-receiver --bind 0.0.0.0:5000,0.0.0.0:5002 --output stream.ts
+//! strata-probe-recv --bind 0.0.0.0:5000,0.0.0.0:5002 --output stream.ts
 //!
 //! # Prometheus metrics
-//! strata-receiver --bind 0.0.0.0:5000 --metrics-port 9090
+//! strata-probe-recv --bind 0.0.0.0:5000 --metrics-port 9090
 //! ```
 
 use std::io::Write;

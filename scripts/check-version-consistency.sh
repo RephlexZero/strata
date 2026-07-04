@@ -13,10 +13,10 @@ CORE_CRATES=(
     "strata-bonding"
     "strata-common"
     "strata-control"
+    "strata-protocol"
     "strata-sender"
     "strata-receiver"
     "strata-dashboard"
-    "strata-portal"
     "strata-sim"
 )
 

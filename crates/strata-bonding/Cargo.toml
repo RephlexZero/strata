@@ -7,6 +7,12 @@ edition = "2024"
 name = "strata-probe"
 path = "src/bin/strata_probe.rs"
 
+# Explicit name: autodiscovery called this `strata_receiver`, which collides
+# with the strata-receiver daemon crate's binary in packaging/PATH.
+[[bin]]
+name = "strata-probe-recv"
+path = "src/bin/strata_receiver.rs"
+
 [features]
 default = []
 bursty_diag = []
