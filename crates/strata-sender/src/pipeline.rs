@@ -382,14 +382,57 @@ fn spawn_pipeline(payload: &StreamStartPayload) -> anyhow::Result<Child> {
         cmd.arg("--dest").arg(&dest_str);
     }
 
-    // Write bonding config to temp file if non-empty
-    if !payload.bonding_config.is_null() {
+    // Write bonding config (+ per-link interface bindings) to a temp file.
+    // Every destination shares the receiver's host, so the pipeline's
+    // `ip route get` fallback resolves all links onto the default route —
+    // the bonded links must be pinned to distinct interfaces here, via the
+    // [[links]] section the pipeline gives priority to.
+    let mut config_tbl = match toml::Value::try_from(&payload.bonding_config) {
+        Ok(toml::Value::Table(t)) => t,
+        _ => toml::value::Table::new(),
+    };
+    if !config_tbl.contains_key("links") && !payload.destinations.is_empty() {
+        let mut ifaces: Vec<String> = crate::hardware::scan_network_interfaces()
+            .into_iter()
+            .filter(|i| i.state == strata_protocol::models::InterfaceState::Connected)
+            .map(|i| i.name)
+            .collect();
+        ifaces.sort();
+        if ifaces.len() < payload.destinations.len() {
+            tracing::warn!(
+                links = payload.destinations.len(),
+                connected = ifaces.len(),
+                "fewer connected interfaces than links; unpinned links fall back to route lookup"
+            );
+        }
+        let links: Vec<toml::Value> = payload
+            .destinations
+            .iter()
+            .zip(ifaces.iter())
+            .map(|(uri, iface)| {
+                let mut t = toml::value::Table::new();
+                t.insert("uri".into(), toml::Value::String(uri.clone()));
+                t.insert("interface".into(), toml::Value::String(iface.clone()));
+                toml::Value::Table(t)
+            })
+            .collect();
+        if !links.is_empty() {
+            tracing::info!(links = ?links, "pinned links to interfaces");
+            config_tbl.insert("links".into(), toml::Value::Array(links));
+        }
+    }
+    if !config_tbl.is_empty() {
         let config_path = format!("/tmp/strata-stream-{}.toml", payload.stream_id);
-        if let Ok(toml_str) = toml::to_string_pretty(&payload.bonding_config) {
-            if let Err(e) = std::fs::write(&config_path, &toml_str) {
-                tracing::warn!(error = %e, path = %config_path, "failed to write bonding config");
-            } else {
-                cmd.arg("--config").arg(&config_path);
+        match toml::to_string_pretty(&toml::Value::Table(config_tbl)) {
+            Ok(toml_str) => {
+                if let Err(e) = std::fs::write(&config_path, &toml_str) {
+                    tracing::warn!(error = %e, path = %config_path, "failed to write bonding config");
+                } else {
+                    cmd.arg("--config").arg(&config_path);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize bonding config");
             }
         }
     }

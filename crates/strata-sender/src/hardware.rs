@@ -94,7 +94,7 @@ impl HardwareScanner {
 
 // ── Real hardware scanning helpers ──────────────────────────────────
 
-fn scan_network_interfaces() -> Vec<NetworkInterface> {
+pub(crate) fn scan_network_interfaces() -> Vec<NetworkInterface> {
     let mut interfaces = Vec::new();
 
     // Read /sys/class/net/ for interface enumeration
