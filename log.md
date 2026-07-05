@@ -699,3 +699,54 @@ strata-pipeline is NOT setcap'd — NoNewPrivileges=true blocks file-cap
 elevation but is compatible with inherited ambient caps. Also: control's
 CORS_ALLOWED_ORIGINS/METRICS_TOKEN are presence-sensitive (empty ≠ unset),
 so compose passes them only as commented opt-ins.
+
+## 2026-07-05 — v1.0 push: platform decisions closed, convergence chain, core-binary refactor
+
+Big session, eight commits on main:
+
+- **Repo hygiene**: root review docs archived to `raw/`, stale `dist/`,
+  `.env.bak`, orphaned `crates/strata-portal/` leftovers removed.
+- **E3 resolved**: control-plane CORS is same-origin by default
+  (`CORS_ALLOWED_ORIGINS` opts in; `*` = old permissive, warned);
+  `/metrics` honors `METRICS_TOKEN` (Bearer). **E10 resolved**: portal
+  keeps its onboarding API, serves a minimal inline status/enroll page,
+  permissive CORS dropped; `PORTAL_DIR`/tower-http gone. dev Dockerfiles
+  were unbuildable since the E1 protocol split (missing strata-protocol,
+  agent image still built the deleted portal crate) — fixed.
+- **Integration bug found & fixed (the convergence milestone's first
+  scalp)**: the receiver daemon spawns `strata-pipeline receiver
+  --stats-dest …` but the pipeline's arg parser exit(1)'d on the unknown
+  flag — every platform-spawned receiver pipeline died instantly. Fixed,
+  and the whole egress-intelligence chain from the field script now
+  travels natively: pipeline emits `egress` (segments_produced across
+  generations, wd_restarts, last_segment_age_ms) in the stats relay →
+  `EgressStats` in strata-protocol → receiver daemon forwards → control
+  caches per stream_id + replays to late dashboards → dashboard renders
+  an HLS Egress card (flowing/stalling/stalled at 5 s/15 s).
+- **FEC hot-update gap closed by deletion**: `FecConfigUpdate` had no
+  producer (its dashboard knobs died as placebo in E1) and a manual FEC
+  pin would fight the adaptive loop — surface removed, wire-compatible.
+- **Binary collision fixed**: bonding dev tool is now `strata-probe-recv`
+  (explicit [[bin]]); version-check script drops strata-portal, adds
+  strata-protocol.
+- **strata-pipeline refactored**: clap derive + split into
+  `src/bin/strata_pipeline/{main,cli,sender,receiver,gate,hotswap,stats,util}.rs`.
+  Flag surface frozen and verified against daemons/scripts/wiki; one
+  help-text lie fixed (--bitrate default is and was 1000, not 2000).
+- **Netem triage**: the three `#[ignore = "Phase A … work in progress"]`
+  reasons were stale (BiscayController landed); reworded to "needs
+  root/netns; revalidate locally".
+- **Unwrap audit** (daemons + control): effectively clean — everything is
+  test helpers, infallible serde-to-String, or `writeln!` to String. One
+  real fix: receiver telemetry's fallback UDP bind could panic the whole
+  telemetry task; now logs and skips the tick.
+- **Docs**: new wiki/Platform-Operations.md (operator manual) and
+  wiki/Daemon-Configuration.md (config story); Deployment.md points at
+  packaging/ and is marked as the manual path; Strata-Platform.md portal
+  section updated; README gained a Production Deployment section.
+- Sender daemon lifecycle test suite (fake control-plane WS server,
+  drives the real binary) inherited from a spend-limit-killed subagent —
+  validated and kept if green.
+
+GitNexus MCP tools were unavailable all session (DB format v42 vs server
+v41) — blast-radius checks done manually (grep callers + crate tests).

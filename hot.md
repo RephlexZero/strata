@@ -5,6 +5,38 @@
 
 ## Current focus
 
+**2026-07-05: v1.0 push landed (9 commits)** — E3/E10 closed
+(CORS_ALLOWED_ORIGINS + METRICS_TOKEN; portal serves an inline page),
+packaging layer shipped (`packaging/` systemd units + installer,
+docker-compose.prod.yml, aarch64 release now blocking), strata-pipeline
+ported to clap and split into modules (flag surface frozen), bonding dev
+binary renamed `strata-probe-recv`, dead FEC hot-update surface deleted,
+and **the convergence chain is in**: the field script's egress
+intelligence (segment heartbeat, wd_restarts, stall state) now travels
+pipeline → daemon → control → dashboard natively ("HLS Egress" card).
+Found en route: platform-spawned receiver pipelines died instantly
+(`--stats-dest` was rejected by the pipeline's arg parser) — exactly the
+class of integration bug the convergence milestone predicted; fixed.
+See log.md 2026-07-05 for the full list. New operator docs:
+[wiki/Platform-Operations.md](wiki/Platform-Operations.md),
+[wiki/Daemon-Configuration.md](wiki/Daemon-Configuration.md).
+
+**Next field session — the v1.0 validation checklist:**
+1. Transport heal cycle (top blocker, unchanged): reproduce a watchdog
+   trip and confirm SO_REUSEADDR lets generation N+1 bind under load —
+   verdict RECOVERED/OK, `wd_restarts≥1`, no `Address already in use`.
+2. Platform end-to-end under real Band 8: enroll the real Orange Pi via
+   strata-sender (portal or env token), click start in the dashboard,
+   receiver daemon spawns the pipeline, video lands on YouTube — and the
+   HLS Egress card tracks reality (compare against the script's verdict
+   on a parallel run).
+3. Confirm the new egress telemetry survives a watchdog rebuild
+   (segments_produced keeps counting across generations).
+4. Bitrate HOLD HIGH in a clean-radio window (carried over).
+5. `packaging/install.sh sender` on a fresh Orange Pi image — three
+   commands, stream works under the systemd unit (ambient CAP_NET_RAW,
+   no setcap).
+
 **2026-07-04: three field runs, three faces of ONE defect — the
 tsparse/tsdemux retiming layer is unstable over bonded-loss input.**
 Full forensics: `runs/INVESTIGATION-2026-07-04.md`. Run 1: playout
@@ -98,10 +130,9 @@ pointing at [wiki/Adaptation-EWMA-Conventions.md](wiki/Adaptation-EWMA-Conventio
   dashboard and rendered beside the sender view.
 
 Control-plane integration suite is now 25 tests (real WS handshakes for
-agent/receiver/dashboard). Remaining deliberately-open platform flags: the
-`CorsLayer::permissive()`/unauthenticated-`/metrics` posture decision (E3),
-and `strata-sender`'s empty portal (`portal.rs`, :3001) still needing a
-follow-up decision after strata-portal's retirement (E10).
+agent/receiver/dashboard). ~~Remaining deliberately-open platform flags:
+E3 (CORS/metrics posture) and E10 (empty portal)~~ — **both resolved
+2026-07-05** (see Current focus above); the E-list is now fully closed.
 
 *Docs*: ARCHITECTURE_REVIEW item 9 done — the three 2026-05 root-level
 review/diagnosis docs are archived to `raw/`, their durable content merged
@@ -224,4 +255,4 @@ override that pinned it is gone — but still needs field confirmation. Watch
 adaptive-redundancy duplication as a wire-overhead contributor when spare is large.
 
 ---
-_Last updated: 2026-07-04 late night (run 6: rebind race confirmed under load — retry budget wasn't enough, SO_REUSEADDR fixes it at the root — awaiting a full heal cycle)_
+_Last updated: 2026-07-05 (v1.0 push: E-list closed, packaging shipped, egress telemetry converged, pipeline refactored — see the field checklist above)_

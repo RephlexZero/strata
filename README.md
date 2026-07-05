@@ -163,6 +163,22 @@ Check YouTube Studio for incoming stream health.
 
 ---
 
+## Production Deployment
+
+The quick start above runs `strata-pipeline` by hand. For a managed fleet —
+control plane + web dashboard + enrolled devices, three commands per box —
+use the packaged platform path:
+
+```bash
+sudo ./packaging/install.sh <sender|receiver|control>   # per role
+```
+
+See [packaging/README.md](packaging/README.md) for systemd units, env files
+and the TLS story, and the wiki's **Platform-Operations** page for the full
+operator manual (control-plane setup, device enrollment, stream health).
+
+---
+
 ## Using GStreamer Directly
 
 If you prefer raw GStreamer pipelines:
