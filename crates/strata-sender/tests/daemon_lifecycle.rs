@@ -7,13 +7,13 @@
 //! `PipelineManager` unit tests), injected via `STRATA_PIPELINE_BIN`.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -27,7 +27,7 @@ use strata_protocol::{
 
 /// The daemon binds fixed host resources (stats UDP 127.0.0.1:9100, the
 /// pipeline control socket below) — run one daemon at a time.
-static SERIAL: Mutex<()> = Mutex::new(());
+static SERIAL: Mutex<()> = Mutex::const_new(());
 
 /// Mirrors `pipeline::CONTROL_SOCK_PATH` in the daemon.
 const CONTROL_SOCK_PATH: &str = "/tmp/strata-pipeline.sock";
@@ -36,8 +36,8 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(30);
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
-fn lock_serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+async fn lock_serial() -> tokio::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().await
 }
 
 // ── Test scaffolding ─────────────────────────────────────────────────
@@ -329,7 +329,7 @@ fn config_update(request_id: &str, bitrate_kbps: u32, tune: Option<&str>) -> Con
 /// and the daemon enters its heartbeat loop.
 #[tokio::test]
 async fn enroll_persists_identity_and_starts_heartbeating() {
-    let _serial = lock_serial();
+    let _serial = lock_serial().await;
     let dir = TestDir::new("enroll");
     let identity_path = dir.path.join("identity.json");
 
@@ -363,7 +363,7 @@ async fn enroll_persists_identity_and_starts_heartbeating() {
 /// the server's ed25519 challenge with a valid signature and resumes.
 #[tokio::test]
 async fn reconnect_answers_ed25519_challenge() {
-    let _serial = lock_serial();
+    let _serial = lock_serial().await;
     let dir = TestDir::new("reconnect");
     let identity_path = dir.path.join("identity.json");
 
@@ -396,7 +396,7 @@ async fn reconnect_answers_ed25519_challenge() {
 /// heartbeat drops the stream.
 #[tokio::test]
 async fn stream_start_runs_pipeline_and_crash_is_reported() {
-    let _serial = lock_serial();
+    let _serial = lock_serial().await;
     let dir = TestDir::new("crash");
     let identity_path = dir.path.join("identity.json");
     let script = FakePipelineScript::new(&dir.path);
@@ -463,7 +463,7 @@ async fn stream_start_runs_pipeline_and_crash_is_reported() {
 /// socket isn't there.
 #[tokio::test]
 async fn config_update_forwards_encoder_or_reports_failure() {
-    let _serial = lock_serial();
+    let _serial = lock_serial().await;
     let dir = TestDir::new("config");
     let identity_path = dir.path.join("identity.json");
     let script = FakePipelineScript::new(&dir.path);
