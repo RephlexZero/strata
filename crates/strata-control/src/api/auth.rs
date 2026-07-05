@@ -27,6 +27,14 @@ async fn register(
     State(state): State<AppState>,
     Json(body): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<RegisterResponse>), ApiError> {
+    // Role checks are not implemented yet (require_role is a stub), so any
+    // account has full control of every device. On an internet-facing
+    // deployment, set DISABLE_REGISTRATION=1 once the operator accounts
+    // exist — otherwise anyone can register and drive the fleet.
+    if std::env::var("DISABLE_REGISTRATION").is_ok() {
+        return Err(ApiError::forbidden("registration is disabled"));
+    }
+
     // Validate
     if body.email.is_empty() || !body.email.contains('@') {
         return Err(ApiError::bad_request("invalid email"));

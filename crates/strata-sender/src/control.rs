@@ -661,10 +661,16 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
         }
         ControlMessage::UpdatesInstall(payload) => {
             tracing::info!("received updates.install");
+            // No on-device OTA path yet — say so instead of pretending.
+            // Device updates run via strata-update.sh (packaging/), manual
+            // or timer-driven; see wiki/Updates-and-Releases.md.
             let resp = UpdatesInstallResponsePayload {
                 request_id: payload.request_id,
-                success: true,
-                error: None,
+                success: false,
+                error: Some(
+                    "remote install is not implemented — run strata-update.sh on the device                      (or enable strata-update.timer)"
+                        .into(),
+                ),
             };
             send_message(state, &AgentMessage::UpdatesInstallResponse(resp)).await;
         }
