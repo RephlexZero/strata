@@ -750,3 +750,60 @@ Big session, eight commits on main:
 
 GitNexus MCP tools were unavailable all session (DB format v42 vs server
 v41) — blast-radius checks done manually (grep callers + crate tests).
+
+## 2026-07-05 (evening) — Production deploy to Hetzner + Orange Pi; the convergence bugs surface
+
+Deployed the platform for real over SSH: control plane (native systemd +
+Postgres 16, dashboard WASM dist) and receiver daemon on the Hetzner box
+(root@65.109.5.169, aarch64), sender agent on the Orange Pi 5 Plus
+(192.168.50.55). Full chain validated live: enroll (one-time token) →
+ed25519 reconnect → stream.start → bonded links over real Band 8 → HLS
+egress to the YouTube field ingest key → egress + receiver-link telemetry
+on the dashboard WS. Deploy artifacts came from `make cross-aarch64` (both
+boxes are aarch64; glibc floor = Pi's jammy 2.35). No public domain yet →
+control speaks plain ws:// on 3000 with SSH-tunnel admin; Caddy TLS is a
+one-step upgrade once a domain points at the box.
+
+The deploy shook out exactly the class of integration bugs the
+convergence milestone predicted:
+- **Platform streams never bonded across modems**: agent spawned the
+  pipeline with same-host destinations and no interface bindings; `ip
+  route get` resolved every link onto the default route (one modem, one
+  carrier NAT IP, 13 watchdog rebuilds in 25 min). Fixed by zipping
+  destinations onto connected interfaces via TOML [[links]]. Verified:
+  two modems arriving from distinct carrier IPs; dead LAN link correctly
+  sidelined by alive-detection.
+- **Receiver-side links were always empty**: receiver-mode strata-stats
+  uses packets_received_link_N keys, but the relay serialized with the
+  sender-style walk. New serialize_receiver_stats + per-link
+  bytes_received plumbed from the receiver transport.
+- **StartLimitIntervalSec sat in [Service]** (systemd ignores it) — first
+  real `install.sh` run caught it. Moved to [Unit] in all three units.
+- **aarch64 release never shipped strata-control** (stale x86-cloud
+  assumption). Fixed in release.yml + SHA256SUMS now published.
+- **Open registration on a public IP**: require_role is a stub, so any
+  account controls the fleet → DISABLE_REGISTRATION env, set on the box.
+- **updates.install was a placebo** (success:true, did nothing) — now
+  reports failure pointing at the real path.
+
+Update story shipped (user asked "how do we stay up to date"): GitHub
+Releases as the channel, packaging/strata-update.sh as the pull-based
+updater (stamp file, SHA256SUMS verify, atomic swap, refuses while a
+stream is live, exit 75), opt-in strata-update.timer for unattended
+fleets, wiki/Updates-and-Releases.md for the whole story incl. rollout
+order (control → receivers → senders).
+
+Receiver daemon lifecycle suite landed (5/5) — twin of the sender's,
+including a stats-relay fidelity test (links + egress). Netem Phase A
+revalidated on the Hetzner box: 2/3 pass once the host firewall allows
+the mgmt-veth subnets ('No stats received' was ufw, not the tests);
+capacity_estimation_converges genuinely fails — the estimate sits at
+capacity_floor_bps (1.5 Mbps) vs a 5 Mbps link, matching live logs.
+Recorded in the ignore strings as a real finding.
+
+Field notes: the videotestsrc ball pattern compresses to ~100 kbps, so
+"bitrate hold high" is unprovable with the test source — final validation
+run switched to the real camera (/dev/video0). Capacity floor pinning at
+low goodput is now a known estimator signature (netem + field agree).
+
+GitNexus MCP still v42/v41-broken; manual blast-radius checks throughout.

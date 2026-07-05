@@ -5,6 +5,38 @@
 
 ## Current focus
 
+**2026-07-05 evening: DEPLOYED — the platform runs in production.**
+Control plane (systemd + Postgres 16 + dashboard) and receiver daemon on
+the Hetzner box (`root@65.109.5.169`, aarch64, ufw open on 3000/tcp +
+5000-5006/udp), sender agent on the Orange Pi 5 Plus (192.168.50.55).
+Full chain proven live: token enroll → ed25519 reconnect → dashboard
+stream start → bonded Band 8 links → HLS to the YouTube field key →
+egress + receiver-link cards fed over the dashboard WS. Credentials:
+`/root/strata-credentials.txt` on the Hetzner box; registration is now
+CLOSED (`DISABLE_REGISTRATION=1`). No domain yet → plain ws:// on 3000,
+admin via SSH tunnel; pointing a domain at the box + Caddy
+(packaging/caddy/) is the TLS upgrade. Field checklist status:
+- (2) platform end-to-end under real Band 8: **DONE live** (two modems
+  from distinct carrier NAT IPs after the link-pinning fix; dead LAN
+  link correctly sidelined).
+- (3) egress telemetry across watchdog rebuilds: **DONE live**
+  (segments_produced kept counting across 13 generations).
+- (5) install.sh on real boxes: **DONE** (Ubuntu 24.04 + Jammy; caught
+  the StartLimitIntervalSec-in-wrong-section bug).
+- (1) heal cycle: watchdog tripped repeatedly in production and rebuilt
+  every time with no `Address already in use` — SO_REUSEADDR holds,
+  though a deliberate under-load repro is still worth one field session.
+- (4) bitrate HOLD HIGH: **still open** — videotestsrc ball compresses
+  to ~100 kbps so the test source can't prove it; last run of the session
+  switched to the real camera (/dev/video0). Related real finding: the
+  capacity estimate pins at capacity_floor_bps (1.5 Mbps) at low
+  goodput — netem revalidation and live field logs agree
+  (capacity_estimation_converges records it; needs estimator work).
+Update story shipped: GitHub Releases + SHA256SUMS, strata-update.sh
+(refuses mid-stream), opt-in strata-update.timer —
+[wiki/Updates-and-Releases.md](wiki/Updates-and-Releases.md). Receiver
+lifecycle suite landed (5/5). See log.md 2026-07-05 (evening).
+
 **2026-07-05: v1.0 push landed (9 commits)** — E3/E10 closed
 (CORS_ALLOWED_ORIGINS + METRICS_TOKEN; portal serves an inline page),
 packaging layer shipped (`packaging/` systemd units + installer,
@@ -188,6 +220,23 @@ packets), all 5 real ones correctly attributed and tagged discontinuous 1:1;
 
 ## Open questions / decisions pending
 
+- **Blackholed link is never marked dead** (found live 2026-07-05): the
+  Pi's LAN interface has no internet route; the pinned link 0 delivered
+  zero packets to the receiver, yet the sender kept it alive=true with
+  loss=0.000 and queued up to ~800 kbps onto it — dead-link detection is
+  loss-window-based and a link with NO receiver feedback never opens a
+  window. Transport-side fix wanted: "bytes in flight but no ACK for N
+  seconds → dead". Mitigation today: don't pin links onto interfaces
+  without a route (or wire the operator enable/disable toggle into the
+  agent's link-pinning filter — currently it filters on Connected only;
+  the enabled flag at scan level is always true, the real toggle lives in
+  HardwareMonitor and isn't threaded into spawn_pipeline yet).
+- **Capacity estimate pins at capacity_floor_bps at low traffic volume**:
+  netem (capacity_estimation_converges: 1.5 vs 5 Mbps) and live field
+  logs agree. Rises once real traffic flows (camera source: floor →
+  ~1.4 Mbps per link estimates within a minute). Estimator work, not a
+  field blocker.
+
 - **Field-validate this change**: finally watch the bitrate HOLD HIGH in a
   clean-radio window (prior runs were link-0-degraded) — confirm the encoder
   no longer cuts/pins when headroom exists.
@@ -255,4 +304,4 @@ override that pinned it is gone — but still needs field confirmation. Watch
 adaptive-redundancy duplication as a wire-overhead contributor when spare is large.
 
 ---
-_Last updated: 2026-07-05 (v1.0 push: E-list closed, packaging shipped, egress telemetry converged, pipeline refactored — see the field checklist above)_
+_Last updated: 2026-07-05 evening (production deploy: Hetzner + Orange Pi live end-to-end, convergence bugs fixed in the field, update story shipped)_

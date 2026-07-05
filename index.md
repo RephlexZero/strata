@@ -38,6 +38,7 @@ Scan before opening any full page. Keep summaries to one line.
 | [wiki/Deployment.md](wiki/Deployment.md) | Manual (non-platform) production setup, privileges, performance budgets, troubleshooting | deployment, ops |
 | [wiki/Platform-Operations.md](wiki/Platform-Operations.md) | Operator manual for the platform path — control plane setup, device enrollment, receivers, stream health, troubleshooting | platform, ops |
 | [wiki/Daemon-Configuration.md](wiki/Daemon-Configuration.md) | Which config knob lives where per daemon (flags/env/TOML) and the /etc/strata/<role>.env pattern | config, reference, platform |
+| [wiki/Updates-and-Releases.md](wiki/Updates-and-Releases.md) | Release channel (GitHub, SHA256SUMS), strata-update.sh pull updater, opt-in timer, rollout order, honest OTA-stub status | releases, updates, ops |
 | [wiki/Testing.md](wiki/Testing.md) | Test matrix, simulation framework, CI workflows, regression thresholds | testing, ci |
 
 <!--
