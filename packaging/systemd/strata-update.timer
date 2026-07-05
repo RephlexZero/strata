@@ -1,0 +1,13 @@
+# Strata unattended update timer — opt-in companion to strata-update.service.
+# Daily with a randomized spread so a fleet doesn't hammer GitHub at once.
+
+[Unit]
+Description=Daily Strata update check
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=4h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

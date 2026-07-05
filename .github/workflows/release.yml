@@ -122,6 +122,8 @@ jobs:
             "staging/strata-${VERSION}-aarch64-linux-gnu.so"
           cp cross-output/strata-pipeline \
             "staging/strata-pipeline-${VERSION}-aarch64-linux-gnu"
+          cp cross-output/strata-control \
+            "staging/strata-control-${VERSION}-aarch64-linux-gnu"
           cp cross-output/strata-sender \
             "staging/strata-sender-${VERSION}-aarch64-linux-gnu"
           cp cross-output/strata-receiver \
@@ -154,6 +156,13 @@ jobs:
           pattern: release-*
           path: artifacts
 
+      # Checksums let strata-update.sh verify downloads before swapping
+      # binaries into place.
+      - name: Generate SHA256SUMS
+        run: |
+          (cd artifacts/release-x86_64 && sha256sum *) > SHA256SUMS
+          (cd artifacts/release-aarch64 && sha256sum *) >> SHA256SUMS
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -162,6 +171,7 @@ jobs:
           files: |
             artifacts/release-x86_64/*
             artifacts/release-aarch64/*
+            SHA256SUMS
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

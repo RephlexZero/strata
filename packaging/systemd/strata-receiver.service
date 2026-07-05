@@ -10,6 +10,7 @@ Description=Strata receiver daemon (bonded stream ingest)
 Documentation=https://github.com/RephlexZero/strata
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -25,7 +26,6 @@ StateDirectory=strata
 
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
 
 # Hardening
 NoNewPrivileges=true

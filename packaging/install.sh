@@ -100,6 +100,12 @@ if [ "$ROLE" = "sender" ] || [ "$ROLE" = "receiver" ]; then
     fi
 fi
 
+# ── Updater (optional but shipped with every role) ──────────────
+if UPDATER="$(find_file strata-update.sh 2>/dev/null)"; then
+    install -m 755 "$UPDATER" /usr/local/bin/strata-update.sh
+    echo "Installed /usr/local/bin/strata-update.sh (see packaging/systemd/strata-update.timer for unattended updates)"
+fi
+
 # ── Systemd unit + env file ─────────────────────────────────────
 install -m 644 "$(find_file "strata-$ROLE.service")" "/etc/systemd/system/strata-$ROLE.service"
 echo "Installed /etc/systemd/system/strata-$ROLE.service"

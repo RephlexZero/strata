@@ -1,0 +1,20 @@
+# Strata unattended updater — one-shot, driven by strata-update.timer.
+# Opt-in: not installed by install.sh. Copy this file and the timer to
+# /etc/systemd/system/, set ROLE below, then:
+#   sudo systemctl enable --now strata-update.timer
+#
+# strata-update.sh exits 75 (EX_TEMPFAIL) instead of updating while a
+# stream is live; SuccessExitStatus treats that as a clean "try next tick".
+
+[Unit]
+Description=Strata unattended update check
+Documentation=https://github.com/RephlexZero/strata
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Set to this box's role: sender | receiver | control
+Environment=ROLE=sender
+ExecStart=/usr/local/bin/strata-update.sh ${ROLE}
+SuccessExitStatus=75

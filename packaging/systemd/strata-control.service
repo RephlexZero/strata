@@ -10,6 +10,7 @@ Description=Strata control plane
 Documentation=https://github.com/RephlexZero/strata
 After=network-online.target postgresql.service
 Wants=network-online.target
+StartLimitIntervalSec=0
 # After only (not Requires): postgres may live on another box or in Docker.
 
 [Service]
@@ -21,7 +22,6 @@ ExecStart=/usr/local/bin/strata-control
 
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
 
 # Hardening
 NoNewPrivileges=true

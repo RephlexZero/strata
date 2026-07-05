@@ -7,6 +7,8 @@ Description=Strata sender agent (bonded cellular uplink)
 Documentation=https://github.com/RephlexZero/strata
 After=network-online.target
 Wants=network-online.target
+# Never give up restarting — a field uplink may be down for minutes.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -24,8 +26,6 @@ StateDirectory=strata
 
 Restart=always
 RestartSec=5
-# Field device: never stop retrying — the uplink may be down for minutes.
-StartLimitIntervalSec=0
 
 # CAP_NET_RAW: the spawned strata-pipeline needs raw sockets for
 # SO_BINDTODEVICE onto each modem interface. Ambient capabilities are

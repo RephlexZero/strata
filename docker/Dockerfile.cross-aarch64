@@ -65,6 +65,7 @@ COPY crates/strata-gst/Cargo.toml crates/strata-gst/Cargo.toml
 COPY crates/strata-receiver/Cargo.toml crates/strata-receiver/Cargo.toml
 COPY crates/strata-sender/Cargo.toml crates/strata-sender/Cargo.toml
 COPY crates/strata-transport/Cargo.toml crates/strata-transport/Cargo.toml
+COPY crates/strata-protocol/Cargo.toml crates/strata-protocol/Cargo.toml
 COPY crates/strata-sim/Cargo.toml crates/strata-sim/Cargo.toml
 COPY crates/strata-dashboard/Cargo.toml crates/strata-dashboard/Cargo.toml
 # Stub lib.rs so cargo can resolve the workspace and fetch deps

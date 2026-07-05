@@ -90,6 +90,21 @@ nginx alternative: `certbot --nginx` plus a `proxy_pass
 http://127.0.0.1:3000` block — remember the explicit `Upgrade`/`Connection
 "upgrade"` headers for the WebSocket paths (details in the Caddyfile header).
 
+## Updating
+
+`install.sh` also installs `/usr/local/bin/strata-update.sh` — a pull-based
+updater against GitHub Releases (checksum-verified, atomic swap, refuses
+while a stream is live, restarts the unit):
+
+```bash
+sudo strata-update.sh sender                     # latest
+sudo strata-update.sh receiver --version v0.7.0  # pin / roll back
+```
+
+Unattended: copy `systemd/strata-update.{service,timer}` in, set `ROLE=`,
+`systemctl enable --now strata-update.timer`. Full story:
+`wiki/Updates-and-Releases.md`.
+
 ## Logs & status
 
 ```bash
