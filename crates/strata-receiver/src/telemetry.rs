@@ -43,15 +43,26 @@ pub async fn run(state: Arc<ReceiverState>) {
 
         for (stream_id, stats_port) in &active {
             // Lazily bind sockets for new streams
-            let sock = sockets.entry(*stats_port).or_insert_with(|| {
-                let addr = format!("127.0.0.1:{stats_port}");
-                let s = std::net::UdpSocket::bind(&addr).unwrap_or_else(|_| {
-                    // Already bound or unavailable — bind to ephemeral as fallback
-                    std::net::UdpSocket::bind("127.0.0.1:0").expect("failed to bind UDP socket")
-                });
-                s.set_nonblocking(true).ok();
-                s
-            });
+            let sock = match sockets.entry(*stats_port) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let addr = format!("127.0.0.1:{stats_port}");
+                    // Already bound or unavailable — ephemeral as fallback; a
+                    // panic here would silently kill the whole telemetry task.
+                    match std::net::UdpSocket::bind(&addr)
+                        .or_else(|_| std::net::UdpSocket::bind("127.0.0.1:0"))
+                    {
+                        Ok(s) => {
+                            s.set_nonblocking(true).ok();
+                            e.insert(s)
+                        }
+                        Err(err) => {
+                            tracing::warn!(stream_id, error = %err, "telemetry socket bind failed — skipping this tick");
+                            continue;
+                        }
+                    }
+                }
+            };
 
             // Drain incoming stats, keep the latest
             let mut last_stats: Option<(Vec<LinkStats>, Option<EgressStats>)> = None;

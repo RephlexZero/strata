@@ -246,7 +246,7 @@ fn require_privileged_env() -> Option<PathBuf> {
 /// Capacity step-change: two links start at 4 Mbps each, then one drops to
 /// 1 Mbps mid-stream. Verifies throughput recovers and doesn't collapse.
 #[test]
-#[ignore = "Requires BBR-based capacity estimation (Phase A) - work in progress"]
+#[ignore = "Needs root/netns — run with --ignored. Written for Phase A BBR capacity estimation, which has since landed (BiscayController); kept ignored pending local revalidation (2026-07-05 triage)"]
 fn capacity_step_change() {
     let bin = match require_privileged_env() {
         Some(b) => b,
@@ -1514,7 +1514,7 @@ fn burst_loss() {
 /// over 30 seconds. Verifies the capacity estimator detects the increase and
 /// encoder bitrate ramps up.
 #[test]
-#[ignore = "Requires BBR-based capacity estimation (Phase A) - work in progress"]
+#[ignore = "Needs root/netns — run with --ignored. Written for Phase A BBR capacity estimation, which has since landed (BiscayController); kept ignored pending local revalidation (2026-07-05 triage)"]
 fn bandwidth_ramp() {
     let bin = match require_privileged_env() {
         Some(b) => b,
@@ -1690,7 +1690,7 @@ fn bandwidth_ramp() {
 /// This is the key Phase A integration assertion: if `estimated_capacity_bps`
 /// is always 0 (ACK path broken) or wildly wrong, this test catches it.
 #[test]
-#[ignore = "Requires BBR-based capacity estimation (Phase A) - work in progress"]
+#[ignore = "Needs root/netns — run with --ignored. Written for Phase A BBR capacity estimation, which has since landed (BiscayController); kept ignored pending local revalidation (2026-07-05 triage)"]
 fn capacity_estimation_converges() {
     let bin = match require_privileged_env() {
         Some(b) => b,

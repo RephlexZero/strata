@@ -3862,6 +3862,7 @@ version = "0.6.0"
 dependencies = [
  "arc-swap",
  "bytes",
+ "clap",
  "crossbeam-channel",
  "ctrlc",
  "gst-plugin-hlssink3",
