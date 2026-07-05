@@ -8,7 +8,7 @@
 //! whenever the control plane is reachable beyond the scrape network.
 
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use strata_common::metrics::render_prometheus;
@@ -154,8 +154,8 @@ pub async fn handler(State(state): State<AppState>, headers: HeaderMap) -> Respo
 
 #[cfg(test)]
 mod tests {
-    use strata_protocol::models::LinkStats;
     use strata_protocol::StreamStatsPayload;
+    use strata_protocol::models::LinkStats;
 
     #[test]
     fn fleet_metrics_rendering() {

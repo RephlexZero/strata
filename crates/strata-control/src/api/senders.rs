@@ -1035,7 +1035,13 @@ async fn set_stream_destinations(
         request_id,
         destination_ids: body.destination_ids,
     };
-    proxy_to_agent(&state, &id, &ControlMessage::StreamDestinations(payload), 10).await
+    proxy_to_agent(
+        &state,
+        &id,
+        &ControlMessage::StreamDestinations(payload),
+        10,
+    )
+    .await
 }
 
 // ── Jitter Buffer ───────────────────────────────────────────────────
@@ -1133,8 +1139,7 @@ async fn proxy_to_agent(
         .get(sender_id)
         .ok_or_else(|| ApiError::bad_request("sender is not connected"))?;
 
-    let envelope =
-        Envelope::from_message(msg).map_err(|e| ApiError::internal(e.to_string()))?;
+    let envelope = Envelope::from_message(msg).map_err(|e| ApiError::internal(e.to_string()))?;
     let json = serde_json::to_string(&envelope).map_err(|e| ApiError::internal(e.to_string()))?;
 
     let request_id = msg

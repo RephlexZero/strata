@@ -143,37 +143,36 @@ async fn start_stream(
         Some(relay_url.clone())
     };
     let stream_id = ids::stream_id();
-    let (receiver_id_opt, strata_dests) =
-        match pick_receiver(&state, &user.user_id).await {
-            Some((rcv_id, bind_host)) => {
-                let ports = request_receiver_start(
-                    &state,
-                    &rcv_id,
-                    &stream_id,
-                    enabled_count as u32,
-                    relay_url_opt.clone(),
-                )
-                .await?;
-                let dests: Vec<String> = ports
-                    .iter()
-                    .map(|p| format!("strata://{bind_host}:{p}"))
-                    .collect();
-                (Some(rcv_id), dests)
+    let (receiver_id_opt, strata_dests) = match pick_receiver(&state, &user.user_id).await {
+        Some((rcv_id, bind_host)) => {
+            let ports = request_receiver_start(
+                &state,
+                &rcv_id,
+                &stream_id,
+                enabled_count as u32,
+                relay_url_opt.clone(),
+            )
+            .await?;
+            let dests: Vec<String> = ports
+                .iter()
+                .map(|p| format!("strata://{bind_host}:{p}"))
+                .collect();
+            (Some(rcv_id), dests)
+        }
+        None => {
+            // Env-var fallback for unmanaged deployments: fixed ports.
+            let links = build_receiver_links();
+            let count = enabled_count.min(links.len());
+            if count == 0 {
+                return Err(ApiError::bad_request("no receiver links configured"));
             }
-            None => {
-                // Env-var fallback for unmanaged deployments: fixed ports.
-                let links = build_receiver_links();
-                let count = enabled_count.min(links.len());
-                if count == 0 {
-                    return Err(ApiError::bad_request("no receiver links configured"));
-                }
-                let dests = links[..count]
-                    .iter()
-                    .map(|addr| format!("strata://{addr}"))
-                    .collect();
-                (None, dests)
-            }
-        };
+            let dests = links[..count]
+                .iter()
+                .map(|addr| format!("strata://{addr}"))
+                .collect();
+            (None, dests)
+        }
+    };
 
     tracing::info!(
         links = strata_dests.len(),
@@ -212,16 +211,14 @@ async fn start_stream(
         stream_id: stream_id.clone(),
         source: body.source.unwrap_or(default_source),
         encoder: {
-            let enc = body
-                .encoder
-                .unwrap_or(strata_protocol::EncoderConfig {
-                    bitrate_kbps: 0, // placeholder — overridden below
-                    tune: Some("zerolatency".into()),
-                    keyint_max: Some(60),
-                    codec: Some("h265".into()),
-                    min_bitrate_kbps: None,
-                    max_bitrate_kbps: None,
-                });
+            let enc = body.encoder.unwrap_or(strata_protocol::EncoderConfig {
+                bitrate_kbps: 0, // placeholder — overridden below
+                tune: Some("zerolatency".into()),
+                keyint_max: Some(60),
+                codec: Some("h265".into()),
+                min_bitrate_kbps: None,
+                max_bitrate_kbps: None,
+            });
             // Resolve codec (default h265). YouTube and other modern
             // platforms accept H.265 via Enhanced RTMP / eflvmux.
             let codec = enc.codec.clone().unwrap_or_else(|| "h265".into());

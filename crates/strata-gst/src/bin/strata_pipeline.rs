@@ -640,8 +640,11 @@ fn run_sender(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Resolve min/max from CLI or profile defaults
-    let profile =
-        strata_protocol::profiles::lookup_profile(Some(resolution), Some(framerate), Some(codec_str));
+    let profile = strata_protocol::profiles::lookup_profile(
+        Some(resolution),
+        Some(framerate),
+        Some(codec_str),
+    );
     let min_bitrate_kbps_val = min_bitrate_kbps.unwrap_or(profile.min_kbps);
     let max_bitrate_kbps_val = max_bitrate_kbps.unwrap_or(profile.max_kbps);
 
@@ -2413,7 +2416,7 @@ fn run_receiver(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{timeline_step, TimelineStep, MAX_FORWARD_STEP_NS};
+    use super::{MAX_FORWARD_STEP_NS, TimelineStep, timeline_step};
 
     #[test]
     fn timeline_step_classifies_all_regimes() {
@@ -2429,7 +2432,9 @@ mod tests {
             "exactly at the bound is still credible"
         );
         // Backwards → the mpegtsmux-fatal case (2026-07-04 run 1).
-        assert!(timeline_step(Some(21_007_913_971), Some(22_264_073_509)) == TimelineStep::Regression);
+        assert!(
+            timeline_step(Some(21_007_913_971), Some(22_264_073_509)) == TimelineStep::Regression
+        );
         // The run-2 corrupt-PES latch: video leapt ~+107 s in one step.
         assert!(
             timeline_step(Some(227_320_000_000), Some(24_694_000_000)) == TimelineStep::WildJump

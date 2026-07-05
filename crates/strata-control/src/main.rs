@@ -8,8 +8,8 @@
 
 use std::net::SocketAddr;
 
-use axum::http::{header, Method};
 use axum::Router;
+use axum::http::{Method, header};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -84,7 +84,9 @@ async fn main() -> anyhow::Result<()> {
     let cors = match std::env::var("CORS_ALLOWED_ORIGINS") {
         Err(_) => CorsLayer::new(),
         Ok(v) if v.trim() == "*" => {
-            tracing::warn!("CORS_ALLOWED_ORIGINS=* — permissive CORS, do not expose to the internet");
+            tracing::warn!(
+                "CORS_ALLOWED_ORIGINS=* — permissive CORS, do not expose to the internet"
+            );
             CorsLayer::permissive()
         }
         Ok(v) => {
@@ -92,11 +94,21 @@ async fn main() -> anyhow::Result<()> {
                 .split(',')
                 .map(str::trim)
                 .filter(|o| !o.is_empty())
-                .map(|o| o.parse().map_err(|e| anyhow::anyhow!("invalid origin {o:?} in CORS_ALLOWED_ORIGINS: {e}")))
+                .map(|o| {
+                    o.parse().map_err(|e| {
+                        anyhow::anyhow!("invalid origin {o:?} in CORS_ALLOWED_ORIGINS: {e}")
+                    })
+                })
                 .collect::<Result<_, _>>()?;
             CorsLayer::new()
                 .allow_origin(AllowOrigin::list(origins))
-                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE])
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::PATCH,
+                    Method::DELETE,
+                ])
                 .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
         }
     };

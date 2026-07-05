@@ -82,8 +82,12 @@ impl AgentMessage {
     pub fn request_id(&self) -> Option<&str> {
         use AgentMessage::*;
         match self {
-            AuthLogin(_) | AuthChallengeResponse(_) | DeviceStatus(_) | StreamStats(_)
-            | StreamEnded(_) | InterfaceCommandResponse(_) => None,
+            AuthLogin(_)
+            | AuthChallengeResponse(_)
+            | DeviceStatus(_)
+            | StreamStats(_)
+            | StreamEnded(_)
+            | InterfaceCommandResponse(_) => None,
             ConfigSetResponse(p) => Some(&p.request_id),
             ConfigUpdateResponse(p) => p.request_id.as_deref(),
             TestRunResponse(p) => Some(&p.request_id),
@@ -377,7 +381,8 @@ mod tests {
 
     #[test]
     fn envelope_parse_message_rejects_unknown_type() {
-        let json = r#"{"id":"x","type":"no.such.message","ts":"2026-01-01T00:00:00Z","payload":{}}"#;
+        let json =
+            r#"{"id":"x","type":"no.such.message","ts":"2026-01-01T00:00:00Z","payload":{}}"#;
         let envelope: Envelope = serde_json::from_str(json).unwrap();
         assert!(envelope.parse_message::<AgentMessage>().is_err());
     }

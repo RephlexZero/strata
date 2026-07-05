@@ -23,8 +23,8 @@ use tokio::sync::mpsc;
 
 use strata_common::auth;
 use strata_protocol::{
-    AgentMessage, AuthChallengePayload, AuthLoginPayload, AuthLoginResponsePayload,
-    ControlMessage, DashboardEvent, Envelope, PROTOCOL_VERSION,
+    AgentMessage, AuthChallengePayload, AuthLoginPayload, AuthLoginResponsePayload, ControlMessage,
+    DashboardEvent, Envelope, PROTOCOL_VERSION,
 };
 
 use crate::state::{AgentHandle, AppState};
@@ -39,11 +39,10 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // Handshake: enrollment (single message) or challenge/response (two).
-    let (sender_id, owner_id, hostname) =
-        match authenticate(&state, &mut ws_tx, &mut ws_rx).await {
-            Some(identity) => identity,
-            None => return,
-        };
+    let (sender_id, owner_id, hostname) = match authenticate(&state, &mut ws_tx, &mut ws_rx).await {
+        Some(identity) => identity,
+        None => return,
+    };
 
     tracing::info!(sender_id = %sender_id, "agent connected");
 
@@ -116,14 +115,13 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     // restart. Active streams are left alone here; the next heartbeat
     // reconciles them, and the sweeper ends them if the agent stays away
     // past UNOBSERVED_GRACE (see stream_state.rs).
-    let active: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM streams WHERE sender_id = $1 AND state = ANY($2)",
-    )
-    .bind(&sender_id)
-    .bind(&crate::stream_state::ACTIVE_STATES[..])
-    .fetch_one(state.pool())
-    .await
-    .unwrap_or(0);
+    let active: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM streams WHERE sender_id = $1 AND state = ANY($2)")
+            .bind(&sender_id)
+            .bind(&crate::stream_state::ACTIVE_STATES[..])
+            .fetch_one(state.pool())
+            .await
+            .unwrap_or(0);
     if active > 0 {
         tracing::info!(
             sender_id = %sender_id,
@@ -190,9 +188,7 @@ async fn authenticate(
             Some((sender_id, owner_id, hostname))
         }
         Err(msg) => {
-            let _ = ws_tx
-                .send(Message::Text(error_response(&msg).into()))
-                .await;
+            let _ = ws_tx.send(Message::Text(error_response(&msg).into())).await;
             None
         }
     }
@@ -235,13 +231,12 @@ async fn enroll(
         );
     };
 
-    let row: Option<(String, Option<String>, bool)> = sqlx::query_as(
-        "SELECT owner_id, enrollment_token, enrolled FROM senders WHERE id = $1",
-    )
-    .bind(&sender_id)
-    .fetch_optional(state.pool())
-    .await
-    .map_err(|e| format!("db error: {e}"))?;
+    let row: Option<(String, Option<String>, bool)> =
+        sqlx::query_as("SELECT owner_id, enrollment_token, enrolled FROM senders WHERE id = $1")
+            .bind(&sender_id)
+            .fetch_optional(state.pool())
+            .await
+            .map_err(|e| format!("db error: {e}"))?;
 
     let Some((owner_id, token_hash, _enrolled)) = row else {
         return Err("invalid enrollment token".into());

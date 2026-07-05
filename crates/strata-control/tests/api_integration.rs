@@ -896,7 +896,10 @@ async fn connect_agent_ws(
     let resp = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
         .await
         .expect("agent auth response");
-    assert_eq!(resp["payload"]["success"], true, "agent auth failed: {resp}");
+    assert_eq!(
+        resp["payload"]["success"], true,
+        "agent auth failed: {resp}"
+    );
 
     (ws, sender_id)
 }
@@ -1025,12 +1028,11 @@ async fn heartbeat_reconciles_stream_not_running_on_sender() {
 
     let current = wait_for_state(&state, "str_gone", "ended").await;
     assert_eq!(current, "ended");
-    let err: Option<String> =
-        sqlx::query_scalar("SELECT error_message FROM streams WHERE id = $1")
-            .bind("str_gone")
-            .fetch_one(state.pool())
-            .await
-            .unwrap();
+    let err: Option<String> = sqlx::query_scalar("SELECT error_message FROM streams WHERE id = $1")
+        .bind("str_gone")
+        .fetch_one(state.pool())
+        .await
+        .unwrap();
     assert_eq!(err.as_deref(), Some("not running on sender (reconciled)"));
 }
 
@@ -1078,13 +1080,15 @@ async fn heartbeat_readopts_inferred_end_but_not_confirmed_end() {
 
     let readopted = wait_for_state(&state, "str_inferred", "live").await;
     assert_eq!(readopted, "live", "inferred end must be readopted");
-    let err: Option<String> =
-        sqlx::query_scalar("SELECT error_message FROM streams WHERE id = $1")
-            .bind("str_inferred")
-            .fetch_one(state.pool())
-            .await
-            .unwrap();
-    assert_eq!(err, None, "readoption must clear the inferred-end attribution");
+    let err: Option<String> = sqlx::query_scalar("SELECT error_message FROM streams WHERE id = $1")
+        .bind("str_inferred")
+        .fetch_one(state.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        err, None,
+        "readoption must clear the inferred-end attribution"
+    );
 
     let confirmed: String = sqlx::query_scalar("SELECT state FROM streams WHERE id = $1")
         .bind("str_confirmed")
@@ -1109,12 +1113,14 @@ async fn transition_rejects_illegal_moves() {
     let token_suffix = "trans";
 
     // Seed a user + sender + ended stream directly.
-    sqlx::query("INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, 'x', 'operator')")
-        .bind(format!("usr_{token_suffix}"))
-        .bind(format!("{token_suffix}@test.com"))
-        .execute(state.pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, 'x', 'operator')",
+    )
+    .bind(format!("usr_{token_suffix}"))
+    .bind(format!("{token_suffix}@test.com"))
+    .execute(state.pool())
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO senders (id, owner_id) VALUES ($1, $2)")
         .bind(format!("snd_{token_suffix}"))
         .bind(format!("usr_{token_suffix}"))
@@ -1202,11 +1208,16 @@ async fn enroll_agent_with_key(
             "agent_version": "test", "hostname": "keyed", "arch": "x86_64",
         },
     });
-    ws.send(Message::Text(auth.to_string().into())).await.unwrap();
+    ws.send(Message::Text(auth.to_string().into()))
+        .await
+        .unwrap();
     let resp = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
         .await
         .expect("enrollment response");
-    assert_eq!(resp["payload"]["success"], true, "enrollment failed: {resp}");
+    assert_eq!(
+        resp["payload"]["success"], true,
+        "enrollment failed: {resp}"
+    );
 
     (sender_id, token)
 }
@@ -1243,7 +1254,9 @@ async fn enrollment_token_is_single_use_and_key_auth_works() {
             "agent_version": "test", "hostname": "replay", "arch": "x86_64",
         },
     });
-    ws.send(Message::Text(auth.to_string().into())).await.unwrap();
+    ws.send(Message::Text(auth.to_string().into()))
+        .await
+        .unwrap();
     let resp = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
         .await
         .expect("replay response");
@@ -1265,7 +1278,9 @@ async fn enrollment_token_is_single_use_and_key_auth_works() {
             "agent_version": "test", "hostname": "keyed", "arch": "x86_64",
         },
     });
-    ws.send(Message::Text(auth.to_string().into())).await.unwrap();
+    ws.send(Message::Text(auth.to_string().into()))
+        .await
+        .unwrap();
 
     let challenge_msg = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
         .await
@@ -1278,7 +1293,9 @@ async fn enrollment_token_is_single_use_and_key_auth_works() {
         "id": "t", "type": "auth.challenge.response", "ts": chrono::Utc::now().to_rfc3339(),
         "payload": { "device_id": sender_id, "signature": signature },
     });
-    ws.send(Message::Text(response.to_string().into())).await.unwrap();
+    ws.send(Message::Text(response.to_string().into()))
+        .await
+        .unwrap();
 
     let result = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
         .await
@@ -1324,7 +1341,9 @@ async fn challenge_auth_rejects_wrong_key() {
             "agent_version": "test", "hostname": "mallory", "arch": "x86_64",
         },
     });
-    ws.send(Message::Text(auth.to_string().into())).await.unwrap();
+    ws.send(Message::Text(auth.to_string().into()))
+        .await
+        .unwrap();
 
     let challenge_msg = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
         .await
@@ -1336,7 +1355,9 @@ async fn challenge_auth_rejects_wrong_key() {
         "id": "t", "type": "auth.challenge.response", "ts": chrono::Utc::now().to_rfc3339(),
         "payload": { "device_id": sender_id, "signature": signature },
     });
-    ws.send(Message::Text(response.to_string().into())).await.unwrap();
+    ws.send(Message::Text(response.to_string().into()))
+        .await
+        .unwrap();
 
     let result = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
         .await
@@ -1390,11 +1411,16 @@ async fn receiver_stream_start_ack_routes_allocated_ports() {
             "bind_host": "203.0.113.7", "link_ports": [5000, 5002, 5004], "max_streams": 4,
         },
     });
-    ws.send(Message::Text(auth.to_string().into())).await.unwrap();
+    ws.send(Message::Text(auth.to_string().into()))
+        .await
+        .unwrap();
     let resp = ws_recv_json(&mut ws, std::time::Duration::from_secs(2))
         .await
         .expect("receiver auth response");
-    assert_eq!(resp["payload"]["success"], true, "receiver auth failed: {resp}");
+    assert_eq!(
+        resp["payload"]["success"], true,
+        "receiver auth failed: {resp}"
+    );
 
     // Simulate the control plane's request/ack: register a pending request,
     // have the "receiver" answer with its allocated ports, and check the
@@ -1412,14 +1438,15 @@ async fn receiver_stream_start_ack_routes_allocated_ports() {
             "bind_ports": [5002, 5004],
         },
     });
-    ws.send(Message::Text(ack.to_string().into())).await.unwrap();
+    ws.send(Message::Text(ack.to_string().into()))
+        .await
+        .unwrap();
 
     let value = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
         .await
         .expect("ack timed out")
         .expect("oneshot dropped");
-    let ack: strata_protocol::ReceiverStreamStartedPayload =
-        serde_json::from_value(value).unwrap();
+    let ack: strata_protocol::ReceiverStreamStartedPayload = serde_json::from_value(value).unwrap();
     assert!(ack.success);
     assert_eq!(ack.bind_ports, vec![5002, 5004]);
 }

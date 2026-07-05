@@ -17,13 +17,13 @@ mod tabs;
 
 use crate::AuthState;
 use crate::api;
+use crate::ws::WsClient;
 use strata_protocol::api::{SenderDetail, SenderFullStatus, StreamSummary};
 use strata_protocol::models::{
     LinkStats, MediaInput, NetworkInterface, StreamState, TransportReceiverMetrics,
     TransportSenderMetrics,
 };
 use strata_protocol::{DashboardEvent, TestRunResponsePayload};
-use crate::ws::WsClient;
 
 use helpers::{apply_full_status, format_duration};
 use tabs::{DestinationModal, DiagnosticsTab, NetworkTab, SettingsTab, SourceTab, StreamTab};
@@ -60,7 +60,8 @@ pub fn SenderDetailPage() -> impl IntoView {
         signal(Option::<TransportReceiverMetrics>::None);
     let (stream_state, set_stream_state) = signal(String::from("idle"));
     let (active_stream_id, set_active_stream_id) = signal(Option::<String>::None);
-    let (stream_detail, set_stream_detail) = signal(Option::<strata_protocol::api::StreamDetail>::None);
+    let (stream_detail, set_stream_detail) =
+        signal(Option::<strata_protocol::api::StreamDetail>::None);
 
     // History for graph
     let (stats_history, set_stats_history) =
@@ -119,7 +120,8 @@ pub fn SenderDetailPage() -> impl IntoView {
 
     // Destination picker modal
     let (show_start_modal, set_show_start_modal) = signal(false);
-    let (destinations, set_destinations) = signal(Vec::<strata_protocol::api::DestinationSummary>::new());
+    let (destinations, set_destinations) =
+        signal(Vec::<strata_protocol::api::DestinationSummary>::new());
     let (selected_dest, set_selected_dest) = signal(Option::<String>::None);
     let (selected_codec, set_selected_codec) = signal(String::from("h265"));
     let (dests_loading, set_dests_loading) = signal(false);

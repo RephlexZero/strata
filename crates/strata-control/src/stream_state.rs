@@ -147,9 +147,7 @@ pub async fn reconcile_sender(app: &AppState, sender_id: &str, owner_id: &str, r
         if running.contains(stream_id) {
             continue;
         }
-        if state == "starting"
-            && started_at.map(|t| now - t < STARTING_GRACE).unwrap_or(true)
-        {
+        if state == "starting" && started_at.map(|t| now - t < STARTING_GRACE).unwrap_or(true) {
             continue;
         }
         match transition(
@@ -162,7 +160,11 @@ pub async fn reconcile_sender(app: &AppState, sender_id: &str, owner_id: &str, r
         {
             Ok(true) => {
                 app.live_streams().remove(stream_id);
-                tracing::warn!(sender_id, stream_id, "reconcile: stream not running on sender — ended");
+                tracing::warn!(
+                    sender_id,
+                    stream_id,
+                    "reconcile: stream not running on sender — ended"
+                );
                 app.broadcast_dashboard(
                     owner_id,
                     DashboardEvent::StreamStateChanged {
@@ -198,7 +200,11 @@ pub async fn reconcile_sender(app: &AppState, sender_id: &str, owner_id: &str, r
             Some(_) => match readopt(app.pool(), stream_id).await {
                 Ok(true) => {
                     app.live_streams().insert(stream_id.clone());
-                    tracing::info!(sender_id, stream_id, "reconcile: readopted stream still running on sender");
+                    tracing::info!(
+                        sender_id,
+                        stream_id,
+                        "reconcile: readopted stream still running on sender"
+                    );
                     app.broadcast_dashboard(
                         owner_id,
                         DashboardEvent::StreamStateChanged {
@@ -212,7 +218,8 @@ pub async fn reconcile_sender(app: &AppState, sender_id: &str, owner_id: &str, r
                 Ok(false) => {
                     // Confirmed/user-requested end — enforce it.
                     tracing::warn!(
-                        sender_id, stream_id,
+                        sender_id,
+                        stream_id,
                         "reconcile: sender still running a stream that was deliberately ended — re-sending stream.stop"
                     );
                     send_agent_stop(app, sender_id, stream_id).await;
@@ -221,7 +228,8 @@ pub async fn reconcile_sender(app: &AppState, sender_id: &str, owner_id: &str, r
             },
             None => {
                 tracing::warn!(
-                    sender_id, stream_id,
+                    sender_id,
+                    stream_id,
                     "reconcile: sender reports a stream unknown to this control plane — re-sending stream.stop"
                 );
                 send_agent_stop(app, sender_id, stream_id).await;
@@ -264,9 +272,7 @@ pub async fn reconcile_receiver(
         if running.contains(stream_id) {
             continue;
         }
-        if state == "starting"
-            && started_at.map(|t| now - t < STARTING_GRACE).unwrap_or(true)
-        {
+        if state == "starting" && started_at.map(|t| now - t < STARTING_GRACE).unwrap_or(true) {
             continue;
         }
         match transition(
@@ -279,7 +285,11 @@ pub async fn reconcile_receiver(
         {
             Ok(true) => {
                 app.live_streams().remove(stream_id);
-                tracing::warn!(receiver_id, stream_id, "reconcile: stream not running on receiver — ended");
+                tracing::warn!(
+                    receiver_id,
+                    stream_id,
+                    "reconcile: stream not running on receiver — ended"
+                );
                 // The sender may still be transmitting into a dead socket.
                 send_agent_stop(app, sender_id, stream_id).await;
                 app.broadcast_dashboard(
@@ -302,7 +312,8 @@ pub async fn reconcile_receiver(
             continue;
         }
         tracing::warn!(
-            receiver_id, stream_id,
+            receiver_id,
+            stream_id,
             "reconcile: receiver running a stream the DB considers done — sending receiver.stream.stop"
         );
         send_receiver_stop(app, receiver_id, stream_id).await;
@@ -316,16 +327,20 @@ pub async fn reconcile_receiver(
 pub async fn sweep(app: &AppState) {
     let now = Utc::now();
 
-    let candidates: Vec<(String, String, String, Option<chrono::DateTime<chrono::Utc>>)> =
-        sqlx::query_as(
-            "SELECT s.id, s.sender_id, sn.owner_id, sn.last_seen_at \
+    let candidates: Vec<(
+        String,
+        String,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = sqlx::query_as(
+        "SELECT s.id, s.sender_id, sn.owner_id, sn.last_seen_at \
              FROM streams s JOIN senders sn ON sn.id = s.sender_id \
              WHERE s.state = ANY($1)",
-        )
-        .bind(&ACTIVE_STATES[..])
-        .fetch_all(app.pool())
-        .await
-        .unwrap_or_default();
+    )
+    .bind(&ACTIVE_STATES[..])
+    .fetch_all(app.pool())
+    .await
+    .unwrap_or_default();
 
     for (stream_id, sender_id, owner_id, last_seen_at) in candidates {
         // A connected agent's heartbeats reconcile this stream — skip it.
@@ -348,7 +363,11 @@ pub async fn sweep(app: &AppState) {
         {
             Ok(true) => {
                 app.live_streams().remove(&stream_id);
-                tracing::warn!(sender_id, stream_id, "sweep: sender unobserved past grace — stream ended");
+                tracing::warn!(
+                    sender_id,
+                    stream_id,
+                    "sweep: sender unobserved past grace — stream ended"
+                );
                 app.broadcast_dashboard(
                     owner_id,
                     DashboardEvent::StreamStateChanged {
@@ -418,7 +437,11 @@ async fn send_agent_stop(app: &AppState, sender_id: &str, stream_id: &str) {
         && let Ok(json) = serde_json::to_string(&envelope)
         && agent.tx.send(json).await.is_err()
     {
-        tracing::warn!(sender_id, stream_id, "reconcile stream.stop dropped: agent channel closed");
+        tracing::warn!(
+            sender_id,
+            stream_id,
+            "reconcile stream.stop dropped: agent channel closed"
+        );
     }
 }
 
@@ -436,6 +459,10 @@ async fn send_receiver_stop(app: &AppState, receiver_id: &str, stream_id: &str) 
         && let Ok(json) = serde_json::to_string(&envelope)
         && rcv.tx.send(json).await.is_err()
     {
-        tracing::warn!(receiver_id, stream_id, "reconcile receiver.stream.stop dropped: receiver channel closed");
+        tracing::warn!(
+            receiver_id,
+            stream_id,
+            "reconcile receiver.stream.stop dropped: receiver channel closed"
+        );
     }
 }

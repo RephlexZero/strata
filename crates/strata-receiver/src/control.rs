@@ -321,7 +321,10 @@ async fn handle_control_message(state: &ReceiverState, raw: &str) {
             // pool — the receiver owns its ports (E6).
             let active = state.pipelines.lock().await.active_count() as u32;
             if active >= state.max_streams {
-                let ack = fail(format!("at capacity ({active}/{} streams)", state.max_streams));
+                let ack = fail(format!(
+                    "at capacity ({active}/{} streams)",
+                    state.max_streams
+                ));
                 send_message(state, &ReceiverMessage::StreamStarted(ack)).await;
                 return;
             }

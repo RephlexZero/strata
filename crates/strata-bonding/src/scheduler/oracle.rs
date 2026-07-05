@@ -453,8 +453,8 @@ impl CapacityOracle {
 
         // Conservative blending: 30% new, 70% old
         if self.upper_bound > 0.0 {
-            self.upper_bound =
-                FLOOR_EWMA_ALPHA_RISE * capped_bps + (1.0 - FLOOR_EWMA_ALPHA_RISE) * self.upper_bound;
+            self.upper_bound = FLOOR_EWMA_ALPHA_RISE * capped_bps
+                + (1.0 - FLOOR_EWMA_ALPHA_RISE) * self.upper_bound;
         } else {
             self.upper_bound = capped_bps;
         }

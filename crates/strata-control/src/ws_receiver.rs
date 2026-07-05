@@ -33,11 +33,11 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // Handshake: enrollment (single message) or challenge/response (two).
-    let (receiver_id, owner_id, hostname) =
-        match authenticate(&state, &mut ws_tx, &mut ws_rx).await {
-            Some(identity) => identity,
-            None => return,
-        };
+    let (receiver_id, owner_id, hostname) = match authenticate(&state, &mut ws_tx, &mut ws_rx).await
+    {
+        Some(identity) => identity,
+        None => return,
+    };
 
     tracing::info!(receiver_id = %receiver_id, "receiver connected");
 
@@ -158,9 +158,7 @@ async fn authenticate(
             Some((receiver_id, owner_id, hostname))
         }
         Err(msg) => {
-            let _ = ws_tx
-                .send(Message::Text(error_response(&msg).into()))
-                .await;
+            let _ = ws_tx.send(Message::Text(error_response(&msg).into())).await;
             None
         }
     }

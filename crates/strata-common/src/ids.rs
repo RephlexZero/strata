@@ -74,10 +74,7 @@ pub fn split_enrollment_token(raw: &str) -> Option<(String, String)> {
     if device_id.is_empty() || secret.is_empty() {
         return None;
     }
-    Some((
-        device_id.to_string(),
-        normalize_enrollment_token(secret),
-    ))
+    Some((device_id.to_string(), normalize_enrollment_token(secret)))
 }
 
 /// Normalize an enrollment token for comparison: uppercase, strip dashes/spaces.

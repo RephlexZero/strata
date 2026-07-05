@@ -120,7 +120,8 @@ pub fn BandwidthGraph(
 pub fn OtaUpdatesCard(sender_id: Memo<String>, is_online: Memo<bool>) -> impl IntoView {
     let auth = expect_context::<AuthState>();
 
-    let (update_info, set_update_info) = signal(Option::<strata_protocol::UpdatesCheckResponsePayload>::None);
+    let (update_info, set_update_info) =
+        signal(Option::<strata_protocol::UpdatesCheckResponsePayload>::None);
     let (checking, set_checking) = signal(false);
     let (installing, set_installing) = signal(false);
     let (ota_msg, set_ota_msg) = signal(Option::<(String, &'static str)>::None);
@@ -414,7 +415,8 @@ pub fn PcapCaptureCard(sender_id: Memo<String>, is_online: Memo<bool>) -> impl I
 
     let (duration, set_duration) = signal(10u32);
     let (capturing, set_capturing) = signal(false);
-    let (pcap_result, set_pcap_result) = signal(Option::<strata_protocol::PcapCaptureResponsePayload>::None);
+    let (pcap_result, set_pcap_result) =
+        signal(Option::<strata_protocol::PcapCaptureResponsePayload>::None);
     let (pcap_msg, set_pcap_msg) = signal(Option::<(String, &'static str)>::None);
 
     let do_capture = move |_: web_sys::MouseEvent| {
@@ -997,7 +999,8 @@ pub fn MultiDestRoutingCard(
 ) -> impl IntoView {
     let auth = expect_context::<AuthState>();
 
-    let (destinations, set_destinations) = signal(Vec::<strata_protocol::api::DestinationSummary>::new());
+    let (destinations, set_destinations) =
+        signal(Vec::<strata_protocol::api::DestinationSummary>::new());
     let (active_ids, set_active_ids) = signal(Vec::<String>::new());
     let (applying, set_applying) = signal(false);
     let (msg, set_msg) = signal(Option::<(String, &'static str)>::None);
@@ -1473,7 +1476,8 @@ pub fn ConfigManagementCard(sender_id: Memo<String>, is_online: Memo<bool>) -> i
 pub fn TlsManagementCard(sender_id: Memo<String>, is_online: Memo<bool>) -> impl IntoView {
     let auth = expect_context::<AuthState>();
 
-    let (tls_status, set_tls_status) = signal(Option::<strata_protocol::TlsStatusResponsePayload>::None);
+    let (tls_status, set_tls_status) =
+        signal(Option::<strata_protocol::TlsStatusResponsePayload>::None);
     let (loading, set_loading) = signal(false);
     let (renewing, set_renewing) = signal(false);
     let (tls_msg, set_tls_msg) = signal(Option::<(String, &'static str)>::None);

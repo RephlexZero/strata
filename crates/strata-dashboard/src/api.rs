@@ -692,7 +692,10 @@ pub async fn set_jitter_buffer(
 // ── OTA Updates ─────────────────────────────────────────────────────
 
 /// Check for available firmware/software updates.
-pub async fn check_updates(token: &str, sender_id: &str) -> ApiResult<strata_protocol::UpdatesCheckResponsePayload> {
+pub async fn check_updates(
+    token: &str,
+    sender_id: &str,
+) -> ApiResult<strata_protocol::UpdatesCheckResponsePayload> {
     let resp = Request::get(&format!("/api/senders/{sender_id}/updates/check"))
         .header("Authorization", &auth_header(token))
         .send()
@@ -808,10 +811,7 @@ pub async fn capture_pcap(
 // ── Alerting Rules ──────────────────────────────────────────────────
 
 /// Get alerting rules for a sender.
-pub async fn get_alert_rules(
-    token: &str,
-    sender_id: &str,
-) -> ApiResult<Vec<AlertRule>> {
+pub async fn get_alert_rules(token: &str, sender_id: &str) -> ApiResult<Vec<AlertRule>> {
     let resp = Request::get(&format!("/api/senders/{sender_id}/alerts"))
         .header("Authorization", &auth_header(token))
         .send()
@@ -826,11 +826,7 @@ pub async fn get_alert_rules(
 }
 
 /// Create or update an alerting rule.
-pub async fn set_alert_rule(
-    token: &str,
-    sender_id: &str,
-    rule: &AlertRule,
-) -> ApiResult<()> {
+pub async fn set_alert_rule(token: &str, sender_id: &str, rule: &AlertRule) -> ApiResult<()> {
     let resp = Request::post(&format!("/api/senders/{sender_id}/alerts"))
         .header("Authorization", &auth_header(token))
         .json(rule)
@@ -864,7 +860,10 @@ pub async fn delete_alert_rule(token: &str, sender_id: &str, rule_id: &str) -> A
 // ── TLS Certificate Management ──────────────────────────────────────
 
 /// Get TLS certificate status for a sender's local portal.
-pub async fn get_tls_status(token: &str, sender_id: &str) -> ApiResult<strata_protocol::TlsStatusResponsePayload> {
+pub async fn get_tls_status(
+    token: &str,
+    sender_id: &str,
+) -> ApiResult<strata_protocol::TlsStatusResponsePayload> {
     let resp = Request::get(&format!("/api/senders/{sender_id}/tls"))
         .header("Authorization", &auth_header(token))
         .send()

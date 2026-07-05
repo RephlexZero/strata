@@ -189,7 +189,10 @@ pub fn sign_challenge(private_key_b64: &str, challenge_b64: &str) -> Result<Stri
     let seed = BASE64
         .decode(private_key_b64)
         .map_err(|_| AuthError::InvalidKey)?;
-    let seed: [u8; 32] = seed.as_slice().try_into().map_err(|_| AuthError::InvalidKey)?;
+    let seed: [u8; 32] = seed
+        .as_slice()
+        .try_into()
+        .map_err(|_| AuthError::InvalidKey)?;
     let signing_key = SigningKey::from_bytes(&seed);
     let signature = signing_key.sign(challenge_b64.as_bytes());
     Ok(BASE64.encode(signature.to_bytes()))
@@ -220,7 +223,9 @@ pub fn verify_challenge(
         return Ok(false);
     };
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    Ok(verifying_key.verify(challenge_b64.as_bytes(), &signature).is_ok())
+    Ok(verifying_key
+        .verify(challenge_b64.as_bytes(), &signature)
+        .is_ok())
 }
 
 #[cfg(test)]
