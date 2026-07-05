@@ -807,3 +807,27 @@ run switched to the real camera (/dev/video0). Capacity floor pinning at
 low goodput is now a known estimator signature (netem + field agree).
 
 GitNexus MCP still v42/v41-broken; manual blast-radius checks throughout.
+
+## 2026-07-06 — UX & trust audit after the operator's failed livestream
+
+Operator couldn't get a watchable stream from the dashboard (night of
+07-05). Full forensics + code audit: raw/UX_TRUST_AUDIT.md. Verdict: NO
+re-architecture — the platform's bones (protocol, enrollment, reconciler,
+transport) worked as designed; six edge defects chained: (F1) link 0
+pinned to the routeless LAN because pinning ignores routes and the
+dashboard toggles; (F2) Go Live modal has NO source picker — always sends
+source:None → server defaults to test pattern; (F3) camera hot-switch to
+/dev/video1 (metadata node, not capture) crashed the pipeline while the UI
+said "Source switched successfully" (fire-and-forget); (F4) dashboard
+interface toggle panics the pipeline (hotswap.rs:423 reads pad property
+'interface' on the mux data pad — gstreamer-rs panics on missing
+property); (F5) stream end reasons discarded at BOTH layers
+(ws_agent.rs:447 drops device reasons; dashboard drops control-plane
+reasons with `..`) so crashes render as clean "ended"; (F6) trickle +
+min-bitrate 3000 → receiver egress-watchdog rebuild loop. 16 U-findings +
+P0/P1/P2 fix plan in the doc. Registration answer: relays enroll fine via
+REST+token (multi-receiver, least-loaded pick) but there is NO receiver UI
+and per-device config is thin (daemon flags overwrite DB; bonding_config
+always null). Box hygiene: stopped the broken stream via API; Pi timezone
+Asia/Shanghai → Europe/London. Rig cheat-sheet (video0=camera capture,
+video1=metadata, eth0=modem 2!, enP4p65s0=routeless LAN) is in the doc.

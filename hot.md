@@ -5,6 +5,21 @@
 
 ## Current focus
 
+**2026-07-06: UX & TRUST AUDIT — the operator failed to livestream; full
+audit in [raw/UX_TRUST_AUDIT.md](raw/UX_TRUST_AUDIT.md). Verdict: no
+re-architecture; fix the trust layer.** Failure chain (all confirmed from
+logs/DB): Go Live modal can't select a source (always test pattern) →
+camera hot-switch offered /dev/video1 (metadata node) and crashed while
+the UI claimed success → dashboard interface toggle panics the pipeline
+(hotswap.rs:423 pad-property read) → end reasons dropped at both layers so
+every crash rendered as a clean "ended" → link pinning chose the routeless
+LAN (ignores routes + operator toggles). P0 fixes queued: toggle_link
+panic guard; persist/display end reasons; source picker in Go Live;
+ack all agent-bound commands; capture-capable device filter. Rig facts:
+`/dev/video0` = the camera (MJPG 1080p30/60); `eth0` = **modem 2**;
+`enP4p65s0` = routeless LAN. Broken stream stopped; Pi TZ now
+Europe/London.
+
 **2026-07-05 evening: DEPLOYED — the platform runs in production.**
 Control plane (systemd + Postgres 16 + dashboard) and receiver daemon on
 the Hetzner box (`root@65.109.5.169`, aarch64, ufw open on 3000/tcp +
@@ -304,4 +319,4 @@ override that pinned it is gone — but still needs field confirmation. Watch
 adaptive-redundancy duplication as a wire-overhead contributor when spare is large.
 
 ---
-_Last updated: 2026-07-05 evening (production deploy: Hetzner + Orange Pi live end-to-end, convergence bugs fixed in the field, update story shipped)_
+_Last updated: 2026-07-06 (UX & trust audit after the failed operator livestream — raw/UX_TRUST_AUDIT.md)_
