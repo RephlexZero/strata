@@ -71,6 +71,7 @@ pub type DeliveredPayload = (Bytes, bool);
 struct LinkRuntimeStats {
     packets_received: u64,
     packets_delivered: u64,
+    bytes_received: u64,
     loss_rate: f64,
 }
 
@@ -165,6 +166,7 @@ impl TransportBondingReceiver {
                                     link_id: *link_id,
                                     packets_received: ls.packets_received,
                                     packets_delivered: ls.packets_delivered,
+                                    bytes_received: ls.bytes_received,
                                     loss_rate: ls.loss_rate,
                                 })
                                 .collect();
@@ -674,6 +676,7 @@ async fn link_reader_async(
                                 LinkRuntimeStats {
                                     packets_received: rx_stats.packets_received,
                                     packets_delivered: rx_stats.packets_delivered,
+                                    bytes_received: rx_stats.bytes_received,
                                     loss_rate: loss_after_fec,
                                 },
                             );

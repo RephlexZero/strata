@@ -337,6 +337,10 @@ mod imp {
                                         .field(
                                             format!("loss_link_{}", link.link_id),
                                             link.loss_rate,
+                                        )
+                                        .field(
+                                            format!("bytes_received_link_{}", link.link_id),
+                                            link.bytes_received,
                                         );
                                 }
                                 let _ =

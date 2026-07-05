@@ -110,3 +110,60 @@ pub(crate) fn serialize_bonding_stats(s: &gst::StructureRef) -> serde_json::Valu
         "timestamp_ms": wall_time_ms,
     })
 }
+
+/// Serialize a receiver-side `strata-stats` structure for the stats relay.
+///
+/// The receiver structure carries per-link keys in the
+/// `packets_received_link_N` style (not the sender's `link_N_rtt` style
+/// that [`serialize_bonding_stats`] probes), so it needs its own walk.
+/// `observed_bps` is derived from rx-byte deltas between calls via
+/// `rx_rate_state` (link id → (bytes, when)).
+pub(crate) fn serialize_receiver_stats(
+    s: &gst::StructureRef,
+    rx_rate_state: &mut std::collections::HashMap<u32, (u64, std::time::Instant)>,
+) -> serde_json::Value {
+    let alive_links = s.get::<u64>("alive_links").unwrap_or(0);
+    let wall_time_ms = s.get::<u64>("wall_time_ms").unwrap_or(0);
+    let now = std::time::Instant::now();
+    let mut links = Vec::new();
+
+    let max_probe = alive_links.max(8) as u32;
+    for id in 0..max_probe {
+        let Ok(packets_received) = s.get::<u64>(&format!("packets_received_link_{}", id)) else {
+            continue;
+        };
+        let packets_delivered = s
+            .get::<u64>(&format!("packets_delivered_link_{}", id))
+            .unwrap_or(0);
+        let loss = s.get::<f64>(&format!("loss_link_{}", id)).unwrap_or(0.0);
+        let bytes_received = s
+            .get::<u64>(&format!("bytes_received_link_{}", id))
+            .unwrap_or(0);
+
+        let observed_bps = match rx_rate_state.insert(id, (bytes_received, now)) {
+            Some((prev_bytes, prev_when)) => {
+                let secs = now.duration_since(prev_when).as_secs_f64();
+                if secs > 0.0 {
+                    (bytes_received.saturating_sub(prev_bytes) as f64 * 8.0 / secs).round() as u64
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
+
+        links.push(serde_json::json!({
+            "id": id,
+            "loss_rate": loss,
+            "received_bytes": bytes_received,
+            "observed_bps": observed_bps,
+            "packets_received": packets_received,
+            "packets_delivered": packets_delivered,
+        }));
+    }
+
+    serde_json::json!({
+        "links": links,
+        "timestamp_ms": wall_time_ms,
+    })
+}

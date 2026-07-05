@@ -13,7 +13,7 @@ use gststrata::hls_upload;
 
 use crate::cli::ReceiverArgs;
 use crate::gate::{install_delivered_stream_gate, install_monotonic_dts_gate};
-use crate::stats::serialize_bonding_stats;
+use crate::stats::serialize_receiver_stats;
 use crate::util::{configure_hlssink3_muxer, register_plugins};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +227,9 @@ pub(crate) fn run_receiver(args: &ReceiverArgs) -> Result<(), Box<dyn std::error
     // Cumulative across generations — the daemon-facing egress heartbeat
     // must not reset when the watchdog rebuilds the pipeline.
     let mut segments_total: u64 = 0;
+    // Per-link rx-byte history for observed_bps in the stats relay.
+    let mut rx_rate_state: std::collections::HashMap<u32, (u64, Instant)> =
+        std::collections::HashMap::new();
     loop {
         let pipeline_str = if use_hls_relay {
             let hls_dir = hls_tmp_dir.as_ref().unwrap();
@@ -517,7 +520,7 @@ pub(crate) fn run_receiver(args: &ReceiverArgs) -> Result<(), Box<dyn std::error
                             if s.name() == "strata-stats" {
                                 eprintln!("Element Message: {}", s);
                                 if let Some(sock) = &stats_socket {
-                                    let mut v = serialize_bonding_stats(s);
+                                    let mut v = serialize_receiver_stats(s, &mut rx_rate_state);
                                     if use_hls_relay {
                                         v["egress"] = serde_json::json!({
                                             "segments_produced": segments_total,

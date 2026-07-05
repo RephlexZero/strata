@@ -169,6 +169,7 @@ pub struct ReassemblyLinkStats {
     pub link_id: usize,
     pub packets_received: u64,
     pub packets_delivered: u64,
+    pub bytes_received: u64,
     pub loss_rate: f64,
 }
 
