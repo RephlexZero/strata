@@ -87,6 +87,12 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
 
 /// Minimal HTTP/1.1 GET returning the response body. No TLS, no redirects —
 /// HiLink modem UIs are plain HTTP on the LAN gateway.
+///
+/// Reads exactly `Content-Length` body bytes rather than waiting for EOF:
+/// HiLink's httpd ignores our `Connection: close` request header and
+/// replies `Connection: Keep-Alive` regardless, so `read_to_end()` would
+/// block for its keep-alive timeout (tens of seconds) instead of ours,
+/// making every probe silently time out and return `None`.
 async fn http_get(host: &str, path: &str, cookie: Option<&str>) -> Option<String> {
     let fut = async {
         let mut stream = TcpStream::connect((host, 80)).await.ok()?;
@@ -96,15 +102,56 @@ async fn http_get(host: &str, path: &str, cookie: Option<&str>) -> Option<String
         let req =
             format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{cookie_hdr}Connection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).await.ok()?;
-        let mut buf = Vec::with_capacity(4096);
-        stream.read_to_end(&mut buf).await.ok()?;
-        let text = String::from_utf8_lossy(&buf);
-        let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string())?;
-        // Tolerate chunked encoding well enough for tag extraction — the
-        // chunk-size lines never contain '<', so extract_tag still works.
-        Some(body)
+        read_http_body(&mut stream).await
     };
     tokio::time::timeout(HTTP_TIMEOUT, fut).await.ok().flatten()
+}
+
+/// Read an HTTP response's body off an already-connected stream, using the
+/// `Content-Length` header rather than EOF to know when the body ends.
+async fn read_http_body(stream: &mut TcpStream) -> Option<String> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        let n = stream.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None; // closed before headers completed
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if buf.len() > 16384 {
+            return None; // headers unreasonably large — bail
+        }
+    };
+
+    let content_length: usize = String::from_utf8_lossy(&buf[..header_end])
+        .lines()
+        .find_map(|l| {
+            l.split_once(':')
+                .filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+        })
+        .and_then(|(_, v)| v.trim().parse().ok())
+        .unwrap_or(0);
+
+    while buf.len() < header_end + content_length {
+        let n = stream.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            break; // closed early — use what arrived
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+
+    let body_end = (header_end + content_length).min(buf.len());
+    Some(String::from_utf8_lossy(&buf[header_end..body_end]).to_string())
+}
+
+/// Find the first occurrence of `needle` in `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 #[cfg(test)]
@@ -129,5 +176,42 @@ mod tests {
     async fn probe_of_non_modem_returns_none() {
         // Nothing listens on this TEST-NET address; must time out to None.
         assert!(probe("192.0.2.1").await.is_none());
+    }
+
+    /// Reproduces the real HiLink bug: the server sends `Connection:
+    /// Keep-Alive` and never closes the socket, regardless of what the
+    /// client asked for. `read_http_body` must return the body promptly
+    /// by honoring `Content-Length`, not hang waiting for EOF.
+    #[tokio::test]
+    async fn read_http_body_ignores_server_keep_alive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req_buf = [0u8; 1024];
+            let _ = sock.read(&mut req_buf).await;
+            let body = "<response><rsrp>-95dBm</rsrp></response>";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nConnection: Keep-Alive\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            // Never close the socket — this is what real HiLink firmware does.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let mut client = tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(addr))
+            .await
+            .unwrap()
+            .unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+
+        let body = tokio::time::timeout(Duration::from_secs(1), read_http_body(&mut client))
+            .await
+            .expect("read_http_body must not hang on a keep-alive connection")
+            .expect("body should be parsed");
+        assert_eq!(body, "<response><rsrp>-95dBm</rsrp></response>");
     }
 }

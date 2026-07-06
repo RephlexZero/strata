@@ -5,24 +5,75 @@
 
 ## Current focus
 
-**2026-07-06: ALL 16 AUDIT FINDINGS FIXED — awaiting redeploy.** Every
-U-finding in [raw/UX_TRUST_AUDIT.md](raw/UX_TRUST_AUDIT.md) is implemented
-and ticked in the doc: toggle_link panic guard; end reasons persisted
-end-to-end (`end_reason`/`end_inferred`, migration 004) and rendered
-(dismissible notice, Reason column, `restarted_from` lineage); Go Live
-source picker (camera default + TEST PATTERN badge); acked source.switch +
-interface commands; rich interface identity (driver/bus/USB
-product/subnet/gateway/default-route + live HiLink modem probe —
-carrier/RAT/band/RSRP via the gateway HTTP API, `hilink.rs`); pinning
-filters on enabled∧connected∧default-routed and reports the
-link→interface mapping in stats; persisted admin toggles; capture-only
-video pickers; real total_bytes; Receivers page (register + one-time
-token); real has_role; staleness ageing; local-time timestamps. Suites:
-49+8+4+5+25+44 green, clippy clean. **NOT yet on the boxes — next step:
-`make cross-aarch64`, redeploy Hetzner + Pi, then a real camera stream
-end-to-end.** Rig facts: `/dev/video0` = the camera (MJPG 1080p30/60);
-`eth0` = **modem 2**; `enP4p65s0` = routeless LAN. Pi TZ now
-Europe/London.
+**2026-07-06: ALL 16 AUDIT FINDINGS FIXED AND DEPLOYED.** Every U-finding
+in [raw/UX_TRUST_AUDIT.md](raw/UX_TRUST_AUDIT.md) is implemented, ticked,
+and now running on both boxes: toggle_link panic guard; end reasons
+persisted end-to-end (`end_reason`/`end_inferred`, migration 004 — applied
+live, verified via `\d streams`) and rendered (dismissible notice, Reason
+column, `restarted_from` lineage); Go Live source picker (camera default +
+TEST PATTERN badge); acked source.switch + interface commands; rich
+interface identity (driver/bus/USB product/subnet/gateway/default-route +
+live HiLink modem probe — carrier/RAT/band/RSRP via the gateway HTTP API,
+`hilink.rs`); pinning filters on enabled∧connected∧default-routed and
+reports the link→interface mapping in stats; persisted admin toggles;
+capture-only video pickers; real total_bytes; Receivers page (register +
+one-time token); real has_role; staleness ageing; local-time timestamps.
+Suites: 49+8+4+5+25+44 green, clippy clean. Deployed via `make
+cross-aarch64` + manual rsync/systemd swap to both boxes (control →
+receiver → sender order; DB backed up to `/root/strata-*.sql` before the
+migration ran); all three services reconnected on persisted ed25519
+identity with zero errors in the post-deploy logs. Rig facts:
+`/dev/video0` = the camera (MJPG 1080p30/60); `eth0` = **modem 2**;
+`enP4p65s0` = routeless LAN. Pi TZ now Europe/London.
+
+**2026-07-06 (live-fire test): first real camera stream to YouTube found
+two bugs.** (1) `hilink.rs`'s `http_get` used `read_to_end()`, but the
+HiLink httpd ignores our `Connection: close` and always replies
+`Connection: Keep-Alive` — every probe blocked for the full 1200ms
+timeout and silently returned `None`, so carrier/RSRP/band were `null`
+on the dashboard despite the modems being reachable. Fixed: read by
+`Content-Length` instead (`read_http_body`, regression test simulates a
+keep-alive server that never closes the socket). Redeployed to the Pi,
+confirmed live: `carrier="3 UK" signal_dbm=-104/-103 technology=LTE
+band=20`. (2) **The actual "YouTube gets no data" symptom is
+capacity-floor pinning** (previously flagged below, not fixed by the
+audit pass): the stream's `min_bitrate_kbps=3000` floor sat well above
+the real per-link capacity at RSRP ~-104dBm (~1.2-1.5 Mbps/link with up
+to 45% loss). The adapter logs `sustained=true → reduce=true` but can't
+go below the floor, so the encoder keeps forcing 3 Mbps into links that
+can't carry it → self-inflicted AQM congestion collapse (200-1000+
+drops/sec) → receiver's HLS segmenter starves → egress watchdog
+rebuilds the pipeline every 30-40s → each rebuild resets the HLS
+media-sequence, so YouTube's ingest never accumulates a continuous
+stream even though every individual segment PUT gets HTTP 202. Not yet
+fixed in code (still tracked as "capacity-floor estimator pinning"
+below) — operational workaround is to set bitrate to match real
+conditions (e.g. min≈500, target≈1500, max≈2500 kbps) until the
+estimator itself is fixed.
+
+**2026-07-06 (evening retry): YouTube ingest itself was the blocker —
+codec/playlist suspected, key+plumbing PROVEN FINE.** Second live
+attempt, same 3000/5000/6000 settings, but radio much better (band 20,
+agg 7-9 Mbps, <1% loss, one watchdog rebuild total) — transport
+delivered clean full-video HEVC segments for minutes, PUTs flowed
+(TLS conn to a.upload.youtube.com, MBs ACKed), and YouTube still
+showed nothing. Key insight: **YouTube returns HTTP 202 even for
+garbage PUTs** — acceptance failures are completely silent. A/B test:
+stopped the stream, pushed ffmpeg testsrc **H.264+AAC HLS to the same
+ingest URL → appeared on YouTube immediately** (user confirmed).
+Remaining suspects for why Strata's output is silently discarded:
+(a) **H.265** — mpph265enc HEVC Main; YouTube docs claim HLS HEVC
+support but unverified for this shape; (b) **`#EXT-X-DISCONTINUITY`
+tags** — the uploader injected them on ~45% of segments early on
+(+ `#EXT-X-DISCONTINUITY-SEQUENCE` forever after); ingest endpoints
+often don't tolerate these. **Next: discriminator test — same ffmpeg
+push with libx265**; if H.265 testsrc appears → codec fine, kill the
+discontinuity-tag rewriting (or gate it); if it doesn't → add H.264
+(mpph264enc) as the platform default / YouTube-destination default.
+Evidence preserved: /root/hls-debug-20260706/ on the Hetzner box
+(playlist + segments + ffmpeg test log). Stream stop correctly
+recorded `end_reason=control_plane_stop, end_inferred=false` — audit
+machinery working in prod.
 
 **2026-07-05 evening: DEPLOYED — the platform runs in production.**
 Control plane (systemd + Postgres 16 + dashboard) and receiver daemon on

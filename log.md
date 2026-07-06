@@ -860,3 +860,103 @@ errors, and local-time timestamps. Verified: protocol 49, sender 8+4,
 receiver 5, control integration 25 (Postgres, migration 004 applied),
 bonding net 44 — all green; clippy clean on touched crates. Not yet
 redeployed to the boxes — needs make cross-aarch64 + install.
+
+## 2026-07-06 (later still) — redeployed all 16 audit fixes to Hetzner + Pi
+
+`make cross-aarch64` (built strata-control/receiver/sender/pipeline +
+libgststrata.so together — the Docker cross image already compiles all
+four) plus `trunk build --release` for the dashboard WASM bundle. Took a
+`pg_dump` backup on Hetzner first (9 rows, no live streams at deploy
+time), then rsync'd binaries + dashboard dist to `/tmp` on each box,
+stopped services, swapped `/usr/local/bin/*` + the gstreamer plugin +
+`/usr/local/share/strata/dashboard`, restarted in control → receiver →
+sender order. Migration 004 (`end_reason`/`end_inferred`/`restarted_from`)
+applied cleanly on control-plane startup, confirmed via `\d streams`. All
+three services reconnected on their persisted ed25519 device keys (no
+re-enrollment needed) with zero errors/panics in the post-restart logs —
+only expected transient "connection refused" on the sender while the
+control plane was mid-restart, which self-healed on the next retry.
+Did **not** re-apply `setcap` to the Pi's `strata-pipeline`: the sender
+unit grants `CAP_NET_RAW` via `AmbientCapabilities`, and `NoNewPrivileges`
+in that unit means a setcap'd binary would silently fail to gain the
+capability instead — plain binary swap is correct there.
+Next: drive an actual camera stream through the redeployed stack to
+confirm the audit fixes hold live (dashboard.md still just says "next
+step" for that — genuinely still open).
+
+## 2026-07-06 (live-fire) — first real stream found a HiLink probe bug + confirmed a known transport bug
+
+User went live for real: camera on, bitrate flowing sender→receiver, but
+YouTube never showed the stream. Diagnosed two separate things:
+
+1. **New bug in this session's `hilink.rs`.** `http_get` called
+   `read_to_end()` expecting the socket to close, but HiLink's httpd
+   ignores the client's `Connection: close` and always answers
+   `Connection: Keep-Alive` — confirmed with a raw `/dev/tcp` request that
+   returned the full body instantly but left the socket open for 45s+.
+   Every probe call blocked for the full 1200ms timeout and returned
+   `None`, so the dashboard's carrier/RSRP/band fields were silently
+   always null. Fixed by reading exactly `Content-Length` bytes instead
+   (`read_http_body`); added a regression test that spins up a local
+   listener replying with `Connection: Keep-Alive` and never closing the
+   socket, asserting the read still returns promptly. Rebuilt, redeployed
+   to the Pi (control-plane had no live stream at the time, safe to
+   restart), confirmed live: `carrier="3 UK" signal_dbm=-104/-103
+   technology=LTE band=20` now populate correctly.
+2. **Root cause of "YouTube gets nothing" is the pre-existing
+   capacity-floor-pinning bug**, not anything from the audit fixes or the
+   redeploy. `min_bitrate_kbps=3000` on the destination sat well above
+   the actual per-link capacity at RSRP ~-104dBm (~1.2-1.5 Mbps/link, up
+   to 45% loss). Sender logs show `sustained=true → reduce=true` but the
+   adapter can't cut below the configured floor, so it keeps forcing 3
+   Mbps into links that can't carry it, causing self-inflicted AQM
+   congestion collapse (hundreds to 1000+ drops/sec) that starves the
+   receiver's HLS segmenter. The egress watchdog then rebuilds the
+   pipeline every 30-40s ("no HLS segment for 15s"), and each rebuild
+   resets the HLS media-sequence from scratch — so YouTube's ingest never
+   accumulates a continuous stream even though every individual segment
+   PUT gets HTTP 202 Accepted. Confirmed via curl that the CID/network
+   path/ingest endpoint are all fine in isolation. Not fixed in code this
+   session (still the known "capacity-floor estimator pinning" item) —
+   told the user to retry with saner bitrate settings (min≈500,
+   target≈1500, max≈2500 kbps) as an immediate workaround.
+
+Also hit (and diagnosed) the documented `cargo test | tail` wedge hazard
+mid-session: a leaked `fake-pipeline.sh` test helper from
+`daemon_lifecycle` integration tests got reparented to init and kept a
+pipe open for 3+ hours after `cargo test` itself had finished, blocking
+`tail` on EOF that would never come. Found it via `/proc/<pid>/fd` pipe-
+inode matching, killed it, output flushed immediately. Confirms the
+existing workaround note (avoid `cargo test | tail`, or be ready to hunt
+down and kill orphaned children by pipe inode).
+
+## 2026-07-06 (night) — YouTube ingest A/B test: key+plumbing proven fine, Strata's output is what's rejected
+
+Second live attempt (same 3000/5000/6000 encoder settings, user didn't
+lower them) — but this time the radio was good: band 20, aggregate
+capacity 7–9 Mbps, <1% loss, encoder steady at 3000–3250 kbps, only one
+egress-watchdog rebuild in the whole run. Clean full-video HEVC+AAC
+segments (ffprobe-verified) streamed for minutes, an established TLS
+connection to a.upload.youtube.com ACKed megabytes — and YouTube still
+showed nothing. Proved YouTube's 202s are meaningless by PUTting literal
+garbage: also 202. Ingest failures are fully silent.
+
+A/B test: stopped the stream (correctly recorded
+`end_reason=control_plane_stop, end_inferred=false` — migration 004
+machinery observed working in prod), then pushed ffmpeg
+testsrc2 H.264+AAC HLS directly to the same ingest URL from the Hetzner
+box. **User confirmed it appeared on YouTube.** So: stream key, event,
+URL format, PUT mechanics, playlist ordering — all fine. What YouTube
+silently discards is specifically Strata's output. Two suspects left:
+(a) HEVC (mpph265enc Main profile) vs YouTube's HLS ingest; (b) the
+`#EXT-X-DISCONTINUITY`/`#EXT-X-DISCONTINUITY-SEQUENCE` tags hls_upload.rs
+injects (~45% of segments were tagged early in the run — ingest
+endpoints often don't tolerate discontinuity tags at all). Discriminator
+queued: same ffmpeg push with libx265; appears → kill/gate the
+discontinuity rewriting; doesn't → default YouTube destinations to
+H.264 (mpph264enc). Evidence: /root/hls-debug-20260706/ on Hetzner
+(final playlist, last 4 segments, ffmpeg test log).
+
+Earlier the same evening: deployed the hilink.rs keep-alive fix to the
+Pi (modem probe now live in prod: carrier="3 UK", LTE, band 20, RSRP
+-104/-103 dBm on both links) after the Pi came back from a power cycle.
