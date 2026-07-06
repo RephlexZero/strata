@@ -384,6 +384,7 @@ async fn handle_control_message(state: &ReceiverState, raw: &str) {
                     reason: StreamEndReason::ControlPlaneStop,
                     duration_s: stats.duration_s,
                     total_bytes: stats.total_bytes,
+                    error: None,
                 };
                 send_message(state, &ReceiverMessage::StreamEnded(ended)).await;
             }

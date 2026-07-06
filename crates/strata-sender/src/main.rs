@@ -9,6 +9,7 @@
 
 mod control;
 mod hardware;
+mod hilink;
 mod metrics;
 mod pipeline;
 mod pipeline_monitor;

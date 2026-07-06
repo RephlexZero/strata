@@ -38,6 +38,11 @@ pub fn DestinationModal(
     selected_codec: ReadSignal<String>,
     set_selected_codec: WriteSignal<String>,
     dests_loading: ReadSignal<bool>,
+    hw_inputs: ReadSignal<Vec<MediaInput>>,
+    selected_source: ReadSignal<String>,
+    set_selected_source: WriteSignal<String>,
+    selected_device: ReadSignal<String>,
+    set_selected_device: WriteSignal<String>,
     on_confirm: impl Fn(web_sys::MouseEvent) + 'static + Copy + Send,
 ) -> impl IntoView {
     let auth = expect_context::<AuthState>();
@@ -98,6 +103,62 @@ pub fn DestinationModal(
                                         }).collect::<Vec<_>>()}
                                     </div>
                                 }.into_any()
+                            }
+                        }}
+                    </div>
+
+                    // Video source — the start request always sends an
+                    // explicit source now; the old modal sent none and the
+                    // server silently defaulted to a test pattern
+                    // (UX_TRUST_AUDIT U11).
+                    <div class="divider text-xs text-base-content/40">"Video Source"</div>
+                    <div class="flex flex-col gap-2">
+                        {move || {
+                            let cameras: Vec<MediaInput> = hw_inputs.get().into_iter()
+                                .filter(|i| i.input_type == strata_protocol::models::MediaInputType::V4l2)
+                                .collect();
+                            let has_camera = !cameras.is_empty();
+                            view! {
+                                <label class="flex items-center gap-3 p-3 bg-base-300 rounded cursor-pointer hover:bg-base-content/10 border border-base-300"
+                                    class:border-primary=move || selected_source.get() == "camera"
+                                    class:opacity-50=!has_camera
+                                >
+                                    <input type="radio" name="start_source" class="radio radio-sm radio-primary"
+                                        checked=move || selected_source.get() == "camera"
+                                        disabled=!has_camera
+                                        on:change=move |_| set_selected_source.set("camera".into())
+                                    />
+                                    <div class="flex-1">
+                                        <div class="font-medium text-sm">"Camera"</div>
+                                        <div class="text-xs text-base-content/60">
+                                            {if has_camera { "Capture device on the sender" } else { "No capture device detected on the sender" }}
+                                        </div>
+                                        {has_camera.then(|| view! {
+                                            <select class="select select-bordered select-sm w-full mt-2"
+                                                prop:value=move || selected_device.get()
+                                                on:change=move |ev| set_selected_device.set(event_target_value(&ev))
+                                            >
+                                                {cameras.iter().map(|c| {
+                                                    let dev = c.device.clone();
+                                                    let label = format!("{} ({})", c.label, c.device);
+                                                    view! { <option value=dev>{label}</option> }
+                                                }).collect::<Vec<_>>()}
+                                            </select>
+                                        })}
+                                    </div>
+                                </label>
+                                <label class="flex items-center gap-3 p-3 bg-base-300 rounded cursor-pointer hover:bg-base-content/10 border border-base-300"
+                                    class:border-primary=move || selected_source.get() == "test"
+                                >
+                                    <input type="radio" name="start_source" class="radio radio-sm radio-primary"
+                                        checked=move || selected_source.get() == "test"
+                                        on:change=move |_| set_selected_source.set("test".into())
+                                    />
+                                    <div>
+                                        <div class="font-medium text-sm">"Test pattern"</div>
+                                        <div class="text-xs text-warning">"Broadcasts colour bars — not the camera"</div>
+                                    </div>
+                                </label>
                             }
                         }}
                     </div>
@@ -558,7 +619,7 @@ pub fn StreamTab(
             <TransportTuningCard sender_id=sender_id stream_state=stream_state />
 
             // Multi-Destination Routing
-            <MultiDestRoutingCard sender_id=sender_id stream_state=stream_state />
+            <MultiDestRoutingCard sender_id=sender_id stream_state=stream_state stream_detail=stream_detail />
 
             // Receiver Jitter Buffer
             <JitterBufferCard sender_id=sender_id stream_state=stream_state receiver_metrics=receiver_metrics />
@@ -633,6 +694,7 @@ pub fn SourceTab(
                     return;
                 }
                 SourceSwitchPayload {
+                    request_id: None, // filled by the control plane
                     mode: "v4l2".into(),
                     device: Some(dev),
                     pattern: None,
@@ -647,6 +709,7 @@ pub fn SourceTab(
                     return;
                 }
                 SourceSwitchPayload {
+                    request_id: None,
                     mode: "uri".into(),
                     uri: Some(uri),
                     pattern: None,
@@ -654,6 +717,7 @@ pub fn SourceTab(
                 }
             }
             _ => SourceSwitchPayload {
+                request_id: None,
                 mode: "test".into(),
                 pattern: Some(test_pattern.get_untracked()),
                 uri: None,
@@ -663,7 +727,9 @@ pub fn SourceTab(
 
         leptos::task::spawn_local(async move {
             match api::switch_source(&token, &id, &req).await {
-                Ok(()) => set_switch_msg.set(Some(("Source switched successfully".into(), "ok"))),
+                Ok(()) => {
+                    set_switch_msg.set(Some(("Source switch confirmed by device".into(), "ok")))
+                }
                 Err(e) => set_switch_msg.set(Some((format!("Failed: {e}"), "err"))),
             }
             set_switching.set(false);
@@ -1045,9 +1111,11 @@ pub fn NetworkTab(
     set_iface_loading: WriteSignal<Option<String>>,
     scan_msg: ReadSignal<Option<(String, &'static str)>>,
     set_scan_msg: WriteSignal<Option<(String, &'static str)>>,
-    set_error: WriteSignal<Option<String>>,
 ) -> impl IntoView {
     let auth = expect_context::<AuthState>();
+    // Per-tab error surface — interface command failures used to vanish
+    // into the global page banner (U15).
+    let (iface_msg, set_iface_msg) = signal(Option::<String>::None);
 
     let auth_scan = auth.clone();
     let do_scan = move |_| {
@@ -1106,6 +1174,17 @@ pub fn NetworkTab(
                 view! { <div class={cls}>{msg}</div> }
             })}
 
+            {move || iface_msg.get().map(|msg| view! {
+                <div class="alert alert-error text-sm mb-3">
+                    <span>{msg}</span>
+                    <button class="btn btn-ghost btn-xs" on:click=move |_| set_iface_msg.set(None)>"✕"</button>
+                </div>
+            })}
+
+            <p class="text-xs text-base-content/50 mb-3">
+                "The enable toggle excludes an interface from the bonded stream (live and future starts). It does not change the OS interface."
+            </p>
+
             {move || {
                 let ifaces = interfaces.get();
                 if ifaces.is_empty() {
@@ -1144,6 +1223,16 @@ pub fn NetworkTab(
                             if let Some(cid) = &iface.cell_id { meta.push(format!("Cell {cid}")); }
                             if let Some(db) = iface.signal_dbm { meta.push(format!("{db} dBm")); }
                             if let Some(ip) = &iface.ip { meta.push(ip.clone()); }
+                            if let Some(sn) = &iface.subnet { meta.push(sn.clone()); }
+                            // Physical identity — a USB modem named eth0 is
+                            // indistinguishable from LAN by name alone (U3/U16).
+                            if let Some(pr) = &iface.product { meta.push(pr.clone()); }
+                            if let Some(d) = &iface.driver {
+                                let bus = iface.bus.as_deref().unwrap_or("");
+                                meta.push(if bus.is_empty() { d.clone() } else { format!("{d} ({bus})") });
+                            }
+                            if let Some(gw) = &iface.gateway { meta.push(format!("gw {gw}")); }
+                            let no_route = connected && !iface.has_default_route;
 
                             let toggle = move |_| {
                                 let sid = sender_id.get_untracked();
@@ -1157,7 +1246,7 @@ pub fn NetworkTab(
                                         api::enable_interface(&token, &sid, &iface_name).await
                                     };
                                     if let Err(e) = result {
-                                        set_error.set(Some(e));
+                                        set_iface_msg.set(Some(e));
                                     }
                                     set_iface_loading.set(None);
                                 });
@@ -1177,7 +1266,7 @@ pub fn NetworkTab(
                                 set_iface_loading.set(Some(iface_name.clone()));
                                 leptos::task::spawn_local(async move {
                                     if let Err(e) = api::lock_band(&token, &sid, &iface_name, band).await {
-                                        set_error.set(Some(e));
+                                        set_iface_msg.set(Some(e));
                                     }
                                     set_iface_loading.set(None);
                                 });
@@ -1194,7 +1283,7 @@ pub fn NetworkTab(
                                     set_iface_loading.set(Some(iface_name.clone()));
                                     leptos::task::spawn_local(async move {
                                         if let Err(e) = api::set_priority(&token, &sid, &iface_name, prio).await {
-                                            set_error.set(Some(e));
+                                            set_iface_msg.set(Some(e));
                                         }
                                         set_iface_loading.set(None);
                                     });
@@ -1214,7 +1303,7 @@ pub fn NetworkTab(
                                 set_iface_loading.set(Some(iface_name.clone()));
                                 leptos::task::spawn_local(async move {
                                     if let Err(e) = api::set_apn(&token, &sid, &iface_name, apn, None, Some(current_roaming)).await {
-                                        set_error.set(Some(e));
+                                        set_iface_msg.set(Some(e));
                                     }
                                     set_iface_loading.set(None);
                                 });
@@ -1233,7 +1322,7 @@ pub fn NetworkTab(
                                 let apn = current_apn_roaming.clone();
                                 leptos::task::spawn_local(async move {
                                     if let Err(e) = api::set_apn(&token, &sid, &iface_name, apn, None, Some(roaming)).await {
-                                        set_error.set(Some(e));
+                                        set_iface_msg.set(Some(e));
                                     }
                                     set_iface_loading.set(None);
                                 });
@@ -1268,6 +1357,9 @@ pub fn NetworkTab(
                                             />
                                             <div>
                                                 <span class="font-semibold font-mono text-sm">{name}</span>
+                                                {no_route.then(|| view! {
+                                                    <span class="badge badge-warning badge-xs ml-2" title="No default route — this interface cannot reach the internet and is never pinned to a bonded link">"no internet route"</span>
+                                                })}
                                                 <div class="flex gap-2 text-xs text-base-content/60">
                                                     {meta.into_iter().map(|p| view! {
                                                         <span>{p}</span>
@@ -1557,11 +1649,17 @@ pub fn SettingsTab(
                                 </tr>
                                 <tr>
                                     <td class="text-base-content/60">"Created"</td>
-                                    <td>{move || sender.get().map(|s| s.created_at.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default()}</td>
+                                    <td>{move || crate::pages::format_local_time(sender.get().map(|s| s.created_at.to_rfc3339()).as_deref())}</td>
                                 </tr>
                                 <tr>
                                     <td class="text-base-content/60">"Last seen"</td>
-                                    <td>{move || sender.get().and_then(|s| s.last_seen_at).map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(|| "Never".into())}</td>
+                                    <td>{move || {
+                                        let seen = sender.get().and_then(|s| s.last_seen_at);
+                                        match seen {
+                                            Some(t) => crate::pages::format_local_time(Some(&t.to_rfc3339())),
+                                            None => "Never".into(),
+                                        }
+                                    }}</td>
                                 </tr>
                             </tbody>
                         </table>

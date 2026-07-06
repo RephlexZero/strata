@@ -1,6 +1,4 @@
 use leptos::prelude::*;
-use wasm_bindgen::JsCast;
-use wasm_bindgen::prelude::*;
 
 use crate::AuthState;
 use crate::api;
@@ -549,49 +547,33 @@ pub fn AlertingRulesCard(sender_id: Memo<String>, is_online: Memo<bool>) -> impl
             enabled: true,
         };
         set_alert_msg.set(None);
+        let reload = load_after_create;
         leptos::task::spawn_local(async move {
+            // Refetch on the server's confirmation, not a fixed timer — a
+            // slow server made fresh rules appear to not have taken (U15).
             match api::set_alert_rule(&token, &id, &rule).await {
                 Ok(()) => {
                     set_show_create.set(false);
                     set_new_name.set(String::new());
                     set_new_threshold.set("5000000".into());
                     set_alert_msg.set(Some(("Rule created".into(), "ok")));
+                    reload();
                 }
                 Err(e) => set_alert_msg.set(Some((format!("Failed: {e}"), "err"))),
             }
         });
-        let reload = load_after_create;
-        // Reload after short delay
-        let cb = Closure::<dyn Fn()>::wrap(Box::new(move || {
-            reload();
-        }));
-        let _ = web_sys::window()
-            .unwrap()
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                cb.as_ref().unchecked_ref(),
-                500,
-            );
-        cb.forget();
     };
 
     let load_after_delete = load_rules;
     let on_delete = move |rule_id: String| {
         let token = auth.token.get_untracked().unwrap_or_default();
         let id = sender_id.get_untracked();
-        leptos::task::spawn_local(async move {
-            let _ = api::delete_alert_rule(&token, &id, &rule_id).await;
-        });
         let reload = load_after_delete;
-        let cb = Closure::<dyn Fn()>::wrap(Box::new(move || {
-            reload();
-        }));
-        let _ = web_sys::window()
-            .unwrap()
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                cb.as_ref().unchecked_ref(),
-                500,
-            );
-        cb.forget();
+        leptos::task::spawn_local(async move {
+            if api::delete_alert_rule(&token, &id, &rule_id).await.is_ok() {
+                reload();
+            }
+        });
     };
 
     view! {
@@ -996,28 +978,43 @@ pub fn TransportTuningCard(
 pub fn MultiDestRoutingCard(
     sender_id: Memo<String>,
     stream_state: ReadSignal<String>,
+    stream_detail: ReadSignal<Option<strata_protocol::api::StreamDetail>>,
 ) -> impl IntoView {
     let auth = expect_context::<AuthState>();
 
     let (destinations, set_destinations) =
         signal(Vec::<strata_protocol::api::DestinationSummary>::new());
+    // Server-confirmed routing state: seeded from the stream's start-time
+    // destination, then updated only on acked apply — the old version
+    // painted "Active" badges straight from local clicks (U13 placebo).
     let (active_ids, set_active_ids) = signal(Vec::<String>::new());
     let (applying, set_applying) = signal(false);
     let (msg, set_msg) = signal(Option::<(String, &'static str)>::None);
     let (loaded, set_loaded) = signal(false);
 
-    // Load destinations when stream goes live
+    // Load destinations when stream goes live; seed from the stream row.
     let auth_load = auth.clone();
     Effect::new(move || {
         let st = stream_state.get();
         if (st == "live" || st == "starting") && !loaded.get_untracked() {
             let token = auth_load.token.get_untracked().unwrap_or_default();
             set_loaded.set(true);
+            if let Some(dest) = stream_detail.get_untracked().and_then(|d| d.destination_id) {
+                set_active_ids.set(vec![dest]);
+            }
             leptos::task::spawn_local(async move {
                 if let Ok(dests) = api::list_destinations(&token).await {
                     set_destinations.set(dests);
                 }
             });
+        }
+    });
+    // The stream detail can arrive after the live transition — seed then.
+    Effect::new(move || {
+        if let Some(dest) = stream_detail.get().and_then(|d| d.destination_id)
+            && active_ids.get_untracked().is_empty()
+        {
+            set_active_ids.set(vec![dest]);
         }
     });
 
@@ -1028,16 +1025,18 @@ pub fn MultiDestRoutingCard(
         } else {
             ids.push(dest_id);
         }
-        let ids_clone = ids.clone();
-        set_active_ids.set(ids);
 
         let token = auth.token.get_untracked().unwrap_or_default();
         let id = sender_id.get_untracked();
         set_applying.set(true);
         set_msg.set(None);
         leptos::task::spawn_local(async move {
-            match api::set_stream_destinations(&token, &id, &ids_clone).await {
-                Ok(()) => set_msg.set(Some(("Destinations updated".into(), "ok"))),
+            match api::set_stream_destinations(&token, &id, &ids).await {
+                Ok(()) => {
+                    // Only reflect state the agent acked.
+                    set_active_ids.set(ids);
+                    set_msg.set(Some(("Destinations updated".into(), "ok")));
+                }
                 Err(e) => set_msg.set(Some((format!("Failed: {e}"), "err"))),
             }
             set_applying.set(false);
@@ -1096,7 +1095,7 @@ pub fn MultiDestRoutingCard(
                                             <div class="text-xs text-base-content/60 font-mono">{d.platform.clone()} " · " {d.url.clone()}</div>
                                         </div>
                                         {is_active.then(|| view! {
-                                            <span class="badge badge-success badge-sm">"Active"</span>
+                                            <span class="badge badge-success badge-sm">"Routing"</span>
                                         })}
                                     </label>
                                 }

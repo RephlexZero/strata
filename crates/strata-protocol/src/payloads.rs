@@ -84,6 +84,9 @@ pub struct StreamEndedPayload {
     pub reason: StreamEndReason,
     pub duration_s: u64,
     pub total_bytes: u64,
+    /// Human-readable detail for error/crash ends (e.g. "pipeline exit code 1").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +212,10 @@ pub struct ConfigUpdateResponsePayload {
 /// Command to switch the active video source on a running pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceSwitchPayload {
+    /// Request-correlation ID — echoed back in `source.switch.response`.
+    /// Optional for wire compatibility with older control planes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// Source mode: "test", "v4l2", "uri".
     pub mode: String,
     /// V4L2 device path (used when mode = "v4l2").
@@ -226,6 +233,10 @@ pub struct SourceSwitchPayload {
 /// Command to manage a network interface on the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceCommandPayload {
+    /// Request-correlation ID — echoed back in `interface.command.response`.
+    /// Optional for wire compatibility with older control planes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// The interface name (e.g. "wwan0").
     pub interface: String,
     /// Action: "enable", "disable", "lock_band", "set_priority".
@@ -250,9 +261,24 @@ pub struct InterfaceCommandPayload {
 /// Response to an interface command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceCommandResponsePayload {
+    /// Echoed request-correlation ID (None from older agents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub success: bool,
     pub interface: String,
     pub action: String,
+    pub error: Option<String>,
+}
+
+/// Response to source.switch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceSwitchResponsePayload {
+    /// Echoed request-correlation ID (None from older agents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub success: bool,
+    /// The mode that was requested ("test", "v4l2", "uri").
+    pub mode: String,
     pub error: Option<String>,
 }
 
@@ -611,6 +637,9 @@ pub struct ReceiverStreamEndedPayload {
     pub reason: StreamEndReason,
     pub duration_s: u64,
     pub total_bytes: u64,
+    /// Human-readable detail for error/crash ends (e.g. "pipeline exit code 1").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Receiver reports per-second stats for a stream.

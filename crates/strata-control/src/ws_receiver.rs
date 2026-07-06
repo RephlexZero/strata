@@ -430,11 +430,18 @@ async fn handle_receiver_message(state: &AppState, receiver_id: &str, owner_id: 
             .await
             .unwrap_or(false);
             if assigned {
+                let reason = serde_json::to_value(payload.reason)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from));
                 let _ = crate::stream_state::transition(
                     state.pool(),
                     &payload.stream_id,
                     strata_protocol::models::StreamState::Ended,
-                    None,
+                    crate::stream_state::EndAttribution {
+                        reason: reason.as_deref(),
+                        error: payload.error.as_deref(),
+                        inferred: false,
+                    },
                 )
                 .await;
             }

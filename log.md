@@ -831,3 +831,32 @@ and per-device config is thin (daemon flags overwrite DB; bonding_config
 always null). Box hygiene: stopped the broken stream via API; Pi timezone
 Asia/Shanghai → Europe/London. Rig cheat-sheet (video0=camera capture,
 video1=metadata, eth0=modem 2!, enP4p65s0=routeless LAN) is in the doc.
+
+## 2026-07-06 (later) — implemented every fix from the UX & trust audit
+
+All 16 U-findings from raw/UX_TRUST_AUDIT.md implemented and ticked off in
+the doc (each heading carries a "✅ FIXED" note describing the fix).
+Highlights: toggle_link no longer panics the pipeline (find_property
+guard); stream end reasons persist end-to-end (StreamEnded.error +
+end_reason/end_inferred columns, migration 004 — readoption now keys off
+end_inferred, not error_message) and render in the dashboard (dismissible
+"why it ended" notice + streams Reason column + restarted_from lineage);
+Go Live has a source picker defaulting to the first real camera, with a
+TEST PATTERN badge when streaming the test source; source.switch and
+interface commands are acked end-to-end (request_id) so "success" is now
+device-confirmed; interface scans report driver/bus/USB-product/subnet/
+gateway/has_default_route and probe HiLink modem gateways over their HTTP
+API (new strata-sender/src/hilink.rs — carrier, RAT, band, cell, RSRP,
+15 s cache); link pinning uses eligible_interfaces() (admin-enabled ∧
+connected ∧ default-routed) and the final link→interface mapping overlays
+per-link stats; admin toggles persist to /var/lib/strata/
+interface-admin.json; video pickers only list VIDIOC_QUERYCAP capture
+nodes and the daemon pre-rejects bad devices on source.switch;
+total_bytes is real; the starvation WARN logs transitions only; the
+dashboard gained a Receivers page (register/list/delete + one-time
+token), real has_role gating, seeded+acked multi-dest state, WS
+auth-failure badge, device-status staleness ageing, scoped interface
+errors, and local-time timestamps. Verified: protocol 49, sender 8+4,
+receiver 5, control integration 25 (Postgres, migration 004 applied),
+bonding net 44 — all green; clippy clean on touched crates. Not yet
+redeployed to the boxes — needs make cross-aarch64 + install.

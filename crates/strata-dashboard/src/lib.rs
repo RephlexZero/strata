@@ -14,6 +14,7 @@ use leptos_router::path;
 
 use pages::destinations::DestinationsPage;
 use pages::login::LoginPage;
+use pages::receivers::ReceiversPage;
 use pages::sender_detail::SenderDetailPage;
 use pages::senders::SendersPage;
 use pages::streams::StreamsPage;
@@ -65,9 +66,16 @@ impl AuthState {
         self.token.get_untracked().is_some()
     }
 
-    /// Every authenticated user has full access.
-    pub fn has_role(&self, _required: &str) -> bool {
-        true
+    /// Role gate for UI controls. The server has two roles (operator,
+    /// viewer); its "admin"-gated endpoints accept any operator today, so
+    /// "admin" and "operator" rank equally here. This used to return true
+    /// unconditionally, making every disabled= guard decorative
+    /// (UX_TRUST_AUDIT U13).
+    pub fn has_role(&self, required: &str) -> bool {
+        match required {
+            "viewer" => true,
+            _ => self.role.get_untracked() == "operator",
+        }
     }
 }
 
@@ -121,13 +129,16 @@ fn DashboardShell() -> impl IntoView {
                 </div>
                 <ul class="menu flex-1 p-2 gap-0.5">
                     <li><a href="/senders">"📡 Senders"</a></li>
+                    <li><a href="/receivers">"📥 Receivers"</a></li>
                     <li><a href="/streams">"📺 Streams"</a></li>
                     <li><a href="/destinations">"🎯 Destinations"</a></li>
                 </ul>
                 <div class="p-3 border-t border-base-300">
                     <div class="flex justify-between items-center">
                         <span>
-                            {move || if ws.connected.get() {
+                            {move || if ws.auth_failed.get() {
+                                view! { <span class="badge badge-error badge-sm gap-1"><span class="w-2 h-2 rounded-full bg-error"></span>"Auth failed"</span> }.into_any()
+                            } else if ws.connected.get() {
                                 view! { <span class="badge badge-success badge-sm gap-1"><span class="w-2 h-2 rounded-full bg-success"></span>"Live"</span> }.into_any()
                             } else {
                                 view! { <span class="badge badge-ghost badge-sm gap-1"><span class="w-2 h-2 rounded-full bg-base-content/30"></span>"Offline"</span> }.into_any()
@@ -148,6 +159,7 @@ fn DashboardShell() -> impl IntoView {
                     <Route path=path!("/") view=SendersPage />
                     <Route path=path!("/senders") view=SendersPage />
                     <Route path=path!("/senders/:id") view=SenderDetailPage />
+                    <Route path=path!("/receivers") view=ReceiversPage />
                     <Route path=path!("/streams") view=StreamsPage />
                     <Route path=path!("/destinations") view=DestinationsPage />
                 </Routes>

@@ -262,10 +262,25 @@ async fn start_stream(
     });
     let config_json_final = serde_json::to_string(&full_config).ok();
 
+    // Lineage: a start shortly after this sender's previous stream ended is
+    // a restart in the operator's mental model — record the link so the
+    // dashboard can show continuity instead of an unrelated new broadcast.
+    let restarted_from: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM streams \
+         WHERE sender_id = $1 AND state IN ('ended', 'failed') \
+           AND ended_at > $2 \
+         ORDER BY ended_at DESC LIMIT 1",
+    )
+    .bind(&sender_id)
+    .bind(Utc::now() - chrono::Duration::seconds(60))
+    .fetch_optional(state.pool())
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
     // Insert stream row into DB (with receiver_id if assigned)
     sqlx::query(
-        "INSERT INTO streams (id, sender_id, destination_id, receiver_id, state, started_at, config_json) \
-         VALUES ($1, $2, $3, $4, 'starting', $5, $6)",
+        "INSERT INTO streams (id, sender_id, destination_id, receiver_id, state, started_at, config_json, restarted_from) \
+         VALUES ($1, $2, $3, $4, 'starting', $5, $6, $7)",
     )
     .bind(&stream_id)
     .bind(&sender_id)
@@ -273,6 +288,7 @@ async fn start_stream(
     .bind(&receiver_id_opt)
     .bind(Utc::now())
     .bind(&config_json_final)
+    .bind(&restarted_from)
     .execute(state.pool())
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -289,7 +305,11 @@ async fn start_stream(
             state.pool(),
             &stream_id,
             strata_protocol::models::StreamState::Failed,
-            Some("failed to send stream.start to agent"),
+            crate::stream_state::EndAttribution {
+                reason: Some("error"),
+                error: Some("failed to send stream.start to agent"),
+                inferred: true,
+            },
         )
         .await;
         if let Some(ref rcv_id) = receiver_id_opt
@@ -318,6 +338,7 @@ async fn start_stream(
             sender_id: sender_id.clone(),
             state: strata_protocol::models::StreamState::Starting,
             error: None,
+            reason: None,
         },
     );
 
@@ -359,7 +380,7 @@ async fn stop_stream(
         state.pool(),
         &stream_id,
         strata_protocol::models::StreamState::Stopping,
-        None,
+        crate::stream_state::EndAttribution::none(),
     )
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -413,6 +434,7 @@ async fn stop_stream(
             sender_id: sender_id.clone(),
             state: strata_protocol::models::StreamState::Stopping,
             error: None,
+            reason: None,
         },
     );
 
@@ -436,6 +458,7 @@ async fn stop_stream(
                         sender_id,
                         state: strata_protocol::models::StreamState::Ended,
                         error: Some("stop timeout".into()),
+                        reason: Some("timeout".into()),
                     },
                 );
                 tracing::warn!("stream stop timed out, forced to ended");
@@ -459,9 +482,14 @@ async fn list_streams(
             String,
             String,
             Option<chrono::DateTime<chrono::Utc>>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
         ),
     >(
-        "SELECT s.id, s.sender_id, s.state, s.started_at \
+        "SELECT s.id, s.sender_id, s.state, s.started_at, s.ended_at, \
+                s.end_reason, s.error_message, s.restarted_from \
          FROM streams s JOIN senders sn ON s.sender_id = sn.id \
          WHERE sn.owner_id = $1 \
          ORDER BY s.created_at DESC LIMIT 50",
@@ -473,12 +501,29 @@ async fn list_streams(
 
     let streams = rows
         .into_iter()
-        .map(|(id, sender_id, state_str, started_at)| StreamSummary {
-            id,
-            sender_id,
-            state: state_str,
-            started_at,
-        })
+        .map(
+            |(
+                id,
+                sender_id,
+                state_str,
+                started_at,
+                ended_at,
+                end_reason,
+                error_message,
+                restarted_from,
+            )| {
+                StreamSummary {
+                    id,
+                    sender_id,
+                    state: state_str,
+                    started_at,
+                    ended_at,
+                    end_reason,
+                    error_message,
+                    restarted_from,
+                }
+            },
+        )
         .collect();
 
     Ok(Json(streams))
@@ -491,8 +536,8 @@ async fn get_stream(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<StreamDetail>, ApiError> {
-    let row = sqlx::query_as::<_, (String, String, Option<String>, String, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, i64, Option<String>)>(
-        "SELECT s.id, s.sender_id, s.destination_id, s.state, s.started_at, s.ended_at, s.config_json, s.total_bytes, s.error_message \
+    let row = sqlx::query_as::<_, (String, String, Option<String>, String, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, Option<String>, i64, Option<String>, Option<String>, Option<String>)>(
+        "SELECT s.id, s.sender_id, s.destination_id, s.state, s.started_at, s.ended_at, s.config_json, s.total_bytes, s.error_message, s.end_reason, s.restarted_from \
          FROM streams s JOIN senders sn ON s.sender_id = sn.id \
          WHERE s.id = $1 AND sn.owner_id = $2",
     )
@@ -513,6 +558,8 @@ async fn get_stream(
         config_json,
         total_bytes,
         error_message,
+        end_reason,
+        restarted_from,
     ) = row;
 
     Ok(Json(StreamDetail {
@@ -525,6 +572,8 @@ async fn get_stream(
         config_json,
         total_bytes,
         error_message,
+        end_reason,
+        restarted_from,
     }))
 }
 

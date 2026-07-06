@@ -21,9 +21,9 @@ use strata_protocol::{
     ControlMessage, DeviceStatusPayload, Envelope, FileEntry, FilesListResponsePayload,
     InterfaceCommandResponsePayload, InterfacesScanResponsePayload, JitterBufferResponsePayload,
     LogLineEntry, LogsResponsePayload, NetworkToolResponsePayload, PcapCaptureResponsePayload,
-    PowerCommandResponsePayload, StreamDestinationsResponsePayload, StreamEndReason,
-    StreamEndedPayload, TestRunResponsePayload, TlsRenewResponsePayload, TlsStatusResponsePayload,
-    UpdatesCheckResponsePayload, UpdatesInstallResponsePayload,
+    PowerCommandResponsePayload, SourceSwitchResponsePayload, StreamDestinationsResponsePayload,
+    StreamEndReason, StreamEndedPayload, TestRunResponsePayload, TlsRenewResponsePayload,
+    TlsStatusResponsePayload, UpdatesCheckResponsePayload, UpdatesInstallResponsePayload,
 };
 
 use crate::AgentState;
@@ -322,14 +322,16 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
         }
         ControlMessage::StreamStart(payload) => {
             tracing::info!(stream_id = %payload.stream_id, "received stream.start");
+            let eligible = state.hardware.eligible_interfaces();
             let mut pipeline = state.pipeline.lock().await;
-            if let Err(e) = pipeline.start((*payload).clone()) {
+            if let Err(e) = pipeline.start((*payload).clone(), eligible) {
                 tracing::error!(error = %e, "failed to start pipeline");
                 let ended = StreamEndedPayload {
                     stream_id: payload.stream_id,
                     reason: StreamEndReason::Error,
                     duration_s: 0,
                     total_bytes: 0,
+                    error: Some(e.to_string()),
                 };
                 send_message(state, &AgentMessage::StreamEnded(ended)).await;
             }
@@ -343,6 +345,7 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
                 reason: StreamEndReason::ControlPlaneStop,
                 duration_s: stats.duration_s,
                 total_bytes: stats.total_bytes,
+                error: None,
             };
             send_message(state, &AgentMessage::StreamEnded(ended)).await;
         }
@@ -396,13 +399,39 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
                 pattern = ?payload.pattern,
                 "received source.switch"
             );
-            let pipeline = state.pipeline.lock().await;
-            pipeline.switch_source(
-                &payload.mode,
-                payload.device.as_deref(),
-                payload.uri.as_deref(),
-                payload.pattern.as_deref(),
-            );
+            // Reject bad v4l2 devices BEFORE they reach the pipeline —
+            // v4l2src fails asynchronously on a non-capture node (camera
+            // metadata nodes, codec nodes) and takes the whole pipeline
+            // down with it (2026-07-05 field crash on /dev/video1).
+            let result = if payload.mode == "v4l2" {
+                let device = payload.device.as_deref().unwrap_or("/dev/video0");
+                if !crate::hardware::is_capture_device(device) {
+                    Err(format!("{device} is not a video capture device"))
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            };
+            let result = match result {
+                Ok(()) => {
+                    let pipeline = state.pipeline.lock().await;
+                    pipeline.switch_source(
+                        &payload.mode,
+                        payload.device.as_deref(),
+                        payload.uri.as_deref(),
+                        payload.pattern.as_deref(),
+                    )
+                }
+                Err(e) => Err(e),
+            };
+            let resp = SourceSwitchResponsePayload {
+                request_id: payload.request_id.clone(),
+                success: result.is_ok(),
+                mode: payload.mode.clone(),
+                error: result.err(),
+            };
+            send_message(state, &AgentMessage::SourceSwitchResponse(resp)).await;
         }
         ControlMessage::InterfaceCommand(payload) => {
             tracing::info!(
@@ -440,6 +469,7 @@ async fn handle_control_message(state: &AgentState, raw: &str) {
                 other => (false, Some(format!("unknown action: {other}"))),
             };
             let resp = InterfaceCommandResponsePayload {
+                request_id: payload.request_id.clone(),
                 success,
                 interface: payload.interface.clone(),
                 action: payload.action.clone(),

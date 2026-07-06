@@ -67,7 +67,9 @@ pub fn StreamsPage() -> impl IntoView {
                                         <th>"Stream ID"</th>
                                         <th>"Sender"</th>
                                         <th>"State"</th>
+                                        <th>"Reason"</th>
                                         <th>"Started"</th>
+                                        <th>"Ended"</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -81,9 +83,32 @@ pub fn StreamsPage() -> impl IntoView {
                                                 "failed" => ("badge badge-error gap-1", "w-2 h-2 rounded-full bg-error"),
                                                 _ => ("badge badge-ghost gap-1", "w-2 h-2 rounded-full bg-base-content/30"),
                                             };
+                                            // Reason column: end_reason slug → human text,
+                                            // error detail as hover title (U2).
+                                            let reason_view = match (stream.end_reason.as_deref(), stream.error_message.clone()) {
+                                                (None, None) => view! { <span class="text-base-content/40">"—"</span> }.into_any(),
+                                                (reason, detail) => {
+                                                    let label = reason.map(crate::pages::end_reason_label).unwrap_or("ended").to_string();
+                                                    let title = detail.clone().unwrap_or_default();
+                                                    let is_bad = matches!(reason, Some("pipeline_crash") | Some("error") | Some("unobserved"));
+                                                    let cls = if is_bad { "text-error" } else { "text-base-content/70" };
+                                                    view! { <span class=cls title=title>{label}</span> }.into_any()
+                                                }
+                                            };
+                                            let restart_marker = stream.restarted_from.clone().map(|prev| {
+                                                let short: String = prev.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect();
+                                                view! {
+                                                    <div class="text-[10px] text-base-content/40" title=prev.clone()>
+                                                        {format!("restart of …{short}")}
+                                                    </div>
+                                                }
+                                            });
                                             view! {
                                                 <tr>
-                                                    <td class="font-mono text-xs">{stream.id.clone()}</td>
+                                                    <td class="font-mono text-xs">
+                                                        {stream.id.clone()}
+                                                        {restart_marker}
+                                                    </td>
                                                     <td>
                                                         <a class="link link-primary" href=format!("/senders/{}", stream.sender_id)>
                                                             {stream.sender_id.clone()}
@@ -95,7 +120,9 @@ pub fn StreamsPage() -> impl IntoView {
                                                             {stream.state.clone().to_uppercase()}
                                                         </span>
                                                     </td>
-                                                    <td class="text-xs">{stream.started_at.map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string()).unwrap_or_else(|| "—".into())}</td>
+                                                    <td class="text-xs">{reason_view}</td>
+                                                    <td class="text-xs">{crate::pages::format_local_time(stream.started_at.map(|t| t.to_rfc3339()).as_deref())}</td>
+                                                    <td class="text-xs">{crate::pages::format_local_time(stream.ended_at.map(|t| t.to_rfc3339()).as_deref())}</td>
                                                 </tr>
                                             }
                                         }

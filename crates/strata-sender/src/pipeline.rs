@@ -34,6 +34,10 @@ pub struct PipelineManager {
     stream_id: Option<String>,
     started_at: Option<Instant>,
     total_bytes: u64,
+    /// Interface each bonded link was pinned to at spawn (index = link id).
+    /// Telemetry overlays these names onto per-link stats so the dashboard
+    /// can map every link to a physical interface.
+    link_ifaces: Vec<String>,
 }
 
 /// Stats returned when a pipeline is stopped.
@@ -104,6 +108,7 @@ impl PipelineManager {
             stream_id: None,
             started_at: None,
             total_bytes: 0,
+            link_ifaces: Vec::new(),
         }
     }
 
@@ -144,7 +149,15 @@ impl PipelineManager {
     }
 
     /// Start a sender pipeline.
-    pub fn start(&mut self, payload: StreamStartPayload) -> anyhow::Result<()> {
+    ///
+    /// `eligible_ifaces` is the sorted list of interfaces allowed to carry
+    /// bonded links (admin-enabled + connected + default-routed), from
+    /// `HardwareScanner::eligible_interfaces()`.
+    pub fn start(
+        &mut self,
+        payload: StreamStartPayload,
+        eligible_ifaces: Vec<String>,
+    ) -> anyhow::Result<()> {
         if self.is_running() {
             anyhow::bail!(
                 "pipeline already running (stream {})",
@@ -160,13 +173,19 @@ impl PipelineManager {
         );
 
         // Spawn strata-pipeline
-        let child = spawn_pipeline(&payload)?;
+        let (child, link_ifaces) = spawn_pipeline(&payload, &eligible_ifaces)?;
         self.child = Some(child);
         self.stream_id = Some(payload.stream_id);
         self.started_at = Some(Instant::now());
         self.total_bytes = 0;
+        self.link_ifaces = link_ifaces;
 
         Ok(())
+    }
+
+    /// The interface each bonded link was pinned to (index = link id).
+    pub fn link_interfaces(&self) -> Vec<String> {
+        self.link_ifaces.clone()
     }
 
     /// Stop the current pipeline.
@@ -189,6 +208,7 @@ impl PipelineManager {
         self.stream_id = None;
         self.started_at = None;
         self.total_bytes = 0;
+        self.link_ifaces.clear();
 
         tracing::info!(duration_s = stats.duration_s, "pipeline stopped");
         stats
@@ -197,17 +217,18 @@ impl PipelineManager {
     /// Switch the active video source on a running pipeline.
     ///
     /// Sends a JSON command to the strata-node's control socket.
-    /// The command is fire-and-forget — errors are logged but not propagated.
+    /// Returns `Err` with a reason when there is no running pipeline or
+    /// the socket send fails, so the caller can ack honestly.
     pub fn switch_source(
         &self,
         mode: &str,
         device: Option<&str>,
         uri: Option<&str>,
         pattern: Option<&str>,
-    ) {
+    ) -> Result<(), String> {
         if !self.has_stream() {
             tracing::warn!("cannot switch source: no pipeline running");
-            return;
+            return Err("no pipeline running".into());
         }
 
         let mut cmd = serde_json::json!({
@@ -228,6 +249,9 @@ impl PipelineManager {
         let msg = format!("{}\n", cmd);
         if send_to_control_socket(&msg) {
             tracing::info!(mode, "source switch command sent");
+            Ok(())
+        } else {
+            Err("failed to send to pipeline control socket".into())
         }
     }
 
@@ -283,6 +307,7 @@ impl PipelineManager {
                 self.child = None;
                 self.started_at = None;
                 self.total_bytes = 0;
+                self.link_ifaces.clear();
 
                 Some(ChildExitInfo {
                     stream_id,
@@ -299,9 +324,10 @@ impl PipelineManager {
         }
     }
 
-    /// Update accumulated bytes (called from telemetry).
-    pub fn add_bytes(&mut self, bytes: u64) {
-        self.total_bytes += bytes;
+    /// Record the cumulative bytes sent so far (from per-link stats sums),
+    /// so `stream.ended` reports a real total instead of always-zero.
+    pub fn set_total_bytes(&mut self, bytes: u64) {
+        self.total_bytes = self.total_bytes.max(bytes);
     }
 
     /// Get elapsed seconds since pipeline started, if running.
@@ -311,7 +337,13 @@ impl PipelineManager {
 }
 
 /// Spawn the `strata-pipeline` binary as a child process.
-fn spawn_pipeline(payload: &StreamStartPayload) -> anyhow::Result<Child> {
+///
+/// Returns the child plus the interface each link was pinned to
+/// (index = link id in destination order; "" for unpinned links).
+fn spawn_pipeline(
+    payload: &StreamStartPayload,
+    eligible_ifaces: &[String],
+) -> anyhow::Result<(Child, Vec<String>)> {
     let bin = pipeline_binary();
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg("sender");
@@ -387,28 +419,39 @@ fn spawn_pipeline(payload: &StreamStartPayload) -> anyhow::Result<Child> {
     // `ip route get` fallback resolves all links onto the default route —
     // the bonded links must be pinned to distinct interfaces here, via the
     // [[links]] section the pipeline gives priority to.
+    //
+    // `eligible_ifaces` already excludes admin-disabled interfaces and ones
+    // without a default route (a routeless LAN pinned here blackholes half
+    // the stream — 2026-07-05 field failure).
     let mut config_tbl = match toml::Value::try_from(&payload.bonding_config) {
         Ok(toml::Value::Table(t)) => t,
         _ => toml::value::Table::new(),
     };
-    if !config_tbl.contains_key("links") && !payload.destinations.is_empty() {
-        let mut ifaces: Vec<String> = crate::hardware::scan_network_interfaces()
-            .into_iter()
-            .filter(|i| i.state == strata_protocol::models::InterfaceState::Connected)
-            .map(|i| i.name)
+    let mut link_ifaces: Vec<String> = Vec::new();
+    if let Some(links) = config_tbl.get("links").and_then(|l| l.as_array()) {
+        // Central override supplied the mapping — record it for telemetry.
+        link_ifaces = links
+            .iter()
+            .map(|l| {
+                l.get("interface")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
             .collect();
-        ifaces.sort();
-        if ifaces.len() < payload.destinations.len() {
+    } else if !payload.destinations.is_empty() {
+        if eligible_ifaces.len() < payload.destinations.len() {
             tracing::warn!(
                 links = payload.destinations.len(),
-                connected = ifaces.len(),
-                "fewer connected interfaces than links; unpinned links fall back to route lookup"
+                eligible = eligible_ifaces.len(),
+                "fewer eligible interfaces (enabled+connected+default-routed) than links; \
+                 unpinned links fall back to route lookup"
             );
         }
         let links: Vec<toml::Value> = payload
             .destinations
             .iter()
-            .zip(ifaces.iter())
+            .zip(eligible_ifaces.iter())
             .map(|(uri, iface)| {
                 let mut t = toml::value::Table::new();
                 t.insert("uri".into(), toml::Value::String(uri.clone()));
@@ -418,6 +461,11 @@ fn spawn_pipeline(payload: &StreamStartPayload) -> anyhow::Result<Child> {
             .collect();
         if !links.is_empty() {
             tracing::info!(links = ?links, "pinned links to interfaces");
+            link_ifaces = eligible_ifaces
+                .iter()
+                .take(payload.destinations.len())
+                .cloned()
+                .collect();
             config_tbl.insert("links".into(), toml::Value::Array(links));
         }
     }
@@ -439,7 +487,7 @@ fn spawn_pipeline(payload: &StreamStartPayload) -> anyhow::Result<Child> {
 
     tracing::info!(cmd = ?cmd, "spawning strata-node");
     let child = cmd.spawn()?;
-    Ok(child)
+    Ok((child, link_ifaces))
 }
 
 /// Info returned when a child process exits unexpectedly.
@@ -612,7 +660,7 @@ mod tests {
         let _guard = set_test_pipeline_bin(&script.script);
         let mut manager = PipelineManager::new();
 
-        manager.start(sample_payload()).unwrap();
+        manager.start(sample_payload(), Vec::new()).unwrap();
         script.wait_for_marker("started");
         let pid = script.pid();
 
@@ -630,7 +678,7 @@ mod tests {
         let _guard = set_test_pipeline_bin(&script.script);
         let mut manager = PipelineManager::new();
 
-        manager.start(sample_payload()).unwrap();
+        manager.start(sample_payload(), Vec::new()).unwrap();
         script.wait_for_marker("started");
         let pid = script.pid();
 

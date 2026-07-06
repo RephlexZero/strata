@@ -418,7 +418,7 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, owner_id: &str,
                     state.pool(),
                     &payload.stream_id,
                     strata_protocol::models::StreamState::Live,
-                    None,
+                    crate::stream_state::EndAttribution::none(),
                 )
                 .await;
 
@@ -434,6 +434,7 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, owner_id: &str,
                             sender_id: sender_id.to_string(),
                             state: strata_protocol::models::StreamState::Live,
                             error: None,
+                            reason: None,
                         },
                     );
                 }
@@ -448,13 +449,22 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, owner_id: &str,
             // Remove from live_streams tracking
             state.live_streams().remove(&payload.stream_id);
 
-            // Device-confirmed end: no error attribution (that's what makes
-            // it ineligible for readoption).
+            // Device-confirmed end (end_inferred=false → not readoptable).
+            // Persist the device's reason + detail so a crash is
+            // distinguishable from a clean stop (UX_TRUST_AUDIT U2 — this
+            // used to discard both).
+            let reason = serde_json::to_value(payload.reason)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from));
             if let Err(e) = crate::stream_state::transition(
                 state.pool(),
                 &payload.stream_id,
                 strata_protocol::models::StreamState::Ended,
-                None,
+                crate::stream_state::EndAttribution {
+                    reason: reason.as_deref(),
+                    error: payload.error.as_deref(),
+                    inferred: false,
+                },
             )
             .await
             {
@@ -472,7 +482,8 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, owner_id: &str,
                     stream_id: payload.stream_id,
                     sender_id: sender_id.to_string(),
                     state: strata_protocol::models::StreamState::Ended,
-                    error: None,
+                    error: payload.error.clone(),
+                    reason,
                 },
             );
         }
@@ -497,7 +508,8 @@ async fn handle_agent_message(state: &AppState, sender_id: &str, owner_id: &str,
         | AgentMessage::UpdatesCheckResponse(_)
         | AgentMessage::UpdatesInstallResponse(_)
         | AgentMessage::StreamDestinationsResponse(_)
-        | AgentMessage::JitterBufferResponse(_)) => {
+        | AgentMessage::JitterBufferResponse(_)
+        | AgentMessage::SourceSwitchResponse(_)) => {
             if let Some(request_id) = msg.request_id()
                 && let Some((_, tx)) = state.pending_requests().remove(request_id)
             {

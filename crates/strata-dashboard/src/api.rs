@@ -238,6 +238,93 @@ pub async fn delete_destination(token: &str, id: &str) -> ApiResult<()> {
     }
 }
 
+// ── Receivers (relays) ──────────────────────────────────────────────
+
+/// Mirror of strata-control's `ReceiverSummary` (that type lives in the
+/// control crate, not strata-protocol). Timestamps arrive as RFC3339
+/// strings and are rendered as-is.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct ReceiverSummary {
+    pub id: String,
+    pub name: Option<String>,
+    pub hostname: Option<String>,
+    pub region: Option<String>,
+    pub bind_host: String,
+    pub max_streams: i32,
+    pub active_streams: i32,
+    pub online: bool,
+    pub last_seen_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct CreateReceiverResponse {
+    pub receiver_id: String,
+    pub enrollment_token: String,
+}
+
+pub async fn list_receivers(token: &str) -> ApiResult<Vec<ReceiverSummary>> {
+    let resp = Request::get("/api/receivers")
+        .header("Authorization", &auth_header(token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+pub async fn create_receiver(
+    token: &str,
+    name: Option<String>,
+    bind_host: &str,
+    region: Option<String>,
+    max_streams: i32,
+) -> ApiResult<CreateReceiverResponse> {
+    #[derive(serde::Serialize)]
+    struct Body<'a> {
+        name: Option<String>,
+        bind_host: &'a str,
+        region: Option<String>,
+        max_streams: i32,
+    }
+    let resp = Request::post("/api/receivers")
+        .header("Authorization", &auth_header(token))
+        .json(&Body {
+            name,
+            bind_host,
+            region,
+            max_streams,
+        })
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        resp.json().await.map_err(|e| e.to_string())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
+pub async fn delete_receiver(token: &str, id: &str) -> ApiResult<()> {
+    let resp = Request::delete(&format!("/api/receivers/{id}"))
+        .header("Authorization", &auth_header(token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if resp.ok() {
+        Ok(())
+    } else {
+        Err(parse_error(resp).await)
+    }
+}
+
 // ── Sender Management ───────────────────────────────────────────────
 
 /// Get full sender status (hardware, network interfaces, system stats).

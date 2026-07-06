@@ -111,6 +111,17 @@ pub struct StreamSummary {
     pub sender_id: String,
     pub state: String,
     pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    /// Machine-readable end cause ("pipeline_crash", "control_plane_stop",
+    /// "reconciled", …). None while active or from older control planes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// Stream this one replaced (stop→start within the lineage window).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restarted_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +135,13 @@ pub struct StreamDetail {
     pub config_json: Option<String>,
     pub total_bytes: i64,
     pub error_message: Option<String>,
+    /// Machine-readable end cause ("pipeline_crash", "control_plane_stop",
+    /// "reconciled", …). None while active or from older control planes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
+    /// Stream this one replaced (stop→start within the lineage window).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restarted_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

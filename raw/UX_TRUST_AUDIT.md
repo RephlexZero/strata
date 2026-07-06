@@ -102,14 +102,16 @@ Asia/Shanghai (now Europe/London); the broken stream was stopped via the API
 
 ## Part 2 — Findings (U-numbered, ranked)
 
-### U1 (critical) — `toggle_link` panics the pipeline on non-link pads
+### U1 (critical) — `toggle_link` panics the pipeline on non-link pads ✅ FIXED 2026-07-06
+> Fix: skip sink pads without an `interface` property (hotswap.rs `find_property` guard).
 `hotswap.rs:378-443`. Reads `pad.property("interface")` on every sink pad;
 static data pad lacks it → panic → SIGABRT → stream dies. Fix: only inspect
 request pads named `link_%u` (or check
 `pad.has_property("interface")`-equivalent via `find_property` on the pad's
 class before reading). Same latent hazard on the `uri` read at `:431`.
 
-### U2 (critical) — stream end reasons are discarded at BOTH layers
+### U2 (critical) — stream end reasons are discarded at BOTH layers ✅ FIXED 2026-07-06
+> Fix: `StreamEnded` now carries `error`; control persists `end_reason`/`error_message` with a new `end_inferred` flag (readoption keys off the flag, not error_message — migration 004); dashboard shows a dismissible "why it ended" notice and the streams page gained a Reason column.
 Layer 1: `ws_agent.rs:447-477` maps every device-reported end — including
 `PipelineCrash` — to `error: None` / DB NULL.
 Layer 2: even for the reasons the control plane *does* populate (reconciler
@@ -129,7 +131,8 @@ reason in a way that doesn't re-arm readoption, e.g. only treat
 *reconciler-inferred* markers as readoptable rather than keying on
 `error_message IS NOT NULL`.
 
-### U3 (critical) — interface identity is a name-prefix guess
+### U3 (critical) — interface identity is a name-prefix guess ✅ FIXED 2026-07-06
+> Fix: scan now reports driver, bus (usb/pci/platform), USB product string, subnet CIDR, gateway, has_default_route; CDC/modem-class drivers classify as Cellular regardless of name; HiLink gateways are probed over their HTTP API (new hilink.rs) filling carrier/technology/band/cell_id/signal_dbm, cached 15 s.
 `hardware.rs:113-121`: `eth*`/`en*` → "Ethernet", `wwan*` → Cellular.
 A HiLink USB modem enumerating as `eth0` is shown as Ethernet; carrier,
 band, signal, technology are all hardcoded `None` (TODO ModemManager).
@@ -139,7 +142,8 @@ driver (`/sys/class/net/<if>/device/driver`), USB vs PCI bus, and the
 IPv4 subnet; label HiLink subnets (192.168.8/9.x) as cellular. Fix proper:
 ModemManager/NetworkManager probe.
 
-### U4 (critical) — link pinning ignores routability and operator intent
+### U4 (critical) — link pinning ignores routability and operator intent ✅ FIXED 2026-07-06
+> Fix: pinning consumes `HardwareScanner::eligible_interfaces()` (admin-enabled ∧ connected ∧ default-routed); the final link→interface mapping is kept by PipelineManager and overlaid onto per-link stats so every dashboard link row names its physical interface.
 `pipeline.rs:395-423` pins `Connected` interfaces sorted by name onto
 destinations. Tonight that selected the routeless LAN and skipped modem 2.
 Three compounding gaps:
@@ -153,7 +157,8 @@ Fix: pin only interfaces with a default route (or a route to the receiver),
 honor the admin map, and log the final mapping back to the control plane so
 the dashboard can display which interface each link runs on.
 
-### U5 (high) — "disable interface" is an in-memory fiction
+### U5 (high) — "disable interface" is an in-memory fiction ✅ FIXED 2026-07-06
+> Fix: admin state persists to /var/lib/strata/interface-admin.json (env STRATA_INTERFACE_STATE_FILE), is honored at spawn (U4), the REST handler awaits the agent's ack (request_id), and the UI captions the toggle's true scope.
 `hardware.rs:67-78`: sets a HashMap flag, returns success, touches nothing
 at OS level; effect on a live stream is only the (crashy, U1) toggle_link
 pad removal, and the flag doesn't survive daemon restart nor influence the
@@ -167,13 +172,15 @@ at OS level, (b) does not affect which interfaces the NEXT stream pins, and
 the flag (file or control-plane DB), honor it at spawn, and caption the
 toggle with its actual scope.
 
-### U6 (high) — video device picker offers non-capture nodes
+### U6 (high) — video device picker offers non-capture nodes ✅ FIXED 2026-07-06
+> Fix: /dev/video* filtered by VIDIOC_QUERYCAP V4L2_CAP_VIDEO_CAPTURE; the daemon also pre-rejects non-capture devices on source.switch instead of letting v4l2src crash the pipeline.
 `hardware.rs:204` scans `/dev/video*` blind. Fix: keep only nodes with
 `V4L2_CAP_VIDEO_CAPTURE` (open + `VIDIOC_QUERYCAP`, or parse
 `v4l2-ctl --list-devices`), and carry the card name ("FHD Camera") so the
 dashboard shows a human label instead of a bare path.
 
-### U7 (medium) — no restart/continuity concept, so respawns look random
+### U7 (medium) — no restart/continuity concept, so respawns look random ✅ FIXED 2026-07-06
+> Fix: `streams.restarted_from` (migration 004) auto-links a start to the sender's previous stream when it ended <60 s earlier; exposed in the REST API and shown as a "restart of …" marker in the streams list.
 There is genuinely **no** kill-and-respawn path in the daemon (PATH A trace):
 encoder bitrate/tune/keyint, bonding config, source switch, and link toggles
 are true hotswaps over `/tmp/strata-pipeline.sock`; everything else
@@ -185,25 +192,29 @@ streams appear/vanish with no lineage. The 15 s `stopping` window
 churn. Fix options: carry a `restarted_from` field on the new stream, or
 add an explicit stream-level "apply requires restart" flow in the UI.
 
-### U8 (medium) — placebo/zero metrics on the dashboard
+### U8 (medium) — placebo/zero metrics on the dashboard ✅ FIXED 2026-07-06
+> Fix: telemetry accumulates per-link sent_bytes into the pipeline's total; stream.ended now reports a real total_bytes.
 `streams.total_bytes` is 0 for every stream ever (sender reports 0 in
 `StreamEnded`; nothing accumulates it). Rendering a永-zero number erodes
 trust. Either wire it (sum `bytes_sent` from stats) or remove the column
 from the UI.
 
-### U9 (low) — delivery-starved WARN spams at 10 Hz
+### U9 (low) — delivery-starved WARN spams at 10 Hz ✅ FIXED 2026-07-06
+> Fix: logs only the starved↔recovered transitions.
 `net/transport.rs` logs the crush warning every pacing tick while a link is
 starved (hundreds of thousands of lines over a stalled night). Rate-limit
 to state *transitions* (starved↔recovered) or once per N seconds.
 
-### U10 (low) — timestamps and timezones
+### U10 (low) — timestamps and timezones ✅ FIXED 2026-07-06
+> Fix: dashboard renders timestamps in the viewer's local timezone (format_local_time); Pi timezone corrected during the audit.
 Pi was on Asia/Shanghai (fixed to Europe/London during audit). Dashboard
 should render device `last_seen`/stream times in the browser's locale with
 explicit UTC offsets so a mis-zoned device is visible, not confusing.
 
 ### Dashboard-specific findings (from the UI code audit)
 
-### U11 (critical) — Go Live cannot start a camera
+### U11 (critical) — Go Live cannot start a camera ✅ FIXED 2026-07-06
+> Fix: the start modal has a Video Source section (defaults to the first real camera when one exists), always sends an explicit source, and the live banner shows a TEST PATTERN badge when streaming the test source.
 The start modal has only destination + codec radios; it always sends
 `source: None` (`sender_detail.rs:326-353`, `api.rs:133-134`) and the
 server defaults to the test pattern (`streams.rs:191-212`). The device
@@ -212,7 +223,8 @@ Fix: source/device/resolution picker in the start modal, fed by the
 (U6-filtered) device list from the sender's heartbeat, and a visible
 "TEST PATTERN" badge on the live banner when mode=test.
 
-### U12 (high) — fire-and-forget actions report success
+### U12 (high) — fire-and-forget actions report success ✅ FIXED 2026-07-06
+> Fix: source.switch and interface.command carry request_ids and the REST handlers await the agent's response (10 s timeout); errors like "not a video capture device" now reach the operator instead of a fake success toast.
 `switch_source` (`senders.rs:749-776`) and `interface_command`
 (`senders.rs:475-536`) return 200 on enqueue; the UI then shows
 "Source switched successfully" (`tabs.rs:664-670`). Tonight the operator's
@@ -222,7 +234,8 @@ acks — the confirmation semantics are inconsistent across visually identical
 Apply buttons. Fix: route all agent-bound commands through the acked
 request_id path.
 
-### U13 (high) — placebo state in the UI
+### U13 (high) — placebo state in the UI ✅ FIXED 2026-07-06
+> Fix: has_role() gates on the stored role (viewers read-only); multi-dest badges are seeded from the stream's destination and updated only on acked applies (renamed "Routing"); WS auth rejection shows a red "Auth failed" badge instead of "Live".
 - Multi-Dest Routing "Active" badges render a client-local vector that is
   never loaded from the server (`cards.rs:1004,1024-1045`) — pure placebo.
 - `has_role()` returns `true` unconditionally (`lib.rs:69-71`) — every
@@ -232,20 +245,23 @@ request_id path.
   (`ws.rs:161-168` logs to console only).
 - `streams.total_bytes` / "Est. Latency" labeling (see U8).
 
-### U14 (medium) — stale-data rendering
+### U14 (medium) — stale-data rendering ✅ FIXED 2026-07-06
+> Fix: device-status age is tracked; header CPU/RAM grey out with a "data Ns old" badge past 30 s.
 Heartbeat-merged fields persist indefinitely when a partial `device.status`
 omits them (`helpers.rs:15-32`); CPU/RAM/interface cards have no
 last-updated age. Only live stream stats have a staleness heuristic (the
 client-invented 5 s `signal_lost`). Fix: age indicators on device-sourced
 cards; grey-out after N missed heartbeats.
 
-### U15 (medium) — one catch-all error banner
+### U15 (medium) — one catch-all error banner ✅ FIXED 2026-07-06
+> Fix: interface-command errors render scoped inside the Network tab; alert-rule lists refetch on server confirmation instead of a 500 ms timer.
 Start failures, unenroll, interface and test errors all funnel into a
 single top-of-page banner (`sender_detail.rs:458-463`) detached from the
 control that failed. Alert-rule cards refresh on a fixed 500 ms timer
 instead of on server confirmation (`cards.rs:564-594`).
 
-### U16 (low) — naming traps
+### U16 (low) — naming traps ✅ FIXED 2026-07-06
+> Fix: interface rows show driver/bus/product/subnet/gateway plus a "no internet route" chip; link stats always carry interface names (U4 overlay); a dedicated Receivers page removes the destinations-vs-relays trap; timestamps localized (U10).
 "Destinations" page is RTMP/HLS/SRT egress, not relays — an operator
 looking for "add my relay" lands there. Bonding link rows fall back to
 "Link {id}" when the interface name is missing (`tabs.rs:367-371`), so a
@@ -265,9 +281,11 @@ hard-coded UTC strings (`streams.rs:98`, `tabs.rs:1560-1564`).
   `/receiver/ws` — **multiple receivers are fully supported** and stream
   starts pick the least-loaded online receiver owned by the user
   (`streams.rs:538 pick_receiver`), request/ack port allocation included.
-  **But there is no receivers page in the dashboard** — registration is
-  curl-only, and there is no way to see relay fleet state, pick a specific
-  relay for a stream, or pin by region.
+  ~~**But there is no receivers page in the dashboard**~~ — **fixed
+  2026-07-06**: a Receivers page now lists the fleet (online, load, last
+  seen), registers new relays with the one-time enrollment token shown
+  once, and deletes them. Receiver *selection* per stream remains
+  automatic (least-loaded).
 - Unique config per device: senders store only `name`; receivers store
   `bind_host/link_ports/max_streams/region` but the **daemon's CLI flags
   overwrite them on every connect** (`ws_receiver.rs:187-213`) — the control
@@ -283,7 +301,7 @@ config, editable device names.
 
 ---
 
-## Part 4 — Recommended fix plan (priority order)
+## Part 4 — Recommended fix plan (priority order) — ✅ ALL IMPLEMENTED 2026-07-06 (see per-finding notes above)
 
 **P0 — stop lying to the operator (small, surgical):**
 1. U1 toggle_link panic guard.

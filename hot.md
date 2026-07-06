@@ -5,19 +5,23 @@
 
 ## Current focus
 
-**2026-07-06: UX & TRUST AUDIT — the operator failed to livestream; full
-audit in [raw/UX_TRUST_AUDIT.md](raw/UX_TRUST_AUDIT.md). Verdict: no
-re-architecture; fix the trust layer.** Failure chain (all confirmed from
-logs/DB): Go Live modal can't select a source (always test pattern) →
-camera hot-switch offered /dev/video1 (metadata node) and crashed while
-the UI claimed success → dashboard interface toggle panics the pipeline
-(hotswap.rs:423 pad-property read) → end reasons dropped at both layers so
-every crash rendered as a clean "ended" → link pinning chose the routeless
-LAN (ignores routes + operator toggles). P0 fixes queued: toggle_link
-panic guard; persist/display end reasons; source picker in Go Live;
-ack all agent-bound commands; capture-capable device filter. Rig facts:
-`/dev/video0` = the camera (MJPG 1080p30/60); `eth0` = **modem 2**;
-`enP4p65s0` = routeless LAN. Broken stream stopped; Pi TZ now
+**2026-07-06: ALL 16 AUDIT FINDINGS FIXED — awaiting redeploy.** Every
+U-finding in [raw/UX_TRUST_AUDIT.md](raw/UX_TRUST_AUDIT.md) is implemented
+and ticked in the doc: toggle_link panic guard; end reasons persisted
+end-to-end (`end_reason`/`end_inferred`, migration 004) and rendered
+(dismissible notice, Reason column, `restarted_from` lineage); Go Live
+source picker (camera default + TEST PATTERN badge); acked source.switch +
+interface commands; rich interface identity (driver/bus/USB
+product/subnet/gateway/default-route + live HiLink modem probe —
+carrier/RAT/band/RSRP via the gateway HTTP API, `hilink.rs`); pinning
+filters on enabled∧connected∧default-routed and reports the
+link→interface mapping in stats; persisted admin toggles; capture-only
+video pickers; real total_bytes; Receivers page (register + one-time
+token); real has_role; staleness ageing; local-time timestamps. Suites:
+49+8+4+5+25+44 green, clippy clean. **NOT yet on the boxes — next step:
+`make cross-aarch64`, redeploy Hetzner + Pi, then a real camera stream
+end-to-end.** Rig facts: `/dev/video0` = the camera (MJPG 1080p30/60);
+`eth0` = **modem 2**; `enP4p65s0` = routeless LAN. Pi TZ now
 Europe/London.
 
 **2026-07-05 evening: DEPLOYED — the platform runs in production.**
@@ -319,4 +323,4 @@ override that pinned it is gone — but still needs field confirmation. Watch
 adaptive-redundancy duplication as a wire-overhead contributor when spare is large.
 
 ---
-_Last updated: 2026-07-06 (UX & trust audit after the failed operator livestream — raw/UX_TRUST_AUDIT.md)_
+_Last updated: 2026-07-06 (all 16 audit findings implemented — pending redeploy to the boxes)_

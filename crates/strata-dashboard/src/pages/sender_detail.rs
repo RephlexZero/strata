@@ -70,6 +70,9 @@ pub fn SenderDetailPage() -> impl IntoView {
     // Staleness detection
     let (last_stats_ms, set_last_stats_ms) = signal(0.0f64);
     let (signal_lost, set_signal_lost) = signal(false);
+    // Device-status staleness (U14).
+    let (last_status_ms, set_last_status_ms) = signal(0.0f64);
+    let (status_age_s, set_status_age_s) = signal(Option::<u64>::None);
 
     {
         let cb = Closure::<dyn Fn()>::wrap(Box::new(move || {
@@ -80,6 +83,12 @@ pub fn SenderDetailPage() -> impl IntoView {
                 set_signal_lost.set(last > 0.0 && (now - last) > 5000.0);
             } else {
                 set_signal_lost.set(false);
+            }
+            // Age of the last device.status — heartbeats come every ~5s,
+            // so anything past 30s is stale data still on screen (U14).
+            let last_status = last_status_ms.get_untracked();
+            if last_status > 0.0 {
+                set_status_age_s.set(Some(((js_sys::Date::now() - last_status) / 1000.0) as u64));
             }
         }));
         let _ = web_sys::window()
@@ -125,6 +134,12 @@ pub fn SenderDetailPage() -> impl IntoView {
     let (selected_dest, set_selected_dest) = signal(Option::<String>::None);
     let (selected_codec, set_selected_codec) = signal(String::from("h265"));
     let (dests_loading, set_dests_loading) = signal(false);
+    // Go Live source picker (U11): "camera" | "test" + v4l2 device path.
+    let (selected_source, set_selected_source) = signal(String::from("test"));
+    let (selected_device, set_selected_device) = signal(String::new());
+
+    // Why the last stream ended (U2) — reason slug + optional detail.
+    let (end_notice, set_end_notice) = signal(Option::<String>::None);
 
     // Receiver URL change confirm
     let (show_receiver_confirm, set_show_receiver_confirm) = signal(false);
@@ -153,6 +168,23 @@ pub fn SenderDetailPage() -> impl IntoView {
         let st = stream_state.get();
         st == "live" || st == "starting"
     });
+    // The active stream is broadcasting the built-in test pattern, not a
+    // camera — surfaced as a badge so nobody streams colour bars to
+    // production unknowingly (U11).
+    let is_test_source = Memo::new(move |_| {
+        stream_detail
+            .get()
+            .and_then(|d| d.config_json)
+            .and_then(|cj| serde_json::from_str::<serde_json::Value>(&cj).ok())
+            .and_then(|v| {
+                v.get("request")?
+                    .get("source")?
+                    .get("mode")
+                    .map(|m| m.as_str() == Some("test"))
+            })
+            .unwrap_or(false)
+    });
+    let status_stale = Memo::new(move |_| status_age_s.get().map(|a| a > 30).unwrap_or(false));
 
     // ── Data loading ─────────────────────────────────────────────
     let auth_load = auth.clone();
@@ -183,6 +215,7 @@ pub fn SenderDetailPage() -> impl IntoView {
                     set_streams.set(filtered);
                 }
                 if let Ok(status) = api::get_sender_status(&token, &id).await {
+                    set_last_status_ms.set(js_sys::Date::now());
                     apply_full_status(
                         &status,
                         &set_hw_interfaces,
@@ -258,12 +291,32 @@ pub fn SenderDetailPage() -> impl IntoView {
                     stream_id,
                     sender_id: sid,
                     state,
-                    ..
+                    error,
+                    reason,
                 } => {
                     if sid == sender_id {
                         set_stream_state.set(state.to_string());
-                        if matches!(state, StreamState::Starting | StreamState::Live) {
-                            set_active_stream_id.set(Some(stream_id));
+                        match state {
+                            StreamState::Starting | StreamState::Live => {
+                                set_active_stream_id.set(Some(stream_id));
+                                set_end_notice.set(None);
+                            }
+                            StreamState::Ended | StreamState::Failed
+                                // Say WHY it ended — this event used to be
+                                // destructured with `..`, so crashes rendered
+                                // exactly like clean stops (U2).
+                                if (reason.is_some() || error.is_some()) => {
+                                    let label = reason
+                                        .as_deref()
+                                        .map(crate::pages::end_reason_label)
+                                        .unwrap_or("ended");
+                                    let notice = match error {
+                                        Some(detail) => format!("Stream {label}: {detail}"),
+                                        None => format!("Stream {label}"),
+                                    };
+                                    set_end_notice.set(Some(notice));
+                                }
+                            _ => {}
                         }
                     }
                 }
@@ -279,6 +332,8 @@ pub fn SenderDetailPage() -> impl IntoView {
                             }
                         });
                         if let Some(status) = status {
+                            set_last_status_ms.set(js_sys::Date::now());
+                            set_status_age_s.set(Some(0));
                             let status = SenderFullStatus {
                                 network_interfaces: Some(status.network_interfaces),
                                 media_inputs: Some(status.media_inputs),
@@ -311,6 +366,24 @@ pub fn SenderDetailPage() -> impl IntoView {
         set_show_start_modal.set(true);
         set_selected_dest.set(None);
         set_selected_codec.set(String::from("h265"));
+        // Default to the first real camera when one exists — silently
+        // starting a test pattern is how the 2026-07-05 "livestream" ended
+        // up broadcasting colour bars (U11).
+        let first_camera = hw_inputs
+            .get_untracked()
+            .into_iter()
+            .find(|i| i.input_type == strata_protocol::models::MediaInputType::V4l2)
+            .map(|i| i.device);
+        match first_camera {
+            Some(dev) => {
+                set_selected_source.set("camera".into());
+                set_selected_device.set(dev);
+            }
+            None => {
+                set_selected_source.set("test".into());
+                set_selected_device.set(String::new());
+            }
+        }
         set_dests_loading.set(true);
         let token = auth_open.token.get_untracked().unwrap_or_default();
         leptos::task::spawn_local(async move {
@@ -336,10 +409,32 @@ pub fn SenderDetailPage() -> impl IntoView {
             min_bitrate_kbps: None,
             max_bitrate_kbps: None,
         });
+        // Always send an explicit source — omitting it makes the server
+        // default to a test pattern (U11).
+        let source = Some(if selected_source.get_untracked() == "camera" {
+            strata_protocol::SourceConfig {
+                mode: "v4l2".into(),
+                device: Some(selected_device.get_untracked()),
+                uri: None,
+                resolution: Some("1920x1080".into()),
+                framerate: Some(30),
+                passthrough: None,
+            }
+        } else {
+            strata_protocol::SourceConfig {
+                mode: "test".into(),
+                device: None,
+                uri: None,
+                resolution: Some("1920x1080".into()),
+                framerate: Some(30),
+                passthrough: None,
+            }
+        });
         set_action_loading.set(true);
         set_show_start_modal.set(false);
+        set_end_notice.set(None);
         leptos::task::spawn_local(async move {
-            match api::start_stream(&token, &id, dest_id, None, encoder).await {
+            match api::start_stream(&token, &id, dest_id, source, encoder).await {
                 Ok(resp) => {
                     set_stream_state.set(resp.state);
                     set_action_loading.set(false);
@@ -462,6 +557,15 @@ pub fn SenderDetailPage() -> impl IntoView {
                 </div>
             })}
 
+            // Why the last stream ended (dismissible) — crashes used to
+            // render exactly like clean stops (U2).
+            {move || end_notice.get().map(|n| view! {
+                <div class="alert alert-warning text-sm mb-4">
+                    <span>{n}</span>
+                    <button class="btn btn-ghost btn-xs" on:click=move |_| set_end_notice.set(None)>"✕"</button>
+                </div>
+            })}
+
             // Modals (always mounted, shown/hidden by signal)
             <DestinationModal
                 show=show_start_modal
@@ -472,6 +576,11 @@ pub fn SenderDetailPage() -> impl IntoView {
                 selected_codec=selected_codec
                 set_selected_codec=set_selected_codec
                 dests_loading=dests_loading
+                hw_inputs=hw_inputs
+                selected_source=selected_source
+                set_selected_source=set_selected_source
+                selected_device=selected_device
+                set_selected_device=set_selected_device
                 on_confirm=confirm_start_stream
             />
 
@@ -515,13 +624,23 @@ pub fn SenderDetailPage() -> impl IntoView {
                         </p>
                     </div>
                     <div class="flex gap-2 items-center">
-                        // System stats (compact inline)
-                        <div class="hidden md:flex gap-3 text-xs text-base-content/50 font-mono mr-4">
+                        // System stats (compact inline). Greyed + aged when
+                        // the last device.status is old — these values used
+                        // to sit on screen indefinitely with no hint (U14).
+                        <div
+                            class="hidden md:flex gap-3 text-xs text-base-content/50 font-mono mr-4"
+                            class:opacity-40=move || status_stale.get()
+                        >
                             {move || hw_cpu.get().map(|v| view! {
                                 <span>"CPU " {format!("{:.0}%", v)}</span>
                             })}
                             {move || hw_mem.get().map(|v| view! {
                                 <span>"RAM " {v} "MB"</span>
+                            })}
+                            {move || status_stale.get().then(|| view! {
+                                <span class="badge badge-warning badge-xs">
+                                    {move || format!("data {}s old", status_age_s.get().unwrap_or(0))}
+                                </span>
                             })}
                         </div>
                         {move || {
@@ -556,6 +675,9 @@ pub fn SenderDetailPage() -> impl IntoView {
                             <div class="flex items-center gap-2">
                                 {move || signal_lost.get().then(|| view! {
                                     <span class="badge badge-warning badge-sm animate-pulse">"Signal Lost"</span>
+                                })}
+                                {move || is_test_source.get().then(|| view! {
+                                    <span class="badge badge-warning badge-sm font-bold" title="This stream is broadcasting the built-in test pattern, not a camera">"TEST PATTERN"</span>
                                 })}
                                 {move || {
                                     let sm = live_sender_metrics.get();
@@ -674,7 +796,6 @@ pub fn SenderDetailPage() -> impl IntoView {
                         set_iface_loading=set_iface_loading
                         scan_msg=scan_msg
                         set_scan_msg=set_scan_msg
-                        set_error=set_error
                     />
                 </div>
 

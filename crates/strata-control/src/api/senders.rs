@@ -502,7 +502,15 @@ async fn interface_command(
         .get(sender_id)
         .ok_or_else(|| ApiError::bad_request("sender is not connected"))?;
 
+    // Await the agent's ack — returning {ok:true} on mere enqueue let the
+    // dashboard report success for commands the device rejected or never
+    // applied (UX_TRUST_AUDIT U5/U12).
+    let request_id = Uuid::now_v7().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.pending_requests().insert(request_id.clone(), tx);
+
     let payload = InterfaceCommandPayload {
+        request_id: Some(request_id.clone()),
         interface: iface_name.to_string(),
         action: action.to_string(),
         band: opts.band,
@@ -520,6 +528,7 @@ async fn interface_command(
         .send(json)
         .await
         .map_err(|_| ApiError::internal("failed to send command to agent"))?;
+    drop(agent);
 
     tracing::info!(
         sender_id = %sender_id,
@@ -528,11 +537,32 @@ async fn interface_command(
         "interface command sent to agent"
     );
 
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "interface": iface_name,
-        "action": action,
-    })))
+    match tokio::time::timeout(Duration::from_secs(10), rx).await {
+        Ok(Ok(value)) => {
+            let success = value
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if success {
+                Ok(Json(serde_json::json!({
+                    "ok": true,
+                    "interface": iface_name,
+                    "action": action,
+                })))
+            } else {
+                let err = value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("agent rejected the command");
+                Err(ApiError::bad_request(err))
+            }
+        }
+        Ok(Err(_)) => Err(ApiError::internal("agent disconnected")),
+        Err(_) => {
+            state.pending_requests().remove(&request_id);
+            Err(ApiError::internal("agent did not acknowledge the command"))
+        }
+    }
 }
 
 // ── Config Set (proxied to agent with request-response) ─────────────
@@ -750,8 +780,8 @@ async fn switch_source(
     State(state): State<AppState>,
     user: AuthUser,
     Path(sender_id): Path<String>,
-    Json(body): Json<SourceSwitchPayload>,
-) -> Result<StatusCode, ApiError> {
+    Json(mut body): Json<SourceSwitchPayload>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     user.require_role("operator")?;
 
     verify_ownership(&state, &user, &sender_id).await?;
@@ -763,6 +793,14 @@ async fn switch_source(
     let agent_tx = agent.tx.clone();
     drop(agent);
 
+    // Await the agent's ack — a fire-and-forget 200 here let the dashboard
+    // show "Source switched successfully" seconds before the pipeline
+    // crashed on a bad device (UX_TRUST_AUDIT U12, 2026-07-05 field crash).
+    let request_id = Uuid::now_v7().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.pending_requests().insert(request_id.clone(), tx);
+    body.request_id = Some(request_id.clone());
+
     let envelope = Envelope::from_message(&ControlMessage::SourceSwitch(body))
         .map_err(|e| ApiError::internal(e.to_string()))?;
     let json = serde_json::to_string(&envelope).map_err(|e| ApiError::internal(e.to_string()))?;
@@ -772,7 +810,30 @@ async fn switch_source(
         .await
         .map_err(|_| ApiError::internal("failed to send to agent"))?;
 
-    Ok(StatusCode::OK)
+    match tokio::time::timeout(Duration::from_secs(10), rx).await {
+        Ok(Ok(value)) => {
+            let success = value
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if success {
+                Ok(Json(value))
+            } else {
+                let err = value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("agent rejected the source switch");
+                Err(ApiError::bad_request(err))
+            }
+        }
+        Ok(Err(_)) => Err(ApiError::internal("agent disconnected")),
+        Err(_) => {
+            state.pending_requests().remove(&request_id);
+            Err(ApiError::internal(
+                "agent did not acknowledge the source switch",
+            ))
+        }
+    }
 }
 
 // ── File Browser ────────────────────────────────────────────────────

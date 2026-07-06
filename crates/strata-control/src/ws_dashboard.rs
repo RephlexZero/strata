@@ -114,6 +114,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                 sender_id: sender_id.clone(),
                 state: stream_state,
                 error: None,
+                reason: None,
             });
 
             // Also send the last known stream stats if available

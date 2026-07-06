@@ -52,6 +52,7 @@ pub async fn run(state: Arc<AgentState>) {
         };
 
         let elapsed_s = pipeline.elapsed_s();
+        let link_ifaces = pipeline.link_interfaces();
         drop(pipeline); // Release lock before doing I/O
 
         // Drain any pending stats from strata-node's UDP relay.
@@ -69,7 +70,26 @@ pub async fn run(state: Arc<AgentState>) {
             }
         }
 
-        let (links, commanded_bitrate_bps) = last_real_stats.clone().unwrap_or_default();
+        let (mut links, commanded_bitrate_bps) = last_real_stats.clone().unwrap_or_default();
+
+        // Overlay the spawn-time link→interface pinning onto stats whose
+        // interface the pipeline didn't name — the dashboard needs every
+        // link row mappable to a physical interface.
+        for link in &mut links {
+            if (link.interface.is_empty() || link.interface == "unknown")
+                && let Some(iface) = link_ifaces.get(link.id as usize).filter(|s| !s.is_empty())
+            {
+                link.interface = iface.clone();
+            }
+        }
+
+        // Keep the stream's cumulative byte count current so stream.ended
+        // reports a real total.
+        let sent_total: u64 = links.iter().map(|l| l.sent_bytes).sum();
+        if sent_total > 0 {
+            let mut pipeline = state.pipeline.lock().await;
+            pipeline.set_total_bytes(sent_total);
+        }
 
         // Update shared link stats for Prometheus /metrics endpoint
         {

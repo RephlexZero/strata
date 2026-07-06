@@ -73,12 +73,13 @@ pub enum AgentMessage {
     StreamDestinationsResponse(StreamDestinationsResponsePayload),
     #[serde(rename = "stream.jitter_buffer.response")]
     JitterBufferResponse(JitterBufferResponsePayload),
+    #[serde(rename = "source.switch.response")]
+    SourceSwitchResponse(SourceSwitchResponsePayload),
 }
 
 impl AgentMessage {
     /// Request-correlation ID for RPC response messages; `None` for
-    /// telemetry/lifecycle messages (and for `interface.command.response`,
-    /// which carries none on the wire — its REST endpoint is fire-and-forget).
+    /// telemetry/lifecycle messages.
     pub fn request_id(&self) -> Option<&str> {
         use AgentMessage::*;
         match self {
@@ -86,8 +87,9 @@ impl AgentMessage {
             | AuthChallengeResponse(_)
             | DeviceStatus(_)
             | StreamStats(_)
-            | StreamEnded(_)
-            | InterfaceCommandResponse(_) => None,
+            | StreamEnded(_) => None,
+            InterfaceCommandResponse(p) => p.request_id.as_deref(),
+            SourceSwitchResponse(p) => p.request_id.as_deref(),
             ConfigSetResponse(p) => Some(&p.request_id),
             ConfigUpdateResponse(p) => p.request_id.as_deref(),
             TestRunResponse(p) => Some(&p.request_id),
@@ -322,6 +324,11 @@ pub enum DashboardEvent {
         sender_id: String,
         state: crate::models::StreamState,
         error: Option<String>,
+        /// Machine-readable end cause for terminal states: a
+        /// `StreamEndReason` string ("pipeline_crash", "control_plane_stop",
+        /// …) or an inferred slug ("reconciled", "unobserved", "timeout").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 }
 
@@ -366,6 +373,7 @@ mod tests {
             reason: StreamEndReason::UserStop,
             duration_s: 600,
             total_bytes: 50_000_000,
+            error: None,
         });
         let envelope = Envelope::from_message(&msg).unwrap();
         assert_eq!(envelope.msg_type, "stream.ended");
@@ -611,6 +619,7 @@ mod tests {
             stream_id: "str_abc".into(),
             sender_id: "snd_xyz".into(),
             state: crate::models::StreamState::Live,
+            reason: None,
             error: None,
         };
 
@@ -686,6 +695,7 @@ mod tests {
     #[test]
     fn interface_command_payload_serde() {
         let cmd = InterfaceCommandPayload {
+            request_id: None,
             interface: "wwan0".into(),
             action: "enable".into(),
             band: None,

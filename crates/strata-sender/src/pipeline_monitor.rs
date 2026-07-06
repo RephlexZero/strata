@@ -41,11 +41,17 @@ pub async fn run(state: Arc<AgentState>) {
                 "pipeline process exited unexpectedly"
             );
 
+            let error = match (reason, exit_code) {
+                (StreamEndReason::UserStop, _) => None,
+                (_, Some(code)) => Some(format!("pipeline exited with code {code}")),
+                (_, None) => Some("pipeline killed by signal".to_string()),
+            };
             let ended = StreamEndedPayload {
                 stream_id: exit_info.stream_id,
                 reason,
                 duration_s: exit_info.duration_s,
                 total_bytes: exit_info.total_bytes,
+                error,
             };
 
             // Release the lock before sending

@@ -1142,10 +1142,14 @@ async fn transition_rejects_illegal_moves() {
 
     // Terminal states are sticky against every non-readopt transition.
     for to in [StreamState::Live, StreamState::Stopping, StreamState::Ended] {
-        let moved =
-            strata_control::stream_state::transition(state.pool(), "str_terminal", to, None)
-                .await
-                .unwrap();
+        let moved = strata_control::stream_state::transition(
+            state.pool(),
+            "str_terminal",
+            to,
+            strata_control::stream_state::EndAttribution::none(),
+        )
+        .await
+        .unwrap();
         assert!(!moved, "ended → {to} must be rejected");
     }
 
@@ -1154,13 +1158,13 @@ async fn transition_rejects_illegal_moves() {
         state.pool(),
         "str_terminal",
         StreamState::Starting,
-        None,
+        strata_control::stream_state::EndAttribution::none(),
     )
     .await
     .unwrap();
     assert!(!moved);
 
-    // A confirmed end (no error_message) is not readoptable.
+    // A confirmed end (end_inferred = FALSE) is not readoptable.
     let readopted = strata_control::stream_state::readopt(state.pool(), "str_terminal")
         .await
         .unwrap();

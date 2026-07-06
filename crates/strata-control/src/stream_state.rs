@@ -47,18 +47,36 @@ pub const UNOBSERVED_GRACE: chrono::Duration = chrono::Duration::seconds(90);
 /// which does not survive a control-plane restart.
 pub const STOPPING_GRACE: chrono::Duration = chrono::Duration::seconds(60);
 
+/// How a terminal transition is attributed — persisted so the dashboard can
+/// tell a crash from a clean stop (UX_TRUST_AUDIT U2).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EndAttribution<'a> {
+    /// Machine-readable cause: a `StreamEndReason` string from the device
+    /// ("pipeline_crash", "control_plane_stop", …) or an inferred slug.
+    pub reason: Option<&'a str>,
+    /// Human-readable detail ("pipeline exited with code 1").
+    pub error: Option<&'a str>,
+    /// TRUE only for ends the control plane inferred (reconcile/sweep/stop
+    /// timeout) rather than observed — [`readopt`] keys off this.
+    pub inferred: bool,
+}
+
+impl EndAttribution<'_> {
+    /// For non-terminal transitions.
+    pub fn none() -> Self {
+        Self::default()
+    }
+}
+
 /// Attempt a validated transition. The UPDATE's WHERE clause enforces the
 /// legal source states for `to`, so a stale caller can't clobber a newer
 /// state (e.g. a force-end timer firing after the stream already ended is
 /// a no-op). Returns `Ok(true)` iff the row moved.
-///
-/// `error` is recorded for terminal transitions the control plane
-/// *inferred* rather than observed — [`readopt`] keys off it.
 pub async fn transition(
     pool: &PgPool,
     stream_id: &str,
     to: StreamState,
-    error: Option<&str>,
+    attr: EndAttribution<'_>,
 ) -> sqlx::Result<bool> {
     let allowed_from: &[&str] = match to {
         StreamState::Live => &["starting"],
@@ -76,13 +94,17 @@ pub async fn transition(
     let result = sqlx::query(
         "UPDATE streams SET state = $1, \
          ended_at = CASE WHEN $2 THEN COALESCE(ended_at, $3) ELSE ended_at END, \
-         error_message = COALESCE($4, error_message) \
-         WHERE id = $5 AND state = ANY($6)",
+         error_message = COALESCE($4, error_message), \
+         end_reason = COALESCE($5, end_reason), \
+         end_inferred = CASE WHEN $2 THEN $6 ELSE end_inferred END \
+         WHERE id = $7 AND state = ANY($8)",
     )
     .bind(to.to_string())
     .bind(terminal)
     .bind(Utc::now())
-    .bind(error)
+    .bind(attr.error)
+    .bind(attr.reason)
+    .bind(attr.inferred)
     .bind(stream_id)
     .bind(allowed_from)
     .execute(pool)
@@ -96,7 +118,8 @@ pub async fn transition(
 /// that properly ended in the meantime is left alone.
 pub async fn force_end_stopping(pool: &PgPool, stream_id: &str) -> sqlx::Result<bool> {
     let result = sqlx::query(
-        "UPDATE streams SET state = 'ended', ended_at = $1, error_message = 'stop timeout' \
+        "UPDATE streams SET state = 'ended', ended_at = $1, error_message = 'stop timeout', \
+         end_reason = 'timeout', end_inferred = TRUE \
          WHERE id = $2 AND state = 'stopping'",
     )
     .bind(Utc::now())
@@ -109,12 +132,13 @@ pub async fn force_end_stopping(pool: &PgPool, stream_id: &str) -> sqlx::Result<
 /// Reconcile-only: bring back a stream the control plane gave up on while
 /// the device kept running it (WS blip → sweep, control restart, stop
 /// timeout that never reached the device). Only ends the control plane
-/// *inferred* (`error_message` set) are eligible — an end confirmed by the
+/// *inferred* (`end_inferred`) are eligible — an end confirmed by the
 /// device or requested by the user is enforced, not resurrected.
 pub async fn readopt(pool: &PgPool, stream_id: &str) -> sqlx::Result<bool> {
     let result = sqlx::query(
-        "UPDATE streams SET state = 'live', ended_at = NULL, error_message = NULL \
-         WHERE id = $1 AND state IN ('ended', 'failed') AND error_message IS NOT NULL",
+        "UPDATE streams SET state = 'live', ended_at = NULL, error_message = NULL, \
+         end_reason = NULL, end_inferred = FALSE \
+         WHERE id = $1 AND state IN ('ended', 'failed') AND end_inferred",
     )
     .bind(stream_id)
     .execute(pool)
@@ -154,7 +178,11 @@ pub async fn reconcile_sender(app: &AppState, sender_id: &str, owner_id: &str, r
             app.pool(),
             stream_id,
             StreamState::Ended,
-            Some("not running on sender (reconciled)"),
+            EndAttribution {
+                reason: Some("reconciled"),
+                error: Some("not running on sender (reconciled)"),
+                inferred: true,
+            },
         )
         .await
         {
@@ -172,6 +200,7 @@ pub async fn reconcile_sender(app: &AppState, sender_id: &str, owner_id: &str, r
                         sender_id: sender_id.to_string(),
                         state: StreamState::Ended,
                         error: Some("not running on sender".into()),
+                        reason: Some("reconciled".into()),
                     },
                 );
             }
@@ -212,6 +241,7 @@ pub async fn reconcile_sender(app: &AppState, sender_id: &str, owner_id: &str, r
                             sender_id: sender_id.to_string(),
                             state: StreamState::Live,
                             error: None,
+                            reason: None,
                         },
                     );
                 }
@@ -279,7 +309,11 @@ pub async fn reconcile_receiver(
             app.pool(),
             stream_id,
             StreamState::Ended,
-            Some("not running on receiver (reconciled)"),
+            EndAttribution {
+                reason: Some("reconciled"),
+                error: Some("not running on receiver (reconciled)"),
+                inferred: true,
+            },
         )
         .await
         {
@@ -299,6 +333,7 @@ pub async fn reconcile_receiver(
                         sender_id: sender_id.clone(),
                         state: StreamState::Ended,
                         error: Some("not running on receiver".into()),
+                        reason: Some("reconciled".into()),
                     },
                 );
             }
@@ -357,7 +392,11 @@ pub async fn sweep(app: &AppState) {
             app.pool(),
             &stream_id,
             StreamState::Ended,
-            Some("sender unobserved (connection lost)"),
+            EndAttribution {
+                reason: Some("unobserved"),
+                error: Some("sender unobserved (connection lost)"),
+                inferred: true,
+            },
         )
         .await
         {
@@ -375,6 +414,7 @@ pub async fn sweep(app: &AppState) {
                         sender_id,
                         state: StreamState::Ended,
                         error: Some("sender unobserved (connection lost)".into()),
+                        reason: Some("unobserved".into()),
                     },
                 );
             }
@@ -404,7 +444,11 @@ pub async fn sweep(app: &AppState) {
             app.pool(),
             &stream_id,
             StreamState::Ended,
-            Some("stop timeout (swept)"),
+            EndAttribution {
+                reason: Some("timeout"),
+                error: Some("stop timeout (swept)"),
+                inferred: true,
+            },
         )
         .await
         {
@@ -416,6 +460,7 @@ pub async fn sweep(app: &AppState) {
                     sender_id,
                     state: StreamState::Ended,
                     error: Some("stop timeout".into()),
+                    reason: Some("timeout".into()),
                 },
             );
         }

@@ -420,6 +420,12 @@ pub(crate) fn handle_toggle_link(
             if pad.direction() != gst::PadDirection::Sink {
                 continue;
             }
+            // Only link request pads carry uri/interface — the muxer's static
+            // data pad does not, and glib panics (killing the whole pipeline)
+            // on a property read that doesn't exist.
+            if pad.find_property("interface").is_none() {
+                continue;
+            }
             let pad_iface: String = pad.property("interface");
             if pad_iface == iface {
                 target_pad = Some(pad);

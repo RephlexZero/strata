@@ -24,6 +24,11 @@ pub struct WsClient {
     /// Connection status.
     pub connected: ReadSignal<bool>,
     set_connected: WriteSignal<bool>,
+    /// The server rejected our auth.login — the socket may be open but no
+    /// events will ever arrive. Rendered distinctly so the sidebar can't
+    /// claim "Live" while telemetry is dead (UX_TRUST_AUDIT U13).
+    pub auth_failed: ReadSignal<bool>,
+    set_auth_failed: WriteSignal<bool>,
 }
 
 impl Default for WsClient {
@@ -37,18 +42,27 @@ impl WsClient {
     pub fn new() -> Self {
         let (last_event, set_event) = signal(None::<DashboardEvent>);
         let (connected, set_connected) = signal(false);
+        let (auth_failed, set_auth_failed) = signal(false);
         Self {
             last_event,
             set_event,
             connected,
             set_connected,
+            auth_failed,
+            set_auth_failed,
         }
     }
 
     /// Connect to the dashboard WebSocket. Reconnects automatically on disconnect.
     pub fn connect(&self, token: &str) {
         let url = build_ws_url();
-        setup_websocket(url, token.to_string(), self.set_event, self.set_connected);
+        setup_websocket(
+            url,
+            token.to_string(),
+            self.set_event,
+            self.set_connected,
+            self.set_auth_failed,
+        );
     }
 }
 
@@ -92,13 +106,14 @@ fn setup_websocket(
     token: String,
     set_event: WriteSignal<Option<DashboardEvent>>,
     set_connected: WriteSignal<bool>,
+    set_auth_failed: WriteSignal<bool>,
 ) {
     let ws = match WebSocket::new(&url) {
         Ok(ws) => ws,
         Err(e) => {
             log::error!("WebSocket connect failed: {e:?}");
             // Retry after delay
-            schedule_reconnect(url, token, set_event, set_connected);
+            schedule_reconnect(url, token, set_event, set_connected, set_auth_failed);
             return;
         }
     };
@@ -129,7 +144,7 @@ fn setup_websocket(
         move || {
             log::warn!("WebSocket disconnected, reconnecting in 3s…");
             sc.set(false);
-            schedule_reconnect(url.clone(), token.clone(), set_event, sc);
+            schedule_reconnect(url.clone(), token.clone(), set_event, sc, set_auth_failed);
         }
     });
     ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
@@ -158,6 +173,7 @@ fn setup_websocket(
                     .and_then(|p| p.get("success"))
                     .and_then(|s| s.as_bool())
                     .unwrap_or(false);
+                set_auth_failed.set(!ok);
                 if !ok {
                     let err = v
                         .get("payload")
@@ -199,10 +215,17 @@ fn schedule_reconnect(
     token: String,
     set_event: WriteSignal<Option<DashboardEvent>>,
     set_connected: WriteSignal<bool>,
+    set_auth_failed: WriteSignal<bool>,
 ) {
     let reconnect = Closure::wrap(Box::new(move || {
         log::info!("attempting WebSocket reconnect…");
-        setup_websocket(url.clone(), token.clone(), set_event, set_connected);
+        setup_websocket(
+            url.clone(),
+            token.clone(),
+            set_event,
+            set_connected,
+            set_auth_failed,
+        );
     }) as Box<dyn FnMut()>);
 
     let delay_ms = RECONNECT_BASE_MS + (js_sys::Math::random() * RECONNECT_JITTER_MS) as i32;

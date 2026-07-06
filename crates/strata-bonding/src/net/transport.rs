@@ -200,6 +200,10 @@ pub struct TransportLink {
     /// detect a link that is *currently* delivering nothing so its
     /// scheduling weight can be crushed (NOT to latch it dead).
     last_ack_or_report: Mutex<Instant>,
+    /// Whether the last `get_metrics` classified this link delivery-starved.
+    /// Used only to log the starved↔recovered *transitions* instead of
+    /// spamming a WARN every metrics tick (~10 Hz) while starved.
+    was_delivery_starved: std::sync::atomic::AtomicBool,
     /// `(last_resize_at, last_target_bytes)` throttle for the dynamic
     /// `SO_SNDBUF` sizing (F2/ex-F4). `(_, 0)` = never resized yet.
     sndbuf_state: Mutex<(std::time::Instant, usize)>,
@@ -591,6 +595,7 @@ impl TransportLink {
             probe_feedback_block: Mutex::new(ProbeFeedbackBlock::Clear),
             prev_acked_liveness: AtomicU64::new(0),
             last_ack_or_report: Mutex::new(Instant::now()),
+            was_delivery_starved: std::sync::atomic::AtomicBool::new(false),
             sndbuf_state: Mutex::new((std::time::Instant::now(), 0)),
         }
     }
@@ -1364,10 +1369,14 @@ impl LinkSender for TransportLink {
         let last_proof = *self.last_ack_or_report.lock().unwrap();
         let delivery_starved = stats.packets_sent >= STARVED_MIN_SENT
             && now.duration_since(last_proof) >= STARVED_STALE;
-        if delivery_starved {
-            // Observability only — NOT a death. Logged at most ~1/s via
-            // the natural metric-refresh cadence; the link stays in the
-            // bond at trickle weight and self-heals on first ACK/report.
+        // Observability only — NOT a death. Log the starved↔recovered
+        // transitions only: this runs every metrics tick (~10 Hz) and a
+        // blackholed link would otherwise spam hundreds of thousands of
+        // identical WARN lines per hour.
+        let was_starved = self
+            .was_delivery_starved
+            .swap(delivery_starved, Ordering::Relaxed);
+        if delivery_starved && !was_starved {
             tracing::warn!(
                 link_id = self.id,
                 packets_sent = stats.packets_sent,
@@ -1375,6 +1384,11 @@ impl LinkSender for TransportLink {
                 stale_ms = now.duration_since(last_proof).as_millis() as u64,
                 "link delivery-starved: crushing to probe trickle (NOT dead — \
                  auto-recovers on next ACK/report)"
+            );
+        } else if !delivery_starved && was_starved {
+            tracing::info!(
+                link_id = self.id,
+                "link delivery recovered: restoring full capacity weight"
             );
         }
         // The link itself never self-reports dead; OS-down is handled

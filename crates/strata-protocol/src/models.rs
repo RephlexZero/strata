@@ -102,6 +102,26 @@ pub struct NetworkInterface {
     pub sim_pin: Option<String>,
     #[serde(default)]
     pub roaming: bool,
+    /// Kernel driver name (e.g. "cdc_ether", "r8169") — distinguishes a USB
+    /// modem that enumerated as `eth0` from onboard LAN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    /// Bus the device hangs off: "usb", "pci", "platform".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bus: Option<String>,
+    /// USB product/manufacturer string when available (e.g. "HUAWEI_MOBILE").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    /// IPv4 network in CIDR form (e.g. "192.168.8.0/24").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subnet: Option<String>,
+    /// Default-route gateway via this interface, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    /// Whether this interface carries a default route (i.e. is a viable
+    /// internet uplink). Interfaces without one are never pinned to links.
+    #[serde(default)]
+    pub has_default_route: bool,
 }
 
 fn default_true() -> bool {
@@ -466,6 +486,12 @@ mod tests {
             apn: None,
             sim_pin: None,
             roaming: false,
+            driver: None,
+            bus: None,
+            product: None,
+            subnet: None,
+            gateway: None,
+            has_default_route: false,
         };
         let json = serde_json::to_string(&iface).unwrap();
         let parsed: NetworkInterface = serde_json::from_str(&json).unwrap();
@@ -611,6 +637,12 @@ mod tests {
                 apn: None,
                 sim_pin: None,
                 roaming: false,
+                driver: None,
+                bus: None,
+                product: None,
+                subnet: None,
+                gateway: None,
+                has_default_route: false,
             }],
             media_inputs: vec![],
             stream_state: StreamState::Live,

@@ -55,11 +55,17 @@ pub async fn run(state: Arc<ReceiverState>) {
                 stats.remove(&exit_info.stream_id);
             }
 
+            let error = match (reason, exit_code) {
+                (StreamEndReason::UserStop, _) => None,
+                (_, Some(code)) => Some(format!("pipeline exited with code {code}")),
+                (_, None) => Some("pipeline killed by signal".to_string()),
+            };
             let ended = ReceiverStreamEndedPayload {
                 stream_id: exit_info.stream_id,
                 reason,
                 duration_s: exit_info.duration_s,
                 total_bytes: exit_info.total_bytes,
+                error,
             };
 
             let envelope = Envelope::from_message(&ReceiverMessage::StreamEnded(ended));
