@@ -36,19 +36,27 @@ pub fn lookup_profile(
 
     let hfr = fps > 30;
 
-    // H.265 bitrate table (kbps) — YouTube recommended ranges
+    // H.265 bitrate table (kbps). `default`/`max` follow YouTube's
+    // recommended ranges; `min` deliberately does NOT — it becomes the
+    // adapter's hard floor (`min_bitrate_kbps`), and a quality-recommended
+    // floor above what the radio can deliver pins the encoder into
+    // self-inflicted congestion collapse (field 2026-07-05: 1080p min of
+    // 3000 kbps against a degraded cellular bond shredded the stream in
+    // the paced-queue AQM and starved HLS egress). `min` is the lowest
+    // still-decodable, watchable rate at each resolution: ugly video that
+    // arrives beats recommended-quality video that doesn't.
     let (min, default, max) = match (height, hfr) {
-        (0..=540, false) => (800, 1500, 3000),
-        (0..=540, true) => (1000, 2000, 4000),
-        (541..=720, false) => (1500, 3000, 4000),
-        (541..=720, true) => (2000, 4000, 6000),
-        (721..=1080, false) => (3000, 5000, 6000),
-        (721..=1080, true) => (4000, 7000, 10000),
-        (1081..=1440, false) => (6000, 10000, 13000),
-        (1081..=1440, true) => (8000, 14000, 20000),
-        (1441..=2160, false) => (10000, 20000, 30000),
-        (1441..=2160, true) => (13000, 27000, 40000),
-        _ => (13000, 27000, 40000), // 4K+ defaults to 4K
+        (0..=540, false) => (500, 1500, 3000),
+        (0..=540, true) => (500, 2000, 4000),
+        (541..=720, false) => (800, 3000, 4000),
+        (541..=720, true) => (1000, 4000, 6000),
+        (721..=1080, false) => (1000, 5000, 6000),
+        (721..=1080, true) => (1500, 7000, 10000),
+        (1081..=1440, false) => (2000, 10000, 13000),
+        (1081..=1440, true) => (2500, 14000, 20000),
+        (1441..=2160, false) => (3000, 20000, 30000),
+        (1441..=2160, true) => (4000, 27000, 40000),
+        _ => (4000, 27000, 40000), // 4K+ defaults to 4K
     };
 
     // H.264 uses ~1.5x the bitrate for equivalent quality
@@ -87,7 +95,7 @@ mod tests {
     #[test]
     fn profile_720p30_h265() {
         let p = lookup_profile(Some("1280x720"), Some(30), Some("h265"));
-        assert_eq!(p.min_kbps, 1500);
+        assert_eq!(p.min_kbps, 800);
         assert_eq!(p.default_kbps, 3000);
         assert_eq!(p.max_kbps, 4000);
     }
@@ -95,7 +103,7 @@ mod tests {
     #[test]
     fn profile_1080p30_h265() {
         let p = lookup_profile(Some("1920x1080"), Some(30), Some("h265"));
-        assert_eq!(p.min_kbps, 3000);
+        assert_eq!(p.min_kbps, 1000);
         assert_eq!(p.default_kbps, 5000);
         assert_eq!(p.max_kbps, 6000);
     }
@@ -103,7 +111,7 @@ mod tests {
     #[test]
     fn profile_1080p60_h265() {
         let p = lookup_profile(Some("1920x1080"), Some(60), Some("h265"));
-        assert_eq!(p.min_kbps, 4000);
+        assert_eq!(p.min_kbps, 1500);
         assert_eq!(p.default_kbps, 7000);
         assert_eq!(p.max_kbps, 10000);
     }
@@ -111,7 +119,7 @@ mod tests {
     #[test]
     fn profile_4k30_h265() {
         let p = lookup_profile(Some("3840x2160"), Some(30), Some("h265"));
-        assert_eq!(p.min_kbps, 10000);
+        assert_eq!(p.min_kbps, 3000);
         assert_eq!(p.default_kbps, 20000);
         assert_eq!(p.max_kbps, 30000);
     }

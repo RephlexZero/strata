@@ -123,6 +123,28 @@ impl FakePipelineScript {
     }
 }
 
+impl Drop for FakePipelineScript {
+    fn drop(&mut self) {
+        // The daemon dies by SIGKILL (`kill_on_drop`) and never reaps this
+        // child, so an orphaned fake pipeline loops forever holding the
+        // inherited stdout/stderr pipe write-ends open — which wedges
+        // `cargo test | <anything>` long after the suite has passed
+        // (field 2026-07-06: a leaked fake-pipeline.sh blocked `tail` for
+        // 3 hours). Best-effort kill by pidfile; ESRCH is fine.
+        if let Some(pid) = std::fs::read_to_string(&self.pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .filter(|&pid| pid > 0)
+        {
+            // SAFETY: pid was written by the fake pipeline script this
+            // struct created; worst case it's already dead.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 /// The daemon under test, killed when the test ends.
 struct Daemon {
     _child: tokio::process::Child,

@@ -5,6 +5,26 @@
 
 ## Current focus
 
+**2026-07-10: three of the post-livestream improvements implemented
+(NOT yet deployed).** (1) **Floor-yield in the adapter** — the 2026-07-05
+collapse mode (min_bitrate pinned above deliverable capacity → AQM
+shreds the stream while `reduce=true` clamps back to the floor) now
+self-heals: 3+ self-congested ticks at the floor and the floor yields to
+300 kbps until the target ramps home (`adaptation.rs`, `floor_kbps()`,
+two field-regression tests). Profile `min_kbps` also lowered from
+YouTube-quality mins to survival floors (1080p30: 3000 → 1000) since
+that column feeds the adapter floor via streams.rs and sender.rs.
+(2) **HLS media-sequence continuity** — the uploader now keeps
+`#EXT-X-MEDIA-SEQUENCE` counting forward across watchdog rebuilds
+instead of letting hlssink3 reset it to 0 mid-URL (RFC 8216 violation,
+plausibly related to YouTube's silent rejection). (3) **daemon_lifecycle
+orphan fix** — FakePipelineScript kills its script on Drop; no more
+wedged `cargo test | tail`. Known follow-up left open: above-floor
+ramp-up stalls past ~2.5 Mbps (+250-step fails the >10% commit gate;
+an unconditional bypass breaks the feedback-cut interplay — see log.md
+2026-07-10). **Deploy + the libx265 discriminator test are the next
+field actions.**
+
 **2026-07-06: ALL 16 AUDIT FINDINGS FIXED AND DEPLOYED.** Every U-finding
 in [raw/UX_TRUST_AUDIT.md](raw/UX_TRUST_AUDIT.md) is implemented, ticked,
 and now running on both boxes: toggle_link panic guard; end reasons
@@ -45,11 +65,11 @@ can't carry it → self-inflicted AQM congestion collapse (200-1000+
 drops/sec) → receiver's HLS segmenter starves → egress watchdog
 rebuilds the pipeline every 30-40s → each rebuild resets the HLS
 media-sequence, so YouTube's ingest never accumulates a continuous
-stream even though every individual segment PUT gets HTTP 202. Not yet
-fixed in code (still tracked as "capacity-floor estimator pinning"
-below) — operational workaround is to set bitrate to match real
-conditions (e.g. min≈500, target≈1500, max≈2500 kbps) until the
-estimator itself is fixed.
+stream even though every individual segment PUT gets HTTP 202.
+**Fixed in code 2026-07-10** (floor-yield + media-sequence continuity,
+see Current focus) — not yet deployed; until then the operational
+workaround stands (set bitrate to real conditions, e.g. min≈500,
+target≈1500, max≈2500 kbps).
 
 **2026-07-06 (evening retry): YouTube ingest itself was the blocker —
 codec/playlist suspected, key+plumbing PROVEN FINE.** Second live

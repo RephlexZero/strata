@@ -212,6 +212,19 @@ const LINK_MELT_LOSS_RATE: f64 = 0.55;
 /// (queue depth alone is not trustworthy — see `Adaptation-Delay-Pressure`).
 const LINK_MELT_QUEUE_DEPTH: usize = 60;
 
+/// Absolute emergency floor (kbps) the encoder may fall to when the
+/// configured `min_bitrate_kbps` floor is itself the congestion source.
+/// Barely-watchable video that arrives beats configured-quality video that
+/// self-destructs in the paced queue.
+const EMERGENCY_FLOOR_KBPS: u32 = 300;
+/// Consecutive self-congested ticks with the target already pinned at the
+/// configured floor before that floor yields. Combined with
+/// [`AQM_SUSTAINED_TICKS`] this is ~5 s of continuous AQM drops at the
+/// floor — long enough that no transient burst can trip it. A tick count,
+/// not a duration — see the `AQM_SUSTAINED_TICKS` comment for the
+/// `stats_interval_ms` coupling caveat.
+const FLOOR_YIELD_TICKS: u32 = 3;
+
 /// A single link is clearly melting down: high loss AND a deep ARQ queue.
 /// The loss-weighted aggregate can mask this behind a healthy sibling link,
 /// so callers check per-link rather than relying on the aggregate alone.
@@ -283,6 +296,19 @@ pub struct BitrateAdapter {
     /// pins FEC overhead to baseline — congestive loss must not inflate
     /// parity, that's the 50%-overhead-at-zero-spare death spiral.
     self_congested: bool,
+    /// Consecutive self-congested ticks with the target already at the
+    /// configured `min_bitrate_kbps` floor. Feeds the floor-yield latch.
+    floor_pinned_ticks: u32,
+    /// Latched when the configured floor is itself pinning the encoder
+    /// above deliverable capacity (field 2026-07-05: min 3000 kbps forced
+    /// against a ~20 kbps deliverable trickle → every reduce decision
+    /// logged `reduce=true` but clamped back to the floor, AQM shredded
+    /// the stream, and the HLS egress starved into a rebuild loop). While
+    /// latched, all congestion floors drop to [`EMERGENCY_FLOOR_KBPS`];
+    /// clears only once the target has ramped back up to the configured
+    /// floor under genuine capacity, so releasing the latch can never
+    /// itself snap the encoder back into the congestion that set it.
+    floor_yielded: bool,
     /// Consecutive ticks with zero usable capacity while links are still alive.
     /// A single transient zero is a feedback/ACK gap on an otherwise-healthy
     /// link (the next tick reports full capacity), NOT a collapse — slamming to
@@ -427,6 +453,8 @@ impl BitrateAdapter {
             prev_aqm_dropped: 0,
             aqm_dropping_ticks: 0,
             self_congested: false,
+            floor_pinned_ticks: 0,
+            floor_yielded: false,
             zero_capacity_ticks: 0,
             last_increase_time: None,
             ewma_loss_fec: 0.0,
@@ -781,6 +809,42 @@ impl BitrateAdapter {
             );
         }
 
+        // ── Floor-yield latch ─────────────────────────────────────────────
+        // Self-congestion with the target ALREADY at the configured floor
+        // means the floor itself is what's overdriving the links: every
+        // reduce path clamps back to it, so without this the adapter logs
+        // `reduce=true` forever while the AQM shreds the stream. Yield the
+        // floor to EMERGENCY_FLOOR_KBPS. Restore only once the target has
+        // ramped back up to the configured floor under real capacity — an
+        // earlier release would let the min-clamp snap the target straight
+        // back into the congestion that latched it.
+        if self.self_congested && self.current_target_kbps <= self.config.min_bitrate_kbps {
+            self.floor_pinned_ticks += 1;
+        } else {
+            self.floor_pinned_ticks = 0;
+        }
+        if !self.floor_yielded && self.floor_pinned_ticks >= FLOOR_YIELD_TICKS {
+            self.floor_yielded = true;
+            info!(
+                target: "strata::adapt",
+                "[adapt] floor-yield: min_bitrate {} kbps is pinning the encoder above \
+                 deliverable capacity ({} self-congested ticks at the floor) — floor \
+                 yields to {} kbps until the target recovers",
+                self.config.min_bitrate_kbps, self.floor_pinned_ticks, EMERGENCY_FLOOR_KBPS
+            );
+        } else if self.floor_yielded
+            && !self.self_congested
+            && self.current_target_kbps >= self.config.min_bitrate_kbps
+        {
+            self.floor_yielded = false;
+            info!(
+                target: "strata::adapt",
+                "[adapt] floor-yield: target recovered to the configured floor ({} kbps) — \
+                 floor restored",
+                self.config.min_bitrate_kbps
+            );
+        }
+
         // DegradationStage::from_pressure expects capacity/required ratio
         let capacity_ratio = if pressure > 0.0 { 1.0 / pressure } else { 1.0 };
         self.stage = DegradationStage::from_pressure(capacity_ratio);
@@ -880,9 +944,7 @@ impl BitrateAdapter {
         // Determine if we need a bitrate change
         let (new_target, reason) =
             self.compute_target(usable_kbps, pressure, alive_count, self.ever_had_capacity);
-        let new_target = new_target
-            .min(effective_max)
-            .max(self.config.min_bitrate_kbps);
+        let new_target = new_target.min(effective_max).max(self.floor_kbps());
         // Slew-rate limit so the encoder is not whipsawed by per-tick
         // capacity-estimate noise (see `slew_clamp` doc).
         let new_target = self.slew_clamp(new_target, reason);
@@ -905,8 +967,19 @@ impl BitrateAdapter {
         const COMMAND_COMMIT_PCT: f64 = 0.10;
         let abs_change = (new_target as i64 - self.current_target_kbps as i64).unsigned_abs();
         let pct_change = abs_change as f64 / self.current_target_kbps.max(1) as f64;
-        let target_changed =
-            abs_change > COMMAND_COMMIT_ABS_FLOOR_KBPS && pct_change > COMMAND_COMMIT_PCT;
+        // The >10% relative gate rejects capacity-estimate noise, but a
+        // Recovery ramp step climbing home after a floor-yield is not
+        // noise: with the default 250 kbps step the gate blocks every
+        // climb past ~2.5 Mbps (250/2500 = 10%), which would strand a
+        // yielded encoder below a 3 Mbps configured floor forever — the
+        // latch releases only at the floor. Scoped to below-floor targets:
+        // an unconditional Recovery bypass lets ramp-ups commit every tick
+        // at high bitrates, and each same-tick increase suppresses the
+        // feedback cut path via `increased_this_tick`.
+        let ramp_home = reason == AdaptationReason::Recovery
+            && self.current_target_kbps < self.config.min_bitrate_kbps;
+        let target_changed = abs_change > COMMAND_COMMIT_ABS_FLOOR_KBPS
+            && (pct_change > COMMAND_COMMIT_PCT || ramp_home);
         let interval_ok = self
             .last_command_time
             .is_none_or(|t| t.elapsed() >= self.config.min_interval);
@@ -1326,7 +1399,7 @@ impl BitrateAdapter {
             // encoder can actually retreat instead of staying stuck near its
             // pre-collapse target.
             let floor_kbps = if link_collapse || burst_loss || severe_burst || late_pressure {
-                self.config.min_bitrate_kbps
+                self.floor_kbps()
             } else {
                 self.effective_floor_kbps()
             };
@@ -1392,7 +1465,7 @@ impl BitrateAdapter {
         // Emergency: no links
         if alive_count == 0 {
             debug!(target: "strata::adapt", "decision: no alive links → min");
-            return (self.config.min_bitrate_kbps, AdaptationReason::LinkFailure);
+            return (self.floor_kbps(), AdaptationReason::LinkFailure);
         }
 
         // Zero usable capacity: distinguish cold-start from mid-stream collapse.
@@ -1411,7 +1484,7 @@ impl BitrateAdapter {
             const ZERO_CAP_COLLAPSE_TICKS: u32 = 2;
             if had_capacity && self.zero_capacity_ticks >= ZERO_CAP_COLLAPSE_TICKS {
                 debug!(target: "strata::adapt", "decision: zero usable (sustained {} ticks → collapse) → min", self.zero_capacity_ticks);
-                return (self.config.min_bitrate_kbps, AdaptationReason::LinkFailure);
+                return (self.floor_kbps(), AdaptationReason::LinkFailure);
             }
             if had_capacity {
                 debug!(target: "strata::adapt", "decision: zero usable (transient {} tick → hold)", self.zero_capacity_ticks);
@@ -1524,6 +1597,17 @@ impl BitrateAdapter {
         (current, AdaptationReason::Capacity)
     }
 
+    /// The configured static floor, unless the floor-yield latch is set —
+    /// then the emergency floor (see `floor_yielded`). The `.min()` keeps a
+    /// user-configured floor below 300 kbps authoritative.
+    fn floor_kbps(&self) -> u32 {
+        if self.floor_yielded {
+            EMERGENCY_FLOOR_KBPS.min(self.config.min_bitrate_kbps)
+        } else {
+            self.config.min_bitrate_kbps
+        }
+    }
+
     /// Dynamic bitrate floor: never reduce below half of the recent windowed
     /// peak goodput.  The static `min_bitrate_kbps` floor is far too low on
     /// good multi-link setups (e.g. 500 kbps when links delivered 3–4 Mbps
@@ -1533,7 +1617,7 @@ impl BitrateAdapter {
     /// tethered to recent real delivery lets bursts reduce the encode
     /// without dropping off a cliff.
     fn effective_floor_kbps(&self) -> u32 {
-        let static_floor = self.config.min_bitrate_kbps;
+        let static_floor = self.floor_kbps();
         if self.goodput_peak_bps > 0.0 {
             // Floor is the lesser of: half the windowed peak, or 80% of the
             // smoothed goodput.  The dual-cap prevents a single high-peak
@@ -1580,6 +1664,8 @@ impl BitrateAdapter {
         self.prev_jitter_buffer_ms = 0;
         self.last_command_time = None;
         self.capacity_ewma.clear();
+        self.floor_pinned_ticks = 0;
+        self.floor_yielded = false;
     }
 }
 
@@ -1697,6 +1783,112 @@ mod tests {
             adapter.update(&links);
         }
         assert!(!adapter.self_congested, "latch must clear when drops stop");
+    }
+
+    /// Field regression (2026-07-05): min_bitrate 3000 kbps forced against a
+    /// radio delivering a fraction of that. Every reduce decision clamped
+    /// back to the configured floor, so the encoder kept overdriving the
+    /// links (`reduce=true` logged forever), the paced-queue AQM shredded
+    /// the stream, and HLS egress starved into a rebuild loop. Under
+    /// sustained self-congestion at the floor, the floor must yield.
+    #[test]
+    fn pinned_floor_yields_under_sustained_self_congestion() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 6_000,
+            min_bitrate_kbps: 3_000,
+            initial_bitrate_kbps: 3_000,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+        // Radio can only drain ~400 kbps; the 3000 kbps floor overdrives it.
+        let mut links = make_links(&[(8_000.0, true)]);
+        links[0].drain_rate_kbps = Some(400.0);
+        let mut total = 0u64;
+        for _ in 0..12 {
+            total += 50;
+            links[0].aqm_dropped_total = Some(total);
+            adapter.update(&links);
+        }
+        assert!(
+            adapter.floor_yielded,
+            "sustained self-congestion at the floor must latch floor-yield"
+        );
+        assert!(
+            adapter.current_target_kbps() < 3_000,
+            "target must fall below the configured floor ({} kbps)",
+            adapter.current_target_kbps()
+        );
+        // Keep congesting: the target must retreat into the deliverable
+        // envelope (usable ≈ 340 kbps here), far below the configured floor.
+        for _ in 0..20 {
+            total += 50;
+            links[0].aqm_dropped_total = Some(total);
+            adapter.update(&links);
+        }
+        let target = adapter.current_target_kbps();
+        assert!(
+            (EMERGENCY_FLOOR_KBPS..=400).contains(&target),
+            "sustained overdrive must retreat to the deliverable rate, got {target}"
+        );
+    }
+
+    /// Once yielded, the floor must stay yielded until the target has ramped
+    /// back up to the configured floor under real capacity — releasing it
+    /// early would snap the target straight back into the congestion that
+    /// latched it. After recovery, the configured floor is authoritative
+    /// again.
+    #[test]
+    fn yielded_floor_restores_only_after_target_recovers() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 6_000,
+            min_bitrate_kbps: 3_000,
+            initial_bitrate_kbps: 3_000,
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+        let mut links = make_links(&[(8_000.0, true)]);
+        links[0].drain_rate_kbps = Some(400.0);
+        let mut total = 0u64;
+        for _ in 0..12 {
+            total += 50;
+            links[0].aqm_dropped_total = Some(total);
+            adapter.update(&links);
+        }
+        assert!(adapter.floor_yielded);
+        let low = adapter.current_target_kbps();
+        assert!(low < 3_000);
+
+        // Congestion clears but capacity is still poor: the latch must hold
+        // (no snap back up to the configured floor).
+        links[0].aqm_dropped_total = Some(total);
+        for _ in 0..5 {
+            adapter.update(&links);
+        }
+        assert!(
+            adapter.floor_yielded,
+            "latch must hold while the target is still below the floor"
+        );
+        assert!(
+            adapter.current_target_kbps() < 3_000,
+            "target must not snap back to the pinned floor ({} kbps)",
+            adapter.current_target_kbps()
+        );
+
+        // Radio recovers: ramp-up climbs the target back to the configured
+        // floor, and only then does the latch release.
+        links[0].drain_rate_kbps = Some(8_000.0);
+        for _ in 0..120 {
+            adapter.update(&links);
+        }
+        assert!(
+            adapter.current_target_kbps() >= 3_000,
+            "target must recover under real capacity ({} kbps)",
+            adapter.current_target_kbps()
+        );
+        assert!(
+            !adapter.floor_yielded,
+            "latch must release once the target recovers to the floor"
+        );
     }
 
     /// Field regression (2026-06-15): a bursty 2nd modem produced ~10 AQM

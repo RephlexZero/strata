@@ -111,6 +111,7 @@ fn uploader_loop(config: &HlsUploaderConfig, stop: &AtomicBool) {
     let agent = ureq::Agent::new_with_defaults();
     let playlist_path = config.segment_dir.join(&config.playlist_filename);
     let mut discontinuity_state = DiscontinuityState::default();
+    let mut media_sequence_state = MediaSequenceState::default();
 
     eprintln!(
         "HLS uploader: watching {} → {}",
@@ -146,6 +147,7 @@ fn uploader_loop(config: &HlsUploaderConfig, stop: &AtomicBool) {
                     config,
                     &playlist_path,
                     &mut discontinuity_state,
+                    &mut media_sequence_state,
                 );
             }
         }
@@ -164,7 +166,13 @@ fn uploader_loop(config: &HlsUploaderConfig, stop: &AtomicBool) {
         }
     }
     if playlist_path.exists() {
-        upload_playlist_with_retry(&agent, config, &playlist_path, &mut discontinuity_state);
+        upload_playlist_with_retry(
+            &agent,
+            config,
+            &playlist_path,
+            &mut discontinuity_state,
+            &mut media_sequence_state,
+        );
     }
 
     eprintln!(
@@ -253,6 +261,7 @@ fn upload_playlist_with_retry(
     config: &HlsUploaderConfig,
     playlist_path: &Path,
     state: &mut DiscontinuityState,
+    seq_state: &mut MediaSequenceState,
 ) -> bool {
     let text = match std::fs::read_to_string(playlist_path) {
         Ok(t) => t,
@@ -268,6 +277,7 @@ fn upload_playlist_with_retry(
     let discontinuous = config.discontinuous_segments.lock().unwrap();
     let rewritten = rewrite_playlist_discontinuities(&text, &discontinuous, state);
     drop(discontinuous);
+    let rewritten = rewrite_media_sequence(&rewritten, seq_state);
 
     for attempt in 0..MAX_UPLOAD_RETRIES {
         if upload_bytes(
@@ -359,6 +369,71 @@ fn rewrite_playlist_discontinuities(
         out.push('\n');
     }
     out
+}
+
+/// Assigns each segment a continuous media-sequence number so the uploaded
+/// playlist's `#EXT-X-MEDIA-SEQUENCE` never goes backwards across watchdog
+/// pipeline rebuilds. A fresh hlssink3 restarts its own numbering at 0 each
+/// generation, but the uploader keeps publishing to the same live playlist
+/// URL — a backwards media-sequence jump violates RFC 8216 §6.2.2 and an
+/// ingest server may silently treat the stream as broken. Segments are
+/// keyed by filename (unique across generations via the `seg-gNNNN-` prefix),
+/// so numbering survives the reset; entries are pruned to the current
+/// playlist window to bound memory.
+#[derive(Default)]
+struct MediaSequenceState {
+    assigned: std::collections::HashMap<String, u64>,
+    next: u64,
+    seeded: bool,
+}
+
+/// Rewrite `#EXT-X-MEDIA-SEQUENCE` with the uploader's continuous numbering
+/// (see [`MediaSequenceState`]). New segments take numbers in playlist order,
+/// so within a generation the output matches hlssink3's own numbering; after
+/// a rebuild the sequence keeps counting up instead of resetting to 0. The
+/// forward jump this leaves at a rebuild is spec-legal (clients treat skipped
+/// numbers as missed segments), and the first segment of each generation is
+/// already tagged `#EXT-X-DISCONTINUITY` via `discontinuous_segments`.
+fn rewrite_media_sequence(text: &str, state: &mut MediaSequenceState) -> String {
+    let uris: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    if uris.is_empty() {
+        return text.to_string();
+    }
+    if !state.seeded {
+        // Adopt hlssink3's numbering from the first playlist seen, so the
+        // uploaded copy is identical to the on-disk one until a rebuild.
+        state.next = parse_media_sequence(text).unwrap_or(0);
+        state.seeded = true;
+    }
+    for &uri in &uris {
+        if !state.assigned.contains_key(uri) {
+            state.assigned.insert(uri.to_string(), state.next);
+            state.next += 1;
+        }
+    }
+    let first_seq = state.assigned[uris[0]];
+    let window: HashSet<&str> = uris.iter().copied().collect();
+    state.assigned.retain(|name, _| window.contains(name.as_str()));
+
+    let mut out = String::with_capacity(text.len() + 16);
+    for line in text.lines() {
+        if line.starts_with("#EXT-X-MEDIA-SEQUENCE:") {
+            out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{first_seq}\n"));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Parse the `#EXT-X-MEDIA-SEQUENCE` value from playlist text.
+fn parse_media_sequence(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:")?.trim().parse().ok())
 }
 
 /// Return the appropriate MIME type for an HLS file.
@@ -691,6 +766,70 @@ mod tests {
         let out2 = rewrite_playlist_discontinuities(&p2, &discontinuous, &mut state);
         assert!(out2.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1"));
         assert!(!out2.contains("#EXT-X-DISCONTINUITY\n"));
+    }
+
+    // ── rewrite_media_sequence ──────────────────────────────────────────
+
+    fn playlist_with_sequence(seq: u64, segments: &[&str]) -> String {
+        let mut p = format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:{seq}\n"
+        );
+        for seg in segments {
+            p.push_str("#EXTINF:1.000,\n");
+            p.push_str(seg);
+            p.push('\n');
+        }
+        p
+    }
+
+    #[test]
+    fn media_sequence_within_one_generation_matches_hlssink() {
+        let mut state = MediaSequenceState::default();
+        let p1 = playlist_with_sequence(0, &["seg-g0000-00000.ts", "seg-g0000-00001.ts"]);
+        assert_eq!(rewrite_media_sequence(&p1, &mut state), p1);
+        // Window slides: hlssink3 bumps the sequence, ours must agree.
+        let p2 = playlist_with_sequence(1, &["seg-g0000-00001.ts", "seg-g0000-00002.ts"]);
+        assert_eq!(rewrite_media_sequence(&p2, &mut state), p2);
+    }
+
+    #[test]
+    fn media_sequence_adopts_initial_value_mid_stream() {
+        let mut state = MediaSequenceState::default();
+        let p = playlist_with_sequence(7, &["seg-g0000-00007.ts", "seg-g0000-00008.ts"]);
+        assert_eq!(rewrite_media_sequence(&p, &mut state), p);
+    }
+
+    /// The watchdog-rebuild regression: a new generation's hlssink3 resets
+    /// `#EXT-X-MEDIA-SEQUENCE` to 0, but the uploaded playlist must keep
+    /// counting forward — a backwards jump violates RFC 8216 §6.2.2.
+    #[test]
+    fn media_sequence_continues_across_generation_reset() {
+        let mut state = MediaSequenceState::default();
+        // Generation 0, window has slid to sequence 3.
+        let p1 = playlist_with_sequence(
+            3,
+            &["seg-g0000-00003.ts", "seg-g0000-00004.ts", "seg-g0000-00005.ts"],
+        );
+        rewrite_media_sequence(&p1, &mut state);
+        // Rebuild: generation 1 restarts at raw sequence 0.
+        let p2 = playlist_with_sequence(0, &["seg-g0001-00000.ts", "seg-g0001-00001.ts"]);
+        let out = rewrite_media_sequence(&p2, &mut state);
+        assert!(
+            out.contains("#EXT-X-MEDIA-SEQUENCE:6"),
+            "sequence must continue after the last assigned number, got:\n{out}"
+        );
+        assert!(!out.contains("#EXT-X-MEDIA-SEQUENCE:0"));
+        // And keep advancing normally as the new generation's window slides.
+        let p3 = playlist_with_sequence(1, &["seg-g0001-00001.ts", "seg-g0001-00002.ts"]);
+        let out = rewrite_media_sequence(&p3, &mut state);
+        assert!(out.contains("#EXT-X-MEDIA-SEQUENCE:7"), "got:\n{out}");
+    }
+
+    #[test]
+    fn media_sequence_empty_playlist_passthrough() {
+        let mut state = MediaSequenceState::default();
+        let p = "#EXTM3U\n#EXT-X-VERSION:3\n";
+        assert_eq!(rewrite_media_sequence(p, &mut state), p);
     }
 
     // ── HlsUploaderHandle lifecycle ─────────────────────────────────────

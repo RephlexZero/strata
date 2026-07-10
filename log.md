@@ -960,3 +960,59 @@ H.264 (mpph264enc). Evidence: /root/hls-debug-20260706/ on Hetzner
 Earlier the same evening: deployed the hilink.rs keep-alive fix to the
 Pi (modem probe now live in prod: carrier="3 UK", LTE, band 20, RSRP
 -104/-103 dBm on both links) after the Pi came back from a power cycle.
+
+## 2026-07-10 — floor-yield, survivable profile mins, HLS media-sequence continuity, test-harness leak fix
+
+Implemented three of the improvement areas from the 2026-07-06 session
+(items 1, 2 and 5 of the post-livestream list):
+
+**1a. Adaptation floor-yield (`adaptation.rs`).** The 2026-07-05 collapse
+mode — `min_bitrate_kbps` pinned above deliverable capacity, every reduce
+decision logging `reduce=true` but clamping back to the floor while the
+paced-queue AQM shredded the stream — now self-heals. New latch: 3+
+consecutive self-congested ticks (sustained AQM drops at pressure ≥ 0.7)
+with the target already at the configured floor → the floor yields to an
+emergency 300 kbps floor (`EMERGENCY_FLOOR_KBPS`). All congestion floors
+(`update()` clamp, over-pressure cut, feedback cut, `effective_floor_kbps`,
+LinkFailure collapse) route through `floor_kbps()`. The latch releases only
+once the target has ramped back UP to the configured floor under real
+capacity — releasing earlier would let the min-clamp snap the encoder
+straight back into the congestion that latched it. Found + fixed en route:
+the `target_changed` >10% commit gate silently blocked every +250 kbps
+Recovery ramp step past ~2.5 Mbps (250/2500 = 10%), which would have
+stranded a yielded encoder below a 3 Mbps floor forever; Recovery steps
+now bypass the pct gate, but ONLY while below the configured floor — an
+unconditional bypass made every-tick increases suppress the feedback cut
+path via `increased_this_tick` (two existing regression tests caught
+that immediately). The general above-floor ramp stall (encoder cannot
+climb past ~2.5 Mbps by 250-steps after a deep cut) is still there —
+flagged as a follow-up, needs the increase-vs-feedback-cut interplay
+resolved first. Two new field-regression tests; 362 bonding lib tests
+green.
+
+**1b. Profile mins are now survival floors (`profiles.rs`).** The min
+column of the bitrate table was YouTube's *quality-recommended* minimum
+(1080p30 = 3000 kbps) but is consumed as the adapter's hard floor by both
+streams.rs (control defaults) and strata_pipeline sender.rs (CLI
+fallback). Lowered across the board to lowest-watchable (1080p30 → 1000,
+720p30 → 800, 4K30 → 3000, etc.); default/max unchanged.
+
+**2. HLS media-sequence continuity (`hls_upload.rs`).** Every watchdog
+rebuild restarted hlssink3's `#EXT-X-MEDIA-SEQUENCE` at 0 while uploading
+to the same live playlist URL — a backwards jump violates RFC 8216
+§6.2.2 and is exactly the kind of thing an ingest server silently drops
+a stream over (relevant to the open YouTube-rejection investigation).
+The uploader now assigns its own continuous numbering keyed by segment
+filename (unique across generations via the `seg-gNNNN-` prefix): within
+a generation the uploaded playlist is byte-identical to hlssink3's; after
+a rebuild the sequence keeps counting forward. Pairs with the existing
+first-segment-of-generation `#EXT-X-DISCONTINUITY` tagging.
+
+**5. daemon_lifecycle leak (`daemon_lifecycle.rs`).** `FakePipelineScript`
+now kills its script by pidfile on Drop. The daemon dies by SIGKILL
+(`kill_on_drop`) so it never reaps the fake pipeline; the orphan looped
+forever holding inherited pipe fds — the exact mechanism that wedged
+`cargo test | tail` for 3 hours on 2026-07-06.
+
+All suites green (362 bonding, 13 sender, 27 hls_upload, 7 profiles,
+28 control), clippy clean across the four touched crates.
