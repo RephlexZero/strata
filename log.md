@@ -1192,3 +1192,44 @@ boxes): burst_loss's goodput conjunct still compared against the
 target — the one delivered-vs-offered site 40ea7e1 missed; an
 undershooting encoder would have lost its reorder-spike protection.
 User's camera stream restarted on the new binary afterwards.
+
+## 2026-07-12 (00:xx UK) — the 23:48 dropout: phantom capacity → FEC storm → audio wedge
+
+User streamed the real camera; YouTube showed video (media-sequence fix
+confirmed working, encoder cruising 4-5 Mbps — the ramp works on real
+content) with intermittent freezes, then dropped out entirely at 23:48
+UK. Anatomy from both journals:
+
+1. **Phantom capacity**: links claimed cap 4.4+6.2 Mbps while the
+   receiver measured ~3+3 (the PPD oracle over-reads bursty LTE, and
+   ACK-batch stall-release floods inflate btl_bw's samples — accepted
+   as app-limited-high, the survivor-bias ratchet confined to
+   app-limited periods but real on this radio).
+2. **Phantom spare → FEC storm**: spare ≈ 2.9 Mbps latched
+   MaxReliability (50% overhead ceiling) and sized FEC to 27-32%; wire
+   hit ~7.5 Mbps into ~6 Mbps of real radio. Paced queues stood at
+   500-860 pkts (RTT 70→226 ms), AQM shed 822 pkts/tick, and the
+   receiver ate a gap-skip flood at 22:48:30 UTC (the freezes = the
+   same mechanism at lower intensity, 160 splices / 20 min).
+3. **Audio wedge**: the flood wedged the demux/parse audio branch —
+   video recovers at the next IDR, audio has no resync point (q_v full,
+   q_a empty, audio-gate quiet = nothing arriving). hlssink3 starved on
+   interleave → 15 s watchdog → ~20 s dead air → YouTube dropped.
+
+Fixes (commit c0c1ec9, deployed f2173e49 both boxes):
+- **Sender**: FEC spare and the MaxReliability latch (set AND release)
+  are bounded by the proven-goodput ceiling (1.3× windowed peak — the
+  same bound the ramp trusts). Phantom estimate headroom can no longer
+  become parity bytes. Regression test
+  `phantom_capacity_cannot_inflate_fec_spare_or_latch_max_reliability`.
+- **Receiver**: egress watchdog stamps buffer arrivals at both parse
+  outputs; 5 s of audio silence while video flows → immediate rebuild
+  (was 15-30 s). Audio-less streams can't loop (armed only after first
+  audio).
+
+**Open next**: the estimator inflation itself — btl_bw/ack-rate
+sampling needs to be robust to LTE cumulative-ACK flushes (cap
+app-limited-high acceptance against receiver-reported per-link
+goodput, or sample over longer windows). Also the tsdemux audio-wedge
+mechanism could be attacked at the source (why no resync?) — the fast
+rebuild is mitigation, not cure.

@@ -5,6 +5,20 @@
 
 ## Current focus
 
+**2026-07-12 (midnight): the 23:48 dropout root-caused and fixed** —
+phantom capacity (PPD over-read + ACK-batch btl_bw inflation) latched
+MaxReliability, FEC ~30% pushed the wire to 7.5 Mbps into ~6 Mbps of
+real radio → AQM gap-skip flood → demux AUDIO branch wedged (video
+recovers at IDR; audio has no resync) → 15 s watchdog → ~20 s dead air
+= YouTube dropout. Fixed (c0c1ec9, deployed f2173e49 both boxes): FEC
+spare + MaxReliability latch bounded by proven goodput (1.3× peak);
+receiver rebuilds after 5 s of audio-silent-while-video-flows. Positive
+signals from the same stream: YouTube video SHOWED (media-seq fix
+confirmed), encoder ramps to 4-5 Mbps on real content. **Open: the
+estimator ACK-batch inflation itself (btl_bw trusts stall-release ACK
+floods); the tsdemux audio-wedge root cause.** Camera stream restarted
+on the new binary — watch next stream for freeze rate and dropout.
+
 **2026-07-11 (evening): the stall/artifact storm is root-caused and
 fixed — the capacity chain was measuring its own output.** Three fixes,
 all deployed to both boxes (54d9d14 + 40ea7e1, rollback
