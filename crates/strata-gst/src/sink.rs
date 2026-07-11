@@ -93,6 +93,13 @@ mod imp {
         /// catch encoder overshoot independent of the transport.
         pub(crate) ingress_bytes_acc: std::sync::atomic::AtomicU64,
         pub(crate) ingress_last_log: Mutex<std::time::Instant>,
+        /// Latest 1 s encoder+mux egress rate (bits/sec), published by
+        /// `render`'s throttled window. Fed to the adapter as
+        /// `ReceiverFeedback::offered_bps` so goodput comparisons measure the
+        /// network against what was actually offered, not the encoder target —
+        /// a static scene makes hardware encoders undershoot their target by
+        /// 2× or more, which otherwise reads as a permanent goodput shortfall.
+        pub(crate) ingress_rate_bps: std::sync::atomic::AtomicU64,
     }
 
     impl Default for StrataSink {
@@ -116,6 +123,7 @@ mod imp {
                 ts_keyframe: Mutex::new(crate::ts_keyframe::TsKeyframeScanner::new()),
                 ingress_bytes_acc: std::sync::atomic::AtomicU64::new(0),
                 ingress_last_log: Mutex::new(std::time::Instant::now()),
+                ingress_rate_bps: std::sync::atomic::AtomicU64::new(0),
             }
         }
     }
@@ -630,6 +638,10 @@ mod imp {
                                         jitter_buffer_ms: max_jitter,
                                         loss_after_fec: (total_loss_weight / weight_sum) as f32,
                                         late_rate: (total_late_weight / weight_sum) as f32,
+                                        offered_bps: element
+                                            .imp()
+                                            .ingress_rate_bps
+                                            .load(Ordering::Relaxed),
                                     })
                                 } else {
                                     None
@@ -730,6 +742,8 @@ mod imp {
                 if elapsed >= std::time::Duration::from_secs(1) {
                     let bytes = self.ingress_bytes_acc.swap(0, Ordering::Relaxed);
                     let kbps = (bytes as f64 * 8.0 / 1000.0) / elapsed.as_secs_f64();
+                    self.ingress_rate_bps
+                        .store((kbps * 1000.0) as u64, Ordering::Relaxed);
                     *last = std::time::Instant::now();
                     tracing::info!(
                         target: "strata::sink",

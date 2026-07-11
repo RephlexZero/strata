@@ -385,7 +385,10 @@ const ACK_RATE_FALLBACK_HEADROOM_MULT: f64 = 1.2;
 /// directly comparable for app-limited detection.
 fn mono_now_us() -> u64 {
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
 }
 
 impl TransportLink {

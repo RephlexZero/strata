@@ -421,7 +421,9 @@ fn rewrite_media_sequence(text: &str, state: &mut MediaSequenceState) -> String 
     }
     let first_seq = state.assigned[uris[0]];
     let window: HashSet<&str> = uris.iter().copied().collect();
-    state.assigned.retain(|name, _| window.contains(name.as_str()));
+    state
+        .assigned
+        .retain(|name, _| window.contains(name.as_str()));
 
     let has_tag = text
         .lines()
@@ -445,8 +447,12 @@ fn rewrite_media_sequence(text: &str, state: &mut MediaSequenceState) -> String 
 
 /// Parse the `#EXT-X-MEDIA-SEQUENCE` value from playlist text.
 fn parse_media_sequence(text: &str) -> Option<u64> {
-    text.lines()
-        .find_map(|l| l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:")?.trim().parse().ok())
+    text.lines().find_map(|l| {
+        l.strip_prefix("#EXT-X-MEDIA-SEQUENCE:")?
+            .trim()
+            .parse()
+            .ok()
+    })
 }
 
 /// Return the appropriate MIME type for an HLS file.
@@ -821,7 +827,11 @@ mod tests {
         // Generation 0, window has slid to sequence 3.
         let p1 = playlist_with_sequence(
             3,
-            &["seg-g0000-00003.ts", "seg-g0000-00004.ts", "seg-g0000-00005.ts"],
+            &[
+                "seg-g0000-00003.ts",
+                "seg-g0000-00004.ts",
+                "seg-g0000-00005.ts",
+            ],
         );
         rewrite_media_sequence(&p1, &mut state);
         // Rebuild: generation 1 restarts at raw sequence 0.
@@ -859,7 +869,11 @@ mod tests {
         let out = rewrite_media_sequence(&p1, &mut state);
         let lines: Vec<&str> = out.lines().collect();
         let extinf_idx = lines.iter().position(|l| l.starts_with("#EXTINF")).unwrap();
-        assert_eq!(lines[extinf_idx - 1], "#EXT-X-MEDIA-SEQUENCE:0", "got:\n{out}");
+        assert_eq!(
+            lines[extinf_idx - 1],
+            "#EXT-X-MEDIA-SEQUENCE:0",
+            "got:\n{out}"
+        );
 
         // Window slides, tag appears; numbering must agree with hlssink3.
         let p2 = playlist_with_sequence(1, &["seg-g0000-00001.ts", "seg-g0000-00002.ts"]);

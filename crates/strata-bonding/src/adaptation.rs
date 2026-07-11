@@ -253,6 +253,14 @@ pub struct ReceiverFeedback {
     /// even when outright loss is low, so the adapter treats a sustained
     /// late-rate as delay pressure independent of jitter-buffer growth.
     pub late_rate: f32,
+    /// Sender-side encoder+mux egress rate (bits/sec) over the last second —
+    /// what was actually *offered* to the network. 0 = unknown (falls back to
+    /// target-referenced comparisons). Hardware encoders undershoot their
+    /// target by 2× or more on static scenes; comparing delivered goodput
+    /// against the target then reads as a permanent shortfall and pins the
+    /// stream at the floor (2026-07-11 field stream: gp 520 kbps vs target
+    /// 1000 kbps with zero loss, `reduce=true` latched for 80+ s).
+    pub offered_bps: u64,
 }
 
 /// Encoder Bitrate Adapter.
@@ -1259,7 +1267,13 @@ impl BitrateAdapter {
         // depressed encoder output (application-limited trap); the peak retains
         // the memory of what the links actually delivered before the event.
         const GOODPUT_CEILING_CLAMP_TRIGGER: f64 = 0.85;
-        if self.goodput_peak_bps > 0.0 {
+        // Like the shortfall signals below, the clamp only means something
+        // when the network was actually offered the bytes: an undershooting
+        // encoder (static scene) caps delivered goodput at its own output,
+        // and clamping the target to that would pin the stream permanently.
+        let peak_reflects_network_limit = feedback.offered_bps == 0
+            || self.goodput_peak_bps < feedback.offered_bps as f64 * GOODPUT_CEILING_CLAMP_TRIGGER;
+        if self.goodput_peak_bps > 0.0 && peak_reflects_network_limit {
             let peak_gp_kbps = self.goodput_peak_bps / 1000.0;
             let goodput_ceil_kbps = (peak_gp_kbps / (1.0 - self.config.headroom)) as u32;
             let goodput_ceil_kbps = goodput_ceil_kbps.max(self.config.min_bitrate_kbps);
@@ -1278,10 +1292,18 @@ impl BitrateAdapter {
         }
 
         // Compare smoothed goodput against the PRE-update target since goodput
-        // lags the encoder rate by at least one RTT.
+        // lags the encoder rate by at least one RTT — capped at what the
+        // encoder actually put out (`offered_bps`): a shortfall is only a
+        // network signal when the network was given the bytes and failed to
+        // deliver them. Without the cap, a static-scene encoder undershooting
+        // its target reads as a permanent shortfall.
+        let expected_bps = if feedback.offered_bps > 0 {
+            (target_before_update as f64 * 1000.0).min(feedback.offered_bps as f64)
+        } else {
+            target_before_update as f64 * 1000.0
+        };
         let goodput_shortfall = self.ewma_goodput_bps > 0.0
-            && self.ewma_goodput_bps
-                < target_before_update as f64 * 1000.0 * GOODPUT_SHORTFALL_RATIO;
+            && self.ewma_goodput_bps < expected_bps * GOODPUT_SHORTFALL_RATIO;
         // A *severe* shortfall (delivering < 50% of the pre-update rate) is the
         // grace-bypass tier.  Because it compares against the pre-update target,
         // a stale post-increase reading still reflects the OLD rate and can't
@@ -1289,8 +1311,7 @@ impl BitrateAdapter {
         // reorder-immune replacement for the residual signal's grace pass-through.
         const SEVERE_GOODPUT_SHORTFALL_RATIO: f64 = 0.5;
         let severe_goodput_shortfall = self.ewma_goodput_bps > 0.0
-            && self.ewma_goodput_bps
-                < target_before_update as f64 * 1000.0 * SEVERE_GOODPUT_SHORTFALL_RATIO;
+            && self.ewma_goodput_bps < expected_bps * SEVERE_GOODPUT_SHORTFALL_RATIO;
 
         // After a rate increase, receiver metrics are stale for a few seconds
         // (they still reflect the old encoder rate).  Suppress ordinary
@@ -1581,11 +1602,17 @@ impl BitrateAdapter {
             // Cap ramp-up to 1.3x peak goodput — sender-side capacity is
             // optimistic on lossy links; real throughput is what matters.
             // Using the peak (not EWMA) avoids the post-burst ceiling trap.
+            // The cap bounds the INCREASE only — never below `current`. Peak
+            // goodput is itself bounded by what the encoder offered, so on a
+            // static scene (encoder undershooting its target) this ceiling
+            // sits below the current target, and letting it drag the step
+            // down turned a "ramp-up" tick into an instant cut to the floor.
+            // Cutting is the shortfall/clamp paths' job; a ramp step holds.
             const RAMP_UP_GOODPUT_PEAK_CEILING_MULT: f64 = 1.3;
             let target = if self.goodput_peak_bps > 0.0 {
                 let gp_ceiling =
                     (self.goodput_peak_bps * RAMP_UP_GOODPUT_PEAK_CEILING_MULT / 1000.0) as u32;
-                target.min(gp_ceiling)
+                target.min(gp_ceiling).max(current)
             } else {
                 target
             };
@@ -2278,6 +2305,70 @@ mod tests {
 
     // ─── ReceiverFeedback ─────────────────────────────────────────────
 
+    /// A static scene makes the encoder undershoot its target; delivered
+    /// goodput then tracks the *offered* rate, not the target. That must not
+    /// read as a network shortfall (2026-07-11 field stream: gp 520 kbps vs
+    /// target 1000 kbps with zero loss latched `reduce=true` for 80+ s and
+    /// pinned the stream at the floor).
+    #[test]
+    fn feedback_undershooting_encoder_is_not_a_shortfall() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_bitrate_kbps: 1_000,
+            min_interval: Duration::ZERO,
+            congestion_sustain: Duration::ZERO,
+            ..Default::default()
+        });
+        let links = make_links(&[(10_000.0, true)]);
+        // Let the capacity path settle to its headroom equilibrium first so
+        // the undershoot phase measures feedback behavior, not the initial
+        // capacity clamp.
+        for _ in 0..5 {
+            adapter.update(&links);
+        }
+        let baseline = adapter.current_target_kbps();
+
+        // Encoder produces only ~500 kbps (static scene); the network
+        // delivers all of it. Healthy channel, no loss, no lateness.
+        let undershoot = ReceiverFeedback {
+            offered_bps: 520_000,
+            goodput_bps: 510_000,
+            fec_repair_rate: 0.0,
+            jitter_buffer_ms: 50,
+            loss_after_fec: 0.0,
+            late_rate: 0.0,
+        };
+        for _ in 0..12 {
+            adapter.update_with_feedback(&links, &undershoot);
+        }
+        assert!(
+            adapter.current_target_kbps() >= baseline,
+            "undershooting encoder on a clean channel must not cut: {} -> {}",
+            baseline,
+            adapter.current_target_kbps()
+        );
+
+        // Same goodput, but the encoder DID offer the full target and the
+        // network failed to deliver it — that is a genuine shortfall.
+        let congested = ReceiverFeedback {
+            offered_bps: (adapter.current_target_kbps() as u64) * 1000,
+            goodput_bps: 510_000,
+            fec_repair_rate: 0.0,
+            jitter_buffer_ms: 50,
+            loss_after_fec: 0.0,
+            late_rate: 0.0,
+        };
+        let before = adapter.current_target_kbps();
+        for _ in 0..12 {
+            adapter.update_with_feedback(&links, &congested);
+        }
+        assert!(
+            adapter.current_target_kbps() < before,
+            "true delivery shortfall must still cut: stuck at {}",
+            adapter.current_target_kbps()
+        );
+    }
+
     #[test]
     fn feedback_high_loss_forces_ramp_down() {
         let mut adapter = BitrateAdapter::new(AdaptationConfig {
@@ -2293,6 +2384,7 @@ mod tests {
         // Establish a high baseline with healthy feedback so the adapter ramps
         // up well above the loss-constrained ceiling we're about to trigger.
         let healthy = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 6_000_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 50,
@@ -2308,6 +2400,7 @@ mod tests {
         // loss_after_fec 0.60.  burst-loss (>0.35) plus the goodput shortfall
         // against the high baseline both drive the cut.
         let bad = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 500_000, // 500 kbps — severely degraded
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
@@ -2340,6 +2433,7 @@ mod tests {
         let target_after_prime = adapter.current_target_kbps();
 
         let feedback = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 8_000_000,
             fec_repair_rate: 0.01,
             jitter_buffer_ms: 50,
@@ -2369,6 +2463,7 @@ mod tests {
         adapter.update(&links); // prime
 
         let feedback = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 8_000_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 1000,
@@ -2404,6 +2499,7 @@ mod tests {
         };
         let links = make_links(&[(10_000.0, true)]); // clean channel: loss_rate 0.0
         let feedback = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 8_000_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 150,
@@ -2462,6 +2558,7 @@ mod tests {
         for _ in 0..6 {
             jitter_ms += 200;
             let feedback = ReceiverFeedback {
+                offered_bps: 0,
                 goodput_bps: 8_000_000, // healthy, well above target — no goodput shortfall
                 fec_repair_rate: 0.0,
                 jitter_buffer_ms: jitter_ms,
@@ -2499,6 +2596,7 @@ mod tests {
         let start = adapter.current_target_kbps();
 
         let feedback = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 8_000_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 300,
@@ -2560,6 +2658,7 @@ mod tests {
 
         // Healthy priming: adapter ramps freely.
         let healthy = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 8_000_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 50,
@@ -2580,6 +2679,7 @@ mod tests {
         adapter.update_with_feedback(
             &links,
             &ReceiverFeedback {
+                offered_bps: 0,
                 goodput_bps: 8_000_000,
                 fec_repair_rate: 0.0,
                 jitter_buffer_ms: jitter,
@@ -2596,6 +2696,7 @@ mod tests {
             adapter.update_with_feedback(
                 &links,
                 &ReceiverFeedback {
+                    offered_bps: 0,
                     goodput_bps: 8_000_000,
                     fec_repair_rate: 0.0,
                     jitter_buffer_ms: jitter,
@@ -2775,6 +2876,7 @@ mod tests {
 
         // Stall period: goodput=0, loss=1.0 (reorder buffer blocked)
         let stall_fb = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 0,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
@@ -2795,6 +2897,7 @@ mod tests {
 
         // Recovery: goodput=1Mbps, loss=0.0
         let recover_fb = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 1_000_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
@@ -2832,6 +2935,7 @@ mod tests {
         // loss_after_fec = 0.10 with goodput at the full 2 Mbps target:
         // no shortfall, no burst, no melt → no cut.
         let feedback = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 2_000_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
@@ -2873,6 +2977,7 @@ mod tests {
         // Healthy goodput at the target, but a high post-FEC residual (a
         // reorder/late artifact, not channel loss).
         let feedback = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 2_000_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
@@ -2919,6 +3024,7 @@ mod tests {
         // offered rate (delivery is fine — the "loss" is late/reordered).
         // jitter held flat/low so delay_pressure can't confound the burst path.
         let reorder_spike = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 5_000_000, // >> 2 Mbps target — no real collapse
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
@@ -3107,6 +3213,7 @@ mod tests {
         ];
 
         let feedback = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 3_500_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 120,
@@ -3165,6 +3272,7 @@ mod tests {
         ];
 
         let feedback = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 1_950_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
@@ -3198,6 +3306,7 @@ mod tests {
 
         // Phase 1: Stable operation at 1200kbps
         let stable_fb = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 1_200_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
@@ -3211,6 +3320,7 @@ mod tests {
 
         // Phase 2: Stall (gp=0, loss=1.0 for 5 ticks)
         let stall_fb = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 0,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
@@ -3231,6 +3341,7 @@ mod tests {
 
         // Phase 3: Recovery (gp=800kbps, loss=0.0)
         let recover_fb = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 800_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
@@ -3264,6 +3375,7 @@ mod tests {
 
         // Seed EWMA goodput first with a normal reading
         let seed_fb = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 5_000_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
@@ -3274,6 +3386,7 @@ mod tests {
 
         // Now provide very low goodput (well below 70% of target) with zero loss
         let low_gp_fb = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 1_000_000, // 20% of target — below 70% threshold
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
@@ -3318,6 +3431,7 @@ mod tests {
 
         // Seed EWMA goodput with a good reading so we can observe changes
         let seed = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 1_200_000,
             jitter_buffer_ms: 100,
             loss_after_fec: 0.02,
@@ -3336,6 +3450,7 @@ mod tests {
         for cycle in 0..20 {
             // Stall phase: gp=0 → EWMA should NOT update
             let stall = ReceiverFeedback {
+                offered_bps: 0,
                 goodput_bps: 0,
                 jitter_buffer_ms: 1500,
                 loss_after_fec: 1.0,
@@ -3347,6 +3462,7 @@ mod tests {
 
             // Unstall phase: gp>0 → EWMA WILL update with high loss
             let unstall = ReceiverFeedback {
+                offered_bps: 0,
                 goodput_bps: 300_000, // Some delivery, but low
                 jitter_buffer_ms: 1800,
                 loss_after_fec: 0.9, // Most packets expired during stall
@@ -3367,6 +3483,7 @@ mod tests {
 
         // After 20 cycles of this, feed 10 ticks of clean recovery.
         let clean = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 1_000_000,
             jitter_buffer_ms: 200,
             loss_after_fec: 0.0,
@@ -3410,6 +3527,7 @@ mod tests {
         // Simulate a scenario where true sustainable capacity is ~2000 kbps
         // but loss is high due to one degraded link.
         let degraded = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 2_000_000,
             jitter_buffer_ms: 800,
             loss_after_fec: 0.3, // 30% residual loss
@@ -3475,6 +3593,7 @@ mod tests {
         for _ in 0..20 {
             // Mostly stalled
             let stalled = ReceiverFeedback {
+                offered_bps: 0,
                 goodput_bps: 0,
                 jitter_buffer_ms: 1999,
                 loss_after_fec: 1.0,
@@ -3487,6 +3606,7 @@ mod tests {
 
             // Brief goodput blip
             let blip = ReceiverFeedback {
+                offered_bps: 0,
                 goodput_bps: 500_000,
                 jitter_buffer_ms: 1999,
                 loss_after_fec: 0.95,
@@ -3524,6 +3644,7 @@ mod tests {
 
         // Ramp up to set last_increase_time (triggers grace period)
         let good = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 1_000_000,
             jitter_buffer_ms: 100,
             loss_after_fec: 0.0,
@@ -3537,6 +3658,7 @@ mod tests {
         // signal that penetrates grace today — this tests the existing
         // bufferbloat bypass)
         let severe = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 200_000,
             jitter_buffer_ms: 4000, // Severe bufferbloat
             loss_after_fec: 0.95,
@@ -3583,6 +3705,7 @@ mod tests {
         }];
 
         let feedback = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 2_500_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 2_500,
@@ -3621,6 +3744,7 @@ mod tests {
 
         // Poison EWMA high: feed loss=0.8 with valid goodput for several ticks
         let high_loss = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 500_000,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
@@ -3638,6 +3762,7 @@ mod tests {
 
         // Now simulate zero-goodput stall — EWMA should decay
         let stall = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 0,
             fec_repair_rate: 0.0,
             jitter_buffer_ms: 100,
@@ -3730,6 +3855,7 @@ mod tests {
         adapter.update(&links); // prime
 
         let feedback = ReceiverFeedback {
+            offered_bps: 0,
             goodput_bps: 1_000_000,
             jitter_buffer_ms: 50,
             loss_after_fec: 0.0,
