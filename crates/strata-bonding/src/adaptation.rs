@@ -1161,10 +1161,20 @@ impl BitrateAdapter {
         // Shared with `goodput_shortfall` below (§1b: same "70% of offered
         // rate" ratio, two different signals — instantaneous here, EWMA there).
         const GOODPUT_SHORTFALL_RATIO: f64 = 0.7;
+        // "Offered rate" for every delivered-vs-offered comparison this tick:
+        // the pre-update target capped at what the encoder actually produced
+        // (`offered_bps`, 0 = unknown). An undershooting encoder (static
+        // scene) delivers ≈ its own output, far below target — without the
+        // cap that reads as a delivery collapse and re-arms the very cuts the
+        // goodput conjuncts exist to suppress.
+        let expected_bps = if feedback.offered_bps > 0 {
+            (target_before_update as f64 * 1000.0).min(feedback.offered_bps as f64)
+        } else {
+            target_before_update as f64 * 1000.0
+        };
         let burst_loss = feedback.loss_after_fec > BURST_LOSS_AFTER_FEC_THRESHOLD
             && feedback.goodput_bps > 0
-            && (feedback.goodput_bps as f64)
-                < target_before_update as f64 * 1000.0 * GOODPUT_SHORTFALL_RATIO;
+            && (feedback.goodput_bps as f64) < expected_bps * GOODPUT_SHORTFALL_RATIO;
         // Treat sustained post-FEC loss >50% with queue growth as an emergency.
         // This allows an additional same-tick reduction even if capacity-path
         // logic already cut once.
@@ -1291,17 +1301,11 @@ impl BitrateAdapter {
             }
         }
 
-        // Compare smoothed goodput against the PRE-update target since goodput
-        // lags the encoder rate by at least one RTT — capped at what the
-        // encoder actually put out (`offered_bps`): a shortfall is only a
-        // network signal when the network was given the bytes and failed to
-        // deliver them. Without the cap, a static-scene encoder undershooting
-        // its target reads as a permanent shortfall.
-        let expected_bps = if feedback.offered_bps > 0 {
-            (target_before_update as f64 * 1000.0).min(feedback.offered_bps as f64)
-        } else {
-            target_before_update as f64 * 1000.0
-        };
+        // Compare smoothed goodput against `expected_bps` (pre-update target
+        // capped at the encoder's actual output, computed above): a shortfall
+        // is only a network signal when the network was given the bytes and
+        // failed to deliver them. Goodput lags the encoder rate by at least
+        // one RTT, hence the PRE-update target.
         let goodput_shortfall = self.ewma_goodput_bps > 0.0
             && self.ewma_goodput_bps < expected_bps * GOODPUT_SHORTFALL_RATIO;
         // A *severe* shortfall (delivering < 50% of the pre-update rate) is the
