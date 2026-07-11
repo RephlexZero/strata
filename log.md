@@ -1100,3 +1100,60 @@ Monotonic-DTS gate goes quiet following a loss burst (gate had been
 dropping "non-credible" buffers right before each stall). The rebuild
 resilience works but costs a ~20 s outage each time; the audio-gate
 wedge is the next thing to chase if rebuild frequency stays this high.
+
+## 2026-07-11 — stall/artifact storm root-caused: the capacity chain measured itself
+
+User field stream (post media-sequence fix): video on YouTube but
+constant stutter and artifacting. Receiver was splicing ~1/s (158 clean-
+IDR resumes in 15 min, watchdog rebuild every few minutes); sender AQM
+shed ~20% of ALL sent packets (100k+ per link over 21 min, incl. 4.9k
+retransmissions — unrecoverable holes), paced queue pinned at its byte
+cap, 29% of packets arriving past the playout deadline. The trap, in
+three parts, all "the system measuring its own output and calling it
+capacity":
+
+1. **`is_app_limited` hardcoded `false`** at the ACK-rate sample site
+   (transport.rs) — BBR's btl_bw (p75 of delivery rate) converged onto
+   our own send rate (btl_bw 664-714 kbps on links proven at 2400-2900),
+   so pacing ≈ inflow and every IDR burst stood in the queue forever;
+   the capacity chain (oracle→btl_bw→ack fallback) tracked inflow, so
+   pressure ≈ 1 and the adapter floor-locked or sawtoothed (40 cuts
+   >15% in 7 min). Fixed in 54d9d14: a sample is app-limited iff the
+   pacer observed the paced queue empty inside the sample interval;
+   backlogged samples still pull btl_bw down (no survivor-bias ratchet,
+   which is why `false` had been hardcoded).
+2. **Audio Monotonic-DTS gate could starve unboundedly** → hlssink3
+   waits to interleave → 15 s egress watchdog rebuild (~20 s outage
+   each). Fixed in 54d9d14: audio forward-step cap 10 s → 4 s (legit
+   gap-skips ≤ 3 s), plus bounded re-latch onto a ≥1 s self-consistent
+   wild-forward run (≤30 s ahead; forward-only, muxer-safe). Unit-tested
+   state machine (`AudioGate`).
+3. **Delivery signals judged against the encoder TARGET, not what the
+   encoder actually produced** — a static scene undershoots 2-3×, so
+   goodput ≈ offered « target read as permanent congestion
+   (`reduce=true` latched 80+ s at zero loss), and the ramp-up step's
+   1.3×-peak-goodput ceiling could sit BELOW current and turn a ramp
+   tick into a cut to the floor ("Recovery" 7000→1000, observed live).
+   Fixed in 40ea7e1: new `ReceiverFeedback::offered_bps` (sink's
+   measured encoder+mux egress); shortfalls compare against
+   min(target, offered); goodput-ceiling clamp only fires when
+   delivered < offered; ramp cap never below current.
+
+Verification (test-pattern stream, both fixes deployed, 9 min soak):
+0 AQM drops, 0 receiver splices, 0 watchdog rebuilds, 0 audio-gate
+events, 0 cuts across 534 ticks. Target correctly held at 1000 kbps
+because the SMPTE pattern only fills ~360 kbps — under-target hold is
+now deliberate, not a latch. The climb-under-load path needs a real
+camera scene with motion to demonstrate; invariants (no false cuts, no
+self-shed) are what the fixes guarantee. Deployed as an on-disk swap of
+strata-pipeline on both boxes (rollback:
+`/root/rollback-20260711-applimited/`); Pi RUST_LOG restored to info.
+
+Ruled out along the way: HiLink probe as stall trigger (probe load
+unchanged by 6f26c0e), orphaned sender pipelines (lifecycle log is
+clean), codec/packaging (segments decode clean).
+
+Watch next stream for: encoder climbing past 2.5 Mbps on real content,
+btl_bw discovering capacity above inflow (probe-gain samples), and
+whether the 1.3× goodput ceiling makes the climb feel slow (~30%/tick
+compounding — acceptable; revisit only with field evidence).

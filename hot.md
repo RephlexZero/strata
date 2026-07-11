@@ -5,16 +5,29 @@
 
 ## Current focus
 
-**2026-07-11 (later): YouTube no-video root-caused during the first
-field stream** — hlssink3 omits `#EXT-X-MEDIA-SEQUENCE` until its window
-slides, so early-generation playlists uploaded as implicit sequence 0 on
-every watchdog rebuild; the 61f36a6 rewrite only replaced an existing
-tag. Fixed (225c797, tag inserted when absent) and hot-swapped onto
-Hetzner (`/root/rollback-20260711-hlsfix/`) — **takes effect on the next
-stream start; retest YouTube**. Codec theory is dead: segments are
-closed-GOP HEVC+AAC, decode clean, all PUTs 2xx. Open issue: watchdog
-rebuilds every few minutes (audio Monotonic-DTS gate wedges after loss
-bursts → hlssink3 stalls on interleave → 15 s timeout) — see log.md.
+**2026-07-11 (evening): the stall/artifact storm is root-caused and
+fixed — the capacity chain was measuring its own output.** Three fixes,
+all deployed to both boxes (54d9d14 + 40ea7e1, rollback
+`/root/rollback-20260711-applimited/`): (1) `is_app_limited` was
+hardcoded false → btl_bw/pacing converged onto our own send rate →
+standing paced queue, ~20% self-shed, 29% late; now sampled honestly
+from paced-queue-empty observations. (2) Audio DTS-gate starvation
+(the 15 s watchdog rebuilds) now bounded: 4 s audio forward cap +
+re-latch onto a sustained consistent forward timeline. (3) Delivery
+signals now judge the network against `offered_bps` (actual encoder
+egress), not the target — static-scene undershoot no longer reads as
+congestion, and the ramp's goodput ceiling can't cut below current.
+Verified on a 9-min test-pattern stream: 0 AQM drops, 0 splices,
+0 rebuilds, 0 cuts (was: 158 splices/15 min, 40 cuts/7 min).
+**Next field action: a real camera stream with motion** — confirm the
+encoder climbs past 2.5 Mbps on real content and YouTube stays clean
+(media-sequence fix 225c797 is also live; video confirmed showing).
+
+**2026-07-11 (midday): YouTube no-video root-caused** — hlssink3 omits
+`#EXT-X-MEDIA-SEQUENCE` until its window slides; uploaded playlists
+reset to implicit 0 on every rebuild. Fixed (225c797) and deployed;
+user confirmed video now shows. Codec theory dead (closed-GOP HEVC+AAC,
+segments decode clean).
 
 **2026-07-11: ALL OF THE BELOW IS DEPLOYED** (both boxes, log.md
 2026-07-11 deploy entry; rollback in `/root/rollback-20260711/` on each
