@@ -1157,3 +1157,38 @@ Watch next stream for: encoder climbing past 2.5 Mbps on real content,
 btl_bw discovering capacity above inflow (probe-gain samples), and
 whether the 1.3× goodput ceiling makes the climb feel slow (~30%/tick
 compounding — acceptable; revisit only with field evidence).
+
+## 2026-07-11 (late evening) — YouTube blank again on the fixed pipeline; ingest verified end-to-end; discriminator pushed
+
+User's evening camera stream (fixed binaries, encoder happily at
+~4.3 Mbps — the ramp works on real content): dashboard fine, YouTube
+"seeing nothing". Verified on the live box, in order: uploader thread
+alive and watching; persistent HTTPS connection to Google with
+bytes_acked advancing ~2.3 Mbps (uploads genuinely flowing); zero
+non-2xx PUT logs (every completed PUT accepted); segments healthy
+muxed HEVC(Main, closed-GOP)+AAC; playlist monotonic with the inserted
+MEDIA-SEQUENCE. Strata's egress is provably reaching YouTube and being
+accepted — whatever is wrong is on the interpretation side (packaging
+details vs ffmpeg reference: we use VERSION:3 / TARGETDURATION:1 /
+~1 s segments / EXT-X-DISCONTINUITY(+SEQUENCE) after rebuilds; ffmpeg
+emits VERSION:6 / TARGETDURATION:2 / exact-2 s segments / none) — or
+YouTube-side broadcast/session state (Studio possibly showing an
+already-ended broadcast; midday video DID show with byte-identical
+upload code).
+
+Ran the long-queued libx265 discriminator against the same ingest URL
+(user's stream stopped for the window): pre-encoded 60 s
+640x360 HEVC+AAC TS (the ARM box can't do realtime x265 — 3.7 fps at
+720p; first attempt 22:15–22:20 UTC delivered only ~37 s of media),
+then loop-pushed it in realtime with -c copy **22:23:58–22:27:59 UTC**.
+No upload errors. **Check Studio history for the moving test pattern in
+that window**: pattern visible ⇒ ingest+HEVC fine, delta is Strata's
+playlist/mux details (likely candidates above); nothing ⇒ ingest
+session/broadcast state, not packaging — recheck with a fresh
+"Go Live" in Studio.
+
+Also fixed while investigating (a61feb8, deployed 316797b2 to both
+boxes): burst_loss's goodput conjunct still compared against the
+target — the one delivered-vs-offered site 40ea7e1 missed; an
+undershooting encoder would have lost its reorder-spike protection.
+User's camera stream restarted on the new binary afterwards.
