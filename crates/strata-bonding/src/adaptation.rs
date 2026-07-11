@@ -225,6 +225,13 @@ const EMERGENCY_FLOOR_KBPS: u32 = 300;
 /// `stats_interval_ms` coupling caveat.
 const FLOOR_YIELD_TICKS: u32 = 3;
 
+/// Cap on rate the links haven't proven: ramp-up steps and the FEC spare
+/// budget both trust delivered goodput only up to this multiple of the
+/// windowed peak — sender-side capacity estimates are optimistic on lossy
+/// LTE (PPD over-read, ACK-batch btl_bw inflation); real throughput is
+/// what matters.
+const RAMP_UP_GOODPUT_PEAK_CEILING_MULT: f64 = 1.3;
+
 /// A single link is clearly melting down: high loss AND a deep ARQ queue.
 /// The loss-weighted aggregate can mask this behind a healthy sibling link,
 /// so callers check per-link rather than relying on the aggregate alone.
@@ -912,7 +919,15 @@ impl BitrateAdapter {
         const AT_CEILING_FRACTION: f64 = 0.80;
         let at_ceiling = self.current_target_kbps as f64
             >= self.config.max_bitrate_kbps as f64 * AT_CEILING_FRACTION;
-        let big_spare = usable_kbps
+        // Judge spare against delivery-proven capacity, not the raw estimate
+        // (see the spare_bw_kbps cap below) — phantom estimate headroom must
+        // not latch MaxReliability's 50% FEC ceiling.
+        let proven_usable_kbps = if self.goodput_peak_bps > 0.0 {
+            usable_kbps.min(self.goodput_peak_bps * RAMP_UP_GOODPUT_PEAK_CEILING_MULT / 1000.0)
+        } else {
+            usable_kbps
+        };
+        let big_spare = proven_usable_kbps
             > (self.current_target_kbps + self.config.reliability_spare_threshold_kbps) as f64;
 
         // Hysteresis gap back to MaxQuality: revert only once usable capacity
@@ -922,8 +937,13 @@ impl BitrateAdapter {
         const QUALITY_CAP_HYSTERESIS_MULT: f64 = 1.2;
         if at_ceiling && big_spare {
             self.mode = ReliabilityMode::MaxReliability;
-        } else if usable_kbps < self.config.quality_cap_kbps as f64 * QUALITY_CAP_HYSTERESIS_MULT {
-            // Not enough capacity to even reach the quality cap with spare
+        } else if proven_usable_kbps
+            < self.config.quality_cap_kbps as f64 * QUALITY_CAP_HYSTERESIS_MULT
+        {
+            // Not enough (delivery-proven) capacity to even reach the quality
+            // cap with spare. Judged on the proven value so a latch acquired
+            // before goodput evidence existed (first ticks: peak = 0, no cap)
+            // releases once delivery shows the estimate was phantom.
             self.mode = ReliabilityMode::MaxQuality;
         }
 
@@ -961,11 +981,26 @@ impl BitrateAdapter {
         // (see `apply_startup_ramp` doc). No-op once warmed / when disabled.
         let new_target = self.apply_startup_ramp(new_target);
 
-        // Track spare bandwidth
-        self.spare_bw_kbps = if usable_kbps > new_target as f64 {
-            (usable_kbps - new_target as f64) as u32
-        } else {
-            0
+        // Track spare bandwidth. Capacity estimates can run hot (the PPD
+        // oracle over-reads bursty LTE; ACK-batch floods inflate btl_bw past
+        // the radio — 2026-07-11 22:48 field burst: links claimed 4.4+6.2
+        // Mbps while the receiver measured ~3+3), and FEC sizes its overhead
+        // from this spare, so phantom headroom becomes real parity bytes on
+        // the wire. Cap the spare so target + spare never exceeds the same
+        // 1.3× peak-goodput ceiling the ramp trusts: headroom must be proven
+        // by delivery, not just estimated. This also keeps the inflated
+        // estimate from latching MaxReliability mode (its 50% overhead
+        // ceiling) off phantom spare.
+        self.spare_bw_kbps = {
+            let est_spare = (usable_kbps - new_target as f64).max(0.0);
+            let capped = if self.goodput_peak_bps > 0.0 {
+                let proven_wire_ceiling_kbps =
+                    self.goodput_peak_bps * RAMP_UP_GOODPUT_PEAK_CEILING_MULT / 1000.0;
+                est_spare.min((proven_wire_ceiling_kbps - new_target as f64).max(0.0))
+            } else {
+                est_spare
+            };
+            capped as u32
         };
 
         // Only issue command if target changed meaningfully and enough time passed.
@@ -1603,16 +1638,14 @@ impl BitrateAdapter {
             let safe_ceiling =
                 (usable_kbps * (self.config.pressure_threshold - RAMP_UP_HYSTERESIS_GAP)) as u32;
             let target = target.min(safe_ceiling);
-            // Cap ramp-up to 1.3x peak goodput — sender-side capacity is
-            // optimistic on lossy links; real throughput is what matters.
-            // Using the peak (not EWMA) avoids the post-burst ceiling trap.
-            // The cap bounds the INCREASE only — never below `current`. Peak
-            // goodput is itself bounded by what the encoder offered, so on a
-            // static scene (encoder undershooting its target) this ceiling
-            // sits below the current target, and letting it drag the step
-            // down turned a "ramp-up" tick into an instant cut to the floor.
+            // Cap ramp-up to 1.3x peak goodput (module const) — using the
+            // peak (not EWMA) avoids the post-burst ceiling trap. The cap
+            // bounds the INCREASE only — never below `current`. Peak goodput
+            // is itself bounded by what the encoder offered, so on a static
+            // scene (encoder undershooting its target) this ceiling sits
+            // below the current target, and letting it drag the step down
+            // turned a "ramp-up" tick into an instant cut to the floor.
             // Cutting is the shortfall/clamp paths' job; a ramp step holds.
-            const RAMP_UP_GOODPUT_PEAK_CEILING_MULT: f64 = 1.3;
             let target = if self.goodput_peak_bps > 0.0 {
                 let gp_ceiling =
                     (self.goodput_peak_bps * RAMP_UP_GOODPUT_PEAK_CEILING_MULT / 1000.0) as u32;
@@ -2308,6 +2341,52 @@ mod tests {
     }
 
     // ─── ReceiverFeedback ─────────────────────────────────────────────
+
+    /// Capacity estimates can run far above what the links have ever
+    /// delivered (PPD over-read, ACK-batch btl_bw inflation — 2026-07-11
+    /// 22:48 field burst). Phantom headroom must not size FEC spare or latch
+    /// MaxReliability's 50% overhead ceiling: the wire budget is bounded by
+    /// proven goodput.
+    #[test]
+    fn phantom_capacity_cannot_inflate_fec_spare_or_latch_max_reliability() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 6_000,
+            min_bitrate_kbps: 1_000,
+            min_interval: Duration::ZERO,
+            congestion_sustain: Duration::ZERO,
+            ..Default::default()
+        });
+        // Links CLAIM 14 Mbps aggregate, but delivery has only ever proven
+        // ~4.5 Mbps of goodput.
+        let links = make_links(&[(7_000.0, true), (7_000.0, true)]);
+        let feedback = ReceiverFeedback {
+            offered_bps: 5_000_000,
+            goodput_bps: 4_500_000,
+            fec_repair_rate: 0.0,
+            jitter_buffer_ms: 50,
+            loss_after_fec: 0.0,
+            late_rate: 0.0,
+        };
+        for _ in 0..30 {
+            adapter.update_with_feedback(&links, &feedback);
+        }
+        let target = adapter.current_target_kbps();
+        let proven_ceiling = (4_500.0 * RAMP_UP_GOODPUT_PEAK_CEILING_MULT) as u32;
+        let allowed_spare = proven_ceiling.saturating_sub(target);
+        assert!(
+            adapter.spare_bw_kbps() <= allowed_spare + 100,
+            "spare {} must fit under the proven goodput ceiling {} (target {}), \
+             not the phantom estimate",
+            adapter.spare_bw_kbps(),
+            proven_ceiling,
+            target
+        );
+        assert_eq!(
+            adapter.mode(),
+            ReliabilityMode::MaxQuality,
+            "phantom spare must not latch MaxReliability"
+        );
+    }
 
     /// A static scene makes the encoder undershoot its target; delivered
     /// goodput then tracks the *offered* rate, not the target. That must not

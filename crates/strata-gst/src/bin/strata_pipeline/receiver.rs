@@ -341,11 +341,27 @@ pub(crate) fn run_receiver(args: &ReceiverArgs) -> Result<(), Box<dyn std::error
         // HLS re-mux egress: install the DeliveredStream gate on the parsed
         // video and disable mpegtsmux skew correction so it preserves our
         // timestamps.
+        //
+        // Arrival stamps for the audio-wedge fast path: a severe loss burst
+        // can wedge the demux/parse AUDIO branch while video keeps flowing
+        // (2026-07-11 22:48 field stream: audio PES latch after a gap-skip
+        // flood — q_v full, q_a empty, muxer starving on interleave until the
+        // 15 s segment watchdog fired; YouTube read the ~20 s outage as the
+        // stream dropping). Stamping raw buffer arrivals at each parse output
+        // lets the watchdog distinguish "audio dead, video alive" and rebuild
+        // in seconds instead.
+        let audio_arrival: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let video_arrival: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         if use_hls_relay {
             if let Some(vparse) = pipeline.by_name("vparse")
                 && let Some(src) = vparse.static_pad("src")
             {
                 install_delivered_stream_gate(&src, pending_resumes.clone());
+                let stamp = video_arrival.clone();
+                src.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                    *stamp.lock().unwrap() = Some(Instant::now());
+                    gst::PadProbeReturn::Ok
+                });
                 eprintln!("DeliveredStream gate installed on vparse src pad");
             }
             // Audio rides a monotonic-DTS-only gate (see pipeline comment): mpegtsmux
@@ -355,6 +371,11 @@ pub(crate) fn run_receiver(args: &ReceiverArgs) -> Result<(), Box<dyn std::error
                 && let Some(src) = aparse.static_pad("src")
             {
                 install_monotonic_dts_gate(&src);
+                let stamp = audio_arrival.clone();
+                src.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                    *stamp.lock().unwrap() = Some(Instant::now());
+                    gst::PadProbeReturn::Ok
+                });
                 eprintln!("Monotonic-DTS gate installed on aparse src pad");
             }
             if let Some(hls) = pipeline.by_name("hls") {
@@ -577,6 +598,31 @@ pub(crate) fn run_receiver(args: &ReceiverArgs) -> Result<(), Box<dyn std::error
             if let Some(allowance) = stall_allowance
                 && last_progress.elapsed() >= allowance
             {
+                stalled = true;
+                break;
+            }
+            // Audio-wedge fast path: audio flowed this generation, then went
+            // silent for 5 s while video is still arriving — the audio
+            // demux/parse branch is wedged and the muxer is starving on
+            // interleave. Segments will stop shortly; rebuilding now cuts the
+            // dead-air from 15-30 s (segment watchdog) to ~5 s. Gated on
+            // audio having been seen once so an audio-less stream can't loop
+            // rebuilds, and on video actually flowing so a total transport
+            // outage stays the segment watchdog's call.
+            const AUDIO_WEDGE_REBUILD: Duration = Duration::from_secs(5);
+            const VIDEO_FLOWING_WINDOW: Duration = Duration::from_secs(2);
+            if use_hls_relay
+                && let (Some(audio), Some(video)) = (
+                    *audio_arrival.lock().unwrap(),
+                    *video_arrival.lock().unwrap(),
+                )
+                && video.elapsed() < VIDEO_FLOWING_WINDOW
+                && audio.elapsed() >= AUDIO_WEDGE_REBUILD
+            {
+                eprintln!(
+                    "egress-watchdog: audio silent for {} ms while video flows — audio branch wedged, rebuilding early",
+                    audio.elapsed().as_millis()
+                );
                 stalled = true;
                 break;
             }
