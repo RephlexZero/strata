@@ -394,6 +394,11 @@ struct MediaSequenceState {
 /// forward jump this leaves at a rebuild is spec-legal (clients treat skipped
 /// numbers as missed segments), and the first segment of each generation is
 /// already tagged `#EXT-X-DISCONTINUITY` via `discontinuous_segments`.
+///
+/// hlssink3 omits the tag entirely until segments roll off its window, which
+/// an ingest server reads as an implicit sequence of 0 — a backwards jump on
+/// every rebuild (YouTube requires the tag and monotonic increase). When the
+/// tag is missing it is inserted before the first `#EXTINF`.
 fn rewrite_media_sequence(text: &str, state: &mut MediaSequenceState) -> String {
     let uris: Vec<&str> = text
         .lines()
@@ -418,14 +423,22 @@ fn rewrite_media_sequence(text: &str, state: &mut MediaSequenceState) -> String 
     let window: HashSet<&str> = uris.iter().copied().collect();
     state.assigned.retain(|name, _| window.contains(name.as_str()));
 
-    let mut out = String::with_capacity(text.len() + 16);
+    let has_tag = text
+        .lines()
+        .any(|l| l.starts_with("#EXT-X-MEDIA-SEQUENCE:"));
+    let mut out = String::with_capacity(text.len() + 40);
+    let mut inserted = false;
     for line in text.lines() {
         if line.starts_with("#EXT-X-MEDIA-SEQUENCE:") {
             out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{first_seq}\n"));
-        } else {
-            out.push_str(line);
-            out.push('\n');
+            continue;
         }
+        if !has_tag && !inserted && line.starts_with("#EXTINF:") {
+            out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{first_seq}\n"));
+            inserted = true;
+        }
+        out.push_str(line);
+        out.push('\n');
     }
     out
 }
@@ -823,6 +836,40 @@ mod tests {
         let p3 = playlist_with_sequence(1, &["seg-g0001-00001.ts", "seg-g0001-00002.ts"]);
         let out = rewrite_media_sequence(&p3, &mut state);
         assert!(out.contains("#EXT-X-MEDIA-SEQUENCE:7"), "got:\n{out}");
+    }
+
+    fn playlist_without_sequence(segments: &[&str]) -> String {
+        let mut p = String::from("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n");
+        for seg in segments {
+            p.push_str("#EXTINF:1.000,\n");
+            p.push_str(seg);
+            p.push('\n');
+        }
+        p
+    }
+
+    /// hlssink3 omits `#EXT-X-MEDIA-SEQUENCE` until its window slides, which
+    /// reads as an implicit 0 — the tag must be inserted, both on the very
+    /// first playlist (YouTube requires it) and after a rebuild (where the
+    /// implicit 0 is a backwards jump).
+    #[test]
+    fn media_sequence_tag_inserted_when_missing() {
+        let mut state = MediaSequenceState::default();
+        let p1 = playlist_without_sequence(&["seg-g0000-00000.ts"]);
+        let out = rewrite_media_sequence(&p1, &mut state);
+        let lines: Vec<&str> = out.lines().collect();
+        let extinf_idx = lines.iter().position(|l| l.starts_with("#EXTINF")).unwrap();
+        assert_eq!(lines[extinf_idx - 1], "#EXT-X-MEDIA-SEQUENCE:0", "got:\n{out}");
+
+        // Window slides, tag appears; numbering must agree with hlssink3.
+        let p2 = playlist_with_sequence(1, &["seg-g0000-00001.ts", "seg-g0000-00002.ts"]);
+        assert_eq!(rewrite_media_sequence(&p2, &mut state), p2);
+
+        // Rebuild: fresh generation with no tag must continue, not reset to 0.
+        let p3 = playlist_without_sequence(&["seg-g0001-00000.ts"]);
+        let out = rewrite_media_sequence(&p3, &mut state);
+        assert!(out.contains("#EXT-X-MEDIA-SEQUENCE:3"), "got:\n{out}");
+        assert!(!out.contains("#EXT-X-MEDIA-SEQUENCE:0"));
     }
 
     #[test]
