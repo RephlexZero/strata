@@ -5,12 +5,20 @@
 
 ## Current focus
 
+**2026-07-11 (later): YouTube no-video root-caused during the first
+field stream** — hlssink3 omits `#EXT-X-MEDIA-SEQUENCE` until its window
+slides, so early-generation playlists uploaded as implicit sequence 0 on
+every watchdog rebuild; the 61f36a6 rewrite only replaced an existing
+tag. Fixed (225c797, tag inserted when absent) and hot-swapped onto
+Hetzner (`/root/rollback-20260711-hlsfix/`) — **takes effect on the next
+stream start; retest YouTube**. Codec theory is dead: segments are
+closed-GOP HEVC+AAC, decode clean, all PUTs 2xx. Open issue: watchdog
+rebuilds every few minutes (audio Monotonic-DTS gate wedges after loss
+bursts → hlssink3 stalls on interleave → 15 s timeout) — see log.md.
+
 **2026-07-11: ALL OF THE BELOW IS DEPLOYED** (both boxes, log.md
 2026-07-11 deploy entry; rollback in `/root/rollback-20260711/` on each
-box). Remaining next field action: **the libx265 discriminator test**
-(ffmpeg push to the YouTube ingest URL — decides HEVC-vs-discontinuity-
-tags; the media-sequence fix now deployed may itself change the
-outcome, so retest Strata's own output too).
+box).
 
 **2026-07-10: three of the post-livestream improvements implemented.** (1) **Floor-yield in the adapter** — the 2026-07-05
 collapse mode (min_bitrate pinned above deliverable capacity → AQM

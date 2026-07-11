@@ -1072,3 +1072,31 @@ on persisted ed25519 identity with zero errors; heartbeats flowing with
 live modem probe data (both modems "3 UK", LTE band 20, RSRP -98/-101).
 Rollback copies of the previous binaries + dashboard are in
 `/root/rollback-20260711/` on each box.
+
+## 2026-07-11 — field test: YouTube "excellent connection, no video" root-caused
+
+First live stream on the new binaries reproduced the silent rejection.
+Investigation on the live box: segments decode clean (HEVC Main
+IDR_W_RADL closed-GOP + AAC — meets YouTube's stated HLS-ingest
+requirements, so the codec theory is dead), all PUTs return 2xx, but
+hlssink3 writes **no `#EXT-X-MEDIA-SEQUENCE` tag at all** until segments
+roll off its window. The 61f36a6 continuity rewrite only *replaced* an
+existing tag line, so the first ~5 playlists of every watchdog
+generation uploaded with an implicit sequence of 0 — and the egress
+watchdog rebuilt 5 times in 14 minutes, so YouTube saw the sequence
+bounce `…390 → 0 → 480 → 0…` for the whole stream (docs: tag required,
+monotonic increase). Fixed in 225c797: the rewrite now inserts the
+continuous number before the first `#EXTINF` when the tag is absent
+(regression test `media_sequence_tag_inserted_when_missing`). Deployed
+to Hetzner as an on-disk swap of `strata-pipeline` only (uploader lives
+in the binary, not the plugin; checksum-verified, rollback in
+`/root/rollback-20260711-hlsfix/`) — no service restart, so the fix
+takes effect on the next stream start.
+
+Secondary finding, not yet addressed: every watchdog rebuild has the
+same signature — q_v full at ~10 s, q_a empty, no segment for 15 s.
+hlssink3 stalls waiting for audio to interleave after the audio
+Monotonic-DTS gate goes quiet following a loss burst (gate had been
+dropping "non-credible" buffers right before each stall). The rebuild
+resilience works but costs a ~20 s outage each time; the audio-gate
+wedge is the next thing to chase if rebuild frequency stays this high.
