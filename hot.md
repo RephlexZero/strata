@@ -5,8 +5,14 @@
 
 ## Current focus
 
-**2026-07-10: three of the post-livestream improvements implemented
-(NOT yet deployed).** (1) **Floor-yield in the adapter** — the 2026-07-05
+**2026-07-11: ALL OF THE BELOW IS DEPLOYED** (both boxes, log.md
+2026-07-11 deploy entry; rollback in `/root/rollback-20260711/` on each
+box). Remaining next field action: **the libx265 discriminator test**
+(ffmpeg push to the YouTube ingest URL — decides HEVC-vs-discontinuity-
+tags; the media-sequence fix now deployed may itself change the
+outcome, so retest Strata's own output too).
+
+**2026-07-10: three of the post-livestream improvements implemented.** (1) **Floor-yield in the adapter** — the 2026-07-05
 collapse mode (min_bitrate pinned above deliverable capacity → AQM
 shreds the stream while `reduce=true` clamps back to the floor) now
 self-heals: 3+ self-congested ticks at the floor and the floor yields to

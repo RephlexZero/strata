@@ -1054,3 +1054,21 @@ stores at start), so it stays accurate across page reloads.
 
 Suites: 364 bonding, 13 sender, 28 control, 52 gst, 49 protocol;
 clippy clean incl. the dashboard; trunk release build OK.
+
+## 2026-07-11 (deploy) — 61f36a6 + 0360774 shipped to production
+
+Deployed both commits (floor-yield + survivable profile mins + HLS
+media-sequence continuity + ramp-stall fix + dashboard bitrate
+recommendations) to both boxes via `make cross-aarch64` + rsync/systemd
+swap, control → receiver → sender order. Pre-deploy: no live streams,
+Postgres backed up to `/root/strata-predeploy-20260711.sql`. Hetzner got
+strata-control, strata-receiver, strata-pipeline, libgststrata.so and
+the new dashboard bundle (served hash changed, login verified); the Pi
+got strata-sender, strata-pipeline, libgststrata.so (no setcap — the
+unit's AmbientCapabilities grants CAP_NET_RAW). SHA256s verified after
+transfer (first scp attempt timed out mid-file on the slow uplink;
+rsync --partial resumed it). All services reconnected and authenticated
+on persisted ed25519 identity with zero errors; heartbeats flowing with
+live modem probe data (both modems "3 UK", LTE band 20, RSRP -98/-101).
+Rollback copies of the previous binaries + dashboard are in
+`/root/rollback-20260711/` on each box.
