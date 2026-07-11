@@ -179,6 +179,12 @@ pub struct TransportLink {
     pacing: Mutex<PacingState>,
     /// Paced send queue.
     paced_queue: Mutex<std::collections::VecDeque<strata_transport::sender::OutputPacket>>,
+    /// When (`mono_now_us`) the pacer last observed the paced queue empty.
+    /// An ACK-rate sample whose interval contains this instant is app-limited:
+    /// the wire went unfilled, so the measured delivery rate reflects the
+    /// app's send rate, not link capacity (see the `on_bandwidth_sample`
+    /// call site).
+    paced_queue_last_empty_us: AtomicU64,
     /// Capacity oracle — independent of BBR btl_bw.
     oracle: Mutex<CapacityOracle>,
     /// Previous retransmissions snapshot for per-interval loss_rate.
@@ -373,6 +379,14 @@ const BTLBW_ABSOLUTE_CEILING_BPS: f64 = 50_000_000.0;
 /// `BTLBW_VS_ACK_RATE_CAP_MULT` above but NOT confirmed co-tuned with it
 /// (per audit) — don't merge them into one constant.
 const ACK_RATE_FALLBACK_HEADROOM_MULT: f64 = 1.2;
+
+/// Microsecond monotonic clock shared by the ACK-rate sampler and the
+/// paced-queue empty stamp — a single epoch so the two timestamps are
+/// directly comparable for app-limited detection.
+fn mono_now_us() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+}
 
 impl TransportLink {
     /// The paced-queue byte budget shared by the AQM
@@ -585,6 +599,7 @@ impl TransportLink {
                 last_refill: std::time::Instant::now(),
             }),
             paced_queue: Mutex::new(std::collections::VecDeque::new()),
+            paced_queue_last_empty_us: AtomicU64::new(0),
             aqm_dropped_pkts: AtomicU64::new(0),
             aqm_dropped_bytes: AtomicU64::new(0),
             aqm_dropped_retx: AtomicU64::new(0),
@@ -682,6 +697,12 @@ impl TransportLink {
 
         let mut q = self.paced_queue.lock().unwrap();
         if q.is_empty() {
+            // App-limited marker: the wire is not being kept full right now,
+            // so ACK-rate samples covering this instant measure the app's
+            // send rate, not link capacity. The pacer runs every few ms, so
+            // this early return observes any mid-interval queue drain.
+            self.paced_queue_last_empty_us
+                .store(mono_now_us(), Ordering::Relaxed);
             return;
         }
 
@@ -909,12 +930,7 @@ impl TransportLink {
                         }
                     }
 
-                    let now_us = {
-                        static EPOCH: std::sync::OnceLock<std::time::Instant> =
-                            std::sync::OnceLock::new();
-                        let epoch = EPOCH.get_or_init(std::time::Instant::now);
-                        epoch.elapsed().as_micros() as u64
-                    };
+                    let now_us = mono_now_us();
                     let total_acked = self.bytes_acked.load(Ordering::Relaxed);
                     let prev_bytes = self.prev_ack_bytes.load(Ordering::Relaxed);
                     let prev_us = self.prev_ack_time_us.load(Ordering::Relaxed);
@@ -966,15 +982,25 @@ impl TransportLink {
                                     "ACK sample"
                                 );
 
-                                // In multi-link bonding, never mark samples as
-                                // app-limited.  The EDPF scheduler controls how
-                                // much each link receives — low in-flight during
-                                // idle gaps between bursts is normal, not a sign
-                                // that the app can't keep up.  Marking those
-                                // samples app-limited causes the CC to reject all
-                                // low samples, ratcheting btl_bw upward via a
-                                // survivor-bias on high outliers only.
-                                cc.on_bandwidth_sample(delta_bytes, interval_us, false);
+                                // App-limited iff the paced queue was observed
+                                // empty inside this sample's interval: the wire
+                                // went unfilled, so the delivery rate measures
+                                // the app's send rate, not capacity. Hardcoding
+                                // `false` here (2026-07-11 field stream) let
+                                // btl_bw converge onto our own throttled send
+                                // rate — pacing ≈ inflow, so every IDR burst
+                                // stood in the paced queue (sojourn 1-2 s, 29%
+                                // of packets late, continuous AQM shed) and the
+                                // capacity chain tracked inflow instead of the
+                                // link, floor-locking the adapter. This does
+                                // not resurrect the old ratchet-by-survivor-
+                                // bias: samples taken under genuine backlog are
+                                // NOT app-limited and still pull btl_bw down
+                                // when capacity truly drops.
+                                let last_empty_us =
+                                    self.paced_queue_last_empty_us.load(Ordering::Relaxed);
+                                let app_limited = last_empty_us >= prev_us;
+                                cc.on_bandwidth_sample(delta_bytes, interval_us, app_limited);
                             }
                         }
                     } else if prev_us == 0 {
