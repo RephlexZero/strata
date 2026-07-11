@@ -137,6 +137,10 @@ pub fn SenderDetailPage() -> impl IntoView {
     // Go Live source picker (U11): "camera" | "test" + v4l2 device path.
     let (selected_source, set_selected_source) = signal(String::from("test"));
     let (selected_device, set_selected_device) = signal(String::new());
+    // Go Live format picker — feeds the profile-based bitrate
+    // recommendation and the SourceConfig sent to the sender.
+    let (selected_resolution, set_selected_resolution) = signal(String::from("1920x1080"));
+    let (selected_framerate, set_selected_framerate) = signal(30u32);
 
     // Why the last stream ended (U2) — reason slug + optional detail.
     let (end_notice, set_end_notice) = signal(Option::<String>::None);
@@ -366,6 +370,8 @@ pub fn SenderDetailPage() -> impl IntoView {
         set_show_start_modal.set(true);
         set_selected_dest.set(None);
         set_selected_codec.set(String::from("h265"));
+        set_selected_resolution.set(String::from("1920x1080"));
+        set_selected_framerate.set(30);
         // Default to the first real camera when one exists — silently
         // starting a test pattern is how the 2026-07-05 "livestream" ended
         // up broadcasting colour bars (U11).
@@ -411,13 +417,15 @@ pub fn SenderDetailPage() -> impl IntoView {
         });
         // Always send an explicit source — omitting it makes the server
         // default to a test pattern (U11).
+        let resolution = selected_resolution.get_untracked();
+        let framerate = selected_framerate.get_untracked();
         let source = Some(if selected_source.get_untracked() == "camera" {
             strata_protocol::SourceConfig {
                 mode: "v4l2".into(),
                 device: Some(selected_device.get_untracked()),
                 uri: None,
-                resolution: Some("1920x1080".into()),
-                framerate: Some(30),
+                resolution: Some(resolution),
+                framerate: Some(framerate),
                 passthrough: None,
             }
         } else {
@@ -425,8 +433,8 @@ pub fn SenderDetailPage() -> impl IntoView {
                 mode: "test".into(),
                 device: None,
                 uri: None,
-                resolution: Some("1920x1080".into()),
-                framerate: Some(30),
+                resolution: Some(resolution),
+                framerate: Some(framerate),
                 passthrough: None,
             }
         });
@@ -575,6 +583,10 @@ pub fn SenderDetailPage() -> impl IntoView {
                 set_selected_dest=set_selected_dest
                 selected_codec=selected_codec
                 set_selected_codec=set_selected_codec
+                selected_resolution=selected_resolution
+                set_selected_resolution=set_selected_resolution
+                selected_framerate=selected_framerate
+                set_selected_framerate=set_selected_framerate
                 dests_loading=dests_loading
                 hw_inputs=hw_inputs
                 selected_source=selected_source

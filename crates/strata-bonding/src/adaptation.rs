@@ -600,9 +600,9 @@ impl BitrateAdapter {
     /// per-tick goodput / capacity estimates whipsaw the encoder (field run
     /// #10 saw 1039 ↔ 2742 kbps swings every 5 s); CBR-HEVC produces visible
     /// VBV transients on every jump — the "moments of clear, then grey
-    /// noise, then back" pattern. The 15 % step deliberately exceeds the
-    /// 10 % `target_changed` commit threshold so legitimate ramp-up ticks
-    /// still propagate. `LinkFailure` bypasses the limit entirely.
+    /// noise, then back" pattern. (Recovery ramp steps bypass the 10 %
+    /// `target_changed` commit threshold outright — see the commit-gate
+    /// comment in `update()`.) `LinkFailure` bypasses the limit entirely.
     fn slew_clamp(&self, proposed: u32, reason: AdaptationReason) -> u32 {
         if matches!(reason, AdaptationReason::LinkFailure) {
             return proposed;
@@ -968,18 +968,16 @@ impl BitrateAdapter {
         let abs_change = (new_target as i64 - self.current_target_kbps as i64).unsigned_abs();
         let pct_change = abs_change as f64 / self.current_target_kbps.max(1) as f64;
         // The >10% relative gate rejects capacity-estimate noise, but a
-        // Recovery ramp step climbing home after a floor-yield is not
-        // noise: with the default 250 kbps step the gate blocks every
-        // climb past ~2.5 Mbps (250/2500 = 10%), which would strand a
-        // yielded encoder below a 3 Mbps configured floor forever — the
-        // latch releases only at the floor. Scoped to below-floor targets:
-        // an unconditional Recovery bypass lets ramp-ups commit every tick
-        // at high bitrates, and each same-tick increase suppresses the
-        // feedback cut path via `increased_this_tick`.
-        let ramp_home = reason == AdaptationReason::Recovery
-            && self.current_target_kbps < self.config.min_bitrate_kbps;
+        // deliberate Recovery ramp step is not noise: with the default
+        // 250 kbps step the gate silently blocked every climb past
+        // ~2.5 Mbps (250/2500 = 10%), stranding the encoder below its
+        // ceiling after any deep cut (and a floor-yielded encoder below a
+        // 3 Mbps configured floor forever). Safe to bypass unconditionally
+        // because ramp-up now pauses while a receiver congestion signal is
+        // pending (see compute_target), so committing every clean tick
+        // can no longer suppress the feedback cut path.
         let target_changed = abs_change > COMMAND_COMMIT_ABS_FLOOR_KBPS
-            && (pct_change > COMMAND_COMMIT_PCT || ramp_home);
+            && (pct_change > COMMAND_COMMIT_PCT || reason == AdaptationReason::Recovery);
         let interval_ok = self
             .last_command_time
             .is_none_or(|t| t.elapsed() >= self.config.min_interval);
@@ -1305,13 +1303,20 @@ impl BitrateAdapter {
         let feedback_grace = self
             .last_increase_time
             .is_some_and(|t| t.elapsed() < FEEDBACK_GRACE_PERIOD);
-        // Do not apply same-tick cuts on the exact tick of a capacity-path
-        // increase. This avoids increase→cut ping-pong from stale feedback.
+        // These signals are all stale-immune by construction (burst_loss and
+        // the shortfalls compare against the PRE-update target, so a reading
+        // that still reflects the old rate cannot fabricate them), so they
+        // are tracked even on the tick of a capacity-path increase. The old
+        // `!increased_this_tick` exclusions here were circular: with ramp
+        // steps committing every tick, the exclusion kept `raw_signal`
+        // false, which kept `congestion_started` unset, which let the ramp
+        // continue — so the sustain clock never started and the cut never
+        // landed. Ping-pong is instead prevented at the source: compute_target
+        // pauses ramp-up while `congestion_started` is set, so an increase
+        // can coincide with at most the signal's FIRST tick, and the sustain
+        // gate keeps any cut at least `congestion_sustain` away from it.
         let raw_signal = if feedback_grace {
-            link_collapse
-                || delay_pressure
-                || (burst_loss && !increased_this_tick)
-                || (severe_goodput_shortfall && !increased_this_tick)
+            link_collapse || delay_pressure || burst_loss || severe_goodput_shortfall
         } else {
             link_collapse || delay_pressure || goodput_shortfall || burst_loss
         };
@@ -1552,7 +1557,20 @@ impl BitrateAdapter {
         // `consecutive_increases >= 3` is a tick count, not a duration — see
         // the `AQM_SUSTAINED_TICKS` comment for the `stats_interval_ms`
         // coupling caveat.
-        if pressure < ramp_up_threshold && self.consecutive_increases >= 3 && !burst_cooldown {
+        // Also gated on no receiver congestion signal being tracked
+        // (`congestion_started`, set by update_with_feedback AFTER this ran
+        // last tick, so this reads the previous tick's signal). Without
+        // this, ramp-up and the feedback cut evaluation overlap: an
+        // increase committing on the same tick the receiver reports
+        // trouble reads as increase→cut ping-pong, and the guards that
+        // suppressed it also kept the congestion sustain clock from ever
+        // starting — the encoder could climb straight through a sustained
+        // receiver-side collapse.
+        if pressure < ramp_up_threshold
+            && self.consecutive_increases >= 3
+            && !burst_cooldown
+            && self.congestion_started.is_none()
+        {
             let target = current + self.config.ramp_up_kbps_per_step;
             let target = target.min(self.config.max_bitrate_kbps);
             // Cap below the pressure threshold to avoid overshooting into
@@ -2452,9 +2470,10 @@ mod tests {
             };
             adapter.update_with_feedback(&links, &feedback);
         }
-        assert_eq!(
-            adapter.current_target_kbps(),
-            start,
+        // Ramping UP is fine here (clean channel, healthy goodput, spare
+        // capacity) — the invariant under test is strictly "no cut".
+        assert!(
+            adapter.current_target_kbps() >= start,
             "clean-channel reorder/late residual must not cut the encoder \
              via late_pressure/delay_pressure, got {} (started at {})",
             adapter.current_target_kbps(),
@@ -2493,6 +2512,103 @@ mod tests {
              got {} (started at {})",
             adapter.current_target_kbps(),
             start
+        );
+    }
+
+    // ─── Ramp-up commit gate + congestion-signal pause ────────────────
+
+    /// The >10% relative commit gate silently blocked every +250 kbps
+    /// Recovery step past ~2.5 Mbps (250/2500 = 10%), so after any deep cut
+    /// the encoder could never climb back above ~2.5 Mbps. Recovery steps
+    /// must commit on the absolute floor alone.
+    #[test]
+    fn ramp_up_climbs_past_the_relative_commit_gate() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_bitrate_kbps: 500,
+            initial_bitrate_kbps: 2_600, // above the old ~2.5 Mbps stall point
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+        let links = make_links(&[(10_000.0, true)]);
+        for _ in 0..30 {
+            adapter.update(&links);
+        }
+        assert!(
+            adapter.current_target_kbps() >= 5_000,
+            "encoder must ramp well past the old 2.5 Mbps commit-gate stall, got {}",
+            adapter.current_target_kbps()
+        );
+    }
+
+    /// While a receiver congestion signal is being tracked toward the
+    /// sustain gate, ramp-up must pause — otherwise every-tick increases
+    /// suppress the cut evaluation and the encoder climbs straight through
+    /// a receiver-side collapse.
+    #[test]
+    fn ramp_up_pauses_while_congestion_signal_pending() {
+        let mut adapter = BitrateAdapter::new(AdaptationConfig {
+            max_bitrate_kbps: 10_000,
+            min_bitrate_kbps: 500,
+            initial_bitrate_kbps: 1_000, // low: +250 steps passed even the old gate
+            min_interval: Duration::ZERO,
+            // Default (1.5s) sustain: instant test ticks never reach it, so
+            // no cut lands — isolating the ramp-pause behaviour.
+            ..Default::default()
+        });
+        let mut links = make_links(&[(10_000.0, true)]);
+
+        // Healthy priming: adapter ramps freely.
+        let healthy = ReceiverFeedback {
+            goodput_bps: 8_000_000,
+            fec_repair_rate: 0.0,
+            jitter_buffer_ms: 50,
+            loss_after_fec: 0.0,
+            late_rate: 0.0,
+        };
+        for _ in 0..6 {
+            adapter.update_with_feedback(&links, &healthy);
+        }
+        let primed = adapter.current_target_kbps();
+        assert!(primed > 1_000, "precondition: ramping while healthy");
+
+        // Receiver reports growing jitter with real channel loss (delay
+        // pressure) but goodput stays healthy — a signal that must pause the
+        // climb without (yet) cutting.
+        links[0].loss_rate = 0.05;
+        let mut jitter = 100u32;
+        adapter.update_with_feedback(
+            &links,
+            &ReceiverFeedback {
+                goodput_bps: 8_000_000,
+                fec_repair_rate: 0.0,
+                jitter_buffer_ms: jitter,
+                loss_after_fec: 0.0,
+                late_rate: 0.10,
+            },
+        );
+        // The signal could only be observed AFTER this tick's capacity pass,
+        // so allow the one in-flight increase; from here the target must
+        // freeze.
+        let at_signal = adapter.current_target_kbps();
+        for _ in 0..5 {
+            jitter += 200;
+            adapter.update_with_feedback(
+                &links,
+                &ReceiverFeedback {
+                    goodput_bps: 8_000_000,
+                    fec_repair_rate: 0.0,
+                    jitter_buffer_ms: jitter,
+                    loss_after_fec: 0.0,
+                    late_rate: 0.10,
+                },
+            );
+        }
+        assert!(
+            adapter.current_target_kbps() <= at_signal,
+            "ramp-up must pause while a congestion signal is pending: {} > {}",
+            adapter.current_target_kbps(),
+            at_signal
         );
     }
 

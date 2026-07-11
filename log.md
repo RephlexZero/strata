@@ -1016,3 +1016,41 @@ forever holding inherited pipe fds — the exact mechanism that wedged
 
 All suites green (362 bonding, 13 sender, 27 hls_upload, 7 profiles,
 28 control), clippy clean across the four touched crates.
+
+## 2026-07-11 — ramp-stall interplay resolved + profile recommendations in the UI
+
+**Adaptation: the above-floor ramp stall is fixed properly.** Three
+coordinated changes in `adaptation.rs`: (1) ramp-up now pauses while a
+receiver congestion signal is being tracked toward the sustain gate
+(`congestion_started.is_none()` gate in compute_target) — ramping and
+cut evaluation can no longer fight across ticks; (2) the
+`!increased_this_tick` exclusions in the grace-mode raw_signal were
+removed — they were circular (increase blocks signal → sustain clock
+never starts → cut never lands → ramp continues), and the signals are
+stale-immune by construction since burst_loss and both shortfalls
+compare against the PRE-update target; (3) with the interplay gone, the
+Recovery bypass of the >10% commit gate is now unconditional, so the
+encoder can climb past ~2.5 Mbps again after any deep cut (previously
++250-kbps steps silently never committed above 2.5 Mbps — the
+floor-yield unlatch also depends on this climb). Two new regression
+tests (`ramp_up_climbs_past_the_relative_commit_gate`,
+`ramp_up_pauses_while_congestion_signal_pending`); the clean-channel
+reorder test's assertion relaxed from "unchanged" to "no cut" since
+ramping up on a clean channel is now correct. 364 bonding lib tests
+green.
+
+**Dashboard: profile-based bitrate recommendations.** The Go Live modal
+gains Resolution + Framerate pickers (the `RESOLUTIONS`/`FRAMERATES`
+constants finally wired; selections now flow into SourceConfig instead
+of the hardcoded 1080p30) plus a live recommendation panel — for the
+chosen res+fps+codec it shows the profile's start bitrate and adaptive
+range, computed client-side via `strata_protocol::profiles::
+lookup_profile` (dashboard already links strata-protocol; no new API).
+The Encoder Settings card's manual bitrate slider now shows
+"Recommended for {res}@{fps} {codec}: N kbps (adaptive range min–max)"
+with a Use button — driven by the RUNNING stream's shape parsed from
+`StreamDetail.config_json` (the resolved config the control plane
+stores at start), so it stays accurate across page reloads.
+
+Suites: 364 bonding, 13 sender, 28 control, 52 gst, 49 protocol;
+clippy clean incl. the dashboard; trunk release build OK.

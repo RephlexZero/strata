@@ -37,6 +37,10 @@ pub fn DestinationModal(
     set_selected_dest: WriteSignal<Option<String>>,
     selected_codec: ReadSignal<String>,
     set_selected_codec: WriteSignal<String>,
+    selected_resolution: ReadSignal<String>,
+    set_selected_resolution: WriteSignal<String>,
+    selected_framerate: ReadSignal<u32>,
+    set_selected_framerate: WriteSignal<u32>,
     dests_loading: ReadSignal<bool>,
     hw_inputs: ReadSignal<Vec<MediaInput>>,
     selected_source: ReadSignal<String>,
@@ -191,6 +195,75 @@ pub fn DestinationModal(
                             </div>
                         </label>
                     </div>
+
+                    // Format — resolution + framerate drive the profile-based
+                    // bitrate envelope the control plane applies at start.
+                    <div class="divider text-xs text-base-content/40">"Format"</div>
+                    <div class="flex gap-3">
+                        <fieldset class="fieldset flex-1">
+                            <label class="fieldset-label">"Resolution"</label>
+                            <select class="select select-bordered select-sm w-full"
+                                on:change=move |ev| set_selected_resolution.set(event_target_value(&ev))
+                            >
+                                {strata_protocol::profiles::RESOLUTIONS.iter().map(|(value, label)| {
+                                    let v = value.to_string();
+                                    let v2 = value.to_string();
+                                    view! {
+                                        <option value=v selected=move || selected_resolution.get() == v2>
+                                            {*label}
+                                        </option>
+                                    }
+                                }).collect::<Vec<_>>()}
+                            </select>
+                        </fieldset>
+                        <fieldset class="fieldset flex-1">
+                            <label class="fieldset-label">"Framerate"</label>
+                            <select class="select select-bordered select-sm w-full"
+                                on:change=move |ev| {
+                                    if let Ok(v) = event_target_value(&ev).parse::<u32>() {
+                                        set_selected_framerate.set(v);
+                                    }
+                                }
+                            >
+                                {strata_protocol::profiles::FRAMERATES.iter().map(|fps| {
+                                    let fps = *fps;
+                                    view! {
+                                        <option value=fps.to_string() selected=move || selected_framerate.get() == fps>
+                                            {format!("{fps} fps")}
+                                        </option>
+                                    }
+                                }).collect::<Vec<_>>()}
+                            </select>
+                        </fieldset>
+                    </div>
+
+                    // Profile-based bitrate recommendation for the chosen
+                    // resolution + framerate + codec — the same envelope the
+                    // control plane applies when the stream starts.
+                    {move || {
+                        let res = selected_resolution.get();
+                        let fps = selected_framerate.get();
+                        let codec = selected_codec.get();
+                        let p = strata_protocol::profiles::lookup_profile(
+                            Some(&res), Some(fps), Some(&codec),
+                        );
+                        let codec_label = if codec == "h264" { "H.264" } else { "H.265" };
+                        view! {
+                            <div class="bg-base-300 rounded-lg p-3 mt-3 text-sm">
+                                <span class="text-base-content/60">"Recommended for "</span>
+                                <span class="font-mono">{res} "@" {fps} " " {codec_label}</span>
+                                <span class="text-base-content/60">": starts at "</span>
+                                <span class="font-mono font-bold">{p.default_kbps.to_string()} " kbps"</span>
+                                <span class="text-base-content/60">
+                                    ", adapts between "
+                                </span>
+                                <span class="font-mono">
+                                    {p.min_kbps.to_string()} "–" {p.max_kbps.to_string()} " kbps"
+                                </span>
+                                <span class="text-base-content/60">" with link conditions."</span>
+                            </div>
+                        }
+                    }}
 
                     // Codec ↔ destination compatibility guard
                     {move || {
@@ -613,7 +686,7 @@ pub fn StreamTab(
             </div>
 
             // Encoder controls
-            <LiveSettingsCard sender_id=sender_id stream_state=stream_state live_bitrate=live_bitrate />
+            <LiveSettingsCard sender_id=sender_id stream_state=stream_state live_bitrate=live_bitrate stream_detail=stream_detail />
 
             // Transport Tuning controls
             <TransportTuningCard sender_id=sender_id stream_state=stream_state />

@@ -679,16 +679,51 @@ pub fn AlertingRulesCard(sender_id: Memo<String>, is_online: Memo<bool>) -> impl
 // LIVE SETTINGS (encoder controls)
 // ═══════════════════════════════════════════════════════════════════
 
+/// (resolution, framerate, codec) of a running stream, parsed from the
+/// resolved config the control plane stored at start.
+fn stream_encoder_shape(
+    detail: &strata_protocol::api::StreamDetail,
+) -> Option<(String, u32, String)> {
+    let cfg: serde_json::Value = serde_json::from_str(detail.config_json.as_deref()?).ok()?;
+    let req = &cfg["request"];
+    let resolution = req["source"]["resolution"].as_str()?.to_string();
+    let framerate = req["source"]["framerate"].as_u64()? as u32;
+    let codec = req["encoder"]["codec"]
+        .as_str()
+        .unwrap_or("h265")
+        .to_string();
+    Some((resolution, framerate, codec))
+}
+
 #[component]
 pub fn LiveSettingsCard(
     sender_id: Memo<String>,
     stream_state: ReadSignal<String>,
     live_bitrate: ReadSignal<u32>,
+    stream_detail: ReadSignal<Option<strata_protocol::api::StreamDetail>>,
 ) -> impl IntoView {
     let auth = expect_context::<AuthState>();
 
     let (manual_mode, set_manual_mode) = signal(false);
     let (custom_bitrate, set_custom_bitrate) = signal(2500u32);
+
+    // Profile recommendation for the RUNNING stream's shape (res + fps +
+    // codec from its stored config), so the operator knows where the manual
+    // slider should sit.
+    let recommendation = move || {
+        stream_detail
+            .get()
+            .as_ref()
+            .and_then(stream_encoder_shape)
+            .map(|(res, fps, codec)| {
+                let p = strata_protocol::profiles::lookup_profile(
+                    Some(&res),
+                    Some(fps),
+                    Some(&codec),
+                );
+                (res, fps, codec, p)
+            })
+    };
     let (tune, set_tune) = signal(String::from("zerolatency"));
     let (applying, set_applying) = signal(false);
     let (apply_msg, set_apply_msg) = signal(Option::<(String, &'static str)>::None);
@@ -808,6 +843,27 @@ pub fn LiveSettingsCard(
                                 <span>"500"</span>
                                 <span>"15,000"</span>
                             </div>
+                            {move || recommendation().map(|(res, fps, codec, p)| {
+                                let codec_label = if codec == "h264" { "H.264" } else { "H.265" };
+                                view! {
+                                    <div class="flex items-center justify-between mt-2 text-xs">
+                                        <span class="text-base-content/60">
+                                            "Recommended for "
+                                            <span class="font-mono">{res} "@" {fps} " " {codec_label}</span>
+                                            ": "
+                                            <span class="font-mono font-semibold">{p.default_kbps.to_string()} " kbps"</span>
+                                            " (adaptive range "
+                                            <span class="font-mono">{p.min_kbps.to_string()} "–" {p.max_kbps.to_string()}</span>
+                                            ")"
+                                        </span>
+                                        <button class="btn btn-ghost btn-xs"
+                                            on:click=move |_| set_custom_bitrate.set(p.default_kbps)
+                                        >
+                                            "Use"
+                                        </button>
+                                    </div>
+                                }
+                            })}
                         </fieldset>
                     </div>
 

@@ -19,11 +19,15 @@ that column feeds the adapter floor via streams.rs and sender.rs.
 instead of letting hlssink3 reset it to 0 mid-URL (RFC 8216 violation,
 plausibly related to YouTube's silent rejection). (3) **daemon_lifecycle
 orphan fix** — FakePipelineScript kills its script on Drop; no more
-wedged `cargo test | tail`. Known follow-up left open: above-floor
-ramp-up stalls past ~2.5 Mbps (+250-step fails the >10% commit gate;
-an unconditional bypass breaks the feedback-cut interplay — see log.md
-2026-07-10). **Deploy + the libx265 discriminator test are the next
-field actions.**
+wedged `cargo test | tail`. **2026-07-11:** the above-floor ramp stall
+is now fixed for real (ramp-up pauses while a congestion signal is
+pending, the circular `increased_this_tick` exclusions are gone, and
+Recovery steps bypass the >10% commit gate unconditionally — log.md
+2026-07-11), and the dashboard now shows profile-based bitrate
+recommendations: res+fps pickers + recommendation panel in the Go Live
+modal, and a per-running-stream "Recommended: N kbps" hint with Use
+button on the Encoder Settings slider. **Deploy + the libx265
+discriminator test are the next field actions.**
 
 **2026-07-06: ALL 16 AUDIT FINDINGS FIXED AND DEPLOYED.** Every U-finding
 in [raw/UX_TRUST_AUDIT.md](raw/UX_TRUST_AUDIT.md) is implemented, ticked,
