@@ -716,11 +716,8 @@ pub fn LiveSettingsCard(
             .as_ref()
             .and_then(stream_encoder_shape)
             .map(|(res, fps, codec)| {
-                let p = strata_protocol::profiles::lookup_profile(
-                    Some(&res),
-                    Some(fps),
-                    Some(&codec),
-                );
+                let p =
+                    strata_protocol::profiles::lookup_profile(Some(&res), Some(fps), Some(&codec));
                 (res, fps, codec, p)
             })
     };

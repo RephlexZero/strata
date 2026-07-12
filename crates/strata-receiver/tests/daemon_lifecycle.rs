@@ -518,10 +518,10 @@ async fn stats_relay_forwards_links_and_egress() {
             .unwrap();
         let got = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let ReceiverMessage::StreamStats(p) = conn.recv_receiver().await {
-                    if p.stream_id == "str_stats" {
-                        break p;
-                    }
+                if let ReceiverMessage::StreamStats(p) = conn.recv_receiver().await
+                    && p.stream_id == "str_stats"
+                {
+                    break p;
                 }
             }
         })
